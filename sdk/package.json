@@ -1,0 +1,29 @@
+{
+  "name": "@ostraagent/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript SDK for Ostra on Robinhood Chain: post-quantum clearing for agent payments.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "browser": "./src/browser.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "abi": "node scripts/abi.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.4.0",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

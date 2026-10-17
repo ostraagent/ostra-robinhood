@@ -17,8 +17,15 @@ Contents:
 - `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009), batches
   of one-leaf-each leaves checked with LtHash, WOTS approvals, sealing, WOTS leaf spends, refunds after
   48 hours. `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG.
+- `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
+  messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
+  request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
+  aggregator wire format and EIP-191 polls; and `deployOstra`, which deploys the contracts from the
+  Foundry build. Its fork tests run every message against the contracts on a fork of mainnet.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
 forge test -vv             # Vault.fork.t.sol forks Robinhood Chain mainnet (rpc_endpoints.robinhood)
+cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out) and anvil
+node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
 ```

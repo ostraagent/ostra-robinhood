@@ -1,0 +1,355 @@
+// The SDK's messages, ids and addresses against the contracts themselves, on
+// a fork of Robinhood Chain mainnet: Ostra deployed with deploy.ts next to the
+// real USDG and x402BatchSettlement. Every off-chain encoding is compared with
+// the contract's own view function, and every signed call the SDK builds is
+// sent and must land (a vault transfer, a channel open and its close request,
+// a crank change, and a relayed deposit through approval, seal and leaf spend).
+
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
+import {
+  bytesToHex,
+  getAddress,
+  hexToBytes,
+  keccak256,
+  parseEventLogs,
+  parseSignature,
+  stringToHex,
+  verifyTypedData,
+  zeroAddress,
+  type Address,
+  type Hex,
+  type PrivateKeyAccount,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
+import { depositCommitment, type Leaf } from "../src/aggregator.ts";
+import { ROBINHOOD_CHAIN_ID, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { checkDeployment } from "../src/deploy.ts";
+import { parseDeployment, type Deployment } from "../src/deployment.ts";
+import { usdgAbi } from "../src/external-abi.ts";
+import { depositForLeaves, LEAF_DENOMINATION } from "../src/leaves.ts";
+import {
+  approvalMessage,
+  channelId,
+  closeDigest,
+  closeRequestTypedData,
+  decodeOpenChannelParams,
+  decodeSetCrankParams,
+  decodeTransferParams,
+  decodeVaultSpendMessage,
+  depositAuthorizationTypedData,
+  depositKey,
+  depositNonce,
+  leafMessage,
+  openChannelParams,
+  setCrankParams,
+  signApproveBatch,
+  signSpendLeaf,
+  signVaultOpenChannel,
+  signVaultSetCrankKey,
+  signVaultTransfer,
+  transferParams,
+  vaultAddress,
+  vaultChannelConfig,
+  vaultSpendMessage,
+  voucherDigest,
+  voucherTypedData,
+  type OpenChannelParams,
+} from "../src/messages.ts";
+import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readVault } from "../src/reads.ts";
+import { FileWotsStore } from "../src/wots-file.ts";
+import { WotsKeychain } from "../src/wots.ts";
+import { deployOnFork, startFork, type Fork } from "./fork.ts";
+
+const MASTER = hexToBytes(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/master")));
+const keychainId = (name: string) => hexToBytes(keccak256(stringToHex(`OSTRA/EVM/SDK-TEST/${name}`)));
+const session = privateKeyToAccount(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/session-key")));
+const crank = privateKeyToAccount(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/crank")));
+const depositor = privateKeyToAccount(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/depositor")));
+
+let fork: Fork;
+let d: Deployment;
+let relayer: PrivateKeyAccount;
+const dirs: string[] = [];
+
+async function keychain(name: string): Promise<WotsKeychain> {
+  const dir = await mkdtemp(join(tmpdir(), "ostra-sdk-"));
+  dirs.push(dir);
+  return new WotsKeychain(MASTER, keychainId(name), new FileWotsStore(dir));
+}
+
+/** Sends a contract call from the relayer account and requires it to succeed. */
+async function send(address: Address, abi: readonly unknown[], functionName: string, args: readonly unknown[]) {
+  const hash = await fork.wallet(relayer).writeContract({ address, abi: abi as never, functionName: functionName as never, args: args as never, account: relayer, chain: fork.client.chain });
+  const receipt = await fork.client.waitForTransactionReceipt({ hash });
+  assert.equal(receipt.status, "success", `${functionName} failed`);
+  return receipt;
+}
+
+async function createVault(chain: WotsKeychain, initialCrank: Address): Promise<Address> {
+  const root = bytesToHex(chain.keyRoot(0n));
+  const predicted = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root, initialCrank });
+  const receipt = await send(d.vaultFactory, ostraVaultFactoryAbi, "createVault", [USDG, root, initialCrank]);
+  const [created] = parseEventLogs({ abi: ostraVaultFactoryAbi, logs: receipt.logs, eventName: "VaultCreated" });
+  assert.ok(created);
+  assert.equal(created.args.vault, predicted);
+  return predicted;
+}
+
+const balance = (who: Address) => fork.client.readContract({ address: USDG, abi: usdgAbi, functionName: "balanceOf", args: [who] });
+
+before(async () => {
+  fork = await startFork();
+  relayer = fork.accounts[0] as PrivateKeyAccount;
+  d = await deployOnFork(fork);
+});
+
+after(async () => {
+  await fork?.stop();
+  for (const dir of dirs) await rm(dir, { recursive: true, force: true });
+});
+
+test("the deployment is the one deploy.ts makes, and parses back", async () => {
+  assert.equal(d.chainId, ROBINHOOD_CHAIN_ID);
+  assert.equal(d.token, USDG);
+  assert.equal(d.batchSettlement, X402_BATCH_SETTLEMENT);
+  await checkDeployment(fork.client, d, { treasury: fork.accounts[1]!.address, poolAuthority: relayer.address });
+  assert.deepEqual(parseDeployment(JSON.parse(JSON.stringify(d))), d);
+  assert.throws(() => parseDeployment({ ...d, pool: "0x1234" }), /pool is not an address/);
+  assert.throws(() => parseDeployment({ ...d, version: 2 }), /version/);
+});
+
+test("vault addresses are the factory's, and only factory vaults read as vaults", async () => {
+  const chain = await keychain("vault-address");
+  for (const initialCrank of [zeroAddress, crank.address]) {
+    const root = bytesToHex(chain.keyRoot(0n));
+    const onChain = await fork.client.readContract({ address: d.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "vaultAddress", args: [USDG, root, initialCrank] });
+    assert.equal(vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root, initialCrank }), onChain);
+  }
+  const vault = await createVault(chain, crank.address);
+  const state = await readVault(fork.client, d, vault);
+  assert.deepEqual(state, {
+    vault,
+    token: USDG,
+    initialKeyRoot: bytesToHex(chain.keyRoot(0n)),
+    initialCrank: crank.address,
+    keyRoot: bytesToHex(chain.keyRoot(0n)),
+    nonce: 0n,
+    crank: crank.address,
+  });
+  assert.equal(await readVault(fork.client, d, getAddress("0x00000000000000000000000000000000000000aa")), null, "nothing deployed");
+  assert.equal(await readVault(fork.client, d, USDG), null, "not a vault");
+});
+
+test("spend messages are the vault's own, for every action, and decode back", async () => {
+  const chain = await keychain("spend-messages");
+  const vault = await createVault(chain, zeroAddress);
+  const next = bytesToHex(chain.keyRoot(1n));
+  const open: OpenChannelParams = {
+    payerAuthorizer: session.address,
+    receiver: fork.accounts[2]!.address,
+    receiverAuthorizer: fork.accounts[3]!.address,
+    withdrawDelay: 900,
+    salt: keccak256(stringToHex("salt")),
+    amount: 1_000_000n,
+  };
+  const cases = [
+    { action: VAULT_ACTION.TRANSFER, params: transferParams({ to: fork.accounts[2]!.address, amount: 5n }) },
+    { action: VAULT_ACTION.OPEN_CHANNEL, params: openChannelParams(open) },
+    { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(crank.address) },
+    { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(zeroAddress) },
+  ];
+  for (const c of cases) {
+    const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
+    const message = vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: next, action: c.action, params: c.params });
+    assert.equal(bytesToHex(message), onChain, `action ${c.action}`);
+    assert.deepEqual(decodeVaultSpendMessage(message), { chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: next, action: c.action, params: c.params });
+  }
+  assert.deepEqual(decodeTransferParams(cases[0]!.params), { to: fork.accounts[2]!.address, amount: 5n });
+  assert.deepEqual(decodeOpenChannelParams(cases[1]!.params), open);
+  assert.equal(decodeSetCrankParams(cases[2]!.params), crank.address);
+  // What the vault would refuse, the SDK never signs.
+  assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
+  assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
+  assert.throws(() => transferParams({ to: fork.accounts[2]!.address, amount: 0n }), /greater than zero/);
+  assert.throws(() => openChannelParams({ ...open, payerAuthorizer: zeroAddress }), /payerAuthorizer/);
+  assert.throws(() => openChannelParams({ ...open, withdrawDelay: 899 }), /withdrawDelay/);
+  assert.throws(() => openChannelParams({ ...open, withdrawDelay: 2_592_001 }), /withdrawDelay/);
+  assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: next, action: 0, params: cases[2]!.params }), /64 bytes/);
+});
+
+test("a transfer the SDK signs moves USDG once and rotates the key", async () => {
+  const chain = await keychain("transfer");
+  const vault = await createVault(chain, zeroAddress);
+  await fork.dealUsdg(vault, 100_000_000n);
+  const to = fork.accounts[2]!.address;
+  const before = await balance(to);
+  const state = await readVault(fork.client, d, vault);
+  assert.ok(state);
+  const spend = await signVaultTransfer(chain, state, { chainId: ROBINHOOD_CHAIN_ID, to, amount: 5_000_000n });
+  // Signing the same spend again gives the same bytes (resubmit, never re-sign).
+  assert.equal((await signVaultTransfer(chain, state, { chainId: ROBINHOOD_CHAIN_ID, to, amount: 5_000_000n })).signature, spend.signature);
+  await assert.rejects(() => signVaultTransfer(chain, state, { chainId: ROBINHOOD_CHAIN_ID, to, amount: 6_000_000n }), /already signed a different message/);
+  await send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]);
+  assert.equal(await balance(vault), 95_000_000n);
+  assert.equal((await balance(to)) - before, 5_000_000n);
+  const after1 = await readVault(fork.client, d, vault);
+  assert.equal(after1?.nonce, 1n);
+  assert.equal(after1?.keyRoot, bytesToHex(chain.keyRoot(1n)));
+  // The used signature never works again.
+  await assert.rejects(() => send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]));
+});
+
+test("an open the SDK signs creates the channel the SDK names; vouchers and close requests verify", async () => {
+  const buyerChain = await keychain("buyer");
+  const sellerChain = await keychain("seller");
+  const buyer = await createVault(buyerChain, crank.address);
+  const seller = await createVault(sellerChain, crank.address);
+  await fork.dealUsdg(buyer, 50_000_000n);
+  const open: OpenChannelParams = {
+    payerAuthorizer: session.address,
+    receiver: fork.accounts[3]!.address,
+    receiverAuthorizer: seller,
+    withdrawDelay: 900,
+    salt: keccak256(stringToHex("channel 1")),
+    amount: 20_000_000n,
+  };
+  const state = await readVault(fork.client, d, buyer);
+  assert.ok(state);
+  const spend = await signVaultOpenChannel(buyerChain, state, { chainId: ROBINHOOD_CHAIN_ID, open });
+  const receipt = await send(buyer, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]);
+  const config = vaultChannelConfig(buyer, USDG, open);
+  const id = channelId(config);
+  assert.equal(id, await fork.client.readContract({ address: X402_BATCH_SETTLEMENT, abi: x402BatchSettlementAbi, functionName: "getChannelId", args: [config] }));
+  const [opened] = parseEventLogs({ abi: ostraVaultAbi, logs: receipt.logs, eventName: "ChannelOpened" });
+  assert.equal(opened?.args.channelId, id);
+  assert.deepEqual(await readChannel(fork.client, X402_BATCH_SETTLEMENT, id), { channelId: id, balance: 20_000_000n, totalClaimed: 0n, pendingWithdrawal: null });
+  assert.equal(await balance(buyer), 30_000_000n);
+
+  // A cumulative voucher signed by the session key is the contract's digest and recovers to the payerAuthorizer.
+  assert.equal(voucherDigest({ channelId: id, maxClaimableAmount: 1_500_000n }), await fork.client.readContract({ address: X402_BATCH_SETTLEMENT, abi: x402BatchSettlementAbi, functionName: "getVoucherDigest", args: [id, 1_500_000n] }));
+  const voucher = await session.signTypedData(voucherTypedData({ channelId: id, maxClaimableAmount: 1_500_000n }));
+  assert.ok(await verifyTypedData({ ...voucherTypedData({ channelId: id, maxClaimableAmount: 1_500_000n }), address: session.address, signature: voucher }));
+
+  // A close request signed by the session key, at the vault's close nonce, starts the withdrawal once.
+  const block = await fork.client.getBlock();
+  const deadline = block.timestamp + 600n;
+  const nonce = await fork.client.readContract({ address: buyer, abi: ostraVaultAbi, functionName: "closeNonce", args: [id] });
+  assert.equal(nonce, 0n);
+  const typed = closeRequestTypedData({ chainId: ROBINHOOD_CHAIN_ID, vault: buyer, channelId: id, amount: 20_000_000n, nonce, deadline });
+  assert.equal(closeDigest({ chainId: ROBINHOOD_CHAIN_ID, vault: buyer, channelId: id, amount: 20_000_000n, nonce, deadline }), await fork.client.readContract({ address: buyer, abi: ostraVaultAbi, functionName: "closeDigest", args: [id, 20_000_000n, deadline] }));
+  const closeSig = await session.signTypedData(typed);
+  await send(buyer, ostraVaultAbi, "requestClose", [config, 20_000_000n, deadline, closeSig]);
+  const pending = await readChannel(fork.client, X402_BATCH_SETTLEMENT, id);
+  assert.equal(pending.pendingWithdrawal?.amount, 20_000_000n);
+  await assert.rejects(() => send(buyer, ostraVaultAbi, "requestClose", [config, 20_000_000n, deadline, closeSig]), "a close signature works once");
+});
+
+test("a crank change the SDK signs lands", async () => {
+  const chain = await keychain("crank");
+  const vault = await createVault(chain, zeroAddress);
+  const state = await readVault(fork.client, d, vault);
+  assert.ok(state);
+  assert.equal(state.crank, null);
+  const spend = await signVaultSetCrankKey(chain, state, { chainId: ROBINHOOD_CHAIN_ID, crank: crank.address });
+  await send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]);
+  assert.equal((await readVault(fork.client, d, vault))?.crank, crank.address);
+});
+
+test("pool messages are the pool's own; a relayed deposit is approved, sealed and its leaf spent", async () => {
+  const leafChain = await keychain("leaves");
+  const approvalChain = await keychain("approvals");
+  const pool = await readPool(fork.client, d.pool);
+  assert.equal(pool.feeBps, 30);
+  assert.equal(pool.leafAmount, LEAF_DENOMINATION);
+  const leaves: Leaf[] = [{ keyRoot: leafChain.keyRoot(0n), amount: LEAF_DENOMINATION }];
+  const commitment = depositCommitment(leaves);
+  const depositId = keccak256(stringToHex("deposit 1"));
+  const amount = depositForLeaves(1, pool.feeBps);
+  const args = {
+    depositor: depositor.address,
+    depositId,
+    amount,
+    refundOwner: depositor.address,
+    approvalKeyRoot: bytesToHex(approvalChain.keyRoot(0n)),
+    commitment,
+  };
+  const key = depositKey(depositor.address, depositId);
+  assert.equal(key, await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "depositKey", args: [depositor.address, depositId] }));
+  assert.equal(
+    depositNonce({ ...args, chainId: ROBINHOOD_CHAIN_ID, pool: d.pool }),
+    await fork.client.readContract({
+      address: d.pool,
+      abi: ostraPoolAbi,
+      functionName: "depositNonce",
+      args: [depositor.address, depositId, amount, depositor.address, args.approvalKeyRoot, bytesToHex(commitment)],
+    }),
+  );
+
+  // The depositor holds USDG and no ETH; the relayer submits its signed authorization.
+  await fork.dealUsdg(depositor.address, amount);
+  const block = await fork.client.getBlock();
+  const typed = depositAuthorizationTypedData({ ...args, chainId: ROBINHOOD_CHAIN_ID, pool: d.pool, validAfter: 0n, validBefore: block.timestamp + 3600n });
+  const { v, r, s } = parseSignature(await depositor.signTypedData(typed));
+  await send(d.pool, ostraPoolAbi, "depositWithAuthorization", [
+    depositor.address,
+    depositId,
+    amount,
+    depositor.address,
+    args.approvalKeyRoot,
+    bytesToHex(commitment),
+    0n,
+    typed.message.validBefore,
+    Number(v),
+    r,
+    s,
+  ]);
+  const dep = await readDeposit(fork.client, d.pool, key);
+  assert.equal(dep.status, "pending");
+  assert.equal(dep.amount, amount);
+  assert.equal(dep.commitmentHash, keccak256(bytesToHex(commitment)));
+  assert.equal(await balance(depositor.address), 0n);
+
+  // A batch of the one leaf; the depositor approves its exact state.
+  const batchId = pool.batchCount;
+  await send(d.pool, ostraPoolAbi, "createBatch", [1]);
+  await send(d.pool, ostraPoolAbi, "appendLeaves", [batchId, [bytesToHex(leaves[0]!.keyRoot)]]);
+  const batch = await readBatch(fork.client, d.pool, batchId);
+  assert.equal(batch.status, "open");
+  assert.deepEqual(batch.leaves, [{ keyRoot: bytesToHex(leaves[0]!.keyRoot), amount: LEAF_DENOMINATION, spent: false }]);
+  const state = batchStateOf(batch);
+  assert.equal(state, await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "batchState", args: [batchId] }));
+  const nextRoot = bytesToHex(approvalChain.keyRoot(1n));
+  assert.equal(
+    bytesToHex(approvalMessage({ chainId: ROBINHOOD_CHAIN_ID, pool: d.pool, key, batchId, state, nextKeyRoot: nextRoot })),
+    await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "approvalMessage", args: [key, batchId, state, nextRoot] }),
+  );
+  const approval = await signApproveBatch(approvalChain, { index: 0n, currentKeyRoot: dep.approvalKeyRoot }, { chainId: ROBINHOOD_CHAIN_ID, pool: d.pool, key, batchId, state });
+  await send(d.pool, ostraPoolAbi, "approveBatch", [approval.key, approval.batchId, approval.state, approval.nextKeyRoot, approval.signature]);
+  const approved = await readDeposit(fork.client, d.pool, key);
+  assert.equal(approved.approvedBatch, batchId);
+  assert.equal(approved.approvedState, state);
+  assert.equal(approved.approvalKeyRoot, nextRoot);
+
+  await send(d.pool, ostraPoolAbi, "sealBatch", [batchId, [key], [bytesToHex(commitment)]]);
+  assert.equal((await readBatch(fork.client, d.pool, batchId)).status, "sealed");
+  assert.equal((await readDeposit(fork.client, d.pool, key)).status, "consumed");
+
+  // The leaf key moves the leaf, whole, to the destination it signed.
+  const destination = fork.accounts[2]!.address;
+  assert.equal(
+    bytesToHex(leafMessage({ chainId: ROBINHOOD_CHAIN_ID, pool: d.pool, batchId, leafIndex: 0, destination, leafAmount: LEAF_DENOMINATION })),
+    await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "leafMessage", args: [batchId, 0, destination] }),
+  );
+  const before = await balance(destination);
+  const leafSpend = await signSpendLeaf(leafChain, { index: 0n, leafKeyRoot: batch.leaves[0]!.keyRoot }, { chainId: ROBINHOOD_CHAIN_ID, pool: d.pool, batchId, leafIndex: 0, destination, leafAmount: LEAF_DENOMINATION });
+  await send(d.pool, ostraPoolAbi, "spendLeaf", [leafSpend.batchId, leafSpend.leafIndex, leafSpend.destination, leafSpend.signature]);
+  assert.equal((await balance(destination)) - before, LEAF_DENOMINATION);
+  const spentBatch = await readBatch(fork.client, d.pool, batchId);
+  assert.equal(spentBatch.unspent, 0);
+  assert.equal(spentBatch.leaves[0]?.spent, true);
+});

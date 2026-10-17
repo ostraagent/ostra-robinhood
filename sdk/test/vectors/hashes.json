@@ -1,0 +1,38 @@
+{
+  "source": "program-tests/tests/vectors.rs of the Solana program (ostraagent/ostra e4a4153): the hash cases of vectors/core.json",
+  "hashes": [
+    {
+      "keccak256": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+      "name": "empty",
+      "parts": [],
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "keccak256": "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45",
+      "name": "abc",
+      "parts": [
+        "616263"
+      ],
+      "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    },
+    {
+      "keccak256": "c1e19c5757b05eb7b66d229dcd9481d71461c82ed5760e70d2493c8091cf050e",
+      "name": "multi_part",
+      "parts": [
+        "6f73747261",
+        "2f",
+        "76302e31"
+      ],
+      "sha256": "857e11de18b575f5d7b9bfedec1980a8c857ddd1033a6ee6b63f2c3c2d87c9d0"
+    },
+    {
+      "keccak256": "e4851badd296e531952719659e112ec14111b48040ad272e273e2dbcbcb4d2d0",
+      "name": "zero_and_counter",
+      "parts": [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+      ],
+      "sha256": "1ea324e8e9529e82cc7eb76848e3a8636d4266c0cd916a91b03c3bacd0ec182c"
+    }
+  ]
+}
