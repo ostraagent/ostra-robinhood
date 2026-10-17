@@ -1,0 +1,28 @@
+{
+  "name": "@ostraagent/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ostra Agent's logic shared by the MCP package and the web app: vaults, payments, channels, shield and unshield, with storage as an interface.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@ostraagent/sdk": "file:../sdk",
+    "@x402/core": "2.28.0",
+    "@x402/evm": "2.28.0",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

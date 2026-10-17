@@ -1,0 +1,605 @@
+// The agent's own vaults: open one, read it, withdraw from it, open channels
+// from it, change its crank.
+//
+// Vaults per (chain, token), all derived from the master seed, each with its
+// own WOTS keychain (key index = the vault's on-chain nonce), so they never
+// sign with the same one-time key:
+//   * the buyer vault: keychain vaultKeychainId(chain, token), no crank;
+//     it pays (withdraw, open_channel);
+//   * the seller vault: keychain sellerKeychainId(chain, token), created by
+//     accept_payments with the keeper crank (the crank it was created with is
+//     part of its CREATE2 address, kept in the seller record, see seller.ts);
+//     payments to the seller land in it. It does not open channels;
+//   * private vault `index`: keychain privateVaultKeychainId(chain, token,
+//     index), no crank, created by unshield together with the leaf spent
+//     into it (unshield.ts); it pays like the buyer vault, with its own
+//     relayer channels and records (keys.forPrivateVault).
+// Every vault spend is signed only after the checks that could make it fail
+// on-chain have passed, because a signed message that never lands blocks the
+// vault until it is sent (see pending.ts). With the relayer paying (relay.ts),
+// that includes a relayer channel with unused deposit for its price, kept
+// for it until it is sent; the buyer vault opens the relayer channels.
+//
+// On Robinhood Chain (design v0.4) a vault is a beacon proxy at a CREATE2
+// address of (token, initial key root, initial crank) and holds its tokens
+// itself (no token account, no rent); a channel is an x402 batch-settlement
+// channel whose id is fixed by its config, so an open is sent once (on Solana
+// each send of an open had its own slot and channel address).
+
+import { bytesToHex, encodeFunctionData, getAddress, isAddress, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
+import {
+  VAULT_ACTION,
+  channelId as computeChannelId,
+  fromHex,
+  openChannelParams,
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  readVault,
+  signVaultOpenChannel,
+  signVaultSetCrankKey,
+  signVaultTransfer,
+  setCrankParams,
+  transferParams,
+  usdgAbi,
+  vaultAddress as computeVaultAddress,
+  vaultChannelConfig,
+  type ChannelConfig,
+  type OpenChannelParams,
+  type RelayCall,
+  type SignedSpend,
+  type VaultState,
+  type WotsKeychain,
+} from "@ostraagent/sdk";
+import { formatEth, formatTokenAmount, parseTokenAmount, TOKEN_DECIMALS } from "./amount.ts";
+import { ethBalance, tokenBalance, tokenDecimals } from "./chain.ts";
+import { VAULT_SOFT_LIMIT, type Config } from "./config.ts";
+import type { Keys } from "./keys.ts";
+import { decodeVaultOpenChannelMessage, decodeVaultSetCrankKeyMessage, decodeVaultSpendHeader, decodeVaultTransferMessage } from "./pending.ts";
+import { randomBytes } from "./random.ts";
+import { LocalSender, PendingSpendUnpaidError, VAULT_SPEND_GAS, type OpenRelayerChannel, type RelayerChannelTerms, type Reservation, type Sender, type SendOptions } from "./relay.ts";
+
+/** Gas a createVault uses: 240,969 measured on the fork (17 Oct 2026), rounded up. */
+const CREATE_VAULT_GAS = 300_000n;
+/** The local fee payer must hold this many times a transaction's gas at the current gas price (as the keeper funds its crank: 2x). */
+const ETH_HEADROOM = 2n;
+const BACKUP_REMINDER =
+  "no encrypted backup of the master seed has been exported from this machine; the owner should run `node src/backup-cli.ts export <file>` in a terminal and keep the file and passphrase off this machine";
+
+export type OpenVaultResult = {
+  vault: Address;
+  token: Address;
+  nonce: string;
+  created: boolean;
+  txHash?: Hash;
+  softLimit: string;
+  backupReminder?: string;
+  note?: string;
+};
+
+export type PendingWithdrawal = { destination: Address; amount: string };
+export type PendingChannelOpen = { channel: Hex; receiver: Address; receiverAuthorizer: Address; deposit: string; voucherKey: Address };
+/** A crank change signed and not landed; `crank` null removes the crank. */
+export type PendingCrankChange = { crank: Address | null };
+
+/** buyer: the vault that pays; seller: the vault payments to the seller land in; private: a vault unshield created. */
+export type VaultKind = "buyer" | "seller" | "private";
+
+export type BalanceResult = {
+  chainId: number;
+  token: Address;
+  vault: Address;
+  vaultExists: boolean;
+  balance: string;
+  nonce: string | null;
+  softLimit: string;
+  overSoftLimit: boolean;
+  pendingWithdrawal: PendingWithdrawal | null;
+  pendingChannelOpen: PendingChannelOpen | null;
+  /** Seller vault only: the crank now on the vault (null: none) and a crank change not landed yet. */
+  crank?: Address | null;
+  pendingCrankChange?: PendingCrankChange | null;
+  feePayer: Address;
+  feePayerEth: string;
+  backupExported: boolean;
+  backupReminder?: string;
+};
+
+/** A vault spend signed earlier under the current nonce, sent before a new request. */
+export type ResentSpend =
+  | { operation: "withdraw"; txHash: Hash; destination: Address; amount: string }
+  | { operation: "open_channel"; txHash: Hash; channel: Hex; receiverAuthorizer: Address; deposit: string }
+  | { operation: "set_crank"; txHash: Hash; crank: Address | null };
+
+export type WithdrawResult =
+  | { status: "sent"; txHash: Hash; destination: Address; amount: string; vaultNonce: string }
+  | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+export type VaultChannelOpenResult =
+  | { status: "sent"; txHash: Hash; channel: Hex; config: ChannelConfig; vaultNonce: string }
+  | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+export type CrankChangeResult =
+  | { status: "sent"; txHash: Hash; crank: Address | null; vaultNonce: string }
+  | { status: "unchanged"; crank: Address | null; vaultNonce: string }
+  | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+/** A signed channel open about to be sent (new or resent): its params, its config and its channel id. */
+export type ChannelOpening = { open: OpenChannelParams; config: ChannelConfig; channel: Hex };
+
+/** The calldata of OstraVault.spend for a signed spend. */
+export function spendCall(vault: Address, s: { action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }): RelayCall {
+  return { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [s.action, s.nextKeyRoot, s.params, s.signature] }) };
+}
+
+export class VaultService {
+  readonly kind: VaultKind;
+  /** The private vault's number (kind "private"), else null. */
+  readonly privateIndex: bigint | null;
+  readonly #client: PublicClient;
+  readonly #transport: Transport;
+  readonly #config: Config;
+  readonly #keys: Keys;
+  readonly #keychain: WotsKeychain;
+  readonly #sender: Sender;
+  /** The crank the vault was created with (part of its address); unknown for a seller vault until setInitCrank. */
+  #initCrank: Address | null;
+  #queue: Promise<unknown> = Promise.resolve();
+  #onChannelOpening: ((opening: ChannelOpening) => Promise<void>) | null = null;
+
+  constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null) {
+    if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
+    this.kind = kind;
+    this.privateIndex = privateIndex;
+    this.#client = client;
+    this.#transport = transport;
+    this.#config = config;
+    this.#keys = keys;
+    this.#sender = sender;
+    const token = config.deployment.token;
+    this.#keychain =
+      kind === "buyer"
+        ? keys.vaultKeychain(config.chainId, token)
+        : kind === "seller"
+          ? keys.sellerKeychain(config.chainId, token)
+          : keys.privateVaultKeychain(config.chainId, token, privateIndex as bigint);
+    this.#initCrank = kind === "seller" ? null : zeroAddress;
+  }
+
+  /** Seller vault: the crank it is (or will be) created with, which is part of its address. */
+  setInitCrank(crank: Address): void {
+    if (this.kind !== "seller") throw new Error("the buyer vault is created without a crank");
+    if (!isAddress(crank, { strict: false })) throw new RangeError("a crank is an address");
+    this.#initCrank = getAddress(crank);
+  }
+
+  #missing(): string {
+    if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; unshield creates it`;
+    return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
+  }
+
+  /** Runs vault operations one at a time (each reads the nonce it signs with). */
+  #serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(fn, fn);
+    this.#queue = run.catch(() => undefined);
+    return run;
+  }
+
+  async vaultAddress(): Promise<Address> {
+    if (this.#initCrank === null) throw new Error(this.#missing());
+    const d = this.#config.deployment;
+    return computeVaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: this.#keyRoot(0n), initialCrank: this.#initCrank });
+  }
+
+  #keyRoot(index: bigint): Hex {
+    return bytesToHex(this.#keychain.keyRoot(index));
+  }
+
+  async #read(vault: Address): Promise<VaultState | null> {
+    return readVault(this.#client, this.#config.deployment, vault);
+  }
+
+  async #checkToken(): Promise<void> {
+    const decimals = await tokenDecimals(this.#client, this.#config.deployment.token);
+    if (decimals !== TOKEN_DECIMALS) throw new Error(`token ${this.#config.deployment.token} has ${decimals} decimals; this package supports ${TOKEN_DECIMALS}`);
+  }
+
+  /** USDG refuses transfers from and to a frozen address: a spend that moves tokens there would never land. */
+  async #notFrozen(account: Address, what: string): Promise<void> {
+    if (await this.#client.readContract({ address: this.#config.deployment.token, abi: usdgAbi, functionName: "isFrozen", args: [account] })) {
+      throw new Error(`${what} ${account} is frozen by the token issuer; the token refuses transfers from and to it`);
+    }
+  }
+
+  /**
+   * Called before every send of a channel open (new or resent), so the
+   * channel is recorded before it can land.
+   */
+  setChannelOpeningListener(listener: (opening: ChannelOpening) => Promise<void>): void {
+    this.#onChannelOpening = listener;
+  }
+
+  /**
+   * The local fee payer must hold the ETH for a transaction of `gas` (twice
+   * its price now) when it pays; with the relayer paying there is nothing to
+   * check.
+   */
+  async requireEth(gas: bigint, purpose: string, sender: Sender = this.#sender): Promise<void> {
+    if (sender.relayed) return;
+    const need = gas * (await this.#client.getGasPrice()) * ETH_HEADROOM;
+    const have = await ethBalance(this.#client, this.#keys.feePayer.address);
+    if (have < need) {
+      throw new Error(
+        `the fee payer ${this.#keys.feePayer.address} has ${formatEth(have)} ETH and needs at least ${formatEth(need)} ETH to ${purpose}; ` +
+          "send ETH to that address first, or set OSTRA_RELAYER_URL so the Ostra relayer pays",
+      );
+    }
+  }
+
+  /**
+   * How a relayer channel is opened when a payment needs one: the buyer vault
+   * and a private vault open it in place (their callers already hold their
+   * queue); the seller vault leaves it to the buyer vault's queued opener.
+   */
+  #opener(): OpenRelayerChannel | undefined {
+    return this.kind !== "seller" ? (terms) => this.#openRelayerChannelLocked(terms) : undefined;
+  }
+
+  #options(extra: SendOptions = {}): SendOptions {
+    const openChannel = this.#opener();
+    return openChannel === undefined ? extra : { openChannel, ...extra };
+  }
+
+  /** The createVault call of this vault (unshield sends it together with the leaf spent into it). */
+  async createCall(): Promise<RelayCall> {
+    if (this.#initCrank === null) throw new Error(this.#missing());
+    const d = this.#config.deployment;
+    return { to: d.vaultFactory, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [d.token, this.#keyRoot(0n), this.#initCrank] }) };
+  }
+
+  /** Gas the local fee payer needs to create this vault. */
+  createGas(): bigint {
+    return CREATE_VAULT_GAS;
+  }
+
+  open(): Promise<OpenVaultResult> {
+    return this.#serial(async () => {
+      if (this.kind === "private") throw new Error("a private vault is created by unshield, together with the leaf spent into it");
+      await this.#checkToken();
+      const vault = await this.vaultAddress();
+      const token = this.#config.deployment.token;
+      const softLimit = formatTokenAmount(VAULT_SOFT_LIMIT);
+      const existing = await this.#read(vault);
+      if (existing !== null) {
+        const found: OpenVaultResult = { vault, token, nonce: existing.nonce.toString(), created: false, softLimit };
+        if (!(await this.#keys.backupExported())) found.backupReminder = BACKUP_REMINDER;
+        return found;
+      }
+      await this.requireEth(CREATE_VAULT_GAS, "open the vault");
+      // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault is paid up front by the buyer vault.
+      const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" }));
+      const result: OpenVaultResult = { vault, token, nonce: "0", created: true, txHash, softLimit };
+      if (this.#sender.relayed && this.kind === "buyer") {
+        result.note =
+          "the Ostra relayer paid the vault's creation; the vault owes that price, paid with the first voucher of its channel to the relayer, " +
+          "which this server opens from the vault once it holds tokens (nothing else is relayed for the vault until then)";
+      }
+      if (!(await this.#keys.backupExported())) result.backupReminder = BACKUP_REMINDER;
+      return result;
+    });
+  }
+
+  async #pending(nonce: bigint): Promise<{ message: string; signature: string } | null> {
+    const record = await this.#keys.store.load(this.#keychain.keychainId, nonce);
+    return record === undefined ? null : record;
+  }
+
+  status(): Promise<BalanceResult> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress();
+      const token = this.#config.deployment.token;
+      const v = await this.#read(vault);
+      const balance = await tokenBalance(this.#client, token, vault);
+      let pendingWithdrawal: PendingWithdrawal | null = null;
+      let pendingChannelOpen: PendingChannelOpen | null = null;
+      let pendingCrankChange: PendingCrankChange | null = null;
+      if (v !== null) {
+        const p = await this.#pending(v.nonce);
+        if (p !== null) {
+          const message = fromHex(p.message);
+          const header = decodeVaultSpendHeader(message);
+          if (header.action === VAULT_ACTION.TRANSFER) {
+            const t = decodeVaultTransferMessage(message);
+            pendingWithdrawal = { destination: t.to, amount: formatTokenAmount(t.amount) };
+          } else if (header.action === VAULT_ACTION.OPEN_CHANNEL) {
+            const o = decodeVaultOpenChannelMessage(message).open;
+            const config = vaultChannelConfig(vault, token, o);
+            pendingChannelOpen = {
+              channel: computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex,
+              receiver: o.receiver,
+              receiverAuthorizer: o.receiverAuthorizer,
+              deposit: formatTokenAmount(o.amount),
+              voucherKey: o.payerAuthorizer,
+            };
+          } else if (header.action === VAULT_ACTION.SET_CRANK_KEY) {
+            pendingCrankChange = { crank: decodeVaultSetCrankKeyMessage(message).crank };
+          }
+        }
+      }
+      const backupExported = await this.#keys.backupExported();
+      const status: BalanceResult = {
+        chainId: this.#config.chainId,
+        token,
+        vault,
+        vaultExists: v !== null,
+        balance: formatTokenAmount(balance),
+        nonce: v === null ? null : v.nonce.toString(),
+        softLimit: formatTokenAmount(VAULT_SOFT_LIMIT),
+        overSoftLimit: balance > VAULT_SOFT_LIMIT,
+        pendingWithdrawal,
+        pendingChannelOpen,
+        ...(this.kind === "seller" ? { crank: v === null ? null : v.crank, pendingCrankChange } : {}),
+        feePayer: this.#keys.feePayer.address,
+        feePayerEth: formatEth(await ethBalance(this.#client, this.#keys.feePayer.address)),
+        backupExported,
+      };
+      if (!backupExported) status.backupReminder = BACKUP_REMINDER;
+      return status;
+    });
+  }
+
+  /**
+   * Sends the vault spend signed earlier under the vault's current nonce, if
+   * there is one (see pending.ts). Returns what was sent, or null.
+   */
+  async #sendPending(vault: Address, v: VaultState, sender: Sender, reservation: Reservation | null): Promise<ResentSpend | null> {
+    const p = await this.#pending(v.nonce);
+    if (p === null) return null;
+    const message = fromHex(p.message);
+    const signature = `0x${p.signature}` as Hex;
+    const header = decodeVaultSpendHeader(message);
+    if (header.vault !== vault || header.nonce !== v.nonce || header.chainId !== this.#config.chainId || header.nextKeyRoot.toLowerCase() !== this.#keyRoot(v.nonce + 1n).toLowerCase()) {
+      throw new Error("the stored signature does not belong to this vault and nonce");
+    }
+    const token = this.#config.deployment.token;
+    if (header.action === VAULT_ACTION.TRANSFER) {
+      const t = decodeVaultTransferMessage(message);
+      await this.#notFrozen(t.to, "the destination of a withdrawal signed earlier,");
+      const params = transferParams({ to: t.to, amount: t.amount });
+      const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.TRANSFER, nextKeyRoot: t.nextKeyRoot, params, signature })], { reservation });
+      return { operation: "withdraw", txHash, destination: t.to, amount: formatTokenAmount(t.amount) };
+    }
+    if (header.action === VAULT_ACTION.OPEN_CHANNEL) {
+      const { open, nextKeyRoot } = decodeVaultOpenChannelMessage(message);
+      const config = vaultChannelConfig(vault, token, open);
+      const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
+      if (this.#onChannelOpening !== null) await this.#onChannelOpening({ open, config, channel });
+      const params = openChannelParams(open);
+      const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.OPEN_CHANNEL, nextKeyRoot, params, signature })], { reservation });
+      return { operation: "open_channel", txHash, channel, receiverAuthorizer: open.receiverAuthorizer, deposit: formatTokenAmount(open.amount) };
+    }
+    if (header.action === VAULT_ACTION.SET_CRANK_KEY) {
+      const { crank, nextKeyRoot } = decodeVaultSetCrankKeyMessage(message);
+      const params = setCrankParams(crank ?? zeroAddress);
+      const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.SET_CRANK_KEY, nextKeyRoot, params, signature })], { reservation });
+      return { operation: "set_crank", txHash, crank };
+    }
+    throw new Error(`a vault operation this package does not send (spend action ${header.action}) was signed under nonce ${v.nonce} and must be completed first`);
+  }
+
+  /**
+   * Runs `fn` with what a vault spend needs to be paid. With the relayer: a
+   * reservation of unused relayer channel deposit for its price (a channel is
+   * opened first if none has room), released once `fn` is done. When a spend
+   * signed earlier waits and no relayer channel can pay for it, the local fee
+   * payer sends it if it holds the ETH. `moves` is what the spend takes out
+   * of this vault: a relayer channel opened from the buyer vault for it
+   * leaves that much in the buyer vault.
+   */
+  async #paidSpend<T>(sender: Sender, fn: (sender: Sender, reservation: Reservation | null) => Promise<T>, moves = 0n): Promise<T> {
+    let reservation: Reservation | null;
+    try {
+      reservation = await sender.reserve(VAULT_SPEND_GAS, sender === this.#sender ? this.#opener() : undefined, this.kind !== "seller" ? moves : 0n);
+    } catch (err) {
+      if (!(err instanceof PendingSpendUnpaidError)) throw err;
+      const local = new LocalSender(this.#client, this.#transport, this.#keys.feePayer);
+      const need = VAULT_SPEND_GAS * (await this.#client.getGasPrice()) * ETH_HEADROOM;
+      if ((await ethBalance(this.#client, this.#keys.feePayer.address)) < need) {
+        throw new Error(`${err.message}; send at least ${formatEth(need)} ETH to the fee payer ${this.#keys.feePayer.address} and call again: it sends that operation itself`);
+      }
+      return fn(local, null);
+    }
+    try {
+      return await fn(sender, reservation);
+    } finally {
+      sender.release(reservation);
+    }
+  }
+
+  #balance(vault: Address): Promise<bigint> {
+    return tokenBalance(this.#client, this.#config.deployment.token, vault);
+  }
+
+  /** "the vault holds X, less than Y", with where tokens in a relayer channel are when the relayer pays. */
+  #short(balance: bigint, what: string): Error {
+    const held = this.#sender.relayed ? " (a deposit in a channel to the relayer comes back to the vault when the relayer closes that channel, a few minutes after its last use)" : "";
+    return new Error(`the vault holds ${formatTokenAmount(balance)}, less than ${what}${held}`);
+  }
+
+  withdraw(destinationText: string, amountText: string, via?: Sender): Promise<WithdrawResult> {
+    return this.#serial(async () => {
+      const amount = parseTokenAmount(amountText);
+      if (amount === 0n) throw new RangeError("amount must be greater than zero");
+      if (!isAddress(destinationText, { strict: false })) throw new RangeError(`${destinationText} is not an address`);
+      const destination = getAddress(destinationText);
+      if (destination === zeroAddress) throw new RangeError("the destination must not be the zero address");
+      await this.#checkToken();
+      const vault = await this.vaultAddress();
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      const chosen = via ?? this.#sender;
+      await this.requireEth(VAULT_SPEND_GAS, "send the withdrawal", chosen);
+
+      return this.#paidSpend(chosen, async (sender, reservation) => {
+        // Read after the reservation: opening a relayer channel uses the vault's next one-time key.
+        const v = await this.#read(vault);
+        if (v === null) throw new Error(this.#missing());
+        // A spend signed earlier under the current nonce must be sent first.
+        const resent = await this.#sendPending(vault, v, sender, reservation);
+        if (resent !== null) {
+          const vaultNonce = (v.nonce + 1n).toString();
+          if (resent.operation === "withdraw" && parseTokenAmount(resent.amount) === amount && resent.destination === destination) {
+            return { status: "sent", txHash: resent.txHash, destination, amount: resent.amount, vaultNonce };
+          }
+          return {
+            status: "resent_pending",
+            resent,
+            vaultNonce,
+            note: "an earlier signed vault operation had not landed and was sent now; this withdrawal was not executed, call withdraw again for it",
+          };
+        }
+        if (destination === vault) throw new Error("the destination is the vault itself");
+        await this.#notFrozen(vault, "the vault");
+        await this.#notFrozen(destination, "the destination");
+        const balance = await this.#balance(vault);
+        if (balance < amount) throw this.#short(balance, formatTokenAmount(amount));
+
+        const signed: SignedSpend = await signVaultTransfer(this.#keychain, v, { chainId: this.#config.chainId, to: destination, amount });
+        let txHash: Hash;
+        try {
+          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+        } catch (err) {
+          throw new Error(`${(err as Error).message}\nthe signed withdrawal is kept; the next withdraw or open_channel call sends it again before anything else`);
+        }
+        return { status: "sent", txHash, destination, amount: formatTokenAmount(amount), vaultNonce: (v.nonce + 1n).toString() };
+      }, amount);
+    });
+  }
+
+  /**
+   * OpenChannel spend from this vault: an x402 batch-settlement channel with
+   * this vault as payer. `beforeSign` runs once every check has passed, just
+   * before the one-time key signs; it must record the channel. A spend signed
+   * earlier and not landed is sent instead, and this channel is not opened.
+   */
+  openChannel(open: OpenChannelParams, beforeSign: (opening: ChannelOpening) => Promise<void>): Promise<VaultChannelOpenResult> {
+    return this.#serial(async () => {
+      if (this.kind === "seller") throw new Error("channels are not opened from the seller vault");
+      await this.#checkToken();
+      const vault = await this.vaultAddress();
+      if (getAddress(open.receiverAuthorizer) === vault || getAddress(open.receiver) === vault) throw new Error("the channel would pay this agent's own vault");
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      await this.requireEth(VAULT_SPEND_GAS, "send the vault operation");
+
+      return this.#paidSpend(this.#sender, async (sender, reservation) => {
+        const v = await this.#read(vault);
+        if (v === null) throw new Error(this.#missing());
+        const resent = await this.#sendPending(vault, v, sender, reservation);
+        if (resent !== null) {
+          return {
+            status: "resent_pending",
+            resent,
+            vaultNonce: (v.nonce + 1n).toString(),
+            note: "an earlier signed vault operation had not landed and was sent now; this channel was not opened, call open_channel again for it",
+          };
+        }
+        await this.#notFrozen(vault, "the vault");
+        const balance = await this.#balance(vault);
+        if (balance < open.amount) throw this.#short(balance, `the deposit of ${formatTokenAmount(open.amount)}`);
+        const config = vaultChannelConfig(vault, this.#config.deployment.token, open);
+        const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
+        const opening = { open, config, channel };
+        await beforeSign(opening);
+        const signed = await signVaultOpenChannel(this.#keychain, v, { chainId: this.#config.chainId, open });
+        if (this.#onChannelOpening !== null) await this.#onChannelOpening(opening);
+        let txHash: Hash;
+        try {
+          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+        } catch (err) {
+          throw new Error(`${(err as Error).message}\nthe signed channel open is kept; the next open_channel or withdraw call sends it again before anything else`);
+        }
+        return { status: "sent", txHash, channel, config, vaultNonce: (v.nonce + 1n).toString() };
+      }, open.amount);
+    });
+  }
+
+  /**
+   * Opens a channel from the buyer vault to the relayer on the relayer's
+   * terms (relay.ts): the relayer sends it before payment, and its first
+   * voucher pays for it. Callers already inside this vault's queue use the
+   * unqueued variant (#opener).
+   */
+  openRelayerChannel(terms: RelayerChannelTerms): Promise<void> {
+    return this.#serial(() => this.#openRelayerChannelLocked(terms));
+  }
+
+  async #openRelayerChannelLocked(terms: RelayerChannelTerms): Promise<void> {
+    if (this.kind === "seller") throw new Error("relayer channels are not opened from the seller vault");
+    await this.#checkToken();
+    const vault = await this.vaultAddress();
+    const v = await this.#read(vault);
+    if (v === null) throw new Error(this.#missing());
+    if ((await this.#pending(v.nonce)) !== null) {
+      throw new PendingSpendUnpaidError("a vault operation signed earlier waits to be sent and no channel to the relayer has deposit left to pay for it");
+    }
+    await this.#notFrozen(vault, "the vault");
+    const balance = await this.#balance(vault);
+    if (balance < terms.amount) throw this.#short(balance, `the relayer channel deposit of ${formatTokenAmount(terms.amount)}`);
+    const salt = bytesToHex(randomBytes(32));
+    const voucher: PrivateKeyAccount = this.#keys.channelVoucherSigner(this.#config.chainId, this.#config.deployment.token, salt);
+    const open: OpenChannelParams = { payerAuthorizer: voucher.address, receiver: terms.receiver, receiverAuthorizer: terms.receiverAuthorizer, withdrawDelay: terms.withdrawDelay, salt, amount: terms.amount };
+    const config = vaultChannelConfig(vault, this.#config.deployment.token, open);
+    const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
+    const signed = await signVaultOpenChannel(this.#keychain, v, { chainId: this.#config.chainId, open });
+    if (this.#onChannelOpening !== null) await this.#onChannelOpening({ open, config, channel });
+    await this.#sender.send([spendCall(vault, signed)], {});
+  }
+
+  /**
+   * SetCrankKey spend: installs `crank` (the zero address removes the crank).
+   * A spend signed earlier and not landed is sent first; if it was this same
+   * crank change, its result is returned. `via` sends it another way than
+   * this vault's sender (settle_self and rotate_crank without the relayer).
+   */
+  setCrankKey(crankText: Address, via?: Sender): Promise<CrankChangeResult> {
+    return this.#serial(async () => {
+      if (!isAddress(crankText, { strict: false })) throw new RangeError("a crank is an address");
+      const crank = getAddress(crankText);
+      const target = crank === zeroAddress ? null : crank;
+      const vault = await this.vaultAddress();
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      const chosen = via ?? this.#sender;
+      await this.requireEth(VAULT_SPEND_GAS, "send the vault operation", chosen);
+
+      return this.#paidSpend(chosen, async (sender, reservation) => {
+        const v = await this.#read(vault);
+        if (v === null) throw new Error(this.#missing());
+        const resent = await this.#sendPending(vault, v, sender, reservation);
+        if (resent !== null) {
+          const vaultNonce = (v.nonce + 1n).toString();
+          if (resent.operation === "set_crank" && resent.crank === target) return { status: "sent", txHash: resent.txHash, crank: target, vaultNonce };
+          return {
+            status: "resent_pending",
+            resent,
+            vaultNonce,
+            note: "an earlier signed vault operation had not landed and was sent now; the crank was not changed, call again for it",
+          };
+        }
+        if (v.crank === target) return { status: "unchanged", crank: target, vaultNonce: v.nonce.toString() };
+
+        const signed = await signVaultSetCrankKey(this.#keychain, v, { chainId: this.#config.chainId, crank });
+        let txHash: Hash;
+        try {
+          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+        } catch (err) {
+          throw new Error(`${(err as Error).message}\nthe signed crank change is kept; the next call on this vault sends it again before anything else`);
+        }
+        return { status: "sent", txHash, crank: target, vaultNonce: (v.nonce + 1n).toString() };
+      });
+    });
+  }
+
+  /** The crank now on the vault (null: none), or undefined when the vault does not exist. */
+  async currentCrank(): Promise<Address | null | undefined> {
+    const v = await this.#read(await this.vaultAddress());
+    return v === null ? undefined : v.crank;
+  }
+}

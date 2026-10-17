@@ -45,6 +45,13 @@ Contents:
   before payment as the vault's debt; WOTS signatures are escrowed before anything is simulated.
   `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
   ETH; its fork test runs it on a mainnet fork.
+- `core/`: Ostra Agent's logic shared by the MCP package and the web app (`@ostraagent/core`),
+  browser-safe, with records behind a storage interface: the keys derived from the master seed,
+  the buyer, seller and private vaults (open, withdraw, open a channel, change the crank), the
+  relayer client that pays the relayer with vouchers of the vault's channel to it, channels from
+  the vault to Ostra sellers (closed on the payer path: requestClose, then finalizeWithdraw after
+  the grace period), session keys, shield and unshield. `scripts/chain-check.ts` runs it end to end
+  against the keeper, the relayer and a seller server; its fork test runs it on a mainnet fork.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
@@ -54,4 +61,5 @@ node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
 cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
 cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
+cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's and the relayer's npm ci
 ```
