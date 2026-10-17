@@ -8,3 +8,7 @@ evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
 fs_permissions = [{ access = "read", path = "./vectors" }]
+remappings = ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"]
+
+[rpc_endpoints]
+robinhood = "https://rpc.mainnet.chain.robinhood.com"
