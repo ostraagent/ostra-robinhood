@@ -28,6 +28,15 @@ Contents:
   within its 30-second watch) or a seller's signed close request it claims the last voucher, refunds
   the rest and pays the seller's split out (settle, distribute, release). `scripts/chain-check.ts`
   runs the keeper process end to end against a chain; its fork test runs it on a mainnet fork.
+- `merchant/`: the seller server (`@ostraagent/merchant`) and the library the relayer and the AI
+  gateway sell through. Paid routes are x402 batch-settlement channels (`@x402/evm` 2.28.0) paid to
+  the seller's OstraSplit with the seller's Ostra vault as receiverAuthorizer; vouchers are checked
+  by this server's own in-process facilitator, which also sends buyers' EIP-3009 deposits. Every
+  paid voucher is forwarded to the keeper; a buyer's refund and a channel idle for 300 seconds are
+  closed through the keeper; channels a buyer's Ostra vault opened on-chain are adopted from the
+  chain. `scripts/chain-check.ts` runs the keeper and the seller server end to end against a chain
+  with the stock x402 client as buyer; its fork test runs it on a mainnet fork (it waits out the
+  300-second idle close).
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
@@ -35,4 +44,5 @@ forge test -vv             # Vault.fork.t.sol forks Robinhood Chain mainnet (rpc
 cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out) and anvil
 node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
 cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
+cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
 ```
