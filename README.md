@@ -52,6 +52,16 @@ Contents:
   the vault to Ostra sellers (closed on the payer path: requestClose, then finalizeWithdraw after
   the grace period), session keys, shield and unshield. `scripts/chain-check.ts` runs it end to end
   against the keeper, the relayer and a seller server; its fork test runs it on a mainnet fork.
+  `test/shield.fork.test.ts` runs shield and unshield against the aggregator on a fork.
+- `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
+  batches: a depositor posts the leaves of its pending deposit (checked against the on-chain
+  commitment and amount) and polls it with an EIP-191 signature of its depositor key; with at least
+  8 deposits polled in the last 10 minutes it creates a batch, appends the leaves shuffled, seals it
+  once every deposit approved within 15 minutes or abandons it, and forgets which leaf came from
+  which deposit after the seal. A batch takes at most 43 deposits, so its sealBatch transaction
+  stays under the sequencer's 95,000-byte limit. `scripts/aggregator-check.ts` runs the aggregator
+  process end to end with eight depositors; its fork test runs it on a mainnet fork (it waits out
+  the 900-second approval window once, about 20 minutes).
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
@@ -61,5 +71,6 @@ node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
 cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
 cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
-cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's and the relayer's npm ci
+cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
+cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
 ```
