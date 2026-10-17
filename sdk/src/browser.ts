@@ -12,4 +12,5 @@ export * from "./leaves.ts";
 export * from "./lthash.ts";
 export * from "./messages.ts";
 export * from "./reads.ts";
+export * from "./relayer.ts";
 export * from "./wots.ts";

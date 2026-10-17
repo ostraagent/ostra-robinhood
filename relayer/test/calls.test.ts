@@ -1,0 +1,131 @@
+// Reading relay requests: every Ostra function the relayer recognises,
+// unknown and malformed calls, the request hash, and the four kinds relayed
+// before payment.
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { bytesToHex, concat, encodeFunctionData, getAddress, hexToBytes, keccak256, type Address, type Hex } from "viem";
+import {
+  MULTICALL3,
+  VAULT_ACTION,
+  openChannelParams,
+  ostraPoolAbi,
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  relayRequestHash,
+  transferParams,
+  usdgAbi,
+  vaultAddress,
+  type Deployment,
+} from "@ostraagent/sdk";
+import { classify, decodeRelayRequest, parseCall } from "../src/calls.ts";
+
+const at = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
+const d: Deployment = {
+  version: 1,
+  chainId: 4663,
+  token: at(0x5f),
+  batchSettlement: at(0x40),
+  vaultImplementation: at(0x10),
+  vaultBeacon: at(0x11),
+  vaultFactory: at(0x12),
+  poolImplementation: at(0x13),
+  poolBeacon: at(0x14),
+  pool: at(0x15),
+  splitFactory: at(0x16),
+  beaconOwner: at(0x17),
+  fromBlock: "1",
+};
+const relayerVault = at(0xee01);
+const vault = at(0xaa01);
+const root = `0x${"31".repeat(32)}` as Hex;
+const next = `0x${"32".repeat(32)}` as Hex;
+const sig = `0x${"ab".repeat(1892)}` as Hex;
+
+const createVault = (token: Address = d.token, initialKeyRoot: Hex = root) => ({ to: d.vaultFactory, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [token, initialKeyRoot, at(0)] }) });
+const spend = (to: Address, action: number, params: Hex) => ({ to, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, next, params, sig] }) });
+const spendLeaf = (destination: Address, to: Address = d.pool) => ({ to, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "spendLeaf", args: [3n, 5, destination, sig] }) });
+const created = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: root, initialCrank: at(0) });
+const openTo = (receiverAuthorizer: Address) =>
+  spend(vault, VAULT_ACTION.OPEN_CHANNEL, openChannelParams({ payerAuthorizer: at(0xbb01), receiver: at(0xbb02), receiverAuthorizer, withdrawDelay: 900, salt: `0x${"07".repeat(32)}`, amount: 2_000_000n }));
+
+test("every recognised Ostra function is read with its arguments", () => {
+  const c = parseCall(createVault());
+  assert.deepEqual(c, { fn: "createVault", to: d.vaultFactory, token: d.token, initialKeyRoot: root, initialCrank: at(0) });
+  const s = parseCall(spend(vault, VAULT_ACTION.TRANSFER, transferParams({ to: at(0xcc), amount: 5n })));
+  assert.equal(s.fn, "spend");
+  assert.ok(s.fn === "spend" && s.action === 0 && s.nextKeyRoot === next && s.signature === sig);
+  const l = parseCall(spendLeaf(vault));
+  assert.ok(l.fn === "spendLeaf" && l.batchId === 3n && l.leafIndex === 5 && l.destination === vault);
+  const config = { payer: vault, payerAuthorizer: at(0xbb01), receiver: at(0xbb02), receiverAuthorizer: relayerVault, token: d.token, withdrawDelay: 900, salt: `0x${"07".repeat(32)}` as Hex };
+  const rc = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "requestClose", args: [config, 7n, 99n, "0x1234"] }) });
+  assert.ok(rc.fn === "requestClose" && rc.amount === 7n && rc.deadline === 99n);
+  assert.deepEqual(rc.fn === "requestClose" ? rc.config : null, config);
+  const fw = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finalizeWithdraw", args: [config] }) });
+  assert.equal(fw.fn, "finalizeWithdraw");
+  const ab = parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "approveBatch", args: [root, 6n, next, root, sig] }) });
+  assert.ok(ab.fn === "approveBatch" && ab.batchId === 6n && ab.key === root);
+  assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "cancelDeposit", args: [root] }) }).fn, "cancelDeposit");
+  assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "closeDeposit", args: [root] }) }).fn, "closeDeposit");
+  const dep = encodeFunctionData({ abi: ostraPoolAbi, functionName: "depositWithAuthorization", args: [at(0xdd), root, 20_060_181n, at(0xdd), root, bytesToHex(new Uint8Array(2048)), 0n, 99n, 27, root, root] });
+  assert.equal(parseCall({ to: d.pool, data: dep }).fn, "depositWithAuthorization");
+});
+
+test("anything else is an unknown call (the policy refuses it); a recognised function that does not decode is malformed", () => {
+  const transfer = { to: d.token, data: encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [at(1), 1n] }) };
+  assert.deepEqual(parseCall(transfer), { fn: null, to: d.token, selector: transfer.data.slice(0, 10) });
+  // createBatch and sealBatch are Ostra functions the relayer never sends (it must not become an aggregator).
+  assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "createBatch", args: [8] }) }).fn, null);
+  const cut = createVault().data.slice(0, 40) as Hex;
+  assert.throws(() => parseCall({ to: d.vaultFactory, data: cut }, 2), /calls\[2\]: malformed createVault calldata/);
+});
+
+test("the request hash is keccak256(to || data) of the transaction the relayer sends", () => {
+  const one = [createVault()];
+  const tx1 = decodeRelayRequest({ calls: one });
+  assert.equal(tx1.to, d.vaultFactory);
+  assert.equal(tx1.hash, keccak256(concat([hexToBytes(d.vaultFactory), hexToBytes(one[0]!.data)]), "hex"));
+  assert.equal(tx1.hash, relayRequestHash(one));
+  const two = [createVault(), spendLeaf(created)];
+  const tx2 = decodeRelayRequest({ calls: two });
+  assert.equal(tx2.to, MULTICALL3);
+  assert.equal(tx2.parsed.length, 2);
+  assert.notEqual(tx2.hash, tx1.hash);
+  // The same calls with addresses in another letter case are the same request.
+  assert.equal(decodeRelayRequest({ calls: two.map((c) => ({ to: c.to.toLowerCase(), data: c.data.toUpperCase().replace("0X", "0x") })) }).hash, tx2.hash);
+});
+
+test("malformed requests are refused", () => {
+  assert.throws(() => decodeRelayRequest({}), /calls must be a non-empty array/);
+  assert.throws(() => decodeRelayRequest({ calls: [] }), /calls must be a non-empty array/);
+  assert.throws(() => decodeRelayRequest({ calls: Array.from({ length: 9 }, () => createVault()) }), /at most 8 calls/);
+  assert.throws(() => decodeRelayRequest({ calls: [{ to: "0x12", data: "0x12345678" }] }), /calls\[0\]\.to is not an address/);
+  assert.throws(() => decodeRelayRequest({ calls: [{ to: d.pool, data: "0x1234" }] }), /at least a 4-byte selector/);
+  assert.throws(() => decodeRelayRequest({ calls: [{ to: d.pool, data: "0x123456789" }] }), /at least a 4-byte selector/);
+  assert.throws(() => decodeRelayRequest({ calls: [{ ...createVault(), value: "1" }] }), /sends no ETH value/);
+});
+
+test("the four kinds relayed before payment, each the whole request", () => {
+  const kind = (calls: { to: Address; data: Hex }[], prepay = false) => classify(decodeRelayRequest({ calls }), d, relayerVault, prepay);
+  const cv = kind([createVault()]);
+  assert.deepEqual(cv, { kind: "create_vault", ix: { vault: created, token: d.token, initialKeyRoot: root, initialCrank: at(0) } });
+  assert.deepEqual(kind([createVault()], true), { kind: "other", vaults: [created] });
+  const open = kind([openTo(relayerVault)]);
+  assert.equal(open.kind, "open_relayer_channel");
+  assert.ok(open.kind === "open_relayer_channel" && open.ix.vault === vault && open.ix.open.amount === 2_000_000n);
+  // An open to anyone else is an ordinary request of that vault.
+  assert.deepEqual(kind([openTo(at(0xee02))]), { kind: "other", vaults: [vault] });
+  assert.deepEqual(kind([spendLeaf(vault)]), { kind: "spend_leaf", ix: { pool: d.pool, batchId: 3n, leafIndex: 5, destination: vault } });
+  // A spendLeaf to another contract than the pool is not the pool's leaf.
+  assert.deepEqual(kind([spendLeaf(vault, at(0x99))]), { kind: "other", vaults: [] });
+  const un = kind([createVault(), spendLeaf(created)]);
+  assert.equal(un.kind, "unshield_vault");
+  assert.ok(un.kind === "unshield_vault" && un.create.vault === created && un.leaf.destination === created);
+  assert.equal(kind([createVault(), spendLeaf(created)], true).kind, "other");
+  // Anything else: the vaults it acts for, once each.
+  const transfer = spend(vault, VAULT_ACTION.TRANSFER, transferParams({ to: at(0xcc), amount: 5n }));
+  assert.deepEqual(kind([transfer, transfer, createVault(d.token, next)]), {
+    kind: "other",
+    vaults: [vault, vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: next, initialCrank: at(0) })],
+  });
+});

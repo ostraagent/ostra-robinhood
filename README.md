@@ -37,6 +37,14 @@ Contents:
   chain. `scripts/chain-check.ts` runs the keeper and the seller server end to end against a chain
   with the stock x402 client as buyer; its fork test runs it on a mainnet fork (it waits out the
   300-second idle close).
+- `relayer/`: the relayer gate (`@ostraagent/relayer`). Agents post calls to Ostra's contracts
+  (one call, or several sent through Multicall3); the relayer checks them against its policy,
+  prices the transaction (eth_estimateGas x gas price + 10%, at Chainlink ETH/USD + 0.5%), charges
+  it as an Ostra seller through `merchant/` and sends it from its own account, so agents need no
+  ETH. createVault, a leaf spent into a vault, unshield and an open to the relayer are relayed
+  before payment as the vault's debt; WOTS signatures are escrowed before anything is simulated.
+  `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
+  ETH; its fork test runs it on a mainnet fork.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
@@ -45,4 +53,5 @@ cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out)
 node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
 cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
+cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
 ```
