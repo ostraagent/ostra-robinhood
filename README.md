@@ -14,6 +14,9 @@ Contents:
   vouchers and refunds unclaimed escrow.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)
   and the rest to the seller vault.
+- `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009), batches
+  of one-leaf-each leaves checked with LtHash, WOTS approvals, sealing, WOTS leaf spends, refunds after
+  48 hours. `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
