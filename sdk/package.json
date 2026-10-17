@@ -11,7 +11,8 @@
     ".": {
       "browser": "./src/browser.ts",
       "default": "./src/index.ts"
-    }
+    },
+    "./test/fork": "./test/fork.ts"
   },
   "scripts": {
     "abi": "node scripts/abi.ts",

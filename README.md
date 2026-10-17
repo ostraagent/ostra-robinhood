@@ -22,10 +22,17 @@ Contents:
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
   aggregator wire format and EIP-191 polls; and `deployOstra`, which deploys the contracts from the
   Foundry build. Its fork tests run every message against the contracts on a fork of mainnet.
+- `keeper/`: the keeper service (`@ostraagent/keeper`). It guards channels paid to Ostra seller
+  vaults whose crank is its per-merchant crank: it claims a forwarded voucher once 1 token is
+  unclaimed or the oldest unclaimed voucher is an hour old, and on a buyer's close request (seen
+  within its 30-second watch) or a seller's signed close request it claims the last voucher, refunds
+  the rest and pays the seller's split out (settle, distribute, release). `scripts/chain-check.ts`
+  runs the keeper process end to end against a chain; its fork test runs it on a mainnet fork.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
 forge test -vv             # Vault.fork.t.sol forks Robinhood Chain mainnet (rpc_endpoints.robinhood)
 cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out) and anvil
 node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
+cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 ```

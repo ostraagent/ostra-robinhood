@@ -39,6 +39,8 @@ export type Fork = {
   wallet: (account: PrivateKeyAccount) => WalletClient;
   /** Sets `holder`'s USDG balance (anvil_dealERC20, the fork equivalent of forge's deal). */
   dealUsdg: (holder: Address, amount: bigint) => Promise<void>;
+  /** Sets `holder`'s ETH balance in wei (anvil_setBalance). */
+  setBalance: (holder: Address, wei: bigint) => Promise<void>;
   /** Moves the fork's clock forward and mines a block. */
   increaseTime: (seconds: number) => Promise<void>;
   stop: () => Promise<void>;
@@ -61,9 +63,15 @@ export async function startFork(): Promise<Fork> {
   child.on("exit", () => {
     exited = true;
   });
+  // anvil missing from PATH, for example: fail at once instead of waiting.
+  let spawnError: Error | undefined;
+  child.on("error", (err) => {
+    spawnError = err;
+    exited = true;
+  });
   const deadline = Date.now() + 90_000;
   for (;;) {
-    if (exited) throw new Error("anvil exited before the fork was ready");
+    if (exited) throw new Error(spawnError === undefined ? "anvil exited before the fork was ready" : `anvil could not be started: ${spawnError.message}`);
     try {
       await rpc(url, "eth_chainId", []);
       break;
@@ -84,6 +92,9 @@ export async function startFork(): Promise<Fork> {
     wallet: (account) => createWalletClient({ account, chain: robinhoodChain, transport: http(url) }),
     dealUsdg: async (holder, amount) => {
       await rpc(url, "anvil_dealERC20", [holder, USDG, numberToHex(amount)]);
+    },
+    setBalance: async (holder, wei) => {
+      await rpc(url, "anvil_setBalance", [holder, numberToHex(wei)]);
     },
     increaseTime: async (seconds) => {
       await rpc(url, "evm_increaseTime", [seconds]);
