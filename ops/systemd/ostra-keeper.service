@@ -1,0 +1,22 @@
+# Ostra keeper on Robinhood Chain: guards sellers' channels and claims their vouchers.
+# Installed by the setup step of the deploy (README: Running on mainnet), with @NODE@ replaced by the path of node.
+[Unit]
+Description=Ostra keeper on Robinhood Chain: guards sellers' channels and claims their vouchers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+EnvironmentFile=/etc/ostra/robinhood/keeper.env
+ExecStart=@NODE@ src/main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target

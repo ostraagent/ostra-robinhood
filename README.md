@@ -183,6 +183,24 @@ Contents:
   rate it answers 429 with Retry-After. The chain is checked by eth_chainId at start. Its tests run
   viem's calls through it against a mainnet fork.
 
+## Running on mainnet
+
+The contracts are deployed on Robinhood Chain mainnet; their addresses are in
+`deployments/robinhood-mainnet.json` (the record the services read, from block 91991509). One
+deployer account owns the beacons, the pool (treasury and init authority), the hook, the launchpad
+and the dispatcher.
+
+- `sdk/scripts/deploy.ts` deploys from the Foundry build with the deployer key in a 0600 file and
+  writes the record; run again, it resumes or only checks. Its fork test runs it as on mainnet.
+- `relayer/scripts/setup-mainnet.ts` then creates the services' keys under `/etc/ostra/robinhood`
+  (0700), the operator vault (the keeper fee recipient) and the relayer's seller vault with the
+  keeper crank, tops up the keeper, relayer and aggregator accounts with ETH from the deployer, and
+  writes each service's environment file (0600). Run again, it sends nothing. Its fork test starts
+  every service from those files.
+- `ops/systemd/` holds the services' units and `ops/nginx/ostra-robinhood.conf` the server blocks of
+  relayer., keeper., aggregator. and rpc.ostraagent.xyz (TLS added by certbot). nginx sets the
+  client address the relayer and the RPC proxy count their rates by.
+
 The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
 block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
 never printed: anvil's errors are passed on with it replaced. `core/test/recover-logs.test.ts` runs

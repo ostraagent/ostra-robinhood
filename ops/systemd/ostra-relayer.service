@@ -1,0 +1,22 @@
+# Ostra relayer on Robinhood Chain: sends agents' calls and charges them in USDG.
+# Installed by the setup step of the deploy (README: Running on mainnet), with @NODE@ replaced by the path of node.
+[Unit]
+Description=Ostra relayer on Robinhood Chain: sends agents' calls and charges them in USDG
+After=network-online.target ostra-keeper.service
+Wants=network-online.target ostra-keeper.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/relayer
+EnvironmentFile=/etc/ostra/robinhood/relayer.env
+ExecStart=@NODE@ src/server.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target
