@@ -7,9 +7,22 @@
 //      Solana): createVault on the deployment's vault factory; spend,
 //      requestClose and finalizeWithdraw on an Ostra vault of the deployment
 //      in its token; spendLeaf, approveBatch, depositWithAuthorization,
-//      cancelDeposit and closeDeposit on the deployment's pool. Nothing else
-//      is sent, so the relayer's account is never the caller of anything
-//      that gives a caller a role;
+//      cancelDeposit and closeDeposit on the deployment's pool; and on its
+//      launchpad (design v0.4, D2): OstraDevBuy.launchFromVault alone, from a
+//      creator vault in the relayer's token or in WETH (the relayer fronts
+//      the ETH launch fee and charges it), OstraAirdrop claim and close,
+//      OstraDispatcher.claimReferral, OstraCreatorSplit.release, and release
+//      and claimDividends of an OstraVesting OstraDevBuy made
+//      (vestingPool). Vaults in another token (a WETH creator vault, a vault
+//      holding a token the launchpad launched, launchpad.poolOf) spend only
+//      Transfer, Swap and ClaimDividend (a WETH vault ConfigurePool too),
+//      paid by a `payer` vault in the relayer's token; dividends (a vesting's,
+//      a launched-token vault's ClaimDividend) only of a pool paying them in
+//      USDG, WETH or a launched token. Nothing else is sent, so the relayer's
+//      account is never the caller of anything that gives a caller a role,
+//      and no code runs but Ostra's, USDG's, WETH's and the launchpad's,
+//      except the pool, hook and tokens a vault Swap names (within the gas cap
+//      the request paid for);
 //   3. prices the transaction: the gas it uses, simulated from the relayer
 //      (eth_simulateV1), with its L1 data component and the swapGas each
 //      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
@@ -27,7 +40,11 @@
 //      of at most what it was priced at plus the margin (relayGasCap): code
 //      that uses more gas when sent than simulated (a hook or a contract the
 //      agent picks) cannot make the relayer pay more than it was paid, and a
-//      transaction that needs more than that now is not sent;
+//      transaction that needs more than that now is not sent. A request with
+//      a WOTS signature the escrow did not take (not by the key the chain
+//      holds, as the relayer rebuilds its message) that simulates fine is
+//      refused (422 signature_not_escrowed): its message is not the one the
+//      escrow would protect;
 //   4. answers 402 with an x402 batch-settlement challenge for that price,
 //      paid to the relayer's OstraSplit with its vault as receiverAuthorizer
 //      (merchant/src/merchant.ts); a voucher for it pays, and only then is
@@ -75,16 +92,22 @@
 // without a WOTS signature.
 
 import type { IncomingMessage } from "node:http";
-import { getAddress, isAddress, type Address, type PublicClient } from "viem";
+import { getAddress, isAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
   MAX_RELAY_CALLS,
   RelaySimulationError,
   VAULT_ACTION,
+  WETH,
   channelId,
   estimateRelay,
   failedSwaps,
+  ostraDevBuyAbi,
+  ostraHookAbi,
+  ostraLaunchpadAbi,
   readVault,
   relayGasCap,
+  relayPriceWei,
+  relayValue,
   relayTransactionHash,
   simulateRelay,
   vaultChannelConfig,
@@ -130,7 +153,7 @@ export type GateOptions = {
   escrow: SignatureEscrow;
   merchant: GateMerchant;
   /** Sends the relayed transactions (send.ts): the relayer's account. */
-  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }, o?: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint }): Promise<Landed> };
+  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }, o?: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint }): Promise<Landed> };
   /** The relayer's Ostra vault: the receiverAuthorizer of its channels. */
   vault: Address;
   /** The Chainlink feed ETH/USD is read from (shown in the relayer's terms). */
@@ -257,7 +280,7 @@ export class RelayerGate {
     }
     // The WOTS signatures in it have left the client: escrowed before anything else.
     const escrowed = await this.#escrow(tx);
-    if (escrowed !== null) return escrowed;
+    if (escrowed.answer !== null) return escrowed.answer;
     let request: RelayRequest;
     try {
       if (body.prepay !== undefined && typeof body.prepay !== "boolean") throw new Error("prepay must be true or false");
@@ -275,7 +298,7 @@ export class RelayerGate {
       const v = await readVault(this.#o.client, this.#o.deployment, request.payer).catch(() => null);
       if (v === null || v.token !== this.#o.merchant.token) return json(400, { error: "bad_payer", message: `payer ${request.payer} is not an Ostra vault in ${this.#o.merchant.token}` });
     }
-    return this.#serialized(tx.hash, () => this.#relay(tx, request, input));
+    return this.#serialized(tx.hash, () => this.#relay(tx, request, input, escrowed.unescrowed));
   }
 
   /** POST /v1/escrow: escrows the WOTS signatures of `calls` without relaying them. */
@@ -291,28 +314,31 @@ export class RelayerGate {
     } catch (err) {
       return json(400, { error: "bad_transaction", message: (err as Error).message });
     }
-    const refused = await this.#escrow(tx);
+    const refused = (await this.#escrow(tx)).answer;
     return refused ?? json(200, { escrowed: true, request: tx.hash });
   }
 
   /**
-   * Escrows every WOTS signature in `tx` (signatures.ts); the answer refusing
-   * the request, or null to go on.
+   * Escrows every WOTS signature in `tx` (signatures.ts): the answer refusing
+   * the request, or null to go on, and how many of its signatures were not
+   * escrowed (not by the key the chain holds now, as rebuilt here).
    */
-  async #escrow(tx: RelayTx): Promise<Answer | null> {
+  async #escrow(tx: RelayTx): Promise<{ answer: Answer | null; unescrowed: number }> {
+    const go = (unescrowed = 0) => ({ answer: null, unescrowed });
+    const stop = (answer: Answer) => ({ answer, unescrowed: 0 });
     let claims: WotsClaim[];
     try {
       claims = wotsClaims(tx.parsed, tx.calls, this.#o.deployment);
     } catch (err) {
-      return json(400, { error: "bad_transaction", message: (err as Error).message });
+      return stop(json(400, { error: "bad_transaction", message: (err as Error).message }));
     }
-    if (claims.length === 0) return null;
+    if (claims.length === 0) return go();
     // Sent again after it was relayed: escrowed then, and its keys may be used by now.
     const view = this.#o.ledger.view();
-    if (view.paid[tx.hash] !== undefined || Object.values(view.opens).some((o) => o.hash === tx.hash)) return null;
+    if (view.paid[tx.hash] !== undefined || Object.values(view.opens).some((o) => o.hash === tx.hash)) return go();
     const unavailable = (what: string, err: unknown) => {
       this.#o.log("escrow_unavailable", { request: tx.hash, what, error: err instanceof Error ? err.message : String(err) });
-      return json(503, { error: "escrow_unavailable", message: `the WOTS signatures could not be escrowed (${what}); nothing was sent, try again` });
+      return stop(json(503, { error: "escrow_unavailable", message: `the WOTS signatures could not be escrowed (${what}); nothing was sent, try again` }));
     };
     let records: (SignatureRecord | null)[];
     try {
@@ -320,9 +346,10 @@ export class RelayerGate {
     } catch (err) {
       return unavailable("chain read failed", err);
     }
-    // A signature not by the key the chain holds now is not stored: the contract refuses it.
+    // A signature not by the key the chain holds now is not stored: the contract refuses it (the simulation decides).
     const current = records.filter((r): r is SignatureRecord => r !== null);
-    if (current.length === 0) return null;
+    const unescrowed = records.length - current.length;
+    if (current.length === 0) return go(unescrowed);
     let put: { conflict: SignatureRecord | null; added: string[] };
     try {
       put = await this.#o.escrow.put(current);
@@ -330,14 +357,16 @@ export class RelayerGate {
       return unavailable("escrow write failed", err);
     }
     if (put.conflict !== null) {
-      return json(409, {
-        error: "key_reused",
-        message: `WOTS key ${put.conflict.keyRoot} already signed another message; send that signed message again instead`,
-        signature: put.conflict,
-      });
+      return stop(
+        json(409, {
+          error: "key_reused",
+          message: `WOTS key ${put.conflict.keyRoot} already signed another message; send that signed message again instead`,
+          signature: put.conflict,
+        }),
+      );
     }
     if (put.added.length > 0) this.#o.log("signatures_escrowed", { request: tx.hash, keyRoots: put.added });
-    return null;
+    return go(unescrowed);
   }
 
   /** Runs `run` after every earlier run with the same key has finished. */
@@ -353,7 +382,7 @@ export class RelayerGate {
     }
   }
 
-  async #relay(tx: RelayTx, request: RelayRequest, input: RelayInput): Promise<Answer> {
+  async #relay(tx: RelayTx, request: RelayRequest, input: RelayInput, unescrowed: number): Promise<Answer> {
     const done = this.#o.ledger.view().paid[tx.hash];
     if (done !== undefined) return json(200, { txHash: done.txHash, paid: done.amount, repeated: true });
 
@@ -394,7 +423,7 @@ export class RelayerGate {
     const swaps = request.allowFailedSwaps ? [] : swapVaults(tx);
     let quote: Quote;
     try {
-      quote = await this.#quote(tx, classified, leafVault, swaps);
+      quote = await this.#quote(tx, classified, leafVault, swaps, request, unescrowed);
     } catch (err) {
       if (err instanceof PolicyRefusal) return json(422, { error: "refused", message: err.message });
       if (err instanceof QuoteError) return json(err.code === "price_unavailable" || err.code === "simulation_unavailable" ? 503 : 422, { error: err.code, message: err.message });
@@ -506,21 +535,86 @@ export class RelayerGate {
   }
 
   /** Why the calls are outside the relayer's policy, or null (see the header). */
-  async #policyProblem(tx: RelayTx): Promise<string | null> {
+  async #policyProblem(tx: RelayTx, request: RelayRequest): Promise<string | null> {
     const d = this.#o.deployment;
+    const l = d.launchpad;
+    const token = this.#o.merchant.token;
+    const wethOrLaunched = async (t: Address): Promise<"weth" | "launched" | null> => {
+      if (t === WETH) return "weth";
+      if (l === undefined) return null;
+      const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [t] })) as Hex;
+      return BigInt(id) === 0n ? null : "launched";
+    };
+    // Dividends move the pool's dividend token: relayed only when its code is known (USDG, WETH, a launched token).
+    const dividendProblem = async (i: number, id: Hex): Promise<string | null> => {
+      if (l === undefined) return null;
+      const c = (await this.#o.client.readContract({ address: l.hook, abi: ostraHookAbi, functionName: "poolConfig", args: [id] })) as { dividendToken: Address };
+      const t = getAddress(c.dividendToken);
+      if (t === token || t === WETH || BigInt(t) === 0n) return null;
+      if ((await wethOrLaunched(t)) === "launched") return null;
+      return `calls[${i}]: the pool pays dividends in ${t}, not USDG, WETH or a launched token; its dividends are not relayed`;
+    };
     for (const [i, c] of tx.parsed.entries()) {
       const name = c.fn ?? c.selector;
       if (c.to === d.vaultFactory) {
         if (c.fn !== "createVault") return `calls[${i}]: ${name} on the vault factory ${c.to} is not relayed`;
+        if (c.token !== token) {
+          if ((await wethOrLaunched(c.token)) === null) return `calls[${i}]: vaults are created in ${token}, WETH or a token the Ostra launchpad launched, not ${c.token}`;
+          if (request.payer === null) return `calls[${i}]: a vault in ${c.token} is paid for by a payer vault in ${token}`;
+        }
         continue;
       }
       if (c.to === d.pool) {
         if (c.fn === null || !POOL_FNS.has(c.fn)) return `calls[${i}]: ${name} on the pool ${c.to} is not relayed`;
         continue;
       }
+      if (l !== undefined && c.fn === "launchFromVault" && c.to === l.devBuy) {
+        if (tx.parsed.length !== 1) return `calls[${i}]: a launch is relayed alone`;
+        const v = await readVault(this.#o.client, d, c.vault);
+        if (v === null) return `calls[${i}]: the creator vault ${c.vault} is not an Ostra vault`;
+        if (v.token !== token && v.token !== WETH) return `calls[${i}]: the relayer launches from creator vaults in ${token} or WETH`;
+        if (v.token !== token && request.payer === null) return `calls[${i}]: a launch from a WETH creator vault is paid for by a payer vault in ${token}`;
+        continue;
+      }
+      if (l !== undefined && (c.fn === "airdropClaim" || c.fn === "airdropClose")) {
+        if (c.to !== l.airdrop) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
+        continue;
+      }
+      if (l !== undefined && c.fn === "claimReferral") {
+        if (c.to !== l.dispatcher) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
+        continue;
+      }
+      if (l !== undefined && c.fn === "splitRelease") {
+        if (c.to !== l.creatorSplit) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
+        continue;
+      }
+      if (l !== undefined && (c.fn === "vestingRelease" || c.fn === "vestingClaimDividends")) {
+        const id = (await this.#o.client.readContract({ address: l.devBuy, abi: ostraDevBuyAbi, functionName: "vestingPool", args: [c.to] })) as Hex;
+        if (BigInt(id) === 0n) return `calls[${i}]: ${c.to} is not an Ostra dev buy's vesting`;
+        if (c.fn === "vestingClaimDividends") {
+          const p = await dividendProblem(i, id);
+          if (p !== null) return p;
+        }
+        continue;
+      }
       if (c.fn === null || !VAULT_FNS.has(c.fn)) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
       const v = await readVault(this.#o.client, d, c.to);
-      if (v === null || v.token !== this.#o.merchant.token) return `calls[${i}]: ${c.to} is not an Ostra vault in ${this.#o.merchant.token}`;
+      if (v === null) return `calls[${i}]: ${c.to} is not an Ostra vault`;
+      if (v.token === token) continue;
+      // A vault in another token: only what that vault needs, its token's code the launchpad's (or WETH's), paid by a payer vault.
+      const kind = await wethOrLaunched(v.token);
+      if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH or a token the Ostra launchpad launched`;
+      if (request.payer === null) return `calls[${i}]: a vault in ${v.token} is paid for by a payer vault in ${token}`;
+      const allowed: readonly number[] =
+        kind === "weth"
+          ? [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CONFIGURE_POOL, VAULT_ACTION.CLAIM_DIVIDEND]
+          : [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CLAIM_DIVIDEND];
+      if (c.fn !== "spend" || !allowed.includes(c.action)) return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "weth" ? "Transfer, Swap, ConfigurePool and ClaimDividend" : "Transfer, Swap and ClaimDividend"}`;
+      if (kind === "launched" && c.action === VAULT_ACTION.CLAIM_DIVIDEND && l !== undefined) {
+        const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [v.token] })) as Hex;
+        const p = await dividendProblem(i, id);
+        if (p !== null) return p;
+      }
     }
     return null;
   }
@@ -529,13 +623,17 @@ export class RelayerGate {
   // Quote
   // -------------------------------------------------------------------------
 
-  async #quote(tx: RelayTx, classified: Classified, leafVault: Address | null, swaps: readonly Address[]): Promise<Quote> {
+  async #quote(tx: RelayTx, classified: Classified, leafVault: Address | null, swaps: readonly Address[], request: RelayRequest, unescrowed: number): Promise<Quote> {
     const known = this.#o.ledger.view().quotes[tx.hash];
     if (known !== undefined) {
+      // The quote is kept by the calls alone: what the policy decides from the request (its payer) is decided again.
+      const again = await this.#policyProblem(tx, request);
+      if (again !== null) throw new PolicyRefusal(again);
+      // Its signatures were escrowed when it was quoted; a key used since makes the send fail (not sent: credit).
       if (swaps.length !== 0) {
         let logs: RelayMeasure["logs"];
         try {
-          logs = (await simulateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data })).logs;
+          logs = (await simulateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data, value: relayValue(this.#o.deployment, tx) })).logs;
         } catch (err) {
           // A Swap that reverts now, or that the node cannot simulate, is refused before anything is charged.
           if (err instanceof RelaySimulationError) throw new QuoteError(err.code, err.message);
@@ -545,15 +643,19 @@ export class RelayerGate {
       }
       return known;
     }
-    const problem = await this.#policyProblem(tx);
+    const problem = await this.#policyProblem(tx, request);
     if (problem !== null) throw new PolicyRefusal(problem);
 
     let m: RelayMeasure;
     try {
-      m = await estimateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data });
+      m = await estimateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data, value: relayValue(this.#o.deployment, tx) });
     } catch (err) {
       if (err instanceof RelaySimulationError) throw new QuoteError(err.code, err.message);
       throw err;
+    }
+    // It passes the contract with a signature the escrow did not take: its message is not the one rebuilt here.
+    if (unescrowed !== 0) {
+      throw new QuoteError("signature_not_escrowed", "a WOTS signature in the request passes the contract but is not the message the relayer escrows; nothing is relayed for it");
     }
     refuseFailedSwaps(m.logs, swaps);
 
@@ -561,7 +663,7 @@ export class RelayerGate {
     let price: EthUsd;
     try {
       price = await this.#o.ethUsd();
-      amount = weiToTokenUnits(withMargin(m.wei), price, this.#o.merchant.decimals);
+      amount = weiToTokenUnits(relayPriceWei(m), price, this.#o.merchant.decimals);
     } catch (err) {
       throw new QuoteError("price_unavailable", `no usable ETH/USD price: ${(err as Error).message}`);
     }
@@ -569,6 +671,7 @@ export class RelayerGate {
     const quote: Quote = {
       amount: amount.toString(),
       wei: m.wei.toString(),
+      value: m.value.toString(),
       gas: m.gas.toString(),
       gasPrice: m.gasPrice.toString(),
       ethUsd: price.answer.toString(),
@@ -589,7 +692,7 @@ export class RelayerGate {
       pruneQuotes(data, Date.now());
       data.quotes[tx.hash] = quote;
     });
-    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, gasPrice: quote.gasPrice, wei: quote.wei, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
+    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
     return quote;
   }
 
@@ -600,7 +703,7 @@ export class RelayerGate {
   async #send(quote: Quote, swaps: readonly Address[] = []): Promise<Landed> {
     const tx = { to: getAddress(quote.to), data: quote.data as `0x${string}` };
     try {
-      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)) });
+      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)), value: BigInt(quote.value ?? "0") });
     } catch (err) {
       // Its quote no longer holds: the request sent again is priced anew.
       if (err instanceof NotSentError && err.overCap) {
@@ -742,6 +845,16 @@ export class RelayerGate {
     return this.#serialized(`credit:${creditVault}`, () => this.#paidWithCredit(tx, vaults, quote, input, creditVault, swaps));
   }
 
+  /**
+   * What the relayer keeps of `upTo` (base units) when `err` is a transaction that reverted on-chain: its gas,
+   * with the margin, at the quote's ETH/USD (0 for anything else, which cost the relayer nothing).
+   */
+  #keptOnRevert(err: unknown, quote: Quote, upTo: bigint): bigint {
+    if (!(err instanceof NotSentError) || err.spentWei === 0n) return 0n;
+    const cost = weiToTokenUnits(withMargin(err.spentWei), { answer: BigInt(quote.ethUsd), roundId: 0n, updatedAt: 0n }, this.#o.merchant.decimals);
+    return cost < upTo ? cost : upTo;
+  }
+
   async #paidWithCredit(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, creditVault: Address | null, swaps: readonly Address[]): Promise<Answer> {
     const view = this.#o.ledger.view();
     for (const v of vaults) {
@@ -766,16 +879,30 @@ export class RelayerGate {
     };
 
     if (plan.owed === 0n) {
-      // Paid from credit: nothing is charged, and the credit is used only if the transaction lands.
+      // Paid from credit: nothing is charged, and the credit is used only if the transaction lands (less the gas
+      // of one that reverted on-chain, which the relayer paid).
       let landed: Landed;
       try {
         landed = await this.#send(quote, swaps);
       } catch (err) {
         if (err instanceof SendUnknownError) return this.#unknown(tx, err);
-        return json(409, { error: "not_sent", message: (err as Error).message, credit: { vault: creditVault, amount: plan.used.toString(), note: "unchanged" } });
+        const kept = this.#keptOnRevert(err, quote, plan.used);
+        if (kept > 0n && creditVault !== null) {
+          await this.#o.ledger.update((data) => {
+            const left = creditOf(data, creditVault) - kept;
+            if (left > 0n) data.credits[creditVault] = left.toString();
+            else delete data.credits[creditVault];
+          });
+          this.#o.log("credit_spent_on_revert", { request: tx.hash, amount: kept, creditVault, spentWei: (err as NotSentError).spentWei });
+        }
+        return json(409, {
+          error: "not_sent",
+          message: (err as Error).message,
+          credit: { vault: creditVault, amount: (plan.used - kept).toString(), note: kept > 0n ? `the gas of the reverted transaction, ${kept}, was taken from the credit` : "unchanged" },
+        });
       }
       await this.#o.ledger.update((data) => landedIn(data, landed.txHash, 0n));
-      this.#o.log("relayed_from_credit", { request: tx.hash, txHash: landed.txHash, gasUsed: landed.gasUsed, effectiveGasPrice: landed.effectiveGasPrice, amount: quote.amount, creditVault });
+      this.#o.log("relayed_from_credit", { request: tx.hash, txHash: landed.txHash, gasUsed: landed.gasUsed, effectiveGasPrice: landed.effectiveGasPrice, value: landed.value, amount: quote.amount, creditVault });
       return json(200, { txHash: landed.txHash, paid: "0", fromCredit: quote.amount });
     }
     if (plan.voucherFromCreditVault) {
@@ -790,6 +917,17 @@ export class RelayerGate {
       }
     }
     const owed = plan.owed;
+    // What is paid for a transaction that is not sent becomes credit: of the credit vault, or else of the Ostra
+    // vault in the relayer's token whose channel the voucher is from.
+    let creditTo = creditVault;
+    if (creditTo === null) {
+      const header = input.req.headers["payment-signature"];
+      const channel = paymentChannel(Array.isArray(header) ? header.join(", ") : header);
+      if (channel !== undefined && channel !== null) {
+        const v = await readVault(this.#o.client, this.#o.deployment, channel.payer).catch(() => null);
+        if (v !== null && v.token === this.#o.merchant.token) creditTo = channel.payer;
+      }
+    }
     const outcome = await this.#o.merchant.payment(input.req, { description: RELAY_DESCRIPTION, amount: owed });
     if (outcome.kind === "respond") return fromInstructions(outcome.response);
     // Paid: the voucher is charged first, then the transaction is sent.
@@ -801,23 +939,27 @@ export class RelayerGate {
     } catch (err) {
       if (err instanceof SendUnknownError) return this.#unknown(tx, err, settled.headers);
       if (!(err instanceof NotSentError)) this.#o.log("send_failed", { request: tx.hash, error: (err as Error).message });
-      // The agent paid `owed` for a transaction that was not sent: it becomes credit (the credit it used is still unspent).
+      // The agent paid `owed` for a transaction that was not sent: it becomes credit (the credit it used is still
+      // unspent), less the gas of one that reverted on-chain, which the relayer paid.
+      const kept = this.#keptOnRevert(err, quote, owed);
+      const credited = owed - kept;
       await this.#o.ledger.update((data) => {
-        if (creditVault !== null) data.credits[creditVault] = (creditOf(data, creditVault) + owed).toString();
+        if (creditTo !== null && credited > 0n) data.credits[creditTo] = (creditOf(data, creditTo) + credited).toString();
       });
-      this.#o.log("paid_not_sent", { request: tx.hash, amount: owed, creditVault, error: (err as Error).message });
+      this.#o.log("paid_not_sent", { request: tx.hash, amount: owed, kept, creditVault: creditTo, spentWei: err instanceof NotSentError ? err.spentWei : 0n, error: (err as Error).message });
       return json(
         409,
         {
           error: "not_sent",
           message: (err as Error).message,
-          credit: creditVault === null ? null : { vault: creditVault, amount: owed.toString(), note: "taken off the vault's next relayed transaction" },
+          credit: creditTo === null ? null : { vault: creditTo, amount: credited.toString(), note: "taken off the vault's next relayed transaction" },
+          ...(kept > 0n ? { kept: kept.toString() } : {}),
         },
         settled.headers,
       );
     }
     await this.#o.ledger.update((data) => landedIn(data, landed.txHash, owed));
-    this.#o.log("relayed", { request: tx.hash, txHash: landed.txHash, gasUsed: landed.gasUsed, effectiveGasPrice: landed.effectiveGasPrice, amount: owed, creditUsed: plan.used, creditVault, channel: outcome.channelId });
+    this.#o.log("relayed", { request: tx.hash, txHash: landed.txHash, gasUsed: landed.gasUsed, effectiveGasPrice: landed.effectiveGasPrice, value: landed.value, amount: owed, creditUsed: plan.used, creditVault, channel: outcome.channelId });
     return json(200, { txHash: landed.txHash, paid: owed.toString(), ...(plan.used > 0n ? { fromCredit: plan.used.toString() } : {}) }, settled.headers);
   }
 }

@@ -11,7 +11,13 @@ import { test } from "node:test";
 import { bytesToHex, encodeFunctionData, getAddress, type Address, type Hex } from "viem";
 import {
   FileWotsStore,
+  VAULT_ACTION,
   WotsKeychain,
+  devBuyParams,
+  launchFromVaultData,
+  launchHash,
+  launchParams,
+  signVaultDevBuy,
   ostraPoolAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
@@ -302,5 +308,40 @@ test("the escrow folder must be private to its owner", async () => {
     await assert.rejects(SignatureEscrow.open(dir), /accessible by other users/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a vault-funded launch: its DevBuy signature is a claim of the creator vault (action 9 over the launch hash), escrowed with the launch call", async () => {
+  const k = await keychain();
+  try {
+    const devBuy = at(0x76);
+    const dl: Deployment = { ...d, launchpad: { hook: at(0x70), fees: at(0x71), launchpad: at(0x72), creatorSplit: at(0x73), dispatcher: at(0x74), locker: at(0x75), devBuy, vesting: at(0x77), airdrop: at(0x78), owner: at(0x79) } };
+    const nonce = 2n;
+    const state = vaultState(k.keys, nonce);
+    const p = launchParams({ name: "Escrowed", symbol: "ESC", salt: `0x${"06".repeat(32)}`, quote: d.token, creatorVault: vault, startTick: -400_000 });
+    const dev = { quoteIn: 3_000_000n, beneficiary: destination, dividendRecipient: at(0), cliff: 604_800, duration: 86_400 };
+    const s = await signVaultDevBuy(k.keys, { vault, nonce, keyRoot: state.keyRoot }, { chainId: CHAIN, devBuy, launch: p, dev });
+    const call = { to: devBuy, data: launchFromVaultData(p, dev, s) };
+    const tx = decodeRelayRequest({ calls: [call] });
+    const [claim] = wotsClaims(tx.parsed, tx.calls, dl);
+    assert.ok(claim !== undefined && claim.kind === "vault");
+    assert.equal(claim.account, vault);
+    assert.equal(claim.action, VAULT_ACTION.DEV_BUY);
+    assert.equal(claim.params, devBuyParams({ devBuy, launchHash: launchHash(p, dev), amount: 3_000_000n }));
+    const r = escrowRecord(claim, state, block, 9, CHAIN);
+    assert.ok(r !== null);
+    assert.equal(r.account, vault);
+    assert.equal(r.message, bytesToHex(s.message));
+    assert.deepEqual(r.call, { to: devBuy, data: call.data.toLowerCase() });
+    // The same call to another contract than the deployment's OstraDevBuy carries no claim the escrow keeps.
+    const elsewhere = decodeRelayRequest({ calls: [{ to: at(0x99), data: call.data }] });
+    assert.deepEqual(wotsClaims(elsewhere.parsed, elsewhere.calls, dl), []);
+    // Another launch under the same key is another message: never the escrowed one.
+    const other = await signVaultDevBuy(k.keys, { vault, nonce: nonce + 1n, keyRoot: bytesToHex(k.keys.keyRoot(nonce + 1n)) }, { chainId: CHAIN, devBuy, launch: { ...p, symbol: "ESC2" }, dev });
+    const [otherClaim] = wotsClaims(...((t) => [t.parsed, t.calls, dl] as const)(decodeRelayRequest({ calls: [{ to: devBuy, data: launchFromVaultData({ ...p, symbol: "ESC2" }, dev, other) }] })));
+    assert.ok(otherClaim !== undefined);
+    assert.equal(escrowRecord(otherClaim, state, block, 9, CHAIN), null);
+  } finally {
+    await k.done();
   }
 });

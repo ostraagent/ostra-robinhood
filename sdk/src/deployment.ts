@@ -20,7 +20,27 @@ export type Deployment = {
   beaconOwner: Address;
   /** Block of the first deployment transaction: services read events from here. */
   fromBlock: string;
+  /** The launchpad (deployLaunchpad), when it is deployed. */
+  launchpad?: LaunchpadDeployment;
 };
+
+/** Where the Ostra launchpad's contracts are (src/launchpad/). */
+export type LaunchpadDeployment = {
+  hook: Address;
+  fees: Address;
+  launchpad: Address;
+  creatorSplit: Address;
+  dispatcher: Address;
+  locker: Address;
+  devBuy: Address;
+  /** The OstraVesting implementation every dev buy's vesting clones (OstraDevBuy.VESTING). */
+  vesting: Address;
+  airdrop: Address;
+  /** Owner of the hook, the launchpad and the dispatcher. */
+  owner: Address;
+};
+
+const LAUNCHPAD_FIELDS = ["hook", "fees", "launchpad", "creatorSplit", "dispatcher", "locker", "devBuy", "vesting", "airdrop", "owner"] as const;
 
 const ADDRESS_FIELDS = [
   "token",
@@ -48,5 +68,22 @@ export function parseDeployment(value: unknown): Deployment {
     if (typeof a !== "string" || !isAddress(a, { strict: false })) throw new Error(`deployment ${field} is not an address`);
     out[field] = getAddress(a);
   }
+  if (v.launchpad !== undefined) {
+    if (typeof v.launchpad !== "object" || v.launchpad === null) throw new Error("deployment launchpad must be an object");
+    const l = v.launchpad as Record<string, unknown>;
+    const launchpad: Record<string, unknown> = {};
+    for (const field of LAUNCHPAD_FIELDS) {
+      const a = l[field];
+      if (typeof a !== "string" || !isAddress(a, { strict: false })) throw new Error(`deployment launchpad.${field} is not an address`);
+      launchpad[field] = getAddress(a);
+    }
+    out.launchpad = launchpad;
+  }
   return out as Deployment;
+}
+
+/** The launchpad of `d`; throws when the deployment has none. */
+export function launchpadOf(d: Deployment): LaunchpadDeployment {
+  if (d.launchpad === undefined) throw new Error("this deployment has no launchpad");
+  return d.launchpad;
 }

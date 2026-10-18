@@ -138,6 +138,7 @@ export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[
   [VAULT_ACTION.SET_GUARDIAN]: [64],
   [VAULT_ACTION.SET_RECOVERY_POLICY]: [64],
   [VAULT_ACTION.SUPPORT_RECOVERY]: [64],
+  [VAULT_ACTION.DEV_BUY]: [96],
 };
 
 /** Throws unless `params` (hex) has a length OstraVault accepts for `action`. */

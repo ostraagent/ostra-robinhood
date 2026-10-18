@@ -849,7 +849,15 @@ contract LaunchpadForkTest is Test {
         assertEq(hook.poolConfig(id).maxBuy, 15_000_000e18);
         _configure(creatorVault, id, 7, 0);
         assertTrue(token.limitsReleased());
-        _configureReverts(creatorVault, id, 7, 0, OstraHook.NotInTradersFavour.selector);
+        // Released already (as after a graduation or past the limits' end): a release signed before that still lands,
+        // changing nothing, so the creator vault's key is never held by it.
+        uint64 nonceBefore = creatorVault.nonce();
+        uint40 endBefore = hook.poolConfig(id).limitsEndAt;
+        _configure(creatorVault, id, 7, 0);
+        assertEq(creatorVault.nonce(), nonceBefore + 1);
+        assertEq(hook.poolConfig(id).limitsEndAt, endBefore);
+        assertTrue(token.limitsReleased());
+        _configureReverts(creatorVault, id, 7, 1, OstraHook.NotInTradersFavour.selector);
         vm.warp(block.timestamp + 601);
         deal(USDG, address(router), 10_000e6);
         router.swap(key, !tokenIs0, 25_000_000e18, address(router));
@@ -2010,6 +2018,175 @@ contract LaunchpadForkTest is Test {
         (address token,, address vesting) = devBuy.launch{value: fee + 0.001 ether}(p, d);
         assertEq(eth - address(this).balance, fee + 0.001 ether);
         assertGt(IERC20(token).balanceOf(vesting), 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Vault-funded launch (OstraDevBuy.launchFromVault, OstraVault DevBuy spend)
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev The creator vault's signed DevBuy spend for the launch `p` with the dev buy `d`.
+    function _devBuySpend(OstraVault vault, bytes32 keychain, OstraLaunchpad.LaunchParams memory p, OstraDevBuy.DevBuy memory d)
+        internal
+        view
+        returns (bytes32 next, bytes memory signature)
+    {
+        uint64 n = vault.nonce();
+        next = WotsSigner.keyRoot(_seed(keychain, n + 1));
+        bytes memory params = abi.encode(address(devBuy), devBuy.launchHash(p, d), d.quoteIn);
+        signature = WotsSigner.sign(_seed(keychain, n), vault.spendMessage(9, next, params));
+    }
+
+    struct VaultLaunch {
+        OstraVault creatorVault;
+        OstraLaunchpad.LaunchParams p;
+        OstraDevBuy.DevBuy d;
+        bytes32 next;
+        bytes signature;
+        address predicted;
+    }
+
+    function _vaultLaunch(bytes32 salt, uint256 quoteIn) internal returns (VaultLaunch memory v) {
+        v.creatorVault = _vault(USDG, CREATOR);
+        deal(USDG, address(v.creatorVault), 500e6);
+        v.p = _params(Currency.wrap(USDG), address(v.creatorVault), -375_400, salt);
+        v.predicted = devBuy.tokenAddressFromVault(v.p);
+        address tokenVault = factory.vaultAddress(v.predicted, WotsSigner.keyRoot(_seed(CREATOR_TOKEN, 0)), address(0));
+        v.d = _dev(quoteIn, tokenVault, tokenVault);
+        (v.next, v.signature) = _devBuySpend(v.creatorVault, CREATOR, v.p, v.d);
+    }
+
+    /// forge-config: default.isolate = true
+    function test_aCreatorVaultPaysItsDevBuyAndWhoeverSendsItPaysOnlyTheLaunchFee() public {
+        VaultLaunch memory v = _vaultLaunch(bytes32(uint256(60)), 100e6);
+        // Its salt is the creator vault's, apart from any account's own launches.
+        assertTrue(v.predicted != devBuy.tokenAddress(address(this), v.p));
+        assertTrue(v.predicted != devBuy.tokenAddress(address(v.creatorVault), v.p));
+        address relayer = makeAddr("relayer");
+        uint256 fee = launchpad.LAUNCH_FEE();
+        vm.deal(relayer, fee);
+        vm.recordLogs();
+        vm.prank(relayer);
+        uint256 g = gasleft();
+        (address token,, address vesting) = devBuy.launchFromVault{value: fee}(v.p, v.d, v.next, v.signature);
+        console.log("gas vault-funded launch with a dev buy", g - gasleft());
+        assertEq(token, v.predicted);
+        assertEq(relayer.balance, 0);
+        // The launchpad and OstraDevBuy say which token and which vesting are theirs.
+        assertEq(PoolId.unwrap(launchpad.poolOf(token)), PoolId.unwrap(hook.poolKey(launchpad.poolOf(token)).toId()));
+        assertTrue(PoolId.unwrap(launchpad.poolOf(token)) != bytes32(0));
+        assertEq(PoolId.unwrap(devBuy.vestingPool(vesting)), PoolId.unwrap(launchpad.poolOf(token)));
+        assertEq(PoolId.unwrap(launchpad.poolOf(address(v.creatorVault))), bytes32(0));
+        assertEq(PoolId.unwrap(devBuy.vestingPool(token)), bytes32(0));
+        // The vault paid the dev buy with its own key, which rotated.
+        assertEq(v.creatorVault.nonce(), 1);
+        assertEq(v.creatorVault.keyRoot(), v.next);
+        assertEq(IERC20(USDG).balanceOf(address(v.creatorVault)), 400e6);
+        // The same charges as a dev buy paid by its account: no anti-snipe at launch.
+        (uint256 hookFee, uint256 tax, uint256 snipe) = _lastCharge();
+        assertEq(hookFee, 4e6);
+        assertEq(tax, 3e6);
+        assertEq(snipe, 0);
+        assertEq(OstraVesting(vesting).terms().beneficiary, v.d.beneficiary);
+        assertEq(OstraVesting(vesting).terms().cliff, 7 days);
+        assertGt(IERC20(token).balanceOf(vesting), 0);
+        // Nothing stays behind in OstraDevBuy, and no launch is pending once it is done.
+        assertEq(IERC20(USDG).balanceOf(address(devBuy)), 0);
+        assertEq(address(devBuy).balance, 0);
+        assertEq(devBuy.pendingLaunch(address(v.creatorVault)), bytes32(0));
+    }
+
+    /// forge-config: default.isolate = true
+    function test_aVaultsDevBuySignatureMakesOnlyTheLaunchItSigned() public {
+        VaultLaunch memory v = _vaultLaunch(bytes32(uint256(61)), 100e6);
+        address attacker = makeAddr("attacker");
+        vm.deal(attacker, 1 ether);
+        vm.startPrank(attacker);
+        // Another beneficiary, another dev buy amount or another launch parameter: not the hash the vault signed.
+        _refusedWith(v, _dev(100e6, attacker, attacker), v.p);
+        _refusedWith(v, _dev(400e6, v.d.beneficiary, v.d.beneficiary), v.p);
+        OstraLaunchpad.LaunchParams memory other = _params(Currency.wrap(USDG), address(v.creatorVault), -375_400, v.p.salt);
+        other.buyTaxBps = 0;
+        _refusedWith(v, v.d, other);
+        // The spend itself, sent by anyone but OstraDevBuy during that very launch, is refused.
+        bytes memory params = abi.encode(address(devBuy), devBuy.launchHash(v.p, v.d), v.d.quoteIn);
+        vm.expectRevert(OstraVault.Unauthorized.selector);
+        v.creatorVault.spend(9, v.next, params, v.signature);
+        // The launch fee is exact.
+        uint256 fee = launchpad.LAUNCH_FEE();
+        vm.expectRevert(OstraDevBuy.WrongValue.selector);
+        devBuy.launchFromVault{value: fee - 1}(v.p, v.d, v.next, v.signature);
+        vm.expectRevert(OstraDevBuy.WrongValue.selector);
+        devBuy.launchFromVault{value: fee + 1}(v.p, v.d, v.next, v.signature);
+        // ETH comes into OstraDevBuy only from WETH.
+        (bool ok,) = address(devBuy).call{value: 1}("");
+        assertFalse(ok);
+        assertEq(v.creatorVault.nonce(), 0);
+        assertEq(IERC20(USDG).balanceOf(address(v.creatorVault)), 500e6);
+
+        // Submitted by anyone, the signed launch does exactly what the vault signed: the tokens vest to its beneficiary.
+        (address token,, address vesting) = devBuy.launchFromVault{value: fee}(v.p, v.d, v.next, v.signature);
+        vm.stopPrank();
+        assertEq(token, v.predicted);
+        assertEq(OstraVesting(vesting).terms().beneficiary, v.d.beneficiary);
+        assertEq(IERC20(token).balanceOf(attacker), 0);
+        assertEq(v.creatorVault.nonce(), 1);
+        // Used once: the same signature never works again.
+        vm.prank(attacker);
+        vm.expectRevert();
+        devBuy.launchFromVault{value: fee}(v.p, v.d, v.next, v.signature);
+    }
+
+    function _refusedWith(VaultLaunch memory v, OstraDevBuy.DevBuy memory d, OstraLaunchpad.LaunchParams memory p) internal {
+        uint256 fee = launchpad.LAUNCH_FEE();
+        vm.expectRevert();
+        devBuy.launchFromVault{value: fee}(p, d, v.next, v.signature);
+    }
+
+    /// forge-config: default.isolate = true
+    function test_aVaultLaunchesWithoutADevBuyAndPaysNothing() public {
+        OstraVault creatorVault = _vault(USDG, CREATOR);
+        deal(USDG, address(creatorVault), 5e6);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(creatorVault), -375_400, bytes32(uint256(62)));
+        OstraDevBuy.DevBuy memory none;
+        uint256 fee = launchpad.LAUNCH_FEE();
+        // Without a dev buy, every other dev buy field is 0.
+        OstraDevBuy.DevBuy memory half;
+        half.cliff = 7 days;
+        (bytes32 hn, bytes memory hs) = _devBuySpend(creatorVault, CREATOR, p, half);
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "noDevBuy"));
+        devBuy.launchFromVault{value: fee}(p, half, hn, hs);
+        (bytes32 next, bytes memory signature) = _devBuySpend(creatorVault, CREATOR, p, none);
+        vm.recordLogs();
+        (address token, PoolId id, address vesting) = devBuy.launchFromVault{value: fee}(p, none, next, signature);
+        assertEq(token, devBuy.tokenAddressFromVault(p));
+        assertEq(vesting, address(0));
+        assertEq(creatorVault.nonce(), 1);
+        assertEq(IERC20(USDG).balanceOf(address(creatorVault)), 5e6);
+        assertEq(IERC20(token).balanceOf(address(locker)) + IERC20(token).balanceOf(POOL_MANAGER) > 0, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != OstraDevBuy.DevBought.selector);
+        }
+        assertEq(Currency.unwrap(hook.poolKey(id).currency0) == token || Currency.unwrap(hook.poolKey(id).currency1) == token, true);
+    }
+
+    /// forge-config: default.isolate = true
+    function test_anEthPoolsVaultFundedDevBuyIsPaidFromTheCreatorsWeth() public {
+        OstraVault wethVault = _vault(WETH, CREATOR_WETH);
+        deal(WETH, address(wethVault), 0.01 ether);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(address(0)), address(wethVault), -168_200, bytes32(uint256(63)));
+        p.dividendToken = WETH;
+        p.graduationThreshold = 1 ether;
+        address tokenVault = makeAddr("creator token vault");
+        OstraDevBuy.DevBuy memory d = _dev(0.001 ether, tokenVault, address(wethVault));
+        (bytes32 next, bytes memory signature) = _devBuySpend(wethVault, CREATOR_WETH, p, d);
+        uint256 fee = launchpad.LAUNCH_FEE();
+        (address token,, address vesting) = devBuy.launchFromVault{value: fee}(p, d, next, signature);
+        assertEq(IERC20(WETH).balanceOf(address(wethVault)), 0.009 ether);
+        assertGt(IERC20(token).balanceOf(vesting), 0);
+        assertEq(IERC20(WETH).balanceOf(address(devBuy)), 0);
+        assertEq(address(devBuy).balance, 0);
+        assertEq(wethVault.nonce(), 1);
     }
 
     // ---------------------------------------------------------------------------------------------

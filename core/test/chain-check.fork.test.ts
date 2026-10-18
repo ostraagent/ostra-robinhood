@@ -1,9 +1,11 @@
 // Runs scripts/chain-check.ts, unchanged, against a fork of Robinhood Chain
 // mainnet with Ostra deployed on it: the keeper, the relayer and the seller
 // server run as their own processes from their environment, as on the VPS.
-// The fork only stands in for funding: the funder gets 40 USDG
-// (anvil_dealERC20; the check uses about 30 times the price of a createVault
-// plus 1) and the keeper fee payer ETH (anvil_setBalance).
+// The launchpad is deployed next to Ostra (the launchpad step runs). The fork
+// only stands in for funding: the funder gets 70 USDG (anvil_dealERC20; the
+// check uses about 30 times the price of a createVault plus 1, and for the launchpad step twice the price of a launch at
+// the fork's gas price plus 2) and the keeper
+// fee payer ETH (anvil_setBalance).
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -16,14 +18,14 @@ import { after, before, test } from "node:test";
 import { bytesToHex, keccak256, stringToHex, zeroAddress, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { FileWotsStore, USDG, WotsKeychain, ostraVaultFactoryAbi, vaultAddress, type Deployment } from "@ostraagent/sdk";
-import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 
 /** anvil's development account 2 (a public test key, used only on the fork; it only sends transactions). */
 const FUNDER_KEY = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 /** The keeper fee payer of this run (a test key, written where the keeper reads it). */
 const FEE_PAYER_KEY = keccak256(stringToHex("OSTRA/EVM/CORE-CHECK/fee-payer"));
 /** PASS lines the check prints when everything passes. */
-const EXPECTED_PASSES = 28;
+const EXPECTED_PASSES = 35;
 
 let fork: Fork;
 let d: Deployment;
@@ -43,7 +45,7 @@ async function freePort(): Promise<number> {
 before(async () => {
   root = await mkdtemp(join(tmpdir(), "ostra-core-check-"));
   fork = await startFork();
-  d = await deployOnFork(fork);
+  d = await deployLaunchpadOnFork(fork, await deployOnFork(fork));
 });
 
 after(async () => {
@@ -53,7 +55,7 @@ after(async () => {
 
 test("scripts/chain-check.ts passes against the keeper, relayer and seller server processes", async () => {
   const funder = fork.accounts[2]!;
-  await fork.dealUsdg(funder.address, 40_000_000n);
+  await fork.dealUsdg(funder.address, 70_000_000n);
   // The Ostra operator vault that receives the keeper fee.
   const operator = new WotsKeychain(new Uint8Array(32).fill(3), keccak256(stringToHex("OSTRA/EVM/CORE-CHECK/operator"), "bytes"), new FileWotsStore(join(root, "operator-wots")));
   const root0 = bytesToHex(operator.keyRoot(0n));

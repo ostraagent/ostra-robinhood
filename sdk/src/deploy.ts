@@ -9,12 +9,45 @@
 // Both beacons are owned by `beaconOwner` (upgradeable until the Phase 4
 // conditions are met, then released). Every step is checked on chain before
 // the next one, and the result is checked again as a whole.
+//
+// deployLaunchpad adds the launchpad (src/launchpad/): OstraFees, OstraHook at
+// a CREATE2 address mined through the deterministic deployer for its
+// permission bits (LAUNCHPAD.HOOK_FLAGS), OstraLaunchpad, OstraCreatorSplit,
+// OstraDispatcher, OstraLocker, OstraDevBuy (with its OstraVesting
+// implementation) and OstraAirdrop, then wires them (hook.initialize,
+// launchpad.setLocker). The deploying account owns the hook, the launchpad
+// and the dispatcher.
 
 import { readFileSync } from "node:fs";
-import { encodeFunctionData, getAddress, type Abi, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
-import { beaconProxyAbi, ostraPoolAbi, ostraSplitFactoryAbi, ostraVaultAbi, ostraVaultFactoryAbi, upgradeableBeaconAbi } from "./abi.ts";
-import { POOL_FEE_BPS, POOL_MAX_DEPOSIT, POOL_MAX_TOTAL, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, X402_BATCH_SETTLEMENT } from "./constants.ts";
-import type { Deployment } from "./deployment.ts";
+import { concat, encodeDeployData, encodeFunctionData, getAddress, getContractAddress, keccak256, numberToHex, type Abi, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
+import {
+  beaconProxyAbi,
+  ostraAirdropAbi,
+  ostraCreatorSplitAbi,
+  ostraDevBuyAbi,
+  ostraDispatcherAbi,
+  ostraHookAbi,
+  ostraLaunchpadAbi,
+  ostraLockerAbi,
+  ostraPoolAbi,
+  ostraSplitFactoryAbi,
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  upgradeableBeaconAbi,
+} from "./abi.ts";
+import {
+  CREATE2_DEPLOYER,
+  LAUNCHPAD,
+  POOL_FEE_BPS,
+  POOL_MAX_DEPOSIT,
+  POOL_MAX_TOTAL,
+  ROBINHOOD_CHAIN_ID,
+  UNISWAP_V4_POOL_MANAGER,
+  USDG,
+  WETH,
+  X402_BATCH_SETTLEMENT,
+} from "./constants.ts";
+import type { Deployment, LaunchpadDeployment } from "./deployment.ts";
 import { LEAF_DENOMINATION } from "./leaves.ts";
 
 function creationCode(outDir: string, file: string, contract: string): Hex {
@@ -138,4 +171,107 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
     const code = await client.getCode({ address });
     if (code === undefined || code === "0x") throw new Error(`deployment check: no code at the ${name} ${address}`);
   }
+}
+
+/** The salt and address of OstraHook through the deterministic deployer: the first salt whose address carries the hook's permission bits. */
+export function mineHookSalt(initCode: Hex): { salt: Hex; hook: Address } {
+  const bytecodeHash = keccak256(initCode);
+  for (let i = 0n; i < 10_000_000n; ++i) {
+    const salt = numberToHex(i, { size: 32 });
+    const hook = getContractAddress({ opcode: "CREATE2", from: CREATE2_DEPLOYER, salt, bytecodeHash });
+    if ((BigInt(hook) & BigInt(LAUNCHPAD.HOOK_FLAGS_MASK)) === BigInt(LAUNCHPAD.HOOK_FLAGS)) return { salt, hook };
+  }
+  throw new Error("no hook salt found");
+}
+
+export type DeployLaunchpadOptions = Omit<DeployOptions, "beaconOwner" | "treasury" | "poolAuthority">;
+
+/** Deploys and wires the launchpad next to the deployment `d` (deployOstra); returns `d` with its `launchpad`. */
+export async function deployLaunchpad(o: DeployLaunchpadOptions, d: Deployment): Promise<Deployment> {
+  const account = o.walletClient.account;
+  if (account === undefined) throw new Error("the wallet client has no account");
+  const chainId = await o.publicClient.getChainId();
+  if (chainId !== ROBINHOOD_CHAIN_ID || d.chainId !== chainId) throw new Error(`refusing to deploy on chain ${chainId}: Ostra runs on Robinhood Chain (${ROBINHOOD_CHAIN_ID})`);
+  const code = await o.publicClient.getCode({ address: CREATE2_DEPLOYER });
+  if (code === undefined || code === "0x") throw new Error(`no deterministic deployer at ${CREATE2_DEPLOYER}`);
+  const log = o.log ?? (() => undefined);
+  const owner = getAddress(account.address);
+  const chain = o.walletClient.chain ?? null;
+
+  const landed = async (name: string, hash: Hex) => {
+    const receipt = await o.publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw new Error(`${name}: transaction ${hash} failed`);
+    return receipt;
+  };
+  const deploy = async (name: string, abi: Abi, file: string, contract: string, args: readonly unknown[]): Promise<Address> => {
+    const hash = await o.walletClient.deployContract({ abi, bytecode: creationCode(o.outDir, file, contract), args, account, chain });
+    const receipt = await landed(name, hash);
+    if (receipt.contractAddress === null || receipt.contractAddress === undefined) throw new Error(`${name}: no contract address in ${hash}`);
+    const address = getAddress(receipt.contractAddress);
+    log("deployed", { name, address, tx: hash, gasUsed: receipt.gasUsed });
+    return address;
+  };
+  const write = async (name: string, address: Address, abi: Abi, functionName: string, args: readonly unknown[]) => {
+    const hash = await o.walletClient.writeContract({ address, abi, functionName, args, account, chain } as never);
+    await landed(name, hash);
+    log("called", { name, address, tx: hash });
+  };
+
+  const fees = await deploy("OstraFees", [] as Abi, "OstraFees.sol", "OstraFees", []);
+  const initCode = encodeDeployData({ abi: ostraHookAbi, bytecode: creationCode(o.outDir, "OstraHook.sol", "OstraHook"), args: [UNISWAP_V4_POOL_MANAGER, WETH, fees, owner] });
+  const { salt, hook } = mineHookSalt(initCode);
+  await landed("OstraHook", await o.walletClient.sendTransaction({ to: CREATE2_DEPLOYER, data: concat([salt, initCode]), account, chain }));
+  const hookCode = await o.publicClient.getCode({ address: hook });
+  if (hookCode === undefined || hookCode === "0x") throw new Error(`OstraHook: no code at ${hook}`);
+  log("deployed", { name: "OstraHook", address: hook, salt });
+  const launchpad = await deploy("OstraLaunchpad", ostraLaunchpadAbi, "OstraLaunchpad.sol", "OstraLaunchpad", [UNISWAP_V4_POOL_MANAGER, hook, WETH, owner]);
+  const creatorSplit = await deploy("OstraCreatorSplit", ostraCreatorSplitAbi, "OstraCreatorSplit.sol", "OstraCreatorSplit", [hook]);
+  const dispatcher = await deploy("OstraDispatcher", ostraDispatcherAbi, "OstraDispatcher.sol", "OstraDispatcher", [UNISWAP_V4_POOL_MANAGER, hook, WETH, creatorSplit, owner]);
+  const locker = await deploy("OstraLocker", ostraLockerAbi, "OstraLocker.sol", "OstraLocker", [UNISWAP_V4_POOL_MANAGER, launchpad, dispatcher]);
+  const devBuy = await deploy("OstraDevBuy", ostraDevBuyAbi, "OstraDevBuy.sol", "OstraDevBuy", [UNISWAP_V4_POOL_MANAGER, launchpad]);
+  const airdrop = await deploy("OstraAirdrop", ostraAirdropAbi, "OstraAirdrop.sol", "OstraAirdrop", [hook]);
+  await write("OstraHook.initialize", hook, ostraHookAbi, "initialize", [launchpad, locker, dispatcher, devBuy, airdrop]);
+  await write("OstraLaunchpad.setLocker", launchpad, ostraLaunchpadAbi, "setLocker", [locker]);
+  const vesting = (await o.publicClient.readContract({ address: devBuy, abi: ostraDevBuyAbi, functionName: "VESTING" })) as Address;
+  const out: Deployment = { ...d, launchpad: { hook, fees, launchpad, creatorSplit, dispatcher, locker, devBuy, vesting: getAddress(vesting), airdrop, owner } };
+  await checkLaunchpad(o.publicClient, out);
+  return out;
+}
+
+/** Checks on chain that `d.launchpad` is wired as deployLaunchpad wires it. */
+export async function checkLaunchpad(client: PublicClient, d: Deployment): Promise<void> {
+  const l: LaunchpadDeployment | undefined = d.launchpad;
+  if (l === undefined) throw new Error("launchpad check: the deployment has no launchpad");
+  const read = (address: Address, abi: Abi, functionName: string) => client.readContract({ address, abi, functionName }) as Promise<unknown>;
+  const same = async (what: string, address: Address, abi: Abi, functionName: string, want: unknown) => {
+    const got = await read(address, abi, functionName);
+    const norm = (x: unknown) => (typeof x === "string" ? x.toLowerCase() : x);
+    if (norm(got) !== norm(want)) throw new Error(`launchpad check: ${what} is ${String(got)}, expected ${String(want)}`);
+  };
+  if ((BigInt(l.hook) & BigInt(LAUNCHPAD.HOOK_FLAGS_MASK)) !== BigInt(LAUNCHPAD.HOOK_FLAGS)) throw new Error(`launchpad check: the hook ${l.hook} lacks its permission bits`);
+  await same("hook pool manager", l.hook, ostraHookAbi, "POOL_MANAGER", UNISWAP_V4_POOL_MANAGER);
+  await same("hook WETH", l.hook, ostraHookAbi, "WETH", WETH);
+  await same("hook fees", l.hook, ostraHookAbi, "FEES", l.fees);
+  await same("hook launchpad", l.hook, ostraHookAbi, "launchpad", l.launchpad);
+  await same("hook locker", l.hook, ostraHookAbi, "locker", l.locker);
+  await same("hook dispatcher", l.hook, ostraHookAbi, "dispatcher", l.dispatcher);
+  await same("hook dev buy", l.hook, ostraHookAbi, "devBuy", l.devBuy);
+  await same("hook airdrop", l.hook, ostraHookAbi, "airdrop", l.airdrop);
+  await same("hook owner", l.hook, ostraHookAbi, "owner", l.owner);
+  await same("hook tick spacing", l.hook, ostraHookAbi, "TICK_SPACING", LAUNCHPAD.TICK_SPACING);
+  await same("launchpad hook", l.launchpad, ostraLaunchpadAbi, "HOOK", l.hook);
+  await same("launchpad locker", l.launchpad, ostraLaunchpadAbi, "locker", l.locker);
+  await same("launchpad owner", l.launchpad, ostraLaunchpadAbi, "owner", l.owner);
+  await same("launchpad fee", l.launchpad, ostraLaunchpadAbi, "LAUNCH_FEE", LAUNCHPAD.FEE_WEI);
+  await same("launchpad supply", l.launchpad, ostraLaunchpadAbi, "SUPPLY", LAUNCHPAD.SUPPLY);
+  await same("dispatcher hook", l.dispatcher, ostraDispatcherAbi, "HOOK", l.hook);
+  await same("dispatcher split", l.dispatcher, ostraDispatcherAbi, "SPLIT", l.creatorSplit);
+  await same("dispatcher owner", l.dispatcher, ostraDispatcherAbi, "owner", l.owner);
+  await same("creator split hook", l.creatorSplit, ostraCreatorSplitAbi, "HOOK", l.hook);
+  await same("locker launchpad", l.locker, ostraLockerAbi, "LAUNCHPAD", l.launchpad);
+  await same("locker dispatcher", l.locker, ostraLockerAbi, "DISPATCHER", l.dispatcher);
+  await same("dev buy launchpad", l.devBuy, ostraDevBuyAbi, "LAUNCHPAD", l.launchpad);
+  await same("dev buy vesting", l.devBuy, ostraDevBuyAbi, "VESTING", l.vesting);
+  await same("dev buy WETH", l.devBuy, ostraDevBuyAbi, "WETH", WETH);
+  await same("airdrop hook", l.airdrop, ostraAirdropAbi, "HOOK", l.hook);
 }

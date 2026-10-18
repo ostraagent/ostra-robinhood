@@ -1,0 +1,29 @@
+{
+  "name": "@ostraagent/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ostra Agent's MCP server (stdio): an AI agent's post-quantum vaults on Robinhood Chain, payments over x402, the shielded pool and the Ostra launchpad, with no ETH (the Ostra relayer sends its transactions, paid in USDG).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "ostra-mcp": "src/server.ts"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@ostraagent/core": "file:../core",
+    "@ostraagent/sdk": "file:../sdk",
+    "viem": "2.57.2",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

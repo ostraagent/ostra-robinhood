@@ -18,7 +18,29 @@ export const CONTRACTS: Readonly<Record<string, readonly [string, string]>> = {
   x402BatchSettlementAbi: ["IX402BatchSettlement.sol", "IX402BatchSettlement"],
   upgradeableBeaconAbi: ["UpgradeableBeacon.sol", "UpgradeableBeacon"],
   beaconProxyAbi: ["BeaconProxy.sol", "BeaconProxy"],
+  ostraLaunchpadAbi: ["OstraLaunchpad.sol", "OstraLaunchpad"],
+  ostraDevBuyAbi: ["OstraDevBuy.sol", "OstraDevBuy"],
+  ostraHookAbi: ["OstraHook.sol", "OstraHook"],
+  ostraTokenAbi: ["OstraToken.sol", "OstraToken"],
+  ostraAirdropAbi: ["OstraAirdrop.sol", "OstraAirdrop"],
+  ostraVestingAbi: ["OstraVesting.sol", "OstraVesting"],
+  ostraDispatcherAbi: ["OstraDispatcher.sol", "OstraDispatcher"],
+  ostraCreatorSplitAbi: ["OstraCreatorSplit.sol", "OstraCreatorSplit"],
+  ostraLockerAbi: ["OstraLocker.sol", "OstraLocker"],
 };
+
+/** The launchpad's contracts (src/launchpad/). */
+const LAUNCHPAD_CONTRACTS = new Set([
+  "ostraLaunchpadAbi",
+  "ostraDevBuyAbi",
+  "ostraHookAbi",
+  "ostraTokenAbi",
+  "ostraAirdropAbi",
+  "ostraVestingAbi",
+  "ostraDispatcherAbi",
+  "ostraCreatorSplitAbi",
+  "ostraLockerAbi",
+]);
 
 type Artifact = { abi: unknown[]; bytecode: { object: string } };
 
@@ -39,7 +61,8 @@ export function abiSource(outDir: string): string {
   ];
   for (const [name, [file, contract]] of Object.entries(CONTRACTS)) {
     const { abi } = readArtifact(outDir, file, contract);
-    lines.push(`/** ${contract} (src/${file === "IX402BatchSettlement.sol" ? `interfaces/${file}` : file}). */`);
+    const source = file === "IX402BatchSettlement.sol" ? `interfaces/${file}` : name.startsWith("ostra") && LAUNCHPAD_CONTRACTS.has(name) ? `launchpad/${file}` : file;
+    lines.push(`/** ${contract} (src/${source}). */`);
     lines.push(`export const ${name} = ${JSON.stringify(abi, null, 2)} as const;`, "");
   }
   const proxy = readArtifact(outDir, "BeaconProxy.sol", "BeaconProxy").bytecode.object;

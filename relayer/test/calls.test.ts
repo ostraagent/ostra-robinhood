@@ -6,9 +6,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { bytesToHex, concat, encodeFunctionData, getAddress, hexToBytes, keccak256, type Address, type Hex } from "viem";
 import {
+  LAUNCHPAD,
   MULTICALL3,
+  NO_DEV_BUY,
   VAULT_ACTION,
+  launchFromVaultData,
+  launchParams,
   openChannelParams,
+  ostraAirdropAbi,
+  ostraCreatorSplitAbi,
+  ostraDispatcherAbi,
+  ostraVestingAbi,
+  relayValue,
   ostraPoolAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
@@ -128,4 +137,34 @@ test("the four kinds relayed before payment, each the whole request", () => {
     kind: "other",
     vaults: [vault, vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: next, initialCrank: at(0) })],
   });
+});
+
+test("the launchpad's calls: a vault-funded launch acts for its creator vault and carries the launch fee; the public calls are read with their arguments", () => {
+  const l = { hook: at(0x70), fees: at(0x71), launchpad: at(0x72), creatorSplit: at(0x73), dispatcher: at(0x74), locker: at(0x75), devBuy: at(0x76), vesting: at(0x77), airdrop: at(0x78), owner: at(0x79) };
+  const dl: Deployment = { ...d, launchpad: l };
+  const creatorVault = at(0xaa09);
+  const p = launchParams({ name: "T", symbol: "T", salt: `0x${"05".repeat(32)}`, quote: d.token, creatorVault, startTick: -400_000 });
+  const dev = { quoteIn: 5_000_000n, beneficiary: at(0xab), dividendRecipient: at(0), cliff: 604_800, duration: 0 };
+  const launch = { to: l.devBuy, data: launchFromVaultData(p, dev, { nextKeyRoot: next, signature: sig }) };
+  const c = parseCall(launch);
+  assert.ok(c.fn === "launchFromVault" && c.vault === creatorVault && c.nextKeyRoot === next && c.signature === sig && c.dev.quoteIn === 5_000_000n && c.launch.symbol === "T");
+  assert.deepEqual(classify(decodeRelayRequest({ calls: [launch] }), dl, relayerVault), { kind: "other", vaults: [creatorVault] });
+  // The relayer decides the value from the call: the launch fee on the deployment's OstraDevBuy, nothing anywhere else.
+  assert.equal(relayValue(dl, launch), LAUNCHPAD.FEE_WEI);
+  assert.equal(relayValue(dl, { to: l.launchpad, data: launch.data }), 0n);
+  assert.equal(relayValue(d, launch), 0n);
+  const noDev = parseCall({ to: l.devBuy, data: launchFromVaultData(p, NO_DEV_BUY, { nextKeyRoot: next, signature: sig }) });
+  assert.ok(noDev.fn === "launchFromVault" && noDev.dev.quoteIn === 0n);
+  const poolId = `0x${"0e".repeat(32)}` as Hex;
+  const claim = parseCall({ to: l.airdrop, data: encodeFunctionData({ abi: ostraAirdropAbi, functionName: "claim", args: [poolId, at(0xc1), 7n, [root]] }) });
+  assert.ok(claim.fn === "airdropClaim" && claim.poolId === poolId && claim.account === at(0xc1) && claim.amount === 7n);
+  assert.equal(parseCall({ to: l.airdrop, data: encodeFunctionData({ abi: ostraAirdropAbi, functionName: "close", args: [poolId] }) }).fn, "airdropClose");
+  const ref = parseCall({ to: l.dispatcher, data: encodeFunctionData({ abi: ostraDispatcherAbi, functionName: "claimReferral", args: [at(0xc2), d.token] }) });
+  assert.ok(ref.fn === "claimReferral" && ref.referrer === at(0xc2) && ref.currency === d.token);
+  const rel = parseCall({ to: l.creatorSplit, data: encodeFunctionData({ abi: ostraCreatorSplitAbi, functionName: "release", args: [poolId, at(0xc3)] }) });
+  assert.ok(rel.fn === "splitRelease" && rel.account === at(0xc3));
+  assert.equal(parseCall({ to: at(0xd1), data: encodeFunctionData({ abi: ostraVestingAbi, functionName: "release" }) }).fn, "vestingRelease");
+  assert.equal(parseCall({ to: at(0xd1), data: encodeFunctionData({ abi: ostraVestingAbi, functionName: "claimDividends" }) }).fn, "vestingClaimDividends");
+  // A launch call cut short is malformed, not unknown.
+  assert.throws(() => parseCall({ to: l.devBuy, data: launch.data.slice(0, 200) as Hex }, 1), /calls\[1\]: malformed launchFromVault calldata/);
 });

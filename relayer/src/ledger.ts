@@ -41,8 +41,10 @@ export type QuoteKind = "create_vault" | "open_relayer_channel" | "spend_leaf" |
 export type Quote = {
   /** Price in base units of the token, margin included. */
   amount: string;
-  /** Wei charged before the margin: gas estimate x gas price at the quote. */
+  /** Wei charged before the margin: the priced gas x gas price at the quote. */
   wei: string;
+  /** ETH the transaction sends (a vault-funded launch's fee), charged without the margin; absent: 0. */
+  value?: string;
   gas: string;
   gasPrice: string;
   /** The Chainlink ETH/USD answer the price was converted at (8 decimals, before the deviation). */

@@ -233,7 +233,12 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(9, bytes32(0), "", signature);
+        vault.spend(10, bytes32(0), "", signature);
+        // DevBuy: abi.encode(devBuy, launchHash, amount), 96 bytes.
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(9, bytes32(0), new bytes(64), signature);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(9, bytes32(0), new bytes(128), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(6, bytes32(0), new bytes(32), signature);
         vm.expectRevert(OstraVault.BadParams.selector);

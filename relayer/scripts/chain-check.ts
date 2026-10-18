@@ -588,7 +588,9 @@ async function main(): Promise<void> {
     const p1 = await relayPaid(r1);
     const q1 = quoted(r1);
     const rule = (q: Record<string, unknown> | undefined) =>
-      q !== undefined && BigInt(String(q.wei)) === BigInt(String(q.gas)) * BigInt(String(q.gasPrice)) && BigInt(String(q.amount)) === weiToTokenUnits(withMargin(BigInt(String(q.wei))), { answer: BigInt(String(q.ethUsd)), roundId: 0n, updatedAt: 0n }, decimals);
+      q !== undefined &&
+      BigInt(String(q.wei)) === BigInt(String(q.gas)) * BigInt(String(q.gasPrice)) &&
+      BigInt(String(q.amount)) === weiToTokenUnits(withMargin(BigInt(String(q.wei))) + BigInt(String(q.value ?? "0")), { answer: BigInt(String(q.ethUsd)), roundId: 0n, updatedAt: 0n }, decimals);
     check(p1.first.status === 402 && q1 !== undefined && p1.price === BigInt(String(q1.amount)) && rule(q1), "a spend Transfer answers 402 for its price: gas x gas price + 10% at ETH/USD + 0.5%", { price: p1.price, quote: q1 });
     check(p1.second?.status === 200 && p1.second.body?.paid === p1.price?.toString() && (await balance(funder.address)) - fundsBefore === t, "paid by voucher, the transfer is sent", p1.second?.body);
     const r1Again = await post(r1);
@@ -738,9 +740,10 @@ async function main(): Promise<void> {
     check(sum(["relayer_channel_paid", "relayed", "paid_not_sent"], "amount") === paidTotal, "what the vault's channel paid equals the relayer's paid log", { logged: sum(["relayer_channel_paid", "relayed", "paid_not_sent"], "amount"), paidTotal });
     const quotes = ev.filter((e) => e.event === "quoted");
     check(quotes.length > 0 && quotes.every((q) => rule(q)), "every quote follows the rule from its logged gas, gas price and ETH/USD", quotes.length);
-    const gasSpent = ev
-      .filter((e) => typeof e.gasUsed === "string" && typeof e.effectiveGasPrice === "string")
-      .reduce((a, e) => a + BigInt(e.gasUsed as string) * BigInt(e.effectiveGasPrice as string), 0n);
+    // The gas of every landed transaction, the ETH a launch sent, and the gas of any that reverted on-chain.
+    const gasSpent =
+      ev.filter((e) => typeof e.gasUsed === "string" && typeof e.effectiveGasPrice === "string").reduce((a, e) => a + BigInt(e.gasUsed as string) * BigInt(e.effectiveGasPrice as string) + BigInt(String(e.value ?? "0")), 0n) +
+      ev.reduce((a, e) => a + BigInt(String(e.spentWei ?? "0")), 0n);
     const ethNow = await client.getBalance({ address: relayerAccount.address });
     check(ethAtStart - ethNow === gasSpent, "the relayer account paid exactly the gas of the transactions it logged as landed", { spent: ethAtStart - ethNow, logged: gasSpent });
     check((await balance(agentVault)) === deposit - paidTotal, "the agent vault holds what was funded less its six transfers and what it paid the relayer", { vault: await balance(agentVault), deposit, paidTotal });

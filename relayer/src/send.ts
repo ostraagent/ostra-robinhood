@@ -8,11 +8,13 @@
 // is the estimate + 20%, at most the cap the gate gives (what the
 // transaction was priced at, relayGasCap): one that needs more now is not
 // sent. It is signed locally,
-// so its hash is known before the RPC sees it, and then waited for:
+// so its hash is known before the RPC sees it, with the value the gate gives
+// (a vault-funded launch's fee), and then waited for:
 //   * a receipt with status success: landed;
 //   * a reverted receipt: the gas is spent but nothing happened; reported as
 //     not sent (the gate's rule on Solana for a transaction that failed
-//     on-chain);
+//     on-chain), with the wei the gas cost (the gate keeps that much of what
+//     was paid);
 //   * the node answering the send with a JSON-RPC error: it refused the
 //     transaction (Robinhood Chain's sequencer keeps no mempool), not sent;
 //   * no receipt within RECEIPT_TIMEOUT_MS, or the send failing without an
@@ -41,11 +43,14 @@ export class NotSentError extends Error {
   readonly txHash: Hash | null;
   /** True when it was not sent because it needs more gas now than the cap it was priced for. */
   readonly overCap: boolean;
-  constructor(message: string, txHash: Hash | null = null, overCap = false) {
+  /** Wei the relayer's account paid for it: the gas of a transaction that reverted on-chain (0 otherwise). */
+  readonly spentWei: bigint;
+  constructor(message: string, txHash: Hash | null = null, overCap = false, spentWei = 0n) {
     super(message);
     this.name = "NotSentError";
     this.txHash = txHash;
     this.overCap = overCap;
+    this.spentWei = spentWei;
   }
 }
 
@@ -74,7 +79,8 @@ export function isNodeRefusal(err: unknown): boolean {
   return false;
 }
 
-export type Landed = { txHash: Hash; gasUsed: bigint; effectiveGasPrice: bigint; block: bigint };
+/** A landed transaction: its gas, its gas price and the ETH it sent (value). */
+export type Landed = { txHash: Hash; gasUsed: bigint; effectiveGasPrice: bigint; block: bigint; value: bigint };
 
 export class RelaySender {
   readonly #client: PublicClient;
@@ -103,28 +109,28 @@ export class RelaySender {
    * Swap in `tx` is not sent if it fails now (SwapFailed). `maxGas`: the
    * highest gas limit it is sent with.
    */
-  send(tx: { to: Address; data: Hex }, o: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint } = {}): Promise<Landed> {
-    const run = () => this.#send(tx, o.refuseFailedSwaps ?? [], o.maxGas);
+  send(tx: { to: Address; data: Hex }, o: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint } = {}): Promise<Landed> {
+    const run = () => this.#send({ ...tx, value: o.value ?? 0n }, o.refuseFailedSwaps ?? [], o.maxGas);
     const p = this.#tail.then(run, run);
     this.#tail = p.catch(() => undefined);
     return p;
   }
 
-  async #receipt(hash: Hash): Promise<Landed | "reverted" | null> {
+  async #receipt(hash: Hash, value: bigint): Promise<Landed | { reverted: bigint } | null> {
     try {
       const r = await this.#client.getTransactionReceipt({ hash });
-      if (r.status !== "success") return "reverted";
-      return { txHash: hash, gasUsed: r.gasUsed, effectiveGasPrice: r.effectiveGasPrice, block: r.blockNumber };
+      if (r.status !== "success") return { reverted: r.gasUsed * r.effectiveGasPrice };
+      return { txHash: hash, gasUsed: r.gasUsed, effectiveGasPrice: r.effectiveGasPrice, block: r.blockNumber, value };
     } catch {
       return null; // not found (yet)
     }
   }
 
-  async #send(tx: { to: Address; data: Hex }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined): Promise<Landed> {
+  async #send(tx: { to: Address; data: Hex; value: bigint }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined): Promise<Landed> {
     const account = this.#account;
     let gas: bigint;
     try {
-      gas = await this.#client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: 0n });
+      gas = await this.#client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: tx.value });
     } catch (err) {
       const e = err as { shortMessage?: string; message?: string };
       throw new NotSentError(`the transaction reverts now, so it was not sent: ${e.shortMessage ?? e.message ?? String(err)}`);
@@ -137,7 +143,7 @@ export class RelaySender {
     if (refuseFailedSwaps.length !== 0) {
       let failed: ReturnType<typeof failedSwaps>;
       try {
-        failed = failedSwaps((await simulateRelay(this.#client, { relayer: account.address, to: tx.to, data: tx.data })).logs, refuseFailedSwaps);
+        failed = failedSwaps((await simulateRelay(this.#client, { relayer: account.address, to: tx.to, data: tx.data, value: tx.value })).logs, refuseFailedSwaps);
       } catch (err) {
         throw new NotSentError(`its Swap could not be checked, so it was not sent: ${(err as Error).message}`);
       }
@@ -153,7 +159,7 @@ export class RelaySender {
       chain: robinhoodChain,
       to: tx.to,
       data: tx.data,
-      value: 0n,
+      value: tx.value,
       gas: limit,
       nonce,
       maxFeePerGas,
@@ -173,8 +179,8 @@ export class RelaySender {
     if (sendError === undefined) {
       const deadline = Date.now() + this.#receiptTimeoutMs;
       while (Date.now() < deadline) {
-        const r = await this.#receipt(hash);
-        if (r === "reverted") throw new NotSentError(`transaction ${hash} reverted on-chain`, hash);
+        const r = await this.#receipt(hash, tx.value);
+        if (r !== null && "reverted" in r) throw new NotSentError(`transaction ${hash} reverted on-chain`, hash, false, r.reverted);
         if (r !== null) return r;
         await sleep(POLL_MS);
       }
@@ -194,10 +200,10 @@ export class RelaySender {
     await this.#client.sendRawTransaction({ serializedTransaction: replacement }).catch(() => undefined);
     const deadline = Date.now() + this.#settleTimeoutMs;
     while (Date.now() < deadline) {
-      const r = await this.#receipt(hash);
-      if (r === "reverted") throw new NotSentError(`transaction ${hash} reverted on-chain`, hash);
+      const r = await this.#receipt(hash, tx.value);
+      if (r !== null && "reverted" in r) throw new NotSentError(`transaction ${hash} reverted on-chain`, hash, false, r.reverted);
       if (r !== null) return r;
-      if ((await this.#receipt(replacementHash)) !== null) {
+      if ((await this.#receipt(replacementHash, 0n)) !== null) {
         const why = sendError === undefined ? `no receipt within ${this.#receiptTimeoutMs / 1_000} s` : `the send failed without an answer from the node (${(sendError as Error).message})`;
         throw new NotSentError(`transaction ${hash} was replaced at nonce ${nonce}: ${why}`, hash);
       }

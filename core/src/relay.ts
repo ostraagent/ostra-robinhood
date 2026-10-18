@@ -57,6 +57,8 @@ import {
   channelId as computeChannelId,
   decodeOpenChannelParams,
   estimateRelay,
+  relayPriceWei,
+  relayValue,
   maxAcceptedQuote,
   ostraSplitFactoryAbi,
   ostraVaultAbi,
@@ -120,6 +122,12 @@ export type SendOptions = {
    * key can sign anything else.
    */
   allowFailedSwaps?: boolean;
+  /**
+   * ETH the transaction sends, when the local fee payer sends it (a
+   * vault-funded launch's fee, sdk relayValue); the relayer adds that value
+   * itself and charges it.
+   */
+  value?: bigint;
 };
 
 export interface Sender {
@@ -132,9 +140,11 @@ export interface Sender {
   /**
    * Before a vault spend of about `gas` is signed: makes sure it can be
    * paid. `keep` is what that spend moves out of the buyer vault, which a new
-   * relayer channel leaves in it. Release it once it was sent.
+   * relayer channel leaves in it; `extraWei` is ETH the transaction sends that
+   * the relayer fronts and charges (a vault-funded launch's fee). Release it
+   * once it was sent.
    */
-  reserve(gas: bigint, openChannel?: OpenRelayerChannel, keep?: bigint): Promise<Reservation | null>;
+  reserve(gas: bigint, openChannel?: OpenRelayerChannel, keep?: bigint, extraWei?: bigint): Promise<Reservation | null>;
   release(reservation: Reservation | null): void;
 }
 
@@ -165,9 +175,9 @@ export class LocalSender implements Sender {
     return this.#feePayer.address;
   }
 
-  async send(calls: RelayCall[]): Promise<Hash> {
+  async send(calls: RelayCall[], options: SendOptions = {}): Promise<Hash> {
     if (this.#escrow !== null) await this.#escrow.escrow(calls);
-    return sendCalls(this.#client, this.#transport, this.#feePayer, calls);
+    return sendCalls(this.#client, this.#transport, this.#feePayer, calls, options.value ?? 0n);
   }
 
   async reserve(): Promise<Reservation | null> {
@@ -580,8 +590,9 @@ export class RelayerClient implements Sender {
   async #maxAmount(calls: readonly RelayCall[]): Promise<bigint> {
     const facts = await this.facts();
     try {
-      const m = await estimateRelay(this.#client, { relayer: facts.feePayer, ...relayTransaction(calls) });
-      return maxAcceptedQuote(await this.#amountFor(m.wei));
+      const tx = relayTransaction(calls);
+      const m = await estimateRelay(this.#client, { relayer: facts.feePayer, ...tx, value: relayValue(this.#config.deployment, tx) });
+      return maxAcceptedQuote(weiToTokenUnits(relayPriceWei(m), await this.#ethUsd(), TOKEN_DECIMALS));
     } catch (err) {
       if (err instanceof RelaySimulationError) throw new RelayerError(err.reverted ? 422 : 503, err.code, err.message);
       throw err;
@@ -607,8 +618,10 @@ export class RelayerClient implements Sender {
     await (openChannel ?? ((t: RelayerChannelTerms) => this.#buyerVault().openRelayerChannel(t)))(terms);
   }
 
-  async reserve(gas: bigint, openChannel?: OpenRelayerChannel, keep = 0n): Promise<Reservation | null> {
-    const amount = maxAcceptedQuote(await this.#amountFor(gas * (await this.#client.getGasPrice())));
+  async reserve(gas: bigint, openChannel?: OpenRelayerChannel, keep = 0n, extraWei = 0n): Promise<Reservation | null> {
+    // The relayer's rule: the gas with its margin, plus the ETH the transaction sends (no margin on that).
+    const wei = withMargin(gas * (await this.#client.getGasPrice())) + extraWei;
+    const amount = maxAcceptedQuote(weiToTokenUnits(wei, await this.#ethUsd(), TOKEN_DECIMALS));
     for (let attempt = 0; attempt < 2; attempt++) {
       const c = await this.#serial(async () => {
         const found = await this.#channelFor(amount, null);

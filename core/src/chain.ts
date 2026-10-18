@@ -83,16 +83,16 @@ export function revertReason(err: unknown): string {
  * transaction is simulated first (eth_estimateGas): one that reverts now is
  * not sent (SimulationError). Returns the transaction hash.
  */
-export async function sendCalls(client: PublicClient, transport: Transport, account: PrivateKeyAccount, calls: readonly RelayCall[]): Promise<Hash> {
+export async function sendCalls(client: PublicClient, transport: Transport, account: PrivateKeyAccount, calls: readonly RelayCall[], value = 0n): Promise<Hash> {
   const tx = relayTransaction(calls);
   let gas: bigint;
   try {
-    gas = await client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: 0n });
+    gas = await client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value });
   } catch (err) {
     throw new SimulationError(`the transaction reverts now, so it was not sent: ${revertReason(err)}`);
   }
   const wallet = createWalletClient({ account, chain: robinhoodChain, transport });
-  const hash = await wallet.sendTransaction({ account, chain: robinhoodChain, to: tx.to, data: tx.data, value: 0n, gas: gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n });
+  const hash = await wallet.sendTransaction({ account, chain: robinhoodChain, to: tx.to, data: tx.data, value, gas: gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n });
   const receipt = await client.waitForTransactionReceipt({ hash, timeout: RECEIPT_TIMEOUT_MS });
   if (receipt.status !== "success") throw new Error(`transaction ${hash} reverted on-chain`);
   return hash;

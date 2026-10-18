@@ -9,7 +9,7 @@ Contents:
   with the Solana program and the Ostra TypeScript SDK, tested against vectors made by that SDK.
 - `src/OstraVault.sol`, `src/OstraVaultFactory.sol`: vaults spent only with rotating WOTS keys
   (Transfer, OpenChannel, SetCrankKey, Swap, ConfigurePool, ClaimDividend, SetGuardian,
-  SetRecoveryPolicy, SupportRecovery), as beacon proxies at addresses fixed by token, initial
+  SetRecoveryPolicy, SupportRecovery, DevBuy), as beacon proxies at addresses fixed by token, initial
   key root and initial crank. Channels are x402 batch-settlement channels on the deployed
   x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
   vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
@@ -21,7 +21,8 @@ Contents:
   by a swap the market moved; a spend sent from inside another unlock reverts. ConfigurePool is a
   launch creator's change to its pool's rules (`OstraHook.configure`); ClaimDividend claims an
   `OstraToken`'s dividends owed to the vault, to the signed recipient (the owner's vault for the
-  dividend token). A vault whose seed is lost is recovered by its guardians (other vaults): once the
+  dividend token). DevBuy pays a launch's dev buy from a creator vault: only `OstraDevBuy` can send
+  it, and only inside the launch whose hash it signed (`OstraDevBuy.pendingLaunch`). A vault whose seed is lost is recovered by its guardians (other vaults): once the
   threshold supports the same new key root, the recovery waits its delay (36 hours to 14 days) and
   anyone finishes it, or the new key's first spend does; any spend by the current key cancels it.
   `lib/v4-core` is `src/` and `licenses/` of Uniswap v4-core v4.0.0 (commit e50237c), the release
@@ -59,7 +60,13 @@ Contents:
   transaction (the hook fee, the tax, the max buy, the max wallet and the circuit breaker apply, the
   anti-snipe tax does not), at most 5% of the supply, into an `OstraVesting` clone that pays the
   creator's token vault after a 7 to 365 day cliff, linearly over up to 365 days, and earns the
-  pool's dividends for the creator meanwhile. `OstraAirdrop` runs the creator's airdrop rounds: the
+  pool's dividends for the creator meanwhile. `OstraDevBuy.launchFromVault` is the launch an agent
+  without ETH makes: the creator vault signs one DevBuy spend of the launch's hash
+  (keccak256(abi.encode(params, devBuy))) and the dev buy is paid from the vault inside exactly that
+  launch, whoever sends it (the Ostra relayer, which fronts the 0.0002 ETH launch fee); the token's
+  salt is bound to the creator vault, so nobody can take its address first, and what the dev buy
+  did not spend goes back to the vault (WETH again for an ETH pool). `OstraLaunchpad.poolOf` and
+  `OstraDevBuy.vestingPool` prove a token or a vesting is the launchpad's. `OstraAirdrop` runs the creator's airdrop rounds: the
   creator vault buys the tokens into it, sets a round's amount (at most 10% of the supply) and starts
   it with a merkle root; anyone claims for an account for 7 days, then anyone closes the round and
   what was not claimed is burned; one round at a time. A pool's quote is ETH or any ERC-20, a
@@ -77,7 +84,14 @@ Contents:
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
   aggregator wire format and EIP-191 polls; and `deployOstra`, which deploys the contracts from the
-  Foundry build. Its fork tests run every message against the contracts on a fork of mainnet.
+  Foundry build, and `deployLaunchpad` (the hook at a CREATE2 address mined for its flags, wired).
+  The launchpad: launch params with Ostra's defaults, the launch hash and DevBuy spend of a
+  vault-funded launch, airdrop trees; and quotes made before the owner's key signs anything: a vault
+  Swap (`quoteVaultSwap`: the exact spend signed by a throwaway key, simulated with the vault's key
+  root overridden to the throwaway's; the smallest swapGas that swaps, x 1.5 + 50,000; minOut at the
+  slippage; refused above 80% of the circuit breaker's room), a vault-funded launch
+  (`quoteVaultLaunch`) and any other spend (`simulateVaultSpend`). Its fork tests run every message
+  against the contracts on a fork of mainnet.
 - `keeper/`: the keeper service (`@ostraagent/keeper`). It guards channels paid to Ostra seller
   vaults whose crank is its per-merchant crank: it claims a forwarded voucher once 1 token is
   unclaimed or the oldest unclaimed voucher is an hour old, and on a buyer's close request (seen
@@ -103,7 +117,12 @@ Contents:
   swap_fails) unless the request sets allowFailedSwaps; a quoted Swap is simulated again when it
   comes back to be paid and once more just before it is sent. createVault, a leaf spent into a
   vault, unshield and an open to the relayer are relayed before payment as the vault's debt; WOTS
-  signatures are escrowed before anything is simulated.
+  signatures are escrowed before anything is simulated. On the launchpad it relays
+  `OstraDevBuy.launchFromVault` alone, from a creator vault in USDG (or WETH, with a payer), fronting
+  the launch fee and charging it with the gas; the airdrop's claims and closes, referral claims,
+  creator split releases, and an Ostra dev buy vesting's release and dividends; and spends of vaults
+  in WETH or a launched token (Transfer, Swap, ClaimDividend; ConfigurePool for WETH), paid by a
+  `payer` vault in USDG. The gas of a transaction that reverts on-chain is kept from what was paid.
   The signature escrow keeps every WOTS signature until the chain shows its key used: a restored
   device reads it (GET /v1/signatures/<key root>) before signing, and an agent sending with its own
   fee payer escrows first (POST /v1/escrow); a recovering vault's new key is escrowed too.
@@ -123,12 +142,27 @@ Contents:
   so a device restored from the seed sends a signature still in flight instead of signing again),
   the passkey backup of the seed (AES-256-GCM under HKDF of the WebAuthn PRF output, kept by the
   relayer), and the creator vault a launch pays its creator's share to, with its own records and
-  relayer client and an optional auto-shield of its balance into the shielded pool.
+  relayer client and an optional auto-shield of its balance into the shielded pool; `pay`, which
+  pays an x402 batch-settlement offer of an Ostra seller from a channel of the vault; and the
+  launchpad (`launchpad.ts`): buy (USDG from the buyer vault into the agent's vault for that token,
+  created in the same request) and sell back, launch with a dev buy from the creator vault, pool
+  settings, creator shares, airdrop rounds, vesting and referral claims, every vault spend quoted or
+  simulated before its key signs it. A launch signed and not landed is sent again from the launch
+  kept before signing, or from the call in the relayer's signature escrow on a restored device.
   `scripts/chain-check.ts` runs it end to end against the keeper, the relayer and a seller server;
   its fork test runs it on a mainnet fork. `test/recovery.fork.test.ts` runs a guardian recovery
   on a fork.
   `test/shield.fork.test.ts` runs shield, the creator vault's auto-shield and unshield against the
-  aggregator on a fork.
+  aggregator on a fork. `test/launchpad.fork.test.ts` runs the launchpad service on a fork.
+- `mcp/`: Ostra Agent's MCP server (`@ostraagent/mcp`, stdio, `@modelcontextprotocol/sdk` 1.32.1).
+  Its keys and records stay in OSTRA_HOME (0700; files 0600; the seed backed up with
+  `node src/backup-cli.ts export <file>`, encrypted under a passphrase typed in a terminal). Tools:
+  the vault (open_vault, balance, withdraw), channels and pay, the seller side (accept_payments),
+  shield and unshield, recovery, and the launchpad (pool_info, quote_swap, buy, sell, token_vault,
+  transfer_token, claim_dividends, launch, set_pool_setting, set_creator_share, airdrop_fund,
+  airdrop_start, airdrop_claim, airdrop_close, vesting_release, claim_referral and more). A refused
+  tool says whether it was refused before anything was signed. With OSTRA_RELAYER_URL the agent needs
+  no ETH. `test/mcp.fork.test.ts` drives the server over stdio on a fork.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
   batches: a depositor posts the leaves of its pending deposit (checked against the on-chain
   commitment and amount) with its depositor key and deposit id (checked to derive the deposit key,
@@ -157,4 +191,5 @@ cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and t
 cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
 cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
+cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
 ```

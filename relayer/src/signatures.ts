@@ -13,6 +13,9 @@
 //                          leafIndex || destination || the pool's leafAmount
 //   OstraPool.approveBatch "OSTRA/APPROVE/EVM/v1" || chainid || pool || key ||
 //                          batchId || state || nextKeyRoot, all from the call
+//   OstraDevBuy.launchFromVault  the creator vault's DevBuy spend (action 9)
+//                          it carries: a vault spend message of
+//                          abi.encode(devBuy, launchHash(p, d), d.quoteIn)
 //
 // keyed by the key root the relayer recovers itself (wotsRecoverKeyRoot), and
 // only when that is the key root the chain holds now (read at the latest
@@ -27,7 +30,10 @@
 // A record stays until the chain shows its key used: the vault's nonce or key
 // root moved on, the deposit's approval key root changed or the deposit is no
 // longer pending, the leaf was spent. The pruner reads that from the
-// finalized block at or after the block the record was checked at.
+// finalized block at or after the block the record was checked at. A request
+// with several spends of one vault escrows each against the key the one
+// before it rotates to (its signed nextKeyRoot, at the next nonce), and such a
+// record waits while the vault's nonce is below its own.
 // Signatures are not secret once sent, so nothing here is.
 //
 // The records are one JSON file in OSTRA_RELAYER_DATA, written atomically
@@ -43,6 +49,8 @@ import {
   WOTS_SIGNATURE_LEN,
   approvalMessage,
   decodeSwapParams,
+  devBuyParams,
+  launchHash,
   leafMessage,
   ostraPoolAbi,
   ostraVaultAbi,
@@ -127,6 +135,14 @@ export function wotsClaims(parsed: readonly ParsedCall[], calls: readonly { to: 
         }
       }
       out.push({ kind: "vault", account: c.to, nextKeyRoot: c.nextKeyRoot, action: c.action as VaultAction, params: c.params, call, signature: sig(c.signature, "spend") });
+    } else if (c.fn === "launchFromVault" && d.launchpad !== undefined && c.to === d.launchpad.devBuy) {
+      let params: Hex;
+      try {
+        params = devBuyParams({ devBuy: c.to, launchHash: launchHash(c.launch, c.dev), amount: c.dev.quoteIn });
+      } catch (err) {
+        throw new Error(`calls[${i}]: malformed launchFromVault: ${(err as Error).message}`);
+      }
+      out.push({ kind: "vault", account: c.vault, nextKeyRoot: c.nextKeyRoot, action: VAULT_ACTION.DEV_BUY, params, call, signature: sig(c.signature, "DevBuy spend") });
     } else if (c.fn === "spendLeaf" && c.to === d.pool) {
       out.push({ kind: "leaf", account: c.to, batchId: c.batchId, leafIndex: c.leafIndex, destination: c.destination, call, signature: sig(c.signature, "leaf") });
     } else if (c.fn === "approveBatch" && c.to === d.pool) {
@@ -193,6 +209,8 @@ function liveRoot(state: KeyState, keyRoot: string): boolean {
 /** True when the chain's `state` shows the record's key used (or the account gone). */
 export function keyUsed(record: SignatureRecord, state: KeyState | null): boolean {
   if (state === null || state.kind !== record.kind) return true;
+  // A later spend of a request that signed several of the vault's spends: its key comes once those before it land.
+  if (state.kind === "vault" && state.nonce < BigInt(record.nonce ?? "0")) return false;
   if (!liveRoot(state, record.keyRoot)) return true;
   if (state.kind === "vault") return state.nonce.toString() !== record.nonce;
   if (state.kind === "approval") return !state.pending;
@@ -272,11 +290,26 @@ export async function readKeyStates(client: PublicClient, d: Deployment, targets
   return out;
 }
 
-/** The record to escrow for each claim (null: not by the current key), read at the latest block. */
+/**
+ * The record to escrow for each claim (null: not by the current key), read at
+ * the latest block. Spends of one vault later in the same request are read
+ * against the key the spend before them rotates to (its signed nextKeyRoot,
+ * at the next nonce): the escrowed spend before them fixes that key, so they
+ * are escrowed too.
+ */
 export async function escrowRecords(client: PublicClient, d: Deployment, claims: readonly WotsClaim[], now: number): Promise<(SignatureRecord | null)[]> {
   const block = await client.getBlockNumber({ cacheTime: 0 });
   const states = await readKeyStates(client, d, claims.map(claimTarget), block);
-  return claims.map((c, i) => escrowRecord(c, states[i] ?? null, block, now, d.chainId));
+  const next = new Map<string, KeyState>();
+  return claims.map((c, i) => {
+    const chained = c.kind === "vault" ? next.get(lower(c.account)) : undefined;
+    const record = escrowRecord(c, chained ?? states[i] ?? null, block, now, d.chainId);
+    if (c.kind === "vault") {
+      if (record !== null) next.set(lower(c.account), { kind: "vault", keyRoot: c.nextKeyRoot, nonce: BigInt(record.nonce ?? "0") + 1n });
+      else next.delete(lower(c.account));
+    }
+    return record;
+  });
 }
 
 type EscrowData = { version: 1; records: Record<string, SignatureRecord> };

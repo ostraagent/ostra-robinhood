@@ -36,9 +36,19 @@
 
 import { bytesToHex, encodeAbiParameters, encodeFunctionData, getAddress, isAddress, keccak256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
 import {
+  LAUNCHPAD,
   VAULT_ACTION,
   channelId as computeChannelId,
+  decodeDevBuyParams,
+  decodeLaunch,
+  decodeLaunchFromVaultData,
   decodeVaultSpendMessage,
+  encodeLaunch,
+  launchFromVaultData,
+  launchHash,
+  reservedSwapGas,
+  type DevBuyTerms,
+  type LaunchParams,
   fromHex,
   openChannelParams,
   ostraVaultAbi,
@@ -75,6 +85,13 @@ import { LocalSender, PendingSpendUnpaidError, VAULT_SPEND_GAS, type OpenRelayer
 
 /** Gas a createVault uses: 240,969 measured on the fork (17 Oct 2026), rounded up. */
 const CREATE_VAULT_GAS = 300_000n;
+/**
+ * Gas a vault-funded launch with a dev buy is reserved for when it is sent
+ * again without a quote (a launch signed earlier): 2.95 million measured on
+ * the fork (18 Oct 2026, three tiers, a vesting), with room for more tiers.
+ * A new launch is reserved for what its quote measured (launchpad.ts).
+ */
+export const DEV_BUY_LAUNCH_GAS = 4_500_000n;
 /** The local fee payer must hold this many times a transaction's gas at the current gas price (as the keeper funds its crank: 2x). */
 const ETH_HEADROOM = 2n;
 const BACKUP_REMINDER =
@@ -101,9 +118,13 @@ export type PendingCrankChange = { crank: Address | null };
  * in; private: a vault unshield created; creator: the vault a launch pays its
  * creator's share to (OstraLaunchpad creatorVault), with its own records and
  * relayer client (Keys.forCreatorVault), so paying the relayer for it does
- * not tie it to the buyer vault.
+ * not tie it to the buyer vault; token: the vault of a token other than the
+ * relayer's (a token the launchpad launched, WETH) with keychain
+ * vaultKeychainId(chain, that token), which receives what the buyer vault buys
+ * and spends only through `operate` (swap, transfer, claim dividend), its
+ * relayer requests paid by the buyer vault (launchpad.ts).
  */
-export type VaultKind = "buyer" | "seller" | "private" | "creator";
+export type VaultKind = "buyer" | "seller" | "private" | "creator" | "token";
 
 export type BalanceResult = {
   chainId: number;
@@ -180,6 +201,33 @@ export type RecoveryRequest = {
 /** A signed channel open about to be sent (new or resent): its params, its config and its channel id. */
 export type ChannelOpening = { open: OpenChannelParams; config: ChannelConfig; channel: Hex };
 
+/**
+ * A vault operation built outside this file (launchpad.ts: swaps, pool
+ * settings, airdrops, dividends, launches): `build` runs its checks once any
+ * spend signed earlier was sent, then signs with `keychain` at `v` as the
+ * last step and returns the calls to send.
+ */
+export type VaultOperation = {
+  /** Gas the transaction is reserved for before it is signed. */
+  gas: bigint;
+  /** ETH the transaction sends (a vault-funded launch's fee: the relayer fronts it and charges it). */
+  value?: bigint;
+  /** What the spend moves out of this vault (a relayer channel opened for it leaves that much in the vault). */
+  moves?: bigint;
+  /** What the operation is, for messages. */
+  what: string;
+  build: (a: { v: VaultState; vault: Address; keychain: WotsKeychain; chainId: number }) => Promise<RelayCall[]>;
+};
+
+export type VaultOperationResult =
+  | { status: "sent"; txHash: Hash; vaultNonce: string }
+  | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+/** The gas a vault spend is reserved for: VAULT_SPEND_GAS, plus the swapGas a Swap among `calls` reserves (sdk reservedSwapGas). */
+export function spendGas(calls: readonly RelayCall[]): bigint {
+  return calls.reduce((gas, c) => gas + reservedSwapGas(c), VAULT_SPEND_GAS);
+}
+
 /** The calldata of OstraVault.spend for a signed spend. */
 export function spendCall(vault: Address, s: { action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }): RelayCall {
   return { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [s.action, s.nextKeyRoot, s.params, s.signature] }) };
@@ -187,6 +235,8 @@ export function spendCall(vault: Address, s: { action: number; nextKeyRoot: Hex;
 
 export class VaultService {
   readonly kind: VaultKind;
+  /** The token the vault holds: the deployment's (USDG), or a token vault's own. */
+  readonly token: Address;
   /** The private vault's number (kind "private"), else null. */
   readonly privateIndex: bigint | null;
   readonly #client: PublicClient;
@@ -202,18 +252,21 @@ export class VaultService {
   #queue: Promise<unknown> = Promise.resolve();
   #onChannelOpening: ((opening: ChannelOpening) => Promise<void>) | null = null;
 
-  constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null) {
+  constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null, vaultToken: Address | null = null) {
     if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
+    if ((kind === "token") !== (vaultToken !== null)) throw new Error("a token vault, and only a token vault, names its token");
+    if (vaultToken !== null && getAddress(vaultToken) === config.deployment.token) throw new Error(`the vault in ${vaultToken} is the buyer vault, not a token vault`);
     this.kind = kind;
+    this.token = vaultToken === null ? config.deployment.token : getAddress(vaultToken);
     this.privateIndex = privateIndex;
     this.#client = client;
     this.#transport = transport;
     this.#config = config;
     this.#keys = keys;
     this.#sender = sender;
-    const token = config.deployment.token;
+    const token = this.token;
     this.#keychain =
-      kind === "buyer"
+      kind === "buyer" || kind === "token"
         ? keys.vaultKeychain(config.chainId, token)
         : kind === "seller"
           ? keys.sellerKeychain(config.chainId, token)
@@ -233,6 +286,7 @@ export class VaultService {
   #missing(): string {
     if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; unshield creates it`;
     if (this.kind === "creator") return "this agent has no creator vault yet; open it before a launch names it";
+    if (this.kind === "token") return `this agent has no vault in ${this.token} yet; buying the token creates it`;
     return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
   }
 
@@ -256,7 +310,7 @@ export class VaultService {
 
   /** The record of the vault this seed recovered, kept with this vault's records. */
   #adoptedName(): string {
-    return `adopted-${this.kind}-vault.json`;
+    return this.kind === "token" ? `adopted-token-vault-${this.token.toLowerCase()}.json` : `adopted-${this.kind}-vault.json`;
   }
 
   async #adoptedVault(): Promise<Address | null> {
@@ -267,8 +321,8 @@ export class VaultService {
       return null;
     }
     const r = JSON.parse(text) as { chainId?: unknown; token?: unknown; vault?: unknown };
-    if (r.chainId !== this.#config.chainId || typeof r.token !== "string" || getAddress(r.token) !== this.#config.deployment.token || typeof r.vault !== "string" || !isAddress(r.vault, { strict: false })) {
-      throw new Error(`${this.#adoptedName()} is not a recovered vault of chain ${this.#config.chainId} in ${this.#config.deployment.token}`);
+    if (r.chainId !== this.#config.chainId || typeof r.token !== "string" || getAddress(r.token) !== this.token || typeof r.vault !== "string" || !isAddress(r.vault, { strict: false })) {
+      throw new Error(`${this.#adoptedName()} is not a recovered vault of chain ${this.#config.chainId} in ${this.token}`);
     }
     this.#adopted = getAddress(r.vault);
     return this.#adopted;
@@ -279,7 +333,7 @@ export class VaultService {
     if (adopted !== null) return adopted;
     if (this.#initCrank === null) throw new Error(this.#missing());
     const d = this.#config.deployment;
-    return computeVaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: this.#keyRoot(0n), initialCrank: this.#initCrank });
+    return computeVaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: this.token, initialKeyRoot: this.#keyRoot(0n), initialCrank: this.#initCrank });
   }
 
   #keyRoot(index: bigint): Hex {
@@ -304,6 +358,7 @@ export class VaultService {
   }
 
   async #checkToken(): Promise<void> {
+    if (this.kind === "token") throw new Error(`the vault in ${this.token} spends only through its token operations (sell, transfer, claim dividends)`);
     const decimals = await tokenDecimals(this.#client, this.#config.deployment.token);
     if (decimals !== TOKEN_DECIMALS) throw new Error(`token ${this.#config.deployment.token} has ${decimals} decimals; this package supports ${TOKEN_DECIMALS}`);
   }
@@ -328,9 +383,9 @@ export class VaultService {
    * its price now) when it pays; with the relayer paying there is nothing to
    * check.
    */
-  async requireEth(gas: bigint, purpose: string, sender: Sender = this.#sender): Promise<void> {
+  async requireEth(gas: bigint, purpose: string, sender: Sender = this.#sender, value = 0n): Promise<void> {
     if (sender.relayed) return;
-    const need = gas * (await this.#client.getGasPrice()) * ETH_HEADROOM;
+    const need = gas * (await this.#client.getGasPrice()) * ETH_HEADROOM + value;
     const have = await ethBalance(this.#client, this.#keys.feePayer.address);
     if (have < need) {
       throw new Error(
@@ -346,7 +401,12 @@ export class VaultService {
    * queue); the seller vault leaves it to the buyer vault's queued opener.
    */
   #opener(): OpenRelayerChannel | undefined {
-    return this.kind !== "seller" ? (terms) => this.#openRelayerChannelLocked(terms) : undefined;
+    return this.#paysRelayer() ? (terms) => this.#openRelayerChannelLocked(terms) : undefined;
+  }
+
+  /** The vaults that open relayer channels and pay their own requests: the buyer, a private and the creator vault (not the seller vault nor a token vault). */
+  #paysRelayer(): boolean {
+    return this.kind !== "seller" && this.kind !== "token";
   }
 
   #options(extra: SendOptions = {}): SendOptions {
@@ -358,7 +418,7 @@ export class VaultService {
   async createCall(): Promise<RelayCall> {
     if (this.#initCrank === null) throw new Error(this.#missing());
     const d = this.#config.deployment;
-    return { to: d.vaultFactory, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [d.token, this.#keyRoot(0n), this.#initCrank] }) };
+    return { to: d.vaultFactory, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [this.token, this.#keyRoot(0n), this.#initCrank] }) };
   }
 
   /** Gas the local fee payer needs to create this vault. */
@@ -369,9 +429,9 @@ export class VaultService {
   open(): Promise<OpenVaultResult> {
     return this.#serial(async () => {
       if (this.kind === "private") throw new Error("a private vault is created by unshield, together with the leaf spent into it");
-      await this.#checkToken();
+      if (this.kind !== "token") await this.#checkToken();
       const vault = await this.vaultAddress();
-      const token = this.#config.deployment.token;
+      const token = this.token;
       const softLimit = formatTokenAmount(VAULT_SOFT_LIMIT);
       const existing = await this.#read(vault);
       if (existing !== null) {
@@ -380,8 +440,8 @@ export class VaultService {
         return found;
       }
       await this.requireEth(CREATE_VAULT_GAS, "open the vault");
-      // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault is paid up front by the buyer vault.
-      const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" }));
+      // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault and a token vault are paid up front by the buyer vault.
+      const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" || this.kind === "token" }));
       const result: OpenVaultResult = { vault, token, nonce: "0", created: true, txHash, softLimit };
       if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator")) {
         result.note =
@@ -393,6 +453,44 @@ export class VaultService {
     });
   }
 
+  /** The record of the launch the vault's DevBuy spend under `nonce` signs (written before it is signed). */
+  #launchName(vault: Address, nonce: bigint): string {
+    return `launch-${vault.toLowerCase()}-${nonce}.json`;
+  }
+
+  /**
+   * Keeps `launch` with `dev` before the vault's DevBuy spend under `nonce`
+   * signs it: a DevBuy is sent inside OstraDevBuy.launchFromVault, whose
+   * params the signed message only hashes (launchHash), so they are needed to
+   * send it again. A device restored from the seed reads the call from the
+   * relayer's signature escrow instead.
+   */
+  async keepLaunch(nonce: bigint, launch: LaunchParams, dev: DevBuyTerms): Promise<void> {
+    const vault = await this.vaultAddress();
+    await this.#keys.folder.write(this.#launchName(vault, nonce), `${JSON.stringify({ version: 1, vault, nonce: nonce.toString(), launchHash: launchHash(launch, dev), encoded: encodeLaunch(launch, dev) })}\n`);
+  }
+
+  /** The launch the DevBuy spend under `nonce` signed, from this device's record or the escrow's call; checked against `hash`. */
+  async #signedLaunch(vault: Address, nonce: bigint, hash: Hex): Promise<{ launch: LaunchParams; dev: DevBuyTerms }> {
+    const text = await this.#keys.folder.read(this.#launchName(vault, nonce));
+    if (text !== undefined) {
+      const r = JSON.parse(text) as { encoded?: unknown };
+      if (typeof r.encoded === "string" && /^0x[0-9a-fA-F]*$/.test(r.encoded)) {
+        const l = decodeLaunch(r.encoded as Hex);
+        if (launchHash(l.launch, l.dev).toLowerCase() === hash.toLowerCase()) return l;
+      }
+    }
+    const escrow = this.#keys.escrow;
+    if (escrow !== null) {
+      const held = await escrow.call(bytesToHex(this.#keychain.keyRoot(nonce)));
+      if (held !== null && /^0x/.test(held.data)) {
+        const l = decodeLaunchFromVaultData(held.data as Hex);
+        if (launchHash(l.launch, l.dev).toLowerCase() === hash.toLowerCase()) return { launch: l.launch, dev: l.dev };
+      }
+    }
+    throw new Error(`the vault signed a launch (launch hash ${hash}) whose params are neither in this device's records nor in the relayer's signature escrow; it cannot be sent from here`);
+  }
+
   /** The spend signed under `nonce` and not landed: this device's record, or the relayer escrow's (keys.ts). */
   async #pending(nonce: bigint): Promise<{ message: string; signature: string } | null> {
     const record = await this.#keychain.signed(nonce);
@@ -401,6 +499,7 @@ export class VaultService {
 
   status(): Promise<BalanceResult> {
     return this.#serial(async () => {
+      if (this.kind === "token") throw new Error(`the vault in ${this.token} is read with its token's tools (token_vault)`);
       const vault = await this.vaultAddress();
       const token = this.#config.deployment.token;
       const v = await this.#read(vault);
@@ -471,7 +570,7 @@ export class VaultService {
       throw new Error("the stored signature does not belong to this vault and nonce");
     }
     const token = this.#config.deployment.token;
-    if (header.action === VAULT_ACTION.TRANSFER) {
+    if (header.action === VAULT_ACTION.TRANSFER && this.kind !== "token") {
       const t = decodeVaultTransferMessage(message);
       await this.#notFrozen(t.to, "the destination of a withdrawal signed earlier,");
       const params = transferParams({ to: t.to, amount: t.amount });
@@ -493,6 +592,17 @@ export class VaultService {
       const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.SET_CRANK_KEY, nextKeyRoot, params, signature })], { reservation });
       return { operation: "set_crank", txHash, crank };
     }
+    if (header.action === VAULT_ACTION.DEV_BUY) {
+      // A DevBuy lands only inside the launch it signed (OstraDevBuy.launchFromVault), with the launch fee.
+      const s = decodeVaultSpendMessage(message);
+      const { devBuy, launchHash: hash } = decodeDevBuyParams(s.params);
+      const lp = this.#config.deployment.launchpad;
+      if (lp === undefined || getAddress(devBuy) !== lp.devBuy) throw new Error(`the vault signed a DevBuy for ${devBuy}, not this deployment's OstraDevBuy`);
+      const l = await this.#signedLaunch(vault, v.nonce, hash);
+      const call = { to: lp.devBuy, data: launchFromVaultData(l.launch, l.dev, { nextKeyRoot: s.nextKeyRoot, signature }) };
+      const txHash = await sender.send([call], { reservation, value: LAUNCHPAD.FEE_WEI });
+      return { operation: "vault_spend", txHash, action: s.action };
+    }
     // Any other action: the same signed bytes again. A Swap among them is sent even if it fails now: the key
     // already signed it, so nothing else can be signed with it until it lands.
     const s = decodeVaultSpendMessage(message);
@@ -509,14 +619,18 @@ export class VaultService {
    * of this vault: a relayer channel opened from the buyer vault for it
    * leaves that much in the buyer vault.
    */
-  async #paidSpend<T>(sender: Sender, fn: (sender: Sender, reservation: Reservation | null) => Promise<T>, moves = 0n): Promise<T> {
+  async #paidSpend<T>(sender: Sender, fn: (sender: Sender, reservation: Reservation | null) => Promise<T>, moves = 0n, gas = VAULT_SPEND_GAS, extraWei = 0n): Promise<T> {
+    // A spend signed earlier is sent first: the reservation covers it too.
+    const pending = await this.#pendingCost();
+    if (pending.gas > gas) gas = pending.gas;
+    if (pending.extraWei > extraWei) extraWei = pending.extraWei;
     let reservation: Reservation | null;
     try {
-      reservation = await sender.reserve(VAULT_SPEND_GAS, sender === this.#sender ? this.#opener() : undefined, this.kind !== "seller" ? moves : 0n);
+      reservation = await sender.reserve(gas, sender === this.#sender ? this.#opener() : undefined, this.#paysRelayer() ? moves : 0n, extraWei);
     } catch (err) {
       if (!(err instanceof PendingSpendUnpaidError)) throw err;
       const local = new LocalSender(this.#client, this.#transport, this.#keys.feePayer, this.#keys.escrow);
-      const need = VAULT_SPEND_GAS * (await this.#client.getGasPrice()) * ETH_HEADROOM;
+      const need = gas * (await this.#client.getGasPrice()) * ETH_HEADROOM + extraWei;
       if ((await ethBalance(this.#client, this.#keys.feePayer.address)) < need) {
         throw new Error(`${err.message}; send at least ${formatEth(need)} ETH to the fee payer ${this.#keys.feePayer.address} and call again: it sends that operation itself`);
       }
@@ -529,8 +643,58 @@ export class VaultService {
     }
   }
 
+  /** What sending the spend signed under the vault's current nonce needs: its gas and the ETH it sends (none signed: nothing). */
+  async #pendingCost(): Promise<{ gas: bigint; extraWei: bigint }> {
+    const none = { gas: 0n, extraWei: 0n };
+    const vault = await this.vaultAddress().catch(() => null);
+    if (vault === null) return none;
+    const v = await this.#read(vault);
+    if (v === null) return none;
+    const p = await this.#pending(v.nonce);
+    if (p === null) return none;
+    const s = decodeVaultSpendMessage(fromHex(p.message));
+    if (s.action === VAULT_ACTION.DEV_BUY) return { gas: DEV_BUY_LAUNCH_GAS, extraWei: LAUNCHPAD.FEE_WEI };
+    return { gas: spendGas([spendCall(vault, { ...s, signature: `0x${p.signature}` })]), extraWei: 0n };
+  }
+
   #balance(vault: Address): Promise<bigint> {
-    return tokenBalance(this.#client, this.#config.deployment.token, vault);
+    return tokenBalance(this.#client, this.token, vault);
+  }
+
+  /**
+   * Runs `op` from this vault: a spend signed earlier is sent first (and `op`
+   * is not), then `op` builds and signs its spend and it is sent. `via`
+   * sends it another way than this vault's sender.
+   */
+  operate(op: VaultOperation, via?: Sender): Promise<VaultOperationResult> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress();
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      const chosen = via ?? this.#sender;
+      await this.requireEth(op.gas, `send ${op.what}`, chosen, op.value ?? 0n);
+      return this.#paidSpend(
+        chosen,
+        async (sender, reservation) => {
+          const v = await this.#read(vault);
+          if (v === null) throw new Error(this.#missing());
+          const resent = await this.#sendPending(vault, v, sender, reservation);
+          if (resent !== null) {
+            return { status: "resent_pending", resent, vaultNonce: (v.nonce + 1n).toString(), note: `an earlier signed vault operation had not landed and was sent now; ${op.what} was not, call again for it` };
+          }
+          const calls = await op.build({ v, vault, keychain: this.#keychain, chainId: this.#config.chainId });
+          let txHash: Hash;
+          try {
+            txHash = await sender.send(calls, { reservation, ...(op.value === undefined ? {} : { value: op.value }) });
+          } catch (err) {
+            throw new Error(`${(err as Error).message}\nthe signed ${op.what} is kept; the next call on this vault sends it again before anything else`);
+          }
+          return { status: "sent", txHash, vaultNonce: (v.nonce + 1n).toString() };
+        },
+        op.moves ?? 0n,
+        op.gas,
+        op.value ?? 0n,
+      );
+    });
   }
 
   /** "the vault holds X, less than Y", with where tokens in a relayer channel are when the relayer pays. */
@@ -646,7 +810,7 @@ export class VaultService {
   }
 
   async #openRelayerChannelLocked(terms: RelayerChannelTerms): Promise<void> {
-    if (this.kind === "seller") throw new Error("relayer channels are not opened from the seller vault");
+    if (!this.#paysRelayer()) throw new Error(`relayer channels are not opened from the ${this.kind} vault`);
     await this.#checkToken();
     const vault = await this.vaultAddress();
     const v = await this.#read(vault);
@@ -850,14 +1014,14 @@ export class VaultService {
       if (!isAddress(vaultText, { strict: false })) throw new RangeError(`${vaultText} is not an address`);
       const vault = getAddress(vaultText);
       const v = await readVault(this.#client, this.#config.deployment, vault);
-      if (v === null || v.token !== this.#config.deployment.token) throw new Error(`${vault} is not an Ostra vault in ${this.#config.deployment.token}`);
+      if (v === null || v.token !== this.token) throw new Error(`${vault} is not an Ostra vault in ${this.token}`);
       const adopted = await this.#adoptedVault();
       if (adopted !== null && adopted !== vault) throw new Error(`this seed already recovers ${adopted} as its ${this.kind} vault`);
       const newKeyRoot = this.#keyRoot(v.nonce).toLowerCase() as Hex;
       const recovery = await this.#recoveryOf(vault);
       if (v.keyRoot.toLowerCase() !== newKeyRoot && recovery.threshold === 0) throw new Error(`${vault} has no guardian recovery set; it cannot be recovered without its seed`);
       if (adopted === null) {
-        await this.#keys.folder.write(this.#adoptedName(), `${JSON.stringify({ chainId: this.#config.chainId, token: this.#config.deployment.token, vault })}\n`);
+        await this.#keys.folder.write(this.#adoptedName(), `${JSON.stringify({ chainId: this.#config.chainId, token: this.token, vault })}\n`);
         this.#adopted = vault;
       }
       let status: RecoveryRequest["status"];
@@ -876,6 +1040,24 @@ export class VaultService {
         note = `give this key root to the vault's guardians: ${recovery.threshold} of ${recovery.guardianCount} must support it; it changes if the vault's nonce moves`;
       }
       return { vault, status, newKeyRoot, nonce: v.nonce.toString(), recovery, note };
+    });
+  }
+
+  /**
+   * The vault's address, whether it exists, its nonce, its balance in base
+   * units and the action of a spend signed and not landed (any kind).
+   */
+  state(): Promise<{ vault: Address; exists: boolean; nonce: bigint | null; balance: bigint; pendingAction: number | null }> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress();
+      const v = await this.#read(vault);
+      const balance = await this.#balance(vault);
+      let pendingAction: number | null = null;
+      if (v !== null) {
+        const p = await this.#pending(v.nonce);
+        if (p !== null) pendingAction = decodeVaultSpendHeader(fromHex(p.message)).action;
+      }
+      return { vault, exists: v !== null, nonce: v === null ? null : v.nonce, balance, pendingAction };
     });
   }
 

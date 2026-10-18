@@ -29,13 +29,16 @@
 //             Not eth_estimateGas otherwise: that is a gas limit, above what
 //             the transaction uses. There is no rent and nothing comes back
 //             to the relayer, so nothing is refunded.
-//   price     wei + RELAYER_MARGIN_BPS, at the Chainlink price +
+//   value     the ETH the transaction sends (relayValue): a vault-funded
+//             launch carries the launch fee, which the relayer fronts.
+//   price     wei + RELAYER_MARGIN_BPS, plus value, at the Chainlink price +
 //             ETH_USD_DEVIATION_BPS (the feed's deviation threshold), rounded
 //             up to the token's smallest unit. The token is a USD stablecoin,
 //             counted as 1 USD.
 
 import {
   concat,
+  decodeErrorResult,
   decodeEventLog,
   decodeFunctionData,
   decodeFunctionResult,
@@ -52,8 +55,21 @@ import {
   type Log,
   type PublicClient,
 } from "viem";
-import { ostraVaultAbi } from "./abi.ts";
-import { ARBITRUM_NODE_INTERFACE, CHAINLINK_ETH_USD, CHAINLINK_ETH_USD_DECIMALS, MULTICALL3, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE } from "./constants.ts";
+import {
+  ostraAirdropAbi,
+  ostraCreatorSplitAbi,
+  ostraDevBuyAbi,
+  ostraDispatcherAbi,
+  ostraHookAbi,
+  ostraLaunchpadAbi,
+  ostraPoolAbi,
+  ostraTokenAbi,
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  ostraVestingAbi,
+} from "./abi.ts";
+import { ARBITRUM_NODE_INTERFACE, CHAINLINK_ETH_USD, CHAINLINK_ETH_USD_DECIMALS, LAUNCHPAD, MULTICALL3, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE } from "./constants.ts";
+import type { Deployment } from "./deployment.ts";
 import { decodeSwapParams } from "./messages.ts";
 import { chainlinkAggregatorAbi, multicall3Abi, nodeInterfaceAbi } from "./external-abi.ts";
 
@@ -225,11 +241,41 @@ export class RelaySimulationError extends Error {
   }
 }
 
+/** Every error Ostra's contracts define, to name a revert by. */
+const OSTRA_ERRORS = [
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  ostraPoolAbi,
+  ostraLaunchpadAbi,
+  ostraDevBuyAbi,
+  ostraHookAbi,
+  ostraTokenAbi,
+  ostraAirdropAbi,
+  ostraVestingAbi,
+  ostraDispatcherAbi,
+  ostraCreatorSplitAbi,
+].flatMap((abi) => (abi as readonly { type: string }[]).filter((x) => x.type === "error"));
+
+/** The revert `data` as the Ostra error it is ("BadParams(buckets)"), or null when it is none of them. */
+export function ostraRevertReason(data: Hex | undefined): string | null {
+  if (data === undefined || data.length < 10) return null;
+  try {
+    const e = decodeErrorResult({ abi: OSTRA_ERRORS as never, data });
+    const args = (e.args ?? []) as readonly unknown[];
+    return `${e.errorName}(${args.map((a) => String(a)).join(", ")})`;
+  } catch {
+    return null;
+  }
+}
+
 export type RelayMeasure = {
   /** Gas the transaction is priced at: its simulated execution, its L1 data component and the swapGas its Swaps reserve. */
   gas: bigint;
   gasPrice: bigint;
+  /** gas x gasPrice: what the gas costs the relayer at most. */
   wei: bigint;
+  /** ETH the transaction sends (relayValue: a vault-funded launch's fee the relayer fronts). */
+  value: bigint;
   /** The logs the simulated transaction emits (see failedSwaps). */
   logs: readonly Log[];
 };
@@ -250,23 +296,44 @@ export async function l1DataGas(client: PublicClient, to: Address, data: Hex): P
   return gasForL1;
 }
 
+/** A relay transaction as the relayer sends it: from its account, with the value relayValue gives it. */
+export type RelayTxInput = { relayer: Address; to: Address; data: Hex; value?: bigint };
+
 /**
- * `tx` sent from `relayer`, simulated (eth_simulateV1): the gas it uses
- * without the L1 data component, and the logs it emits. A transaction that
- * would revert throws RelaySimulationError (reverted); one the node cannot
- * simulate (an RPC error, a node without eth_simulateV1) throws it with
- * reverted false.
+ * `tx` sent from `relayer`, simulated (eth_simulateV1) on the latest block,
+ * one second after it (the time it would land; a node otherwise picks its own
+ * later time, and time moves anti-snipe, taxes, limits and fees): the gas it
+ * uses without the L1 data component, and the logs it emits. A transaction
+ * that would revert throws RelaySimulationError (reverted); one the node
+ * cannot simulate (an RPC error, a node without eth_simulateV1) throws it with
+ * reverted false. `stateOverrides` (quotes only) change the state it runs on.
  */
-export async function simulateRelay(client: PublicClient, a: { relayer: Address; to: Address; data: Hex }): Promise<{ gasUsed: bigint; logs: readonly Log[] }> {
+export async function simulateRelay(
+  client: PublicClient,
+  a: RelayTxInput,
+  o: { stateOverrides?: { address: Address; stateDiff?: { slot: Hex; value: Hex }[] }[] } = {},
+): Promise<{ gasUsed: bigint; logs: readonly Log[]; time: bigint }> {
   try {
-    const [block] = await client.simulateBlocks({ blocks: [{ calls: [{ account: a.relayer, to: a.to, data: a.data }] }] });
+    const head = await client.getBlock({ blockTag: "latest" });
+    const time = head.timestamp + 1n;
+    const [block] = await client.simulateBlocks({
+      blockNumber: head.number,
+      blocks: [
+        {
+          blockOverrides: { time },
+          ...(o.stateOverrides !== undefined ? { stateOverrides: o.stateOverrides } : {}),
+          calls: [{ account: a.relayer, to: a.to, data: a.data, ...(a.value !== undefined && a.value !== 0n ? { value: a.value } : {}) }],
+        },
+      ],
+    });
     const call = block?.calls[0];
     if (call === undefined) throw new Error("the node returned no simulated call");
     if (call.status !== "success") {
       const e = call.error as { shortMessage?: string; message?: string } | undefined;
-      throw new RelaySimulationError(`the transaction reverts: ${e?.shortMessage ?? e?.message ?? "no reason given"}`);
+      const named = ostraRevertReason(call.data);
+      throw new RelaySimulationError(`the transaction reverts: ${named ?? e?.shortMessage ?? e?.message ?? "no reason given"}`);
     }
-    return { gasUsed: call.gasUsed, logs: call.logs ?? [] };
+    return { gasUsed: call.gasUsed, logs: call.logs ?? [], time };
   } catch (err) {
     if (err instanceof RelaySimulationError) throw err;
     const e = err as { shortMessage?: string; message?: string };
@@ -341,11 +408,31 @@ const SPEND_SELECTOR = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "
  * most), and the logs it emits. The relayer gate prices with it; an agent
  * checks a quote with it.
  */
-export async function estimateRelay(client: PublicClient, a: { relayer: Address; to: Address; data: Hex }): Promise<RelayMeasure> {
+export async function estimateRelay(client: PublicClient, a: RelayTxInput): Promise<RelayMeasure> {
   const { gasUsed, logs } = await simulateRelay(client, a);
   const [l1, gasPrice] = await Promise.all([l1DataGas(client, a.to, a.data), client.getGasPrice()]);
   const gas = gasUsed + l1 + reservedSwapGas(a);
-  return { gas, gasPrice, wei: gas * gasPrice, logs };
+  return { gas, gasPrice, wei: gas * gasPrice, value: a.value ?? 0n, logs };
+}
+
+/** What a relay of `m` is charged in wei before conversion: its gas with RELAYER_MARGIN_BPS, plus the ETH it sends (no margin on that). */
+export function relayPriceWei(m: { wei: bigint; value: bigint }): bigint {
+  return withMargin(m.wei) + m.value;
+}
+
+const LAUNCH_FROM_VAULT_SELECTOR = toFunctionSelector(
+  ostraDevBuyAbi.find((x) => x.type === "function" && x.name === "launchFromVault") as Parameters<typeof toFunctionSelector>[0],
+).toLowerCase();
+
+/**
+ * The ETH a relay transaction sends: OstraDevBuy.launchFromVault on the
+ * deployment's launchpad carries the launch fee (LAUNCHPAD.FEE_WEI), which the
+ * relayer fronts; anything else carries none. Decided from the call, never
+ * by the request.
+ */
+export function relayValue(d: Deployment, tx: { to: Address; data: Hex }): bigint {
+  if (d.launchpad === undefined || getAddress(tx.to) !== d.launchpad.devBuy) return 0n;
+  return tx.data.slice(0, 10).toLowerCase() === LAUNCH_FROM_VAULT_SELECTOR ? LAUNCHPAD.FEE_WEI : 0n;
 }
 
 /** An OstraVault Swap that failed inside the PoolManager (its SwapFailed event): moved nothing, used the spend. */

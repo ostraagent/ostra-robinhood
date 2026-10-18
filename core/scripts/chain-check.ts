@@ -46,6 +46,17 @@
 //      for an authenticator's), is kept by the relayer and opened by a new
 //      device with the same passkey; another seed cannot replace it, another
 //      passkey cannot open it, and the seed's backup key deletes it.
+//  11. The launchpad through the relayer (when the deployment has one): the
+//      creator vault is created before payment as its debt and funded; a
+//      launch with a dev buy the contract would refuse is refused by its quote
+//      and nothing is signed; a launch bundled with another call is refused by
+//      the relayer's policy; the launch with a dev buy is sent from the
+//      creator vault's own relayer channel, the relayer fronting the ETH launch
+//      fee (its log shows the value) and charging it; every token the creator
+//      vault was funded with is in the vault, its relayer channels or the dev
+//      buy. A buy from the buyer vault creates the agent's token vault in the
+//      same request; selling all of it back (the token vault's spend paid by
+//      the buyer vault) returns USDG to the buyer vault.
 // Whether the checks pass or a step fails, the run then cleans up: every
 // relayer channel still holding unclaimed escrow is closed through the keeper
 // (signed with the relayer's merchant key), and the vaults, the relayer
@@ -59,7 +70,9 @@
 //   OSTRA_MERCHANT_LISTEN  host:port for the seller server
 //   OSTRA_CHECK_FUNDER     file (0600) with the 32-byte hex private key of an
 //                          account holding ETH and tokens: 30 times the price
-//                          of a createVault plus 1 (about 0.4 at 0.02 gwei);
+//                          of a createVault plus 1 (about 0.4 at 0.02 gwei),
+//                          plus, for the launchpad step, twice the price of a
+//                          launch (gas and fee) plus 2 (about 4 at 0.02 gwei);
 //                          all of it comes back at the end but the gas
 //   OSTRA_CHECK_STATE      directory (0700) for this check's keys and records;
 //                          each run keeps its keys there, so funds can be
@@ -74,15 +87,23 @@ import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { bytesToHex, createPublicClient, createWalletClient, encodeFunctionData, getAddress, hexToBytes, zeroAddress, type Address, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, createPublicClient, createWalletClient, encodeFunctionData, getAddress, hexToBytes, parseEventLogs, zeroAddress, type Address, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
 import { toClientEvmSigner } from "@x402/evm";
 import { BatchSettlementEvmScheme, type BatchSettlementClientContext } from "@x402/evm/batch-settlement/client";
 import {
+  CHAINLINK_ETH_USD,
   FileWotsStore,
+  LAUNCHPAD,
+  NO_DEV_BUY,
+  WOTS_SIGNATURE_LEN,
   WotsKeychain,
   assertRobinhoodChain,
+  chainlinkEthUsd,
+  launchFromVaultData,
+  launchParams,
+  ostraTokenAbi,
   decodeVaultSpendMessage,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
@@ -95,6 +116,8 @@ import {
   signVaultTransfer,
   usdgAbi,
   vaultAddress,
+  weiToTokenUnits,
+  withMargin,
   type ChannelConfig,
   type SignedSpend,
 } from "@ostraagent/sdk";
@@ -103,11 +126,11 @@ import { MerchantKeys, ensurePrivateDir, isPrivateKey } from "../../merchant/src
 import { CHANNELS_DIR } from "../../merchant/src/store.ts";
 import { parseListen } from "../../relayer/src/config.ts";
 import { openRelayerAccount } from "../../relayer/src/keys.ts";
-import { ChannelService, Keys, LocalSender, PasskeyBackupClient, RelayerClient, RelayerError, SignatureEscrowClient, VaultService, X402_NETWORK, backupName, type Config } from "../src/index.ts";
+import { ChannelService, DEV_BUY_LAUNCH_GAS, Keys, LaunchpadService, LocalSender, PasskeyBackupClient, RelayerClient, RelayerError, SignatureEscrowClient, VaultService, X402_NETWORK, backupName, formatUnitsAmount, type Config } from "../src/index.ts";
 import { MemoryFolder } from "../test/memory-folder.ts";
 
-/** Gas the relayer account is funded for, at the current fee: about forty relayed transactions. */
-const RELAYER_GAS_BUDGET = 40n * 1_500_000n;
+/** Gas the relayer account is funded for, at the current fee: about forty relayed transactions, and a launch (plus its fee, sent with it). */
+const RELAYER_GAS_BUDGET = 40n * 1_500_000n + 5_000_000n;
 /** Gas the agent's fee payer is funded for: three vault spends sent by itself, with headroom. */
 const FEE_PAYER_GAS_BUDGET = 4n * 400_000n * 2n;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -377,6 +400,9 @@ async function main(): Promise<void> {
     const keeperCrank = await crankOf(sellerMerchant.address);
     const sellerVault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot: bytesToHex(sellerKeys.keyRoot(0n)), initialCrank: keeperCrank });
     vaults.push({ name: "the seller vault", keys: sellerKeys, vault: sellerVault });
+    const creatorChain = keys.creatorKeychain(d.chainId, token);
+    const creatorVault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot: bytesToHex(creatorChain.keyRoot(0n)), initialCrank: zeroAddress });
+    if (d.launchpad !== undefined) vaults.push({ name: "the creator vault", keys: creatorChain, vault: creatorVault });
     if (recoverRun !== undefined) return;
 
     await send(funder, d.vaultFactory, encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [token, bytesToHex(relayerVaultKeys.keyRoot(0n)), zeroAddress] }));
@@ -385,7 +411,7 @@ async function main(): Promise<void> {
     await send(funder, relayerVault, spendData(await signVaultSetCrankKey(relayerVaultKeys, rv, { chainId: d.chainId, crank: await crankOf(relayerKeys.merchant) })));
     const { maxFeePerGas } = await client.estimateFeesPerGas();
     await walletOf(funder)
-      .sendTransaction({ account: funder, chain: robinhoodChain, to: relayerAccount.address, value: RELAYER_GAS_BUDGET * maxFeePerGas })
+      .sendTransaction({ account: funder, chain: robinhoodChain, to: relayerAccount.address, value: RELAYER_GAS_BUDGET * maxFeePerGas + LAUNCHPAD.FEE_WEI })
       .then((hash) => client.waitForTransactionReceipt({ hash }));
     relayer = new Proc("relayer", fileURLToPath(new URL("../../relayer/src/server.ts", import.meta.url)), {
       ...baseEnv,
@@ -578,6 +604,66 @@ async function main(): Promise<void> {
     const resaved = await backups.save(keys, credential, prf);
     await backups.remove(keys, credential);
     check((await backups.get(credential)) === null && resaved.updatedAt > saved.updatedAt, "the seed's backup key deletes the backup (and writes it again later)", resaved);
+
+    // --- 11. the launchpad through the relayer ------------------------------------------------------------------------------
+    if (d.launchpad !== undefined) {
+      const lpd = d.launchpad;
+      const creatorKeys = await keys.forCreatorVault(d.chainId, token);
+      const creatorRelayer = new RelayerClient(client, config, creatorKeys, relayerUrl);
+      const creator = new VaultService(client, transport, config, creatorKeys, creatorRelayer, "creator");
+      creatorRelayer.attachBuyerVault(creator);
+      const lp = new LaunchpadService({ client, transport, config, keys, buyer, buyerSender: relayerClient, creator, creatorSender: creatorRelayer });
+      const created = await creator.open();
+      check(created.created && created.vault === creatorVault && (await creatorRelayer.vaultState(creatorVault)).debt > 0n, "the creator vault is created through the relayer before payment and owes its price", created);
+      // What the launch's relayer channel needs (its gas at the current price, the launch fee), twice, plus the dev buy and room.
+      const launchWei = withMargin(DEV_BUY_LAUNCH_GAS * (await client.getGasPrice())) + LAUNCHPAD.FEE_WEI;
+      const launchUnits = weiToTokenUnits(launchWei, await chainlinkEthUsd(client, CHAINLINK_ETH_USD)(), decimals);
+      const creatorFunding = ((2n * launchUnits + tokens("2") + tokens("0.01") - 1n) / tokens("0.01")) * tokens("0.01");
+      await send(funder, token, encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [creatorVault, creatorFunding] }));
+
+      const nonceOfCreator = async () => (await readVault(client, d, creatorVault))?.nonce;
+      const before = await nonceOfCreator();
+      const tooBig = await lp.launch({ name: "Too Big", symbol: "BIG", marketCap: "20", devBuy: { amount: "5" } }).then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
+      check(/launch fails now/.test(tooBig) && (await nonceOfCreator()) === before && (await creator.state()).pendingAction === null, "a launch whose dev buy the contract refuses (above 5% of the supply) is refused by its quote; nothing is signed", tooBig);
+      const relayerEthBefore = await client.getBalance({ address: relayerAccount.address });
+      const launched = await lp.launch({ name: "Ostra Check Launch", symbol: "OCHECK", marketCap: "20000", devBuy: { amount: "1", cliffDays: 7, vestingDays: 30 } });
+      if (launched.status !== "launched") throw new Error(`the launch did not land: ${toJson(launched)}`);
+      const relayedLaunch = await relayer.waitEvent((e) => e.event === "relayed" && e.txHash === launched.txHash, 30);
+      const relayerEthSpent = relayerEthBefore - (await client.getBalance({ address: relayerAccount.address }));
+      check(
+        launched.devBuy !== null && relayedLaunch !== undefined && String(relayedLaunch.value) === LAUNCHPAD.FEE_WEI.toString() && relayerEthSpent >= LAUNCHPAD.FEE_WEI,
+        "the launch with a dev buy is relayed from the creator vault's own relayer channel; the relayer fronts the ETH launch fee and charges it",
+        { launched, relayedLaunch, relayerEthSpent },
+      );
+      let inCreatorChannels = 0n;
+      for (const c of await creatorRelayer.channels()) inCreatorChannels += (await readChannel(client, d.batchSettlement, c.channel)).balance;
+      const devPaid = tokens(launched.devBuy?.paid ?? "0");
+      const creatorNow = await balance(creatorVault);
+      check(creatorNow + inCreatorChannels + devPaid === creatorFunding, "every token the creator vault was funded with is in the vault, its relayer channels or the dev buy", { creatorNow, inCreatorChannels, devPaid });
+
+      // A launch bundled with another call (the creator vault owes nothing now): the relayer launches only alone (a signature that is not the vault's key, never escrowed).
+      const p0 = launchParams({ name: "Bundled", symbol: "BUNDLE", salt: bytesToHex(randomBytes(32)), quote: token, creatorVault, startTick: -400_000 });
+      const fakeCall = { to: lpd.devBuy, data: launchFromVaultData(p0, NO_DEV_BUY, { nextKeyRoot: bytesToHex(randomBytes(32)), signature: `0x${"00".repeat(WOTS_SIGNATURE_LEN)}` }) };
+      const bundled = await fetch(`${relayerUrl}/v1/relay`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ calls: [fakeCall, fakeCall], payer: creatorVault }) });
+      const bundledBody = (await bundled.json()) as { error?: string; message?: string };
+      check(bundled.status === 422 && bundledBody.error === "refused" && /relayed alone/.test(String(bundledBody.message)), "a launch bundled with another call is refused by the relayer's policy", { status: bundled.status, bundledBody });
+
+      const tokenBalanceOf = (who: Address) => client.readContract({ address: launched.token, abi: ostraTokenAbi, functionName: "balanceOf", args: [who] });
+      const bought = await lp.buy({ token: launched.token, amount: "0.5" });
+      const held = await tokenBalanceOf(launched.tokenVault);
+      check(bought.status === "sent" && bought.swapped && (await readVault(client, d, launched.tokenVault)) !== null && held > 0n, "a buy through the relayer creates the agent's token vault in the same request and lands the tokens in it", bought);
+      const sold = await lp.sell({ token: launched.token, amount: formatUnitsAmount(held, 18) });
+      // The USDG the swap paid out went to the buyer vault (the vault's balance also moves with its relayer channels).
+      const paidOut =
+        sold.status === "sent"
+          ? parseEventLogs({ abi: usdgAbi, logs: (await client.getTransactionReceipt({ hash: sold.txHash })).logs, eventName: "Transfer" }).filter((l) => getAddress(l.address) === token && getAddress(l.args.to) === buyerVault)
+          : [];
+      check(
+        sold.status === "sent" && sold.swapped && sold.to === buyerVault && (await tokenBalanceOf(launched.tokenVault)) === 0n && paidOut.length === 1 && tokens(sold.amountOut) === paidOut[0]?.args.value,
+        "selling it all back through the relayer (the token vault's spend paid by the buyer vault) pays the USDG to the buyer vault",
+        { sold, paidOut: paidOut.map((l) => l.args.value) },
+      );
+    }
   } catch (err) {
     runError = err;
   } finally {

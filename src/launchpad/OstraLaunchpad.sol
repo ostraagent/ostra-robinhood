@@ -100,6 +100,9 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
     address public immutable WETH;
     OstraLocker public locker;
     uint256 public launchFeesOwed;
+    /// @notice The pool of every token this launchpad launched (zero for any other address): what proves a token
+    ///         is an Ostra launch, for the Ostra relayer among others.
+    mapping(address token => PoolId) public poolOf;
 
     event Launched(PoolId indexed poolId, address indexed token, address indexed creatorVault, Currency quote);
     event LaunchFeesClaimed(address to, uint256 amount);
@@ -168,6 +171,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
             hooks: IHooks(address(HOOK))
         });
         id = key.toId();
+        poolOf[token] = id;
         HOOK.registerPool(key, _config(p, token, tokenIs0, now_), SUPPLY, p.dividendKey);
         // tokenIs0: the token's price in quote rises with the tick; otherwise it rises as the tick falls, so the
         // pool starts at -startTick in the pool's own tick terms and the tiers go down from there.

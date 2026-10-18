@@ -377,7 +377,9 @@ contract OstraHook is IHooks, Ownable2Step {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Changes one of the pool's rules in the traders' favour (see the FIELD_ constants). Only the pool's
-    ///         creator vault may call it; anything else, including a no-op, reverts.
+    ///         creator vault may call it; anything else, including a no-op, reverts, except RELEASE_LIMITS once the
+    ///         limits are over (released, graduated or past their end), which lands changing nothing: whether they are
+    ///         over can change between the creator vault's signature and its landing.
     function configure(PoolId id, uint8 field, uint256 value) external {
         PoolConfig storage c = _configs[id];
         if (!_states[id].registered) revert NotRegistered();
@@ -406,9 +408,12 @@ contract OstraHook is IHooks, Ownable2Step {
             c.maxBuy = uint128(value);
         } else if (field == FIELD_RELEASE_LIMITS) {
             if (value != 0) revert NotInTradersFavour();
-            if (block.timestamp >= c.limitsEndAt || OstraToken(c.token).limitsReleased()) revert NotInTradersFavour();
-            c.limitsEndAt = uint40(block.timestamp);
-            OstraToken(c.token).releaseLimits();
+            // Graduation (any trader's buy) or the limits' end can come between the creator vault's signature and
+            // its landing; the signed release then lands changing nothing, so it never holds the vault's one-time key.
+            if (block.timestamp < c.limitsEndAt && !OstraToken(c.token).limitsReleased()) {
+                c.limitsEndAt = uint40(block.timestamp);
+                OstraToken(c.token).releaseLimits();
+            }
         } else if (field == FIELD_VOLATILITY_FEE) {
             if (value != 0 || !c.volatilityFee) revert NotInTradersFavour();
             c.volatilityFee = false;

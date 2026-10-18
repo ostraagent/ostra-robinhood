@@ -333,6 +333,11 @@ export type OpenChannelInput = {
   deposit: string;
   gracePeriod: number;
   recipients?: { recipient: string; bps: number }[] | undefined;
+  /**
+   * The channel's receiver as the payee's x402 offer names it (its payTo),
+   * instead of the OstraSplit of `recipients` (set by `pay`).
+   */
+  receiver?: string | undefined;
   /** Set by `pay`. */
   pay?: PayChannelState | undefined;
 };
@@ -475,7 +480,9 @@ export class ChannelService {
       const payeeVault = await readVault(this.#client, this.#config.deployment, payee);
       if (payeeVault === null) throw new Error(`${payee} is not an Ostra vault; open_channel pays Ostra vaults only (pay other sellers with pay)`);
       if (payeeVault.token !== this.#token()) throw new Error(`the payee vault holds ${payeeVault.token}, not ${this.#token()}`);
-      const receiver = await splitAddress(this.#client, this.#config, payee, recipients);
+      if (input.receiver !== undefined && recipients.length !== 0) throw new RangeError("a channel names its receiver or the recipients its split is derived from, not both");
+      const receiver = input.receiver !== undefined ? getAddress(input.receiver) : await splitAddress(this.#client, this.#config, payee, recipients);
+      if (receiver === getAddress("0x0000000000000000000000000000000000000000")) throw new RangeError("the receiver must not be the zero address");
 
       const salt = randomSalt();
       const voucher: PrivateKeyAccount = this.#keys.channelVoucherSigner(this.#config.chainId, this.#token(), salt);

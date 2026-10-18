@@ -15,6 +15,12 @@
 //   OstraPool.spendLeaf(batchId, leafIndex, destination, signature)  WOTS
 //   OstraPool.approveBatch(key, batchId, state, nextKeyRoot, signature)  WOTS
 //   OstraPool.depositWithAuthorization(...), cancelDeposit(key), closeDeposit(key)
+//   OstraDevBuy.launchFromVault(p, d, nextKeyRoot, signature)        WOTS
+//     the creator vault p.creatorVault's DevBuy spend (action 9) inside
+//   OstraAirdrop.claim(poolId, account, amount, proof), close(poolId)
+//   OstraDispatcher.claimReferral(referrer, currency)
+//   OstraCreatorSplit.release(poolId, account)
+//   OstraVesting.release(), claimDividends()
 //
 // Anything else is read as an unknown call; the relayer's policy (gate.ts)
 // refuses it, as Kora's allowed-program list did.
@@ -23,15 +29,22 @@ import { decodeFunctionData, getAddress, toFunctionSelector, type AbiFunction, t
 import {
   VAULT_ACTION,
   decodeOpenChannelParams,
+  ostraAirdropAbi,
+  ostraCreatorSplitAbi,
+  ostraDevBuyAbi,
+  ostraDispatcherAbi,
   ostraPoolAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
+  ostraVestingAbi,
   relayCalls,
   relayRequestHash,
   relayTransaction,
   vaultAddress,
   type ChannelConfig,
   type Deployment,
+  type DevBuyTerms,
+  type LaunchParams,
   type OpenChannelParams,
   type RelayCall,
 } from "@ostraagent/sdk";
@@ -47,6 +60,14 @@ export type ParsedCall =
   | { fn: "depositWithAuthorization"; to: Address }
   | { fn: "cancelDeposit"; to: Address; key: Hex }
   | { fn: "closeDeposit"; to: Address; key: Hex }
+  /** vault: the creator vault p.creatorVault, whose DevBuy spend the call carries. */
+  | { fn: "launchFromVault"; to: Address; launch: LaunchParams; dev: DevBuyTerms; nextKeyRoot: Hex; signature: Hex; vault: Address }
+  | { fn: "airdropClaim"; to: Address; poolId: Hex; account: Address; amount: bigint }
+  | { fn: "airdropClose"; to: Address; poolId: Hex }
+  | { fn: "claimReferral"; to: Address; referrer: Address; currency: Address }
+  | { fn: "splitRelease"; to: Address; poolId: Hex; account: Address }
+  | { fn: "vestingRelease"; to: Address }
+  | { fn: "vestingClaimDividends"; to: Address }
   | { fn: null; to: Address; selector: Hex };
 
 export type RelayTx = {
@@ -59,17 +80,24 @@ export type RelayTx = {
   parsed: ParsedCall[];
 };
 
-/** The Ostra functions the relayer reads, by selector. */
-const KNOWN = new Map<Hex, readonly unknown[]>();
+/** The Ostra functions the relayer reads, by selector: the ABI item and the name the parsed call gets. */
+const KNOWN = new Map<Hex, { abi: readonly unknown[]; as: string }>();
 for (const [abi, names] of [
-  [ostraVaultFactoryAbi, ["createVault"]],
-  [ostraVaultAbi, ["spend", "requestClose", "finalizeWithdraw"]],
-  [ostraPoolAbi, ["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]],
+  [ostraVaultFactoryAbi, [["createVault", "createVault"]]],
+  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"]]],
+  [ostraPoolAbi, [["spendLeaf", "spendLeaf"], ["approveBatch", "approveBatch"], ["depositWithAuthorization", "depositWithAuthorization"], ["cancelDeposit", "cancelDeposit"], ["closeDeposit", "closeDeposit"]]],
+  [ostraDevBuyAbi, [["launchFromVault", "launchFromVault"]]],
+  [ostraAirdropAbi, [["claim", "airdropClaim"], ["close", "airdropClose"]]],
+  [ostraDispatcherAbi, [["claimReferral", "claimReferral"]]],
+  [ostraCreatorSplitAbi, [["release", "splitRelease"]]],
+  [ostraVestingAbi, [["release", "vestingRelease"], ["claimDividends", "vestingClaimDividends"]]],
 ] as const) {
-  for (const name of names) {
+  for (const [name, as] of names) {
     const item = (abi as readonly { type: string; name?: string }[]).find((x) => x.type === "function" && x.name === name);
     if (item === undefined) throw new Error(`the Ostra ABI has no function ${name}`);
-    KNOWN.set(toFunctionSelector(item as AbiFunction).toLowerCase() as Hex, [item]);
+    const selector = toFunctionSelector(item as AbiFunction).toLowerCase() as Hex;
+    if (KNOWN.has(selector)) throw new Error(`two recognised functions share the selector ${selector}`);
+    KNOWN.set(selector, { abi: [item], as });
   }
 }
 
@@ -88,17 +116,33 @@ function toConfig(c: { payer: Address; payerAuthorizer: Address; receiver: Addre
 /** Reads one call by its selector; throws for an Ostra function whose arguments do not decode. */
 export function parseCall(call: RelayCall, index = 0): ParsedCall {
   const selector = call.data.slice(0, 10).toLowerCase() as Hex;
-  const abi = KNOWN.get(selector);
-  if (abi === undefined) return { fn: null, to: call.to, selector };
+  const known = KNOWN.get(selector);
+  if (known === undefined) return { fn: null, to: call.to, selector };
   let decoded: { functionName: string; args: readonly unknown[] };
   try {
-    decoded = decodeFunctionData({ abi: abi as never, data: call.data }) as typeof decoded;
+    decoded = decodeFunctionData({ abi: known.abi as never, data: call.data }) as typeof decoded;
   } catch {
-    throw new Error(`calls[${index}]: malformed ${(abi[0] as { name: string }).name} calldata`);
+    throw new Error(`calls[${index}]: malformed ${(known.abi[0] as { name: string }).name} calldata`);
   }
   const a = decoded.args;
   const to = call.to;
-  switch (decoded.functionName) {
+  switch (known.as) {
+    case "launchFromVault": {
+      const launch = a[0] as LaunchParams;
+      return { fn: "launchFromVault", to, launch, dev: a[1] as DevBuyTerms, nextKeyRoot: a[2] as Hex, signature: a[3] as Hex, vault: getAddress(launch.creatorVault) };
+    }
+    case "airdropClaim":
+      return { fn: "airdropClaim", to, poolId: a[0] as Hex, account: getAddress(a[1] as Address), amount: a[2] as bigint };
+    case "airdropClose":
+      return { fn: "airdropClose", to, poolId: a[0] as Hex };
+    case "claimReferral":
+      return { fn: "claimReferral", to, referrer: getAddress(a[0] as Address), currency: getAddress(a[1] as Address) };
+    case "splitRelease":
+      return { fn: "splitRelease", to, poolId: a[0] as Hex, account: getAddress(a[1] as Address) };
+    case "vestingRelease":
+      return { fn: "vestingRelease", to };
+    case "vestingClaimDividends":
+      return { fn: "vestingClaimDividends", to };
     case "createVault":
       return { fn: "createVault", to, token: getAddress(a[0] as Address), initialKeyRoot: a[1] as Hex, initialCrank: getAddress(a[2] as Address) };
     case "spend":
@@ -156,11 +200,17 @@ function spendLeafCall(c: ParsedCall, d: Deployment): SpendLeafCall | null {
   return { pool: c.to, batchId: c.batchId, leafIndex: c.leafIndex, destination: c.destination };
 }
 
-/** The vault a call acts for: the one createVault makes, or the vault a spend, close request or withdrawal is sent to; null for the pool's calls. */
+/**
+ * The vault a call acts for: the one createVault makes, the vault a spend,
+ * close request or withdrawal is sent to, or the creator vault a
+ * vault-funded launch spends from; null for the pool's calls and the
+ * launchpad's public calls (claims, releases), which act for nobody.
+ */
 export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
   const created = createVaultCall(c, d);
   if (created !== null) return created.vault;
   if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw") return c.to;
+  if (c.fn === "launchFromVault") return c.vault;
   return null;
 }
 

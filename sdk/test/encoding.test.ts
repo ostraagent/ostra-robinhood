@@ -32,8 +32,8 @@ test("randomBytes32 gives 32 fresh bytes", () => {
   assert.notDeepEqual(a, b);
 });
 
-test("the browser entry is the Node entry without FileWotsStore, deployOstra and checkDeployment", () => {
-  const nodeOnly = ["FileWotsStore", "checkDeployment", "deployOstra"];
+test("the browser entry is the Node entry without FileWotsStore and the deployment functions", () => {
+  const nodeOnly = ["FileWotsStore", "checkDeployment", "checkLaunchpad", "deployLaunchpad", "deployOstra", "mineHookSalt"];
   const nodeNames = Object.keys(node).sort();
   const browserNames = Object.keys(browser).sort();
   for (const name of nodeOnly) {

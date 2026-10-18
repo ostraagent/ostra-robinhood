@@ -62,6 +62,26 @@ export class SignatureEscrowClient {
     return { message, signature };
   };
 
+  /**
+   * The call the escrow holds for `keyRoot` (as the request that carried the
+   * signature had it), null when none: what sends again a signature whose
+   * call is not a plain spend of the key's own contract (a vault-funded
+   * launch's DevBuy). The caller checks it against the signed message.
+   */
+  async call(keyRoot: string): Promise<{ to: string; data: string; message: string; signature: string } | null> {
+    if (!/^0x[0-9a-f]{64}$/.test(keyRoot)) throw new RangeError("a key root is 32 bytes of lowercase 0x hex");
+    const { status, body } = await this.#fetch(`/v1/signatures/${keyRoot}`, { headers: { accept: "application/json" } });
+    if (status === 404 && body?.error === "no_signature") return null;
+    if (status >= 500) throw new RelayerUnavailableError(`GET /v1/signatures/${keyRoot} answered ${status}`);
+    if (status !== 200 || body === null) throw new RelayerError(status, "signatures", `GET /v1/signatures/${keyRoot} answered ${status}`);
+    const call = body.call as { to?: unknown; data?: unknown } | undefined;
+    const { message, signature } = body;
+    if (typeof call?.to !== "string" || typeof call.data !== "string" || !HEX.test(call.data) || typeof message !== "string" || typeof signature !== "string" || !HEX.test(message) || !HEX.test(signature)) {
+      throw new RelayerError(status, "signatures", `GET /v1/signatures/${keyRoot} answered a record without its call, message and signature`);
+    }
+    return { to: call.to, data: call.data, message, signature };
+  }
+
   /** Escrows the WOTS signatures in `calls` before this agent sends them itself; resolves once they are held. */
   async escrow(calls: readonly RelayCall[]): Promise<void> {
     const { status, body } = await this.#fetch("/v1/escrow", {

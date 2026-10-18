@@ -48,6 +48,11 @@ export const CHAINLINK_ETH_USD_DECIMALS = 8;
 export const ERC8004_IDENTITY_REGISTRY: Address = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
 export const ERC8004_REPUTATION_REGISTRY: Address = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63";
 
+/** WETH9 on chain 4663 (the one Uniswap v4's PositionManager wraps with): an ETH pool's creator vault holds it. */
+export const WETH: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+/** The deterministic CREATE2 deployer (github.com/Arachnid/deterministic-deployment-proxy): OstraHook is mined with it. */
+export const CREATE2_DEPLOYER: Address = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
+
 /** Multicall3, used to send more than one call in one transaction. */
 export const MULTICALL3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11";
 /** Arbitrum's NodeInterface (gasEstimateComponents: the L1 part of a gas estimate). */
@@ -65,10 +70,10 @@ export const POOL_FEE_BPS = 30;
 export const POOL_MAX_DEPOSIT = 250_000_000n;
 export const POOL_MAX_TOTAL = 2_500_000_000n;
 
-/** OstraVault spend actions. */
 /** OstraVault.SWAP_GAS_RESERVE: gas a Swap must have left beyond swapGas * 64 / 63 when it calls the PoolManager. */
 export const VAULT_SWAP_GAS_RESERVE = 30_000;
 
+/** OstraVault spend actions. */
 export const VAULT_ACTION = {
   TRANSFER: 0,
   OPEN_CHANNEL: 1,
@@ -79,6 +84,7 @@ export const VAULT_ACTION = {
   SET_GUARDIAN: 6,
   SET_RECOVERY_POLICY: 7,
   SUPPORT_RECOVERY: 8,
+  DEV_BUY: 9,
 } as const;
 
 /** OstraVault.MIN_RECOVERY_DELAY and MAX_RECOVERY_DELAY, in seconds (36 hours, 14 days). */
@@ -146,6 +152,22 @@ export const VAULT_SWAP_GAS = {
   MIN: 100_000,
   MAX: 10_000_000,
   DEFAULT: 1_000_000,
+} as const;
+
+/**
+ * OstraLaunchpad: FEE_WEI, the launch fee in ETH (LAUNCH_FEE; the relayer
+ * fronts it for a vault-funded launch and charges it in USDG), SUPPLY, every
+ * launch's fixed supply (18 decimals), TICK_SPACING of every Ostra pool
+ * (OstraHook.TICK_SPACING), and HOOK_FLAGS, the permission bits an OstraHook
+ * address carries in its low 14 bits (beforeInitialize, beforeAddLiquidity,
+ * before/afterSwap, both return deltas).
+ */
+export const LAUNCHPAD = {
+  FEE_WEI: 200_000_000_000_000n,
+  SUPPLY: 1_000_000_000n * 10n ** 18n,
+  TICK_SPACING: 200,
+  HOOK_FLAGS: 0x28cc,
+  HOOK_FLAGS_MASK: 0x3fff,
 } as const;
 
 /**

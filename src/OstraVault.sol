@@ -34,6 +34,11 @@ interface IOstraRecovery {
     function supportRecovery(bytes32 newKeyRoot) external;
 }
 
+/// @notice What a DevBuy spend asks of the OstraDevBuy contract that calls it (OstraDevBuy.pendingLaunch).
+interface IOstraDevBuyLaunch {
+    function pendingLaunch(address vault) external view returns (bytes32);
+}
+
 /// @title OstraVault
 /// @notice Holds one token for an agent and spends it only with a rotating WOTS one-time key, the
 ///         Robinhood Chain port of the Ostra Solana program's Vault (program/src/instructions/vault.rs
@@ -75,6 +80,11 @@ interface IOstraRecovery {
 ///                  0); otherwise 1..guardians and MIN_RECOVERY_DELAY <= delay <= MAX_RECOVERY_DELAY.
 /// * 8 SupportRecovery: params abi.encode(address vault, bytes32 newKeyRoot). Calls vault.supportRecovery(newKeyRoot)
 ///                  as this vault, a guardian of `vault`.
+/// * 9 DevBuy:      params abi.encode(address devBuy, bytes32 launchHash, uint256 amount). Pays `amount` of this
+///                  vault's token (0: none) to `devBuy` for one launch: only `devBuy` itself may send the spend, and
+///                  only while it is launching exactly the launch the owner signed (devBuy.pendingLaunch(this vault)
+///                  == launchHash, the hash of every launch and dev buy parameter, OstraDevBuy.launchHash). So the
+///                  signature, public once sent, can only ever make that launch, whoever submits it.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
@@ -105,6 +115,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_SET_GUARDIAN = 6;
     uint8 public constant ACTION_SET_RECOVERY_POLICY = 7;
     uint8 public constant ACTION_SUPPORT_RECOVERY = 8;
+    uint8 public constant ACTION_DEV_BUY = 9;
 
     /// @notice Bounds of a Swap's signed `swapGas`, the gas its PoolManager call gets exactly (so the sender's gas
     ///         limit never decides whether a swap fails).
@@ -276,6 +287,11 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         } else if (action == ACTION_SET_RECOVERY_POLICY) {
             (uint8 threshold, uint32 delay) = abi.decode(params, (uint8, uint32));
             _setRecoveryPolicy(threshold, delay);
+        } else if (action == ACTION_DEV_BUY) {
+            (address devBuy, bytes32 launchHash, uint256 amount) = abi.decode(params, (address, bytes32, uint256));
+            if (msg.sender != devBuy || launchHash == bytes32(0)) revert Unauthorized();
+            if (IOstraDevBuyLaunch(devBuy).pendingLaunch(address(this)) != launchHash) revert Unauthorized();
+            if (amount != 0) token.safeTransfer(devBuy, amount);
         } else {
             (address vault, bytes32 newKeyRoot) = abi.decode(params, (address, bytes32));
             if (vault == address(0) || vault == address(this) || newKeyRoot == bytes32(0)) revert BadParams();
@@ -300,6 +316,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 64) revert BadParams();
         } else if (action == ACTION_SUPPORT_RECOVERY) {
             if (params.length != 64) revert BadParams();
+        } else if (action == ACTION_DEV_BUY) {
+            if (params.length != 96) revert BadParams();
         } else {
             revert BadAction();
         }

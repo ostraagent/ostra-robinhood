@@ -20,7 +20,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { robinhoodChain } from "../src/chain.ts";
 import { ROBINHOOD_PUBLIC_RPC, USDG } from "../src/constants.ts";
 import { redact } from "../src/chain.ts";
-import { deployOstra } from "../src/deploy.ts";
+import { deployLaunchpad, deployOstra } from "../src/deploy.ts";
 import type { Deployment } from "../src/deployment.ts";
 
 /** anvil's default development accounts 0..3 (public test keys, never used outside a local fork). */
@@ -135,4 +135,10 @@ export async function deployOnFork(fork: Fork): Promise<Deployment> {
     treasury: treasury.address,
     poolAuthority: deployer.address,
   });
+}
+
+/** Deploys the launchpad next to `d` on the fork (deployLaunchpad), owned by account 0. */
+export async function deployLaunchpadOnFork(fork: Fork, d: Deployment): Promise<Deployment> {
+  const [deployer] = fork.accounts as [PrivateKeyAccount];
+  return deployLaunchpad({ publicClient: fork.client, walletClient: fork.wallet(deployer), outDir: OUT_DIR }, d);
 }
