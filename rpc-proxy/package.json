@@ -1,0 +1,23 @@
+{
+  "name": "@ostraagent/rpc-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ostra RPC proxy: reads and simulations on Robinhood Chain for the web app, rate-limited per client IP address, keeping the private RPC URL on the server.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ostraagent/sdk": "file:../sdk",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

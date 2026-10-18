@@ -174,6 +174,14 @@ Contents:
   stays under the sequencer's 95,000-byte limit. `scripts/aggregator-check.ts` runs the aggregator
   process end to end with sixteen depositors in two groups of eight; its fork test runs it on a
   mainnet fork (it waits out the 900-second approval window once, about 20 minutes).
+- `rpc-proxy/`: the RPC proxy for the web app (`@ostraagent/rpc-proxy`). It forwards one JSON-RPC
+  request per POST to the private RPC (OSTRA_RPC_URL, never in an answer or a log line), only the
+  eth_ reads and simulations core and the SDK call (eth_call, eth_simulateV1, eth_getLogs only for
+  one channel's ChannelOpened logs over at most 10,000,000 blocks, and the like); anything that
+  sends is refused (403), since the web app's transactions go through the relayer. Rates per
+  client IP and in total (OSTRA_RPC_PROXY_PER_IP, OSTRA_RPC_PROXY_TOTAL) have no default; over a
+  rate it answers 429 with Retry-After. The chain is checked by eth_chainId at start. Its tests run
+  viem's calls through it against a mainnet fork.
 
 The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
 block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
@@ -192,4 +200,5 @@ cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the k
 cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
 cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
 cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
+cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
 ```
