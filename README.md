@@ -198,8 +198,11 @@ and the dispatcher.
   writes each service's environment file (0600). Run again, it sends nothing. Its fork test starts
   every service from those files.
 - `ops/systemd/` holds the services' units and `ops/nginx/ostra-robinhood.conf` the server blocks of
-  relayer., keeper., aggregator. and rpc.ostraagent.xyz (TLS added by certbot). nginx sets the
-  client address the relayer and the RPC proxy count their rates by.
+  relayer., keeper., aggregator. and rpc.ostraagent.xyz behind Cloudflare (proxied DNS, so the VPS
+  address is in no public record): `ops/nginx/render-cloudflare.py` renders it with Cloudflare's
+  published ranges, nginx serves only connections from them (any other is closed), takes the client
+  address from CF-Connecting-IP on those alone and passes it to the relayer and the RPC proxy for
+  their rates, and serves TLS with a Cloudflare origin certificate whose key was made on the VPS.
 
 The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
 block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
