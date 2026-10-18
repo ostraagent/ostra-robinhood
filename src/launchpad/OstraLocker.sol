@@ -12,9 +12,9 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /// @title OstraLocker
 /// @notice Owns every liquidity position of the Ostra pools and has no function that removes liquidity, so the
-///         launch liquidity (and what the hook's LP bucket adds) stays in the pool forever. Its only other power is
-///         collecting the positions' LP fees, which it hands to OstraHook to share 70/30 between the creator and
-///         the protocol.
+///         launch liquidity (and what the LP bucket adds) stays in the pool forever. Its only other power is
+///         collecting the positions' LP fees, which it hands to OstraDispatcher to share 70/30 between the creator
+///         and the protocol.
 contract OstraLocker is IUnlockCallback {
     using SafeERC20 for IERC20;
 
@@ -24,12 +24,13 @@ contract OstraLocker is IUnlockCallback {
         bytes32 salt;
     }
 
-    /// @notice Salt of the full-range position the hook's LP bucket adds to.
+    /// @notice Salt of the full-range position the LP bucket adds to.
     bytes32 public constant LP_BUCKET_SALT = bytes32(type(uint256).max);
 
     IPoolManager public immutable POOL_MANAGER;
     address public immutable LAUNCHPAD;
-    address public immutable HOOK;
+    /// @notice OstraDispatcher: adds the LP bucket's liquidity and collects the positions' LP fees.
+    address public immutable DISPATCHER;
 
     mapping(PoolId => Position[]) private _positions;
     mapping(PoolId => bool) public hasLpBucketPosition;
@@ -37,16 +38,16 @@ contract OstraLocker is IUnlockCallback {
     event Locked(PoolId indexed poolId, int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt);
 
     error OnlyLaunchpad();
-    error OnlyHook();
+    error OnlyDispatcher();
     error OnlyPoolManager();
     error AlreadyLocked();
     error BadPositions();
     error UnexpectedDelta();
 
-    constructor(address poolManager, address launchpad, address hook) {
+    constructor(address poolManager, address launchpad, address dispatcher) {
         POOL_MANAGER = IPoolManager(poolManager);
         LAUNCHPAD = launchpad;
-        HOOK = hook;
+        DISPATCHER = dispatcher;
     }
 
     function positionsOf(PoolId poolId) external view returns (Position[] memory) {
@@ -107,13 +108,13 @@ contract OstraLocker is IUnlockCallback {
         return "";
     }
 
-    /// @notice Adds `liquidity` to the pool's full-range LP-bucket position. Only the hook, inside its own unlock;
-    ///         the hook settles what the position costs for this contract (settleFor).
+    /// @notice Adds `liquidity` to the pool's full-range LP-bucket position. Only the dispatcher, inside its own
+    ///         unlock; the dispatcher settles what the position costs for this contract (settleFor).
     function addFullRange(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint128 liquidity)
         external
         returns (BalanceDelta delta)
     {
-        if (msg.sender != HOOK) revert OnlyHook();
+        if (msg.sender != DISPATCHER) revert OnlyDispatcher();
         PoolId id = key.toId();
         (delta,) = POOL_MANAGER.modifyLiquidity(
             key,
@@ -132,10 +133,10 @@ contract OstraLocker is IUnlockCallback {
         emit Locked(id, tickLower, tickUpper, liquidity, LP_BUCKET_SALT);
     }
 
-    /// @notice Collects the LP fees of every position of the pool as PoolManager claims of the hook. Only the
-    ///         hook, inside its own unlock. Returns the fees in currency0 and currency1.
-    function collectToHook(PoolKey calldata key) external returns (uint256 fees0, uint256 fees1) {
-        if (msg.sender != HOOK) revert OnlyHook();
+    /// @notice Collects the LP fees of every position of the pool as PoolManager claims of the dispatcher. Only
+    ///         the dispatcher, inside its own unlock. Returns the fees in currency0 and currency1.
+    function collectToDispatcher(PoolKey calldata key) external returns (uint256 fees0, uint256 fees1) {
+        if (msg.sender != DISPATCHER) revert OnlyDispatcher();
         Position[] storage ps = _positions[key.toId()];
         for (uint256 i = 0; i < ps.length; ++i) {
             Position memory p = ps[i];
@@ -155,8 +156,8 @@ contract OstraLocker is IUnlockCallback {
             fees0 += uint256(int256(a0));
             fees1 += uint256(int256(a1));
         }
-        // As PoolManager claims of the hook (ERC-6909), like everything the hook holds for a pool.
-        if (fees0 != 0) POOL_MANAGER.mint(HOOK, key.currency0.toId(), fees0);
-        if (fees1 != 0) POOL_MANAGER.mint(HOOK, key.currency1.toId(), fees1);
+        // As PoolManager claims of the dispatcher (ERC-6909), like everything charged for a pool.
+        if (fees0 != 0) POOL_MANAGER.mint(DISPATCHER, key.currency0.toId(), fees0);
+        if (fees1 != 0) POOL_MANAGER.mint(DISPATCHER, key.currency1.toId(), fees1);
     }
 }

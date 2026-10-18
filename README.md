@@ -31,13 +31,22 @@ Contents:
   launches a fixed-supply `OstraToken` whose whole supply goes into single-sided tiers of one pool
   (the top tier open to the highest price), held forever by `OstraLocker`; `OstraHook`, the pools'
   one hook, charges every swap 1% hook fee (70% creator, 30% protocol, half of that for the OSTRA
-  buyback) plus the pool's buy or sell tax and anti-snipe tax in the quote, and pays them out
-  (creator vault, burn, added liquidity, holder dividends) in `dispatch`. Before graduation only
-  the locker adds liquidity and the max buy and the token's max wallet apply. During the
+  buyback) plus the pool's buy or sell tax and anti-snipe tax in the quote, as PoolManager claims
+  held by `OstraDispatcher`, which pays them out in `dispatch` (anyone may call it): the creator's
+  share, the burn bucket (bought and burned), the LP bucket (full-range liquidity in the locker),
+  the floor bid (a quote-only position one tick spacing below the price that buys when the price
+  falls; what it buys is burned, and it rises with the price by at most one spacing a minute) and
+  holder dividends. The creator's share goes to the creator vault, or through `OstraCreatorSplit`
+  to up to 100 recipients whose shares the creator vault changes at any time with ConfigurePool.
+  A payout the creator's token refuses, or dividends the dividend pool refuses, wait for the next
+  dispatch without holding up the rest; the protocol's share is booked per currency at swap time
+  and claimed by the owner (protocol and OSTRA buyback parts). Before graduation only the locker
+  and the dispatcher add liquidity and the max buy and the token's max wallet apply. During the
   anti-farmer period the token enters no other v4 pool and no Uniswap v2 or v3 style pool. The
   creator vault can change the rules only in the traders' favour (lower taxes, earlier tax end,
   higher max buy, limits released, volatility fee off). A pool's quote is ETH or any ERC-20, a
-  stock token among them. The LP fee is set per swap by `OstraFees`: 0.25%; 0.50% in a pool quoted
+  stock token among them; dividends in another ERC-20 are bought in an existing hookless pool or
+  a launched Ostra pool. The LP fee is set per swap by `OstraFees`: 0.25%; 0.50% in a pool quoted
   in a Robinhood stock token while the NYSE is closed (weekends and the NYSE holidays of 2026 to
   2028, US daylight time computed on chain); if the creator chose it at launch, up to 1% as the
   price moves away from its 60-second EMA (the larger of the two, never above 1%); and a surcharge

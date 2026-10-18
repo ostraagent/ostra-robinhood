@@ -48,8 +48,10 @@ import {
   closeDigest,
   configurePoolParams,
   closeRequestTypedData,
+  creatorShareParams,
   decodeClaimDividendParams,
   decodeConfigurePoolParams,
+  decodeCreatorShareParams,
   decodeOpenChannelParams,
   decodeSetGuardianParams,
   decodeSetRecoveryPolicyParams,
@@ -72,6 +74,7 @@ import {
   signSpendLeaf,
   signVaultClaimDividend,
   signVaultConfigurePool,
+  signVaultSetCreatorShare,
   signVaultOpenChannel,
   signVaultSetCrankKey,
   signVaultSetGuardian,
@@ -246,6 +249,12 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.TAX_END_AT, value: 1n << 40n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.RELEASE_LIMITS, value: 1n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.VOLATILITY_FEE, value: 1n }), /value out of range/);
+  const share = { split: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), recipient: fork.accounts[2]!.address, bps: 2_500 } as const;
+  assert.deepEqual(decodeCreatorShareParams(creatorShareParams(share)), share);
+  assert.throws(() => creatorShareParams({ ...share, recipient: zeroAddress }), /zero address/);
+  assert.throws(() => creatorShareParams({ ...share, bps: 10_001 }), /bps must be/);
+  assert.throws(() => creatorShareParams({ ...share, bps: 1.5 }), /bps must be/);
+  assert.throws(() => decodeCreatorShareParams(configurePoolParams(setting)), /not a creator share/);
   assert.throws(() => claimDividendParams(zeroAddress), /zero address/);
   assert.throws(() => setGuardianParams({ guardian: zeroAddress, enabled: true }), /zero address/);
   assert.throws(() => setRecoveryPolicyParams({ threshold: 1, delay: MIN_RECOVERY_DELAY - 1 }), /delay/);
@@ -395,8 +404,10 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const deployed = await fork.client.waitForTransactionReceipt({ hash: await fork.wallet(relayer).sendTransaction({ to: CREATE2_DEPLOYER, data: concat([salt, initCode]), account: relayer, chain: fork.client.chain }) });
   assert.equal(deployed.status, "success");
   const launchpad = await deployArtifact("OstraLaunchpad.sol", "OstraLaunchpad", [UNISWAP_V4_POOL_MANAGER, hook, WETH, relayer.address]);
-  const locker = await deployArtifact("OstraLocker.sol", "OstraLocker", [UNISWAP_V4_POOL_MANAGER, launchpad, hook]);
-  await send(hook, hookArt.abi, "initialize", [launchpad, locker]);
+  const split = await deployArtifact("OstraCreatorSplit.sol", "OstraCreatorSplit", [hook]);
+  const dispatcher = await deployArtifact("OstraDispatcher.sol", "OstraDispatcher", [UNISWAP_V4_POOL_MANAGER, hook, WETH, split, relayer.address]);
+  const locker = await deployArtifact("OstraLocker.sol", "OstraLocker", [UNISWAP_V4_POOL_MANAGER, launchpad, dispatcher]);
+  await send(hook, hookArt.abi, "initialize", [launchpad, locker, dispatcher]);
   await send(launchpad, launchpadArt.abi, "setLocker", [locker]);
 
   // A USDG launch with dividends in USDG, by a creator whose USDG vault the SDK controls.
@@ -407,7 +418,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
     name: "Ostra SDK Test", symbol: "OSDK", salt: keccak256(stringToHex("sdk launch")), quote: USDG, creatorVault, startTick: -375_400,
     tiers: [{ width: 40_000, supplyBps: 4_000 }, { width: 40_000, supplyBps: 3_000 }, { width: 0, supplyBps: 3_000 }],
     buyTaxBps: 300, sellTaxBps: 500, postBuyTaxBps: 100, postSellTaxBps: 200, taxDuration: 30 * 86_400,
-    creatorBucketBps: 2_500, dividendBucketBps: 2_500, burnBucketBps: 2_500, lpBucketBps: 2_500,
+    creatorBucketBps: 2_500, dividendBucketBps: 2_500, burnBucketBps: 2_500, lpBucketBps: 2_500, floorBucketBps: 0,
     dividendToken: USDG, dividendKey: noKey, minDividendBalance: 10n ** 18n,
     antiSnipeBps: 0, antiSnipeDuration: 0, maxBuy: 0n, maxWallet: 0n, limitsDuration: 0, antiFarmerDuration: 86_400,
     graduationKind: 2, graduationThreshold: 1_000_000_000_000n, volatilityFee: true,
@@ -442,6 +453,18 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   await send(creatorVault, ostraVaultAbi, "spend", [off.action, off.nextKeyRoot, off.params, off.signature]);
   assert.equal((await config()).volatilityFee, false);
 
+  // A creator split share the SDK signs: 25% of the creator payouts to a teammate's address.
+  const splitArt = artifact("OstraCreatorSplit.sol", "OstraCreatorSplit");
+  const teammate = privateKeyToAccount(keccak256(stringToHex("OSTRA/SDK/TEST/teammate"))).address;
+  const shareState = await readVault(fork.client, d, creatorVault);
+  assert.ok(shareState);
+  const shareSpend = await signVaultSetCreatorShare(creatorChain, shareState, { chainId: ROBINHOOD_CHAIN_ID, share: { split, poolId: id, recipient: teammate, bps: 2_500 } });
+  assert.equal(shareSpend.action, VAULT_ACTION.CONFIGURE_POOL);
+  await send(creatorVault, ostraVaultAbi, "spend", [shareSpend.action, shareSpend.nextKeyRoot, shareSpend.params, shareSpend.signature]);
+  const shareOf = (account: Address) => fork.client.readContract({ address: split, abi: splitArt.abi, functionName: "shareOf", args: [id, account] });
+  assert.equal(await shareOf(teammate), 2_500n);
+  assert.equal(await shareOf(creatorVault), 7_500n);
+
   // A buyer vault swaps USDG into its token vault during the anti-farmer period; the swap pays dividends.
   const buyerChain = await keychain("launch-buyer");
   const holderChain = await keychain("launch-holder");
@@ -452,7 +475,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   assert.ok(buyerState);
   const swap = await signVaultSwap(buyerChain, buyerState, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { key, zeroForOne: getAddress(key.currency0) === USDG, amountIn: 20_000_000n, minOut: 1n, recipient: holder } });
   await send(buyer, ostraVaultAbi, "spend", [swap.action, swap.nextKeyRoot, swap.params, swap.signature]);
-  await send(hook, hookArt.abi, "dispatch", [id]);
+  await send(dispatcher, artifact("OstraDispatcher.sol", "OstraDispatcher").abi, "dispatch", [id]);
   const owed = (await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "dividendOf", args: [holder] })) as bigint;
   assert.ok(owed > 0n);
 

@@ -76,6 +76,8 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         uint16 dividendBucketBps;
         uint16 burnBucketBps;
         uint16 lpBucketBps;
+        /// @notice Kept as a quote bid just below the price; what it buys is burned (OstraDispatcher).
+        uint16 floorBucketBps;
         address dividendToken;
         PoolKey dividendKey;
         uint256 minDividendBalance;
@@ -139,6 +141,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
             hook: address(HOOK),
             locker: address(locker),
             launchpad: address(this),
+            dispatcher: HOOK.dispatcher(),
             maxWallet: p.maxWallet,
             limitsDuration: p.limitsDuration,
             antiFarmerDuration: p.antiFarmerDuration,
@@ -195,7 +198,8 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         if (p.buyTaxBps > MAX_TAX_BPS || p.sellTaxBps > MAX_TAX_BPS) revert BadParams("tax");
         if (p.postBuyTaxBps > p.buyTaxBps || p.postSellTaxBps > p.sellTaxBps) revert BadParams("postTax");
         bool taxed = p.buyTaxBps != 0 || p.sellTaxBps != 0 || p.antiSnipeBps != 0;
-        uint256 buckets = uint256(p.creatorBucketBps) + p.dividendBucketBps + p.burnBucketBps + p.lpBucketBps;
+        uint256 buckets = uint256(p.creatorBucketBps) + p.dividendBucketBps + p.burnBucketBps + p.lpBucketBps
+            + p.floorBucketBps;
         if (taxed ? buckets != 10_000 : buckets != 0) revert BadParams("buckets");
         if ((p.dividendBucketBps != 0) != (p.dividendToken != address(0))) revert BadParams("dividendToken");
         if (p.dividendToken != address(0)) _checkDividendToken(p, vaultToken);
@@ -226,6 +230,15 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         if (!((a == quote && b == p.dividendToken) || (b == quote && a == p.dividendToken))) {
             revert BadParams("dividendKey");
         }
+        // A hookless pool or a launched Ostra pool, that exists: another hook, or a pool that can never be
+        // initialized, would only ever make the dividend step fail.
+        address hooks = address(p.dividendKey.hooks);
+        PoolId dk = p.dividendKey.toId();
+        if (hooks != address(0) && (hooks != address(HOOK) || !HOOK.poolState(dk).registered)) {
+            revert BadParams("dividendKey");
+        }
+        bytes32 slot0 = POOL_MANAGER.extsload(keccak256(abi.encodePacked(PoolId.unwrap(dk), bytes32(uint256(6)))));
+        if (uint160(uint256(slot0)) == 0) revert BadParams("dividendKey");
     }
 
     function _checkTiers(LaunchParams calldata p) private view {
@@ -270,6 +283,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         c.dividendBucketBps = p.dividendBucketBps;
         c.burnBucketBps = p.burnBucketBps;
         c.lpBucketBps = p.lpBucketBps;
+        c.floorBucketBps = p.floorBucketBps;
         c.antiSnipeBps = p.antiSnipeBps;
         c.antiSnipeDuration = p.antiSnipeDuration;
         c.maxBuy = p.maxBuy;

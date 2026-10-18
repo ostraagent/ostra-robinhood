@@ -11,11 +11,14 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 import {OstraVault} from "../src/OstraVault.sol";
 import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
+import {OstraCreatorSplit} from "../src/launchpad/OstraCreatorSplit.sol";
+import {OstraDispatcher} from "../src/launchpad/OstraDispatcher.sol";
 import {OstraFees} from "../src/launchpad/OstraFees.sol";
 import {OstraHook} from "../src/launchpad/OstraHook.sol";
 import {OstraLaunchpad} from "../src/launchpad/OstraLaunchpad.sol";
@@ -104,6 +107,8 @@ struct ExactInputSingleParams {
 ///         Uniswap v4 PoolManager, USDG and WETH. Swaps go through a plain PoolManager client and through an
 ///         OstraVault's Swap action.
 contract LaunchpadForkTest is Test {
+    using StateLibrary for IPoolManager;
+
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address internal constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
@@ -119,6 +124,8 @@ contract LaunchpadForkTest is Test {
     OstraVaultFactory internal factory;
     OstraHook internal hook;
     OstraFees internal fees;
+    OstraCreatorSplit internal split;
+    OstraDispatcher internal dispatcher;
     OstraLocker internal locker;
     OstraLaunchpad internal launchpad;
     TestSwapRouter internal router;
@@ -151,8 +158,10 @@ contract LaunchpadForkTest is Test {
         hook = new OstraHook{salt: salt}(POOL_MANAGER, WETH, address(fees), address(this));
         assertEq(uint160(address(hook)) & 0x3FFF, HOOK_FLAGS);
         launchpad = new OstraLaunchpad(POOL_MANAGER, address(hook), WETH, address(this));
-        locker = new OstraLocker(POOL_MANAGER, address(launchpad), address(hook));
-        hook.initialize(address(launchpad), address(locker));
+        split = new OstraCreatorSplit(address(hook));
+        dispatcher = new OstraDispatcher(POOL_MANAGER, address(hook), WETH, address(split), address(this));
+        locker = new OstraLocker(POOL_MANAGER, address(launchpad), address(dispatcher));
+        hook.initialize(address(launchpad), address(locker), address(dispatcher));
         launchpad.setLocker(address(locker));
         router = new TestSwapRouter(POOL_MANAGER);
     }
@@ -228,15 +237,15 @@ contract LaunchpadForkTest is Test {
     }
 
     function _claims(Currency c) internal view returns (uint256) {
-        return IERC6909Balance(POOL_MANAGER).balanceOf(address(hook), c.toId());
+        return IERC6909Balance(POOL_MANAGER).balanceOf(address(dispatcher), c.toId());
     }
 
     /// @dev creatorPaid of the Dispatched event in the recorded logs.
     function _creatorPaid() internal returns (uint256 paid) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 topic = OstraHook.Dispatched.selector;
+        bytes32 topic = OstraDispatcher.Dispatched.selector;
         for (uint256 i = 0; i < logs.length; ++i) {
-            if (logs[i].emitter == address(hook) && logs[i].topics[0] == topic) {
+            if (logs[i].emitter == address(dispatcher) && logs[i].topics[0] == topic) {
                 (paid,,,) = abi.decode(logs[i].data, (uint256, uint256, uint256, uint256));
             }
         }
@@ -339,16 +348,15 @@ contract LaunchpadForkTest is Test {
 
         // Exact input buy of 100 USDG: 1% hook fee + 3% buy tax = 4% of what the buyer pays.
         uint256 claims0 = _claims(usdg);
-        uint256 protocol0 = hook.protocolOwed(usdg);
+        uint256 shares0 = _protocolShares(usdg);
         uint256 before = gasleft();
         BalanceDelta d = _buyExactIn(key, token, 100e6, address(router));
         console.log("gas buy exact input", before - gasleft());
         int128 paid = tokenIs0 ? d.amount1() : d.amount0();
         assertEq(paid, -100e6);
         assertEq(_claims(usdg) - claims0, 4e6);
-        // Hook fee 1e6: 70% creator, 30% protocol, half of that kept for buyback.
-        assertEq(hook.protocolOwed(usdg) - protocol0, 0.15e6);
-        assertEq(hook.buybackOwed(usdg), 0.15e6);
+        // Hook fee 1e6: 70% creator, 30% protocol, half of that kept for buyback (booked per currency at swap time).
+        assertEq(_protocolShares(usdg) - shares0, (uint256(0.15e6) << 128) | 0.15e6);
         OstraHook.Pending memory pend = hook.pending(id);
         assertEq(pend.creator, 0.7e6 + 0.75e6);
         assertEq(pend.dividend, 0.75e6);
@@ -479,6 +487,43 @@ contract LaunchpadForkTest is Test {
     // Dispatch
     // ---------------------------------------------------------------------------------------------
 
+    /// @dev The hook's booked protocol share in `c`: protocol << 128 | buyback.
+    function _protocolShares(Currency c) internal view returns (uint256) {
+        (uint128 protocol, uint128 buyback) = hook.protocolShare(c);
+        return (uint256(protocol) << 128) | buyback;
+    }
+
+    /// @dev Whether the dispatcher emitted an event with `topic` in the recorded logs.
+    function _dispatcherEmitted(bytes32 topic) internal returns (bool found) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == address(dispatcher) && logs[i].topics[0] == topic) found = true;
+        }
+    }
+
+    function _claimProtocolAndBuyback() internal {
+        OstraVault operator = _vault(USDG, keccak256("OSTRA/EVM/TEST/operator-vault"));
+        (uint128 bookedProtocol, uint128 bookedBuyback) = hook.protocolShare(Currency.wrap(USDG));
+        uint256 owedProtocol = dispatcher.protocolOwed(Currency.wrap(USDG));
+        assertGt(owedProtocol, bookedProtocol, "the hook fee's share plus 15% of the locked positions' LP fees");
+        dispatcher.claimProtocol(Currency.wrap(USDG), address(operator));
+        assertEq(IERC20(USDG).balanceOf(address(operator)), owedProtocol);
+        assertEq(dispatcher.protocolOwed(Currency.wrap(USDG)), 0);
+        (bookedProtocol,) = hook.protocolShare(Currency.wrap(USDG));
+        assertEq(bookedProtocol, 0);
+        // The buyback part goes to the account that buys OSTRA and burns it.
+        address buybacker = makeAddr("OSTRA buyback");
+        uint256 owedBuyback = dispatcher.buybackOwed(Currency.wrap(USDG));
+        assertGt(owedBuyback, bookedBuyback);
+        dispatcher.claimBuyback(Currency.wrap(USDG), buybacker);
+        assertEq(IERC20(USDG).balanceOf(buybacker), owedBuyback);
+        vm.expectRevert(OstraDispatcher.NothingToClaim.selector);
+        dispatcher.claimBuyback(Currency.wrap(USDG), buybacker);
+        vm.prank(makeAddr("not the owner"));
+        vm.expectRevert();
+        dispatcher.claimProtocol(Currency.wrap(USDG), buybacker);
+    }
+
     function test_dispatchPaysTheCreatorBurnsAddsLiquidityAndPaysDividends() public {
         (OstraToken token, PoolKey memory key, OstraVault creatorVault) = _launchUsdg(bytes32(uint256(9)));
         PoolId id = key.toId();
@@ -496,7 +541,7 @@ contract LaunchpadForkTest is Test {
 
         vm.recordLogs();
         uint256 g = gasleft();
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
         console.log("gas dispatch", g - gasleft());
         uint256 paid = _creatorPaid();
 
@@ -516,13 +561,10 @@ contract LaunchpadForkTest is Test {
         token.claimTo(holder);
         assertEq(token.balanceOf(holder), held + owed);
         assertEq(token.dividendOf(holder), 0);
-        // The protocol's share goes to the operator's vault.
-        OstraVault operator = _vault(USDG, keccak256("OSTRA/EVM/TEST/operator-vault"));
-        uint256 owedProtocol = hook.protocolOwed(Currency.wrap(USDG));
-        hook.claimProtocol(Currency.wrap(USDG), address(operator));
-        assertEq(IERC20(USDG).balanceOf(address(operator)), owedProtocol);
+        // The protocol's share goes to the operator's vault, the buyback part to the OSTRA buyback.
+        _claimProtocolAndBuyback();
         // A second dispatch right away has little left to do and still works.
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -565,7 +607,7 @@ contract LaunchpadForkTest is Test {
         uint256 creatorShare = hook.pending(id).creator;
         assertGt(creatorShare, 0);
         vm.recordLogs();
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
         // The creator gets its share of the hook fee and tax, plus 70% of the locked positions' LP fees.
         uint256 paid = _creatorPaid();
         assertGt(paid, creatorShare);
@@ -599,7 +641,7 @@ contract LaunchpadForkTest is Test {
         address holder = makeAddr("aapl holder");
         _buyExactIn(key, token, 200e6, holder);
         _buyExactIn(key, token, 200e6, address(router));
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
         uint256 owed = token.dividendOf(holder);
         assertGt(owed, 0);
         vm.prank(holder);
@@ -811,7 +853,7 @@ contract LaunchpadForkTest is Test {
 
         deal(USDG, address(router), 1_000e6);
         _buyExactIn(key, token, 200e6, address(router));
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
         uint256 owed = token.dividendOf(address(bunker));
         assertGt(owed, 0);
         // Only the holder claims its dividends.
@@ -877,7 +919,7 @@ contract LaunchpadForkTest is Test {
 
         // Dispatch pays the creator vault in AAPL; the vault spends it with its WOTS key.
         vm.recordLogs();
-        hook.dispatch(id);
+        dispatcher.dispatch(id);
         uint256 paid = _creatorPaid();
         assertGt(paid, 0);
         assertEq(IERC20(AAPL).balanceOf(address(creatorVault)), paid);
@@ -1088,5 +1130,396 @@ contract LaunchpadForkTest is Test {
         vm.prank(relayer, relayer);
         _spend(bunker, BUYER_TOKEN, 3, abi.encode(key, tokenIs0, sell, uint128(1), address(buyer)));
         assertEq(_swapFee(), 2_500);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Blocks: the creator split and the floor bid (OstraDispatcher, OstraCreatorSplit)
+    // ---------------------------------------------------------------------------------------------
+
+    function _shareValue(address recipient, uint256 bps) internal pure returns (uint256) {
+        return uint256(uint160(recipient)) | (bps << 160);
+    }
+
+    function _setShare(OstraVault creatorVault, PoolId id, address recipient, uint256 bps) internal {
+        _spend(creatorVault, CREATOR, 4, abi.encode(address(split), PoolId.unwrap(id), uint8(0), _shareValue(recipient, bps)));
+    }
+
+    function _setShareReverts(OstraVault creatorVault, PoolId id, uint8 field, uint256 value, bytes4 err) internal {
+        uint64 n = creatorVault.nonce();
+        bytes memory params = abi.encode(address(split), PoolId.unwrap(id), field, value);
+        bytes32 next = WotsSigner.keyRoot(_seed(CREATOR, n + 1));
+        bytes memory signature = WotsSigner.sign(_seed(CREATOR, n), creatorVault.spendMessage(4, next, params));
+        vm.expectRevert(err);
+        creatorVault.spend(4, next, params, signature);
+    }
+
+    function _recipient(uint256 i) internal pure returns (address) {
+        return address(uint160(0x05917000 + i));
+    }
+
+    function _dispatchPaid(PoolId id) internal returns (uint256) {
+        vm.recordLogs();
+        dispatcher.dispatch(id);
+        return _creatorPaid();
+    }
+
+    function test_onlyTheDispatcherTakesAndRestoresAPoolsBookedAmounts() public {
+        (, PoolKey memory key,) = _launchUsdg(bytes32(uint256(29)));
+        OstraHook.Pending memory none;
+        vm.expectRevert(OstraHook.OnlyDispatcher.selector);
+        hook.takePending(key.toId());
+        vm.expectRevert(OstraHook.OnlyDispatcher.selector);
+        hook.restorePending(key.toId(), none);
+        vm.expectRevert(OstraCreatorSplit.OnlyDispatcher.selector);
+        split.credit(key.toId(), USDG, address(this), 1);
+    }
+
+    function test_theCreatorSplitSharesPayoutsAmongAHundredRecipientsAndChangesAnytime() public {
+        (OstraToken token, PoolKey memory key, OstraVault creatorVault) = _launchUsdg(bytes32(uint256(30)));
+        PoolId id = key.toId();
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 5_000e6);
+
+        // Only the creator vault, through a ConfigurePool spend at the split.
+        vm.expectRevert(OstraCreatorSplit.OnlyCreatorVault.selector);
+        split.configure(PoolId.unwrap(id), 0, _shareValue(_recipient(0), 50));
+        // 100 recipients at 50 bps each: half of the payouts; the creator vault keeps the rest. A 101st is refused.
+        for (uint256 i = 0; i < 100; ++i) {
+            _setShare(creatorVault, id, _recipient(i), 50);
+        }
+        assertEq(split.recipientCount(id), 100);
+        assertEq(split.shareOf(id, address(creatorVault)), 5_000);
+        _setShareReverts(creatorVault, id, 0, _shareValue(_recipient(100), 50), OstraCreatorSplit.TooManyRecipients.selector);
+        _setShareReverts(creatorVault, id, 0, _shareValue(address(0), 50), OstraCreatorSplit.BadShare.selector);
+        _setShareReverts(creatorVault, id, 0, _shareValue(address(creatorVault), 50), OstraCreatorSplit.BadShare.selector);
+        _setShareReverts(creatorVault, id, 0, _shareValue(_recipient(0), 50), OstraCreatorSplit.BadShare.selector);
+        _setShareReverts(creatorVault, id, 0, _shareValue(_recipient(0), 5_051), OstraCreatorSplit.BadShare.selector);
+        _setShareReverts(creatorVault, id, 1, _shareValue(_recipient(0), 60), OstraCreatorSplit.BadField.selector);
+
+        // A payout goes through the split: 50 bps to each recipient, 50% to the creator vault.
+        _buyExactIn(key, token, 200e6, makeAddr("split buyer"));
+        uint256 paid = _dispatchPaid(id);
+        assertGt(paid, 0);
+        assertEq(IERC20(USDG).balanceOf(address(creatorVault)), 0);
+        assertEq(IERC20(USDG).balanceOf(address(split)), paid);
+        assertApproxEqAbs(split.owedOf(id, _recipient(7)), (paid * 50) / 10_000, 1);
+        assertApproxEqAbs(split.owedOf(id, address(creatorVault)), paid / 2, 1);
+        // Anyone releases, always to the account.
+        uint256 owed7 = split.owedOf(id, _recipient(7));
+        split.release(id, _recipient(7));
+        assertEq(IERC20(USDG).balanceOf(_recipient(7)), owed7);
+        assertEq(split.owedOf(id, _recipient(7)), 0);
+
+        // The creator vault raises one share and removes another; what was paid before stays at the old shares.
+        uint256 owed1 = split.owedOf(id, _recipient(1));
+        uint256 owed2 = split.owedOf(id, _recipient(2));
+        _setShare(creatorVault, id, _recipient(1), 500);
+        _setShare(creatorVault, id, _recipient(2), 0);
+        assertEq(split.recipientCount(id), 99);
+        assertEq(split.shareOf(id, address(creatorVault)), 10_000 - 98 * 50 - 500);
+        assertEq(split.owedOf(id, _recipient(1)), owed1);
+        assertEq(split.owedOf(id, _recipient(2)), owed2);
+        uint256 vaultOwed = split.owedOf(id, address(creatorVault));
+
+        _buyExactIn(key, token, 200e6, makeAddr("split buyer 2"));
+        uint256 paid2 = _dispatchPaid(id);
+        assertApproxEqAbs(split.owedOf(id, _recipient(1)) - owed1, (paid2 * 500) / 10_000, 1);
+        assertEq(split.owedOf(id, _recipient(2)), owed2, "a removed recipient earns nothing more");
+        assertApproxEqAbs(split.owedOf(id, address(creatorVault)) - vaultOwed, (paid2 * 4_600) / 10_000, 1);
+        // The removed recipient still releases what it earned; the creator vault releases its share.
+        split.release(id, _recipient(2));
+        assertEq(IERC20(USDG).balanceOf(_recipient(2)), owed2);
+        uint256 vaultAll = split.owedOf(id, address(creatorVault));
+        split.release(id, address(creatorVault));
+        assertEq(IERC20(USDG).balanceOf(address(creatorVault)), vaultAll);
+        // Everything owed is covered by what the split holds.
+        uint256 left;
+        for (uint256 i = 0; i < 100; ++i) {
+            left += split.owedOf(id, _recipient(i));
+        }
+        assertLe(left, IERC20(USDG).balanceOf(address(split)));
+        assertLe(IERC20(USDG).balanceOf(address(split)) - left, 200, "rounding dust only");
+        (address[] memory list, uint16[] memory bps) = split.recipients(id);
+        assertEq(list.length, 99);
+        assertEq(bps.length, 99);
+    }
+
+    function test_withoutRecipientsTheCreatorVaultIsPaidDirectly() public {
+        (OstraToken token, PoolKey memory key, OstraVault creatorVault) = _launchUsdg(bytes32(uint256(31)));
+        PoolId id = key.toId();
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 5_000e6);
+        _setShare(creatorVault, id, _recipient(0), 2_000);
+        _buyExactIn(key, token, 200e6, makeAddr("buyer one"));
+        uint256 paid = _dispatchPaid(id);
+        _setShare(creatorVault, id, _recipient(0), 0);
+        assertEq(split.recipientCount(id), 0);
+        _buyExactIn(key, token, 200e6, makeAddr("buyer two"));
+        uint256 paid2 = _dispatchPaid(id);
+        assertEq(IERC20(USDG).balanceOf(address(creatorVault)), paid2, "paid straight to the vault");
+        // What the split held from the first payout is still released at the shares of that time.
+        split.release(id, _recipient(0));
+        split.release(id, address(creatorVault));
+        assertApproxEqAbs(IERC20(USDG).balanceOf(_recipient(0)), (paid * 2_000) / 10_000, 1);
+        assertApproxEqAbs(IERC20(USDG).balanceOf(address(creatorVault)), paid2 + (paid * 8_000) / 10_000, 1);
+    }
+
+    function _tickOf(PoolId id) internal view returns (int24 tick) {
+        (, tick,,) = pm.getSlot0(id);
+    }
+
+    function _floorPool(bytes32 salt) internal returns (OstraToken token, PoolKey memory key, PoolId id, bool tokenIs0) {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, salt);
+        // Only the creator and floor buckets: no conversion buy of the dispatch moves the price before the bid's step.
+        p.creatorBucketBps = 5_000;
+        p.dividendBucketBps = 0;
+        p.burnBucketBps = 0;
+        p.lpBucketBps = 0;
+        p.floorBucketBps = 5_000;
+        p.dividendToken = address(0);
+        p.graduationThreshold = 100_000e6; // the launch rules hold for the whole test
+        p.maxWallet = 0; // the test router holds what it trades
+        address t;
+        (t, id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        token = OstraToken(t);
+        key = hook.poolKey(id);
+        tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+    }
+
+    /// @dev The floor bid recorded by the dispatcher is its position at the range the current price calls for.
+    function _assertFloorAtPrice(PoolId id, bool tokenIs0) internal view returns (int24 lower, int24 upper, uint128 liquidity) {
+        (lower, upper, liquidity,) = dispatcher.floorBid(id);
+        assertGt(liquidity, 0);
+        (int24 wantLower, int24 wantUpper) = dispatcher.floorRange(id);
+        assertEq(lower, wantLower);
+        assertEq(upper, wantUpper);
+        assertEq(upper - lower, 200);
+        int24 tick = _tickOf(id);
+        // On the quote side of the price, so the position holds only quote.
+        if (tokenIs0) assertLe(upper, tick);
+        else assertGt(lower, tick);
+        (uint128 posLiquidity,,) = pm.getPositionInfo(id, address(dispatcher), lower, upper, dispatcher.FLOOR_SALT());
+        assertEq(posLiquidity, liquidity);
+    }
+
+    function _floorBurned() internal returns (bool moved, uint256 burned) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == address(dispatcher) && logs[i].topics[0] == OstraDispatcher.FloorBidSet.selector) {
+                (,,, burned) = abi.decode(logs[i].data, (int24, int24, uint128, uint256));
+                moved = true;
+            }
+        }
+    }
+
+    function test_theFloorBidBuysBelowThePriceBurnsWhatItBoughtAndFollowsThePrice() public {
+        (OstraToken token, PoolKey memory key, PoolId id, bool tokenIs0) = _floorPool(bytes32(uint256(32)));
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 5_000e6);
+        for (uint256 i = 0; i < 4; ++i) {
+            _buyExactIn(key, token, 200e6, address(router));
+        }
+        assertGt(hook.pending(id).floor, 0);
+
+        // The first dispatch puts the whole bucket in the spacing next to the price, on the quote side.
+        dispatcher.dispatch(id);
+        (int24 lower, int24 upper, uint128 liquidity) = _assertFloorAtPrice(id, tokenIs0);
+        assertLe(hook.pending(id).floor, 2, "the whole bucket is in the bid");
+
+        // Sells walk the price down into the bid: while the price is inside it, dispatch leaves it alone.
+        for (uint256 i = 0; i < 200; ++i) {
+            int24 t = _tickOf(id);
+            if (t >= lower && t < upper) break;
+            router.swap(key, tokenIs0, -20_000e18, address(router));
+        }
+        {
+            int24 t = _tickOf(id);
+            assertTrue(t >= lower && t < upper, "the price is inside the bid");
+        }
+        dispatcher.dispatch(id);
+        {
+            (int24 l2, int24 u2, uint128 liq2,) = dispatcher.floorBid(id);
+            assertEq(l2, lower);
+            assertEq(u2, upper);
+            assertEq(liq2, liquidity);
+        }
+        assertGt(hook.pending(id).floor, 0, "the sells' floor tax waits for the price to leave the bid");
+
+        // The price falls through the bid (it buys tokens), then buys lift it above: dispatch burns what the bid
+        // bought and sets a new bid at the new price.
+        router.swap(key, tokenIs0, -1_000_000e18, address(router));
+        _buyExactIn(key, token, 300e6, address(router));
+        _buyExactIn(key, token, 300e6, address(router));
+        uint256 supply = token.totalSupply();
+        vm.recordLogs();
+        dispatcher.dispatch(id);
+        (bool moved, uint256 burned) = _floorBurned();
+        assertTrue(moved);
+        assertGt(burned, 0, "the bid bought tokens and they are burned");
+        assertLe(token.totalSupply(), supply - burned);
+        (int24 l3,, uint128 liq3,) = dispatcher.floorBid(id);
+        assertGt(liq3, 0);
+        assertTrue(l3 != lower, "moved with the price");
+        (uint128 oldLiquidity,,) = pm.getPositionInfo(id, address(dispatcher), lower, upper, dispatcher.FLOOR_SALT());
+        assertEq(oldLiquidity, 0, "the old bid is gone");
+    }
+
+    function test_theFloorBidFollowsARisingPriceOneSpacingAMinute() public {
+        (OstraToken token, PoolKey memory key, PoolId id, bool tokenIs0) = _floorPool(bytes32(uint256(34)));
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 10_000e6);
+        for (uint256 i = 0; i < 4; ++i) {
+            _buyExactIn(key, token, 200e6, address(router));
+        }
+        dispatcher.dispatch(id);
+        (int24 lower,,) = _assertFloorAtPrice(id, tokenIs0);
+        // A pump of many spacings: each dispatch lifts the bid by one spacing, never to the pumped price at once.
+        for (uint256 i = 0; i < 6; ++i) {
+            _buyExactIn(key, token, 400e6, address(router));
+        }
+        (int24 target,) = dispatcher.floorRange(id);
+        assertGt(tokenIs0 ? target - lower : lower - target, 600, "the pump moved the price several spacings");
+        int24 step = tokenIs0 ? int24(200) : int24(-200);
+        for (int24 n = 1; n <= 3; ++n) {
+            vm.warp(block.timestamp + dispatcher.FLOOR_STEP_INTERVAL());
+            dispatcher.dispatch(id);
+            // Dispatching again at once does not lift it again.
+            dispatcher.dispatch(id);
+            dispatcher.dispatch(id);
+            (int24 l, int24 u, uint128 liq,) = dispatcher.floorBid(id);
+            assertEq(l, lower + n * step);
+            assertEq(u, l + 200);
+            assertGt(liq, 0);
+            int24 t = _tickOf(id);
+            assertTrue(t < l || t >= u, "the step stays outside the price");
+        }
+    }
+
+    function test_aOneWeiLpBucketNeverStopsTheDispatch() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(35)));
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 1_000e6);
+        // A buy of 150 wei pays a fee of 6 wei, 5 of it tax: the LP bucket gets 1 wei (half of it is 0).
+        _buyExactIn(key, token, 150, address(router));
+        assertEq(hook.pending(key.toId()).lp, 1);
+        dispatcher.dispatch(key.toId());
+        dispatcher.dispatch(key.toId());
+    }
+
+    function test_aDividendPoolWithAnotherHookIsRefused() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(36)));
+        p.dividendToken = AAPL;
+        p.dividendKey = PoolKey({
+            currency0: Currency.wrap(USDG),
+            currency1: Currency.wrap(AAPL),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(makeAddr("another hook"))
+        });
+        uint256 fee = launchpad.LAUNCH_FEE();
+        vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "dividendKey"));
+        launchpad.launch{value: fee}(p);
+        p.dividendKey.hooks = IHooks(address(0));
+        launchpad.launch{value: fee}(p);
+    }
+
+    function test_aCreatorPayoutTheTokenRefusesWaitsAndTheRestIsPaid() public {
+        OstraVault creatorVault = _vault(AAPL, CREATOR_AAPL);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(AAPL), address(creatorVault), -154_200, bytes32(uint256(37)));
+        p.graduationThreshold = 5e18;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        vm.warp(block.timestamp + 601);
+        deal(AAPL, address(router), 20e18);
+        _buyExactIn(key, token, 1e18, makeAddr("TEST holder"));
+        uint256 creatorShare = hook.pending(id).creator;
+        assertGt(creatorShare, 0);
+
+        // The issuer blocks the creator vault: the payout waits, and the burn, the LP bucket and the dividends go on.
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).blockAccounts(_one(address(creatorVault)));
+        uint256 supply = token.totalSupply();
+        vm.recordLogs();
+        dispatcher.dispatch(id);
+        assertTrue(_dispatcherEmitted(OstraDispatcher.CreatorPayoutDeferred.selector));
+        assertGe(hook.pending(id).creator, creatorShare, "the creator's share waits in the pool");
+        assertEq(IERC20(AAPL).balanceOf(address(creatorVault)), 0);
+        assertLt(token.totalSupply(), supply, "the burn bucket still burned");
+        assertGt(token.dividendOf(makeAddr("TEST holder")), 0, "dividends still paid");
+
+        // Unblocked, the next dispatch pays what waited.
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).unblockAccounts(_one(address(creatorVault)));
+        uint256 paid = _dispatchPaid(id);
+        assertGe(paid, creatorShare);
+        assertEq(IERC20(AAPL).balanceOf(address(creatorVault)), paid);
+        assertEq(hook.pending(id).creator, 0);
+    }
+
+    function _aaplDividendKey() internal pure returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(USDG),
+            currency1: Currency.wrap(AAPL),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(0))
+        });
+    }
+
+    function test_dividendsTheDividendTokenRefusesWaitAndTheRestIsPaid() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(38)));
+        p.dividendToken = AAPL;
+        p.dividendKey = _aaplDividendKey();
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 1_000e6);
+        address holder = makeAddr("deferred dividend holder");
+        _buyExactIn(key, token, 200e6, holder);
+        uint256 bucket = hook.pending(id).dividend;
+        assertGt(bucket, 0);
+
+        // The issuer blocks the token contract: AAPL cannot reach it, the dividends wait, the creator is paid.
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).blockAccounts(_one(address(token)));
+        uint256 vaultBefore = IERC20(USDG).balanceOf(address(v));
+        vm.recordLogs();
+        dispatcher.dispatch(id);
+        assertTrue(_dispatcherEmitted(OstraDispatcher.DividendsDeferred.selector));
+        assertGe(hook.pending(id).dividend, bucket, "the dividend bucket waits");
+        assertEq(token.dividendOf(holder), 0);
+        assertGt(IERC20(USDG).balanceOf(address(v)), vaultBefore, "the creator was paid");
+
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).unblockAccounts(_one(address(token)));
+        dispatcher.dispatch(id);
+        assertGt(token.dividendOf(holder), 0);
+        assertLt(hook.pending(id).dividend, bucket);
+        // Only the dispatcher itself runs its dividend step.
+        OstraHook.PoolConfig memory c = hook.poolConfig(id);
+        vm.expectRevert(OstraDispatcher.OnlySelf.selector);
+        dispatcher.dividendStep(id, key, c, 1);
+    }
+
+    function test_aDividendPoolThatDoesNotExistIsRefused() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(39)));
+        p.dividendToken = AAPL;
+        p.dividendKey = _aaplDividendKey();
+        p.dividendKey.fee = 3001; // a hookless USDG/AAPL pool nobody initialized
+        uint256 fee = launchpad.LAUNCH_FEE();
+        vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "dividendKey"));
+        launchpad.launch{value: fee}(p);
+        // An Ostra pool that was never launched.
+        p.dividendKey.fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
+        p.dividendKey.tickSpacing = 200;
+        p.dividendKey.hooks = IHooks(address(hook));
+        vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "dividendKey"));
+        launchpad.launch{value: fee}(p);
     }
 }

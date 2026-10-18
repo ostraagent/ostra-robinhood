@@ -42,6 +42,7 @@ import {
 } from "viem";
 import { BEACON_PROXY_CREATION_CODE, ostraVaultAbi } from "./abi.ts";
 import {
+  CREATOR_SPLIT,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
   POOL_SETTING,
@@ -333,6 +334,33 @@ export function decodeConfigurePoolParams(params: Hex): ConfigurePoolParams {
 }
 
 /**
+ * A creator split share: a ConfigurePool spend whose `hook` is the
+ * OstraCreatorSplit contract, so the vault calls
+ * split.configure(poolId, CREATOR_SPLIT.FIELD_SHARE, uint160(recipient) | bps << 160).
+ * Only the pool's creator vault may set shares; bps 0 removes the recipient;
+ * the creator vault keeps 10,000 bps minus the recipients' total. The split
+ * also refuses the creator vault itself as a recipient, the current share
+ * again, a total above 10,000 bps and a 101st recipient: simulate before signing.
+ */
+export type CreatorShareParams = { split: Address; poolId: Hex; recipient: Address; bps: number };
+
+/** CreatorShare params: abi.encode(address split, bytes32 poolId, uint8 0, uint256 recipient | bps << 160). */
+export function creatorShareParams(p: CreatorShareParams): Hex {
+  const recipient = nonZeroAddr(p.recipient, "recipient");
+  if (!Number.isInteger(p.bps) || p.bps < 0 || p.bps > CREATOR_SPLIT.BPS) throw new RangeError(`bps must be 0..${CREATOR_SPLIT.BPS}`);
+  const value = BigInt(recipient) | (BigInt(p.bps) << 160n);
+  return encodeAbiParameters(CONFIGURE_POOL_TYPES, [nonZeroAddr(p.split, "split"), bytes32(p.poolId, "poolId"), CREATOR_SPLIT.FIELD_SHARE, value]);
+}
+
+export function decodeCreatorShareParams(params: Hex): CreatorShareParams {
+  const [split, poolId, field, value] = decodeAbiParameters(CONFIGURE_POOL_TYPES, paramsFor(VAULT_ACTION.CONFIGURE_POOL, params));
+  const recipient = value & ((1n << 160n) - 1n);
+  const bps = value >> 160n;
+  if (field !== CREATOR_SPLIT.FIELD_SHARE || recipient === 0n || bps > BigInt(CREATOR_SPLIT.BPS)) throw new RangeError("not a creator share");
+  return { split, poolId, recipient: getAddress(`0x${recipient.toString(16).padStart(40, "0")}`), bps: Number(bps) };
+}
+
+/**
  * ClaimDividend params: abi.encode(address recipient). The vault's token (an
  * OstraToken) pays the dividends it owes the vault to `recipient`, which should
  * be the owner's vault for the dividend token: a vault only spends its own
@@ -481,6 +509,10 @@ export async function signVaultSwap(keychain: WotsKeychain, state: VaultKeyState
 
 export function signVaultConfigurePool(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; configure: ConfigurePoolParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams(a.configure) });
+}
+
+export function signVaultSetCreatorShare(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; share: CreatorShareParams }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: creatorShareParams(a.share) });
 }
 
 export function signVaultClaimDividend(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; recipient: Address }): Promise<SignedSpend> {

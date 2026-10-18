@@ -107,6 +107,17 @@ export const POOL_SETTING = {
   VOLATILITY_FEE: 8,
 } as const;
 
+/**
+ * OstraCreatorSplit: a pool's creator vault shares its creator payouts among up
+ * to MAX_RECIPIENTS recipients and keeps the rest (FIELD_SHARE is its only
+ * configure field; shares change at any time and apply to later payouts).
+ */
+export const CREATOR_SPLIT = {
+  FIELD_SHARE: 0,
+  MAX_RECIPIENTS: 100,
+  BPS: 10_000,
+} as const;
+
 /** OstraPool deposit statuses, by their on-chain number. */
 export const DEPOSIT_STATUS = ["none", "pending", "consumed", "cancelled", "closed"] as const;
 export type DepositStatus = (typeof DEPOSIT_STATUS)[number];
