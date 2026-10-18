@@ -48,15 +48,20 @@ interface IOstraRecovery {
 ///                  channel's voucher key) must not be zero.
 /// * 2 SetCrankKey: params abi.encode(address crank). address(0) removes the crank.
 /// * 3 Swap:        params abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn, uint128 minOut,
-///                  address recipient). An exact-input swap of up to `amountIn` of this vault's token on the
-///                  Uniswap v4 pool `key`, which must have this vault's token on its input side. The vault
-///                  unlocks the PoolManager itself, so the swap's sender (what the pool's hook sees) is this
-///                  vault. At least `minOut` of the other currency goes to `recipient` (another vault, for
-///                  example); native ETH only to a recipient that accepts it. The params may carry a sixth word,
-///                  abi.encode(..., address referrer) (320 bytes): the swap's hookData is then abi.encode(referrer),
-///                  which an OstraHook pool pays a referral on (OstraHook.referralOwed). The pool's hook may refuse
-///                  the swap (an Ostra pool's circuit breaker refuses one that moves its price too far): quote it
-///                  before signing, since a refused spend can only be sent again with the same bytes.
+///                  address recipient, address referrer, uint32 swapGas). An exact-input swap of up to `amountIn`
+///                  of this vault's token on the Uniswap v4 pool `key`, which must have this vault's token on its
+///                  input side. The vault unlocks the PoolManager itself, so the swap's sender (what the pool's hook
+///                  sees) is this vault. At least `minOut` of the other currency goes to `recipient` (another
+///                  vault, for example); native ETH only to a recipient that accepts it. A non-zero `referrer`
+///                  becomes the swap's hookData, abi.encode(referrer), which an OstraHook pool pays a referral on
+///                  (OstraHook.referralOwed). The PoolManager call gets exactly `swapGas` (MIN_SWAP_GAS to
+///                  MAX_SWAP_GAS, signed: a quote's gas with a margin), whatever gas the spend was sent with; with
+///                  less available the spend reverts. A swap that fails inside the PoolManager (below `minOut`,
+///                  refused by the pool's hook, such as an Ostra pool's circuit breaker, a token that refuses the
+///                  transfer, or more than `swapGas` needed) moves nothing but still uses the spend: the vault emits
+///                  SwapFailed with the failure's selector (WrappedError for a hook's or a token's refusal) and the
+///                  next key signs again, so a swap whose market moved never holds the key. A spend sent from inside
+///                  another PoolManager unlock, and malformed params, revert.
 /// * 4 ConfigurePool: params abi.encode(address hook, bytes32 poolId, uint8 field, uint256 value). Calls
 ///                  hook.configure(poolId, field, value) as this vault: an OstraHook lets a pool's creator vault
 ///                  change the pool's rules, and only in the traders' favour (OstraHook.configure).
@@ -100,6 +105,16 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_SET_GUARDIAN = 6;
     uint8 public constant ACTION_SET_RECOVERY_POLICY = 7;
     uint8 public constant ACTION_SUPPORT_RECOVERY = 8;
+
+    /// @notice Bounds of a Swap's signed `swapGas`, the gas its PoolManager call gets exactly (so the sender's gas
+    ///         limit never decides whether a swap fails).
+    uint256 public constant MIN_SWAP_GAS = 100_000;
+    uint256 public constant MAX_SWAP_GAS = 10_000_000;
+    /// @dev Gas kept back beyond SWAP_GAS for the rest of the spend after the call (the failure path included).
+    uint256 private constant SWAP_GAS_RESERVE = 30_000;
+    /// @dev v4-core Lock.IS_UNLOCKED_SLOT: the PoolManager's transient unlocked flag.
+    bytes32 private constant POOL_MANAGER_UNLOCKED_SLOT =
+        0xc090fc4683624cfc3884e9d8de5eca132f2d0ec062aff75d43c0465d5ceeab23;
 
     /// @notice Shortest recovery delay: Argent's 36-hour security period, the shortest in the deployed wallets surveyed.
     uint32 public constant MIN_RECOVERY_DELAY = 36 hours;
@@ -158,6 +173,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     event ChannelOpened(bytes32 indexed channelId, uint128 amount);
     event CloseRequested(bytes32 indexed channelId, uint128 amount, address authorizer);
     event Swapped(bytes32 indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut, address recipient);
+    /// @notice The signed swap failed inside the PoolManager and moved nothing; `reason` is the error's selector.
+    event SwapFailed(bytes32 indexed poolId, bytes4 reason);
     event GuardianSet(address indexed guardian, bool enabled);
     event RecoveryPolicySet(uint8 threshold, uint32 delay);
     event RecoverySupported(uint32 indexed round, bytes32 indexed newKeyRoot, address indexed guardian, uint256 support);
@@ -177,6 +194,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     error UnexpectedCallback();
     error BadSwapDelta();
     error InsufficientOutput();
+    error SwapOutOfGas();
+    error PoolManagerUnlocked();
     error NotGuardian();
     error RecoveryOff();
     error AlreadySupported();
@@ -272,7 +291,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         } else if (action == ACTION_SET_CRANK_KEY) {
             if (params.length != 32) revert BadParams();
         } else if (action == ACTION_SWAP) {
-            if (params.length != 288 && params.length != 320) revert BadParams();
+            if (params.length != 352) revert BadParams();
         } else if (action == ACTION_CONFIGURE_POOL) {
             if (params.length != 128) revert BadParams();
         } else if (action == ACTION_CLAIM_DIVIDEND) {
@@ -341,15 +360,34 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             abi.decode(params, (PoolKey, bool, uint128, uint128, address));
         if (amountIn == 0) revert ZeroAmount();
         if (recipient == address(0)) revert BadParams();
-        // The optional sixth word, the swap's referrer, goes to the pool's hook as its hookData.
-        if (params.length == 320 && abi.decode(params[288:], (address)) == address(0)) revert BadParams();
+        // The referrer (abi.decode refuses a dirty word) and the swap's gas.
+        (, uint256 swapGas) = abi.decode(params[288:], (address, uint32));
+        if (swapGas < MIN_SWAP_GAS || swapGas > MAX_SWAP_GAS) revert BadParams();
         Currency input = zeroForOne ? key.currency0 : key.currency1;
         if (Currency.unwrap(input) != address(token)) revert WrongToken();
+        // From inside someone else's unlock the PoolManager would refuse this one (AlreadyUnlocked): a failure the
+        // swap did not cause, so the spend reverts instead of being used up.
+        if (POOL_MANAGER.exttload(POOL_MANAGER_UNLOCKED_SLOT) != bytes32(0)) revert PoolManagerUnlocked();
+        // The call gets exactly swapGas (EIP-150 passes at most 63/64 of what is left): with less, revert, so that
+        // no gas limit makes the swap fail and a gas estimate only ever settles where the swap decides for itself.
+        if (gasleft() < (swapGas * 64) / 63 + SWAP_GAS_RESERVE) revert SwapOutOfGas();
         _swapPending = true;
-        bytes memory result = POOL_MANAGER.unlock(params);
-        if (_swapPending) revert UnexpectedCallback();
-        (uint256 paid, uint256 received) = abi.decode(result, (uint256, uint256));
-        emit Swapped(PoolId.unwrap(key.toId()), zeroForOne, paid, received, recipient);
+        try POOL_MANAGER.unlock{gas: swapGas}(params) returns (bytes memory result) {
+            if (_swapPending) revert UnexpectedCallback();
+            (uint256 paid, uint256 received) = abi.decode(result, (uint256, uint256));
+            emit Swapped(PoolId.unwrap(key.toId()), zeroForOne, paid, received, recipient);
+        } catch {
+            // The swap failed on its own merits: nothing moved (the PoolManager undid it all) and the key has rotated.
+            _swapPending = false;
+            bytes4 reason;
+            assembly ("memory-safe") {
+                if gt(returndatasize(), 3) {
+                    returndatacopy(0x00, 0x00, 0x04)
+                    reason := and(mload(0x00), 0xffffffff00000000000000000000000000000000000000000000000000000000)
+                }
+            }
+            emit SwapFailed(PoolId.unwrap(key.toId()), reason);
+        }
     }
 
     /// @notice PoolManager callback. Works only inside this vault's own Swap spend, with the params that spend
@@ -366,7 +404,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
                 amountSpecified: -int256(uint256(amountIn)),
                 sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
-            data[288:]
+            // The referrer word, already checked clean in _swap; none when zero.
+            bytes32(data[288:320]) == bytes32(0) ? data[0:0] : data[288:320]
         );
         (int128 inDelta, int128 outDelta) =
             zeroForOne ? (delta.amount0(), delta.amount1()) : (delta.amount1(), delta.amount0());

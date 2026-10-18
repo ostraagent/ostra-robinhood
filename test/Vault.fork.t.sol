@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test, Vm, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -18,6 +20,26 @@ import {WotsSigner} from "./utils/WotsSigner.sol";
 
 /// @notice Vaults on a fork of Robinhood Chain mainnet, against the deployed USDG, x402BatchSettlement and
 ///         Uniswap v4 PoolManager.
+/// @notice Sends a signed Swap spend from inside its own PoolManager unlock.
+contract UnlockedSubmitter is IUnlockCallback {
+    IPoolManager internal immutable PM;
+
+    constructor(address pm) {
+        PM = IPoolManager(pm);
+    }
+
+    function submit(OstraVault vault, bytes32 next, bytes memory params, bytes memory signature) external {
+        PM.unlock(abi.encode(vault, next, params, signature));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (OstraVault vault, bytes32 next, bytes memory params, bytes memory signature) =
+            abi.decode(data, (OstraVault, bytes32, bytes, bytes));
+        vault.spend(3, next, params, signature);
+        return "";
+    }
+}
+
 contract VaultForkTest is Test {
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
@@ -220,6 +242,11 @@ contract VaultForkTest is Test {
         vault.spend(8, bytes32(0), new bytes(32), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(3, bytes32(0), new bytes(256), signature);
+        // The Swap layout is one: 352 bytes (the five-word and six-word forms are refused).
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(3, bytes32(0), new bytes(288), signature);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(3, bytes32(0), new bytes(320), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(4, bytes32(0), new bytes(96), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
@@ -448,7 +475,7 @@ contract VaultForkTest is Test {
         pure
         returns (bytes memory)
     {
-        return abi.encode(key, zeroForOne, amountIn, minOut, recipient);
+        return abi.encode(key, zeroForOne, amountIn, minOut, recipient, address(0), uint32(1_000_000));
     }
 
     /// @dev What a swap of `amountIn` USDG for ETH pays out right now, learned by doing it and rolling back.
@@ -467,13 +494,17 @@ contract VaultForkTest is Test {
         uint256 expected = _ethOut(vault, 10e6);
         assertGt(expected, 0);
 
-        // Below the signed minimum the whole spend reverts: the key does not rotate and nothing moves.
+        // Below the signed minimum the swap fails and nothing moves, but the spend lands: the key rotates, so the
+        // owner signs the next swap with the next key instead of being stuck with a spend that cannot land.
         bytes memory params = _swapParams(_ethUsdg(), false, 10e6, uint128(expected + 1), to);
         (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
-        vm.expectRevert(OstraVault.InsufficientOutput.selector);
+        vm.expectEmit(address(vault));
+        emit OstraVault.SwapFailed(keccak256(abi.encode(_ethUsdg())), OstraVault.InsufficientOutput.selector);
         vault.spend(3, next, params, signature);
-        assertEq(vault.nonce(), 0);
+        assertEq(vault.nonce(), 1);
+        assertEq(vault.keyRoot(), next);
         assertEq(usdg.balanceOf(address(vault)), 100e6);
+        assertEq(to.balance, 0);
 
         params = _swapParams(_ethUsdg(), false, 10e6, uint128(expected), to);
         (next, signature) = _sign(vault, BUYER, 3, params);
@@ -484,7 +515,7 @@ contract VaultForkTest is Test {
         console.log("gas spend Swap (USDG to ETH, v4 pool without hook)", before - gasleft());
         assertEq(to.balance, expected);
         assertEq(usdg.balanceOf(address(vault)), 90e6);
-        assertEq(vault.nonce(), 1);
+        assertEq(vault.nonce(), 2);
         assertEq(vault.keyRoot(), next);
         // The PoolManager keeps no open delta: a second swap in the same block works the same way.
         _spend(vault, BUYER, 3, _swapParams(_ethUsdg(), false, 10e6, 1, to));
@@ -588,13 +619,100 @@ contract VaultForkTest is Test {
         (next, signature) = _sign(vault, BUYER, 3, params);
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(3, next, params, signature);
-        // More than the vault holds: the transfer into the PoolManager fails and nothing moves.
+        assertEq(vault.nonce(), 0);
+        // More than the vault holds: the transfer into the PoolManager fails inside the swap, so nothing moves and
+        // the spend is used up (SwapFailed).
         params = _swapParams(_ethUsdg(), false, 101e6, 1, to);
         (next, signature) = _sign(vault, BUYER, 3, params);
-        vm.expectRevert();
+        vm.recordLogs();
         vault.spend(3, next, params, signature);
+        assertTrue(_swapFailed(address(vault)));
+        assertEq(vault.nonce(), 1);
+        assertEq(usdg.balanceOf(address(vault)), 100e6);
+    }
+
+    function test_theSwapGetsExactlyItsSignedGas() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        _fund(address(vault), 100e6);
+        address to = makeAddr("eth recipient");
+        // Out of bounds: refused before anything moves.
+        bytes memory params = abi.encode(_ethUsdg(), false, uint128(10e6), uint128(1), to, address(0), uint32(99_999));
+        (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(3, next, params, signature);
+        params = abi.encode(_ethUsdg(), false, uint128(10e6), uint128(1), to, address(0), uint32(10_000_001));
+        (next, signature) = _sign(vault, BUYER, 3, params);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(3, next, params, signature);
+        // Too little for the swap the owner signed: it fails the same way under any gas limit, and uses the spend.
+        params = abi.encode(_ethUsdg(), false, uint128(10e6), uint128(1), to, address(0), uint32(100_000));
+        (next, signature) = _sign(vault, BUYER, 3, params);
+        uint256 snapshot = vm.snapshotState();
+        vm.recordLogs();
+        vault.spend{gas: 2_000_000}(3, next, params, signature);
+        assertTrue(_swapFailed(address(vault)));
+        vm.revertToState(snapshot);
+        vm.recordLogs();
+        vault.spend{gas: 20_000_000}(3, next, params, signature);
+        assertTrue(_swapFailed(address(vault)));
+        assertEq(vault.nonce(), 1);
+        assertEq(usdg.balanceOf(address(vault)), 100e6);
+        assertEq(to.balance, 0);
+    }
+
+    function test_aSwapSentFromInsideAnotherUnlockReverts() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        _fund(address(vault), 100e6);
+        bytes memory params = _swapParams(_ethUsdg(), false, 10e6, 1, makeAddr("eth recipient"));
+        (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
+        // Whoever holds the signed spend cannot void it by sending it while the PoolManager is unlocked, where the
+        // vault's own unlock would fail (AlreadyUnlocked): the spend reverts and stays valid.
+        UnlockedSubmitter submitter = new UnlockedSubmitter(POOL_MANAGER);
+        vm.expectRevert(OstraVault.PoolManagerUnlocked.selector);
+        submitter.submit(vault, next, params, signature);
+        assertEq(vault.nonce(), 0);
+        vault.spend(3, next, params, signature);
+        assertEq(vault.nonce(), 1);
+        assertEq(usdg.balanceOf(address(vault)), 90e6);
+    }
+
+    /// @dev Whether `vault` emitted SwapFailed in the recorded logs.
+    function _swapFailed(address vault) internal returns (bool found) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == vault && logs[i].topics[0] == OstraVault.SwapFailed.selector) found = true;
+        }
+    }
+
+    function test_aSwapThatRunsOutOfGasRevertsTheWholeSpend() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        _fund(address(vault), 100e6);
+        address to = makeAddr("eth recipient");
+        bytes memory params = _swapParams(_ethUsdg(), false, 10e6, 1, to);
+        (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
+        // Every gas limit either reverts the spend (too little to give the swap its SWAP_GAS) or swaps: none uses
+        // the key up on a swap that failed for lack of gas, so a gas estimate's binary search can only settle where
+        // the swap goes through.
+        bool swapped;
+        for (uint256 gas = 100_000; gas <= 1_600_000; gas += 50_000) {
+            uint256 snapshot = vm.snapshotState();
+            vm.recordLogs();
+            try vault.spend{gas: gas}(3, next, params, signature) {
+                assertFalse(_swapFailed(address(vault)), "no swap fails for lack of gas");
+                assertGt(to.balance, 0);
+                swapped = true;
+            } catch (bytes memory reason) {
+                assertFalse(swapped, "more gas never turns a swap into a revert");
+                if (gas > 600_000) assertEq(bytes4(reason), OstraVault.SwapOutOfGas.selector);
+            }
+            vm.revertToState(snapshot);
+        }
+        assertTrue(swapped);
         assertEq(vault.nonce(), 0);
         assertEq(usdg.balanceOf(address(vault)), 100e6);
+        vault.spend(3, next, params, signature);
+        assertEq(vault.nonce(), 1);
+        assertGt(to.balance, 0);
     }
 
     function test_unlockCallbackWorksOnlyInsideTheVaultsOwnSwap() public {
@@ -609,25 +727,20 @@ contract VaultForkTest is Test {
         assertEq(usdg.balanceOf(address(vault)), 100e6);
     }
 
-    function test_ethOutputToARecipientThatRefusesEthReverts() public {
+    function test_ethOutputToARecipientThatRefusesEthFailsTheSwap() public {
         OstraVault vault = _vault(BUYER, address(0));
         OstraVault other = _vault(SELLER, address(0));
         _fund(address(vault), 100e6);
-        // A vault has no receive function, so native ETH cannot be paid to it; the whole spend reverts.
+        // A vault has no receive function, so native ETH cannot be paid to it: the PoolManager's payment fails
+        // (WrappedError, NativeTransferFailed), the swap moves nothing and the spend is used up.
         bytes memory params = _swapParams(_ethUsdg(), false, 10e6, 1, address(other));
         (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CustomRevert.WrappedError.selector,
-                address(other),
-                bytes4(0),
-                "",
-                abi.encodePacked(CurrencyLibrary.NativeTransferFailed.selector)
-            )
-        );
+        vm.expectEmit(address(vault));
+        emit OstraVault.SwapFailed(keccak256(abi.encode(_ethUsdg())), CustomRevert.WrappedError.selector);
         vault.spend(3, next, params, signature);
-        assertEq(vault.nonce(), 0);
+        assertEq(vault.nonce(), 1);
         assertEq(usdg.balanceOf(address(vault)), 100e6);
+        assertEq(address(other).balance, 0);
     }
 
     // ---------------------------------------------------------------------------------------------

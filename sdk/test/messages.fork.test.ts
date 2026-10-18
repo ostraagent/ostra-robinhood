@@ -36,6 +36,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
+import { airdropLeaf, airdropTree } from "../src/airdrop.ts";
 import { CIRCUIT_BREAKER, DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
@@ -66,8 +67,11 @@ import {
   leafMessage,
   openChannelParams,
   poolId,
+  decodeStartAirdropParams,
   recoveryKeyRoot,
   referralHookData,
+  signVaultSetAirdropAmount,
+  signVaultStartAirdrop,
   setCrankParams,
   setGuardianParams,
   setRecoveryPolicyParams,
@@ -208,7 +212,7 @@ test("spend messages are the vault's own, for every action, and decode back", as
     { action: VAULT_ACTION.SET_GUARDIAN, params: setGuardianParams({ guardian: fork.accounts[3]!.address, enabled: true }) },
     { action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams({ threshold: 2, delay: DEFAULT_RECOVERY_DELAY }) },
     { action: VAULT_ACTION.SUPPORT_RECOVERY, params: supportRecoveryParams({ vault: fork.accounts[2]!.address, newKeyRoot: next }) },
-    { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address }) },
+    { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address, swapGas: 600_000n }) },
   ];
   for (const c of cases) {
     const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
@@ -219,16 +223,16 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.deepEqual(decodeTransferParams(cases[0]!.params), { to: fork.accounts[2]!.address, amount: 5n });
   assert.deepEqual(decodeOpenChannelParams(cases[1]!.params), open);
   assert.equal(decodeSetCrankParams(cases[2]!.params), crank.address);
-  assert.deepEqual(decodeSwapParams(cases[4]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address });
+  assert.deepEqual(decodeSwapParams(cases[4]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, swapGas: 1_000_000n });
   assert.deepEqual(decodeConfigurePoolParams(cases[5]!.params), { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.MAX_BUY, value: 5n });
   assert.equal(decodeClaimDividendParams(cases[6]!.params), fork.accounts[2]!.address);
   assert.deepEqual(decodeSetGuardianParams(cases[7]!.params), { guardian: fork.accounts[3]!.address, enabled: true });
   assert.deepEqual(decodeSetRecoveryPolicyParams(cases[8]!.params), { threshold: 2, delay: DEFAULT_RECOVERY_DELAY });
   assert.deepEqual(decodeSupportRecoveryParams(cases[9]!.params), { vault: fork.accounts[2]!.address, newKeyRoot: next });
-  // A Swap with a referrer: 320 bytes, the referrer as the sixth word (the hook's hookData).
-  assert.equal((cases[10]!.params.length - 2) / 2, 320);
-  assert.deepEqual(decodeSwapParams(cases[10]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address });
-  assert.equal(`0x${cases[10]!.params.slice(2 + 288 * 2)}`, referralHookData(fork.accounts[3]!.address));
+  // A Swap with a referrer: the sixth word (the hook's hookData), and its own swap gas.
+  assert.equal((cases[10]!.params.length - 2) / 2, 352);
+  assert.deepEqual(decodeSwapParams(cases[10]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address, swapGas: 600_000n });
+  assert.equal(`0x${cases[10]!.params.slice(2 + 288 * 2, 2 + 320 * 2)}`, referralHookData(fork.accounts[3]!.address));
   // What the vault would refuse, the SDK never signs.
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
   assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
@@ -247,8 +251,9 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => swapParams({ ...swap, amountIn: 1n << 128n }), /amountIn out of range/);
   assert.throws(() => swapParams({ ...swap, recipient: zeroAddress }), /zero address/);
   assert.throws(() => swapParams({ ...swap, referrer: zeroAddress }), /referrer must not be the zero address/);
-  assert.throws(() => decodeSwapParams(`${swapParams(swap)}${"00".repeat(32)}` as Hex), /referrer must not be the zero address/);
-  assert.throws(() => decodeSwapParams(`${swapParams(swap)}${"00".repeat(64)}` as Hex), /288 or 320 bytes/);
+  assert.throws(() => decodeSwapParams(`${swapParams(swap)}${"00".repeat(32)}` as Hex), /352 bytes/);
+  assert.throws(() => swapParams({ ...swap, swapGas: 99_999n }), /swapGas must be/);
+  assert.throws(() => swapParams({ ...swap, swapGas: 10_000_001n }), /swapGas must be/);
   assert.throws(() => referralHookData(zeroAddress), /zero address/);
   const referred = swapParams({ ...swap, referrer: fork.accounts[3]!.address });
   assert.throws(() => decodeSwapParams(`${referred.slice(0, 2 + 288 * 2)}01${referred.slice(2 + 288 * 2 + 2)}` as Hex), /not a clean address word/);
@@ -423,7 +428,9 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const split = await deployArtifact("OstraCreatorSplit.sol", "OstraCreatorSplit", [hook]);
   const dispatcher = await deployArtifact("OstraDispatcher.sol", "OstraDispatcher", [UNISWAP_V4_POOL_MANAGER, hook, WETH, split, relayer.address]);
   const locker = await deployArtifact("OstraLocker.sol", "OstraLocker", [UNISWAP_V4_POOL_MANAGER, launchpad, dispatcher]);
-  await send(hook, hookArt.abi, "initialize", [launchpad, locker, dispatcher]);
+  const devBuy = await deployArtifact("OstraDevBuy.sol", "OstraDevBuy", [UNISWAP_V4_POOL_MANAGER, launchpad]);
+  const airdrop = await deployArtifact("OstraAirdrop.sol", "OstraAirdrop", [hook]);
+  await send(hook, hookArt.abi, "initialize", [launchpad, locker, dispatcher, devBuy, airdrop]);
   await send(launchpad, launchpadArt.abi, "setLocker", [locker]);
 
   // A USDG launch with dividends in USDG, by a creator whose USDG vault the SDK controls.
@@ -488,6 +495,36 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const shareOf = (account: Address) => fork.client.readContract({ address: split, abi: splitArt.abi, functionName: "shareOf", args: [id, account] });
   assert.equal(await shareOf(teammate), 2_500n);
   assert.equal(await shareOf(creatorVault), 7_500n);
+
+  // An airdrop round: the creator vault buys it into OstraAirdrop, the SDK builds the tree for what the round will
+  // hold, the creator vault starts it, and a proof the SDK made is claimed on chain.
+  const airdropArt = artifact("OstraAirdrop.sol", "OstraAirdrop");
+  await fork.dealUsdg(creatorVault, 50_000_000n);
+  const buyState = await readVault(fork.client, d, creatorVault);
+  assert.ok(buyState);
+  const roundBuy = await signVaultSwap(creatorChain, buyState, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { key, zeroForOne: getAddress(key.currency0) === USDG, amountIn: 50_000_000n, minOut: 1n, recipient: airdrop } });
+  await send(creatorVault, ostraVaultAbi, "spend", [roundBuy.action, roundBuy.nextKeyRoot, roundBuy.params, roundBuy.signature]);
+  const roundAmount = (await fork.client.readContract({ address: airdrop, abi: airdropArt.abi, functionName: "available", args: [id] })) as bigint;
+  assert.ok(roundAmount > 0n);
+  const third = roundAmount / 3n;
+  const accounts = ["airdrop-a", "airdrop-b", "airdrop-c"].map((n) => privateKeyToAccount(keccak256(stringToHex(`OSTRA/SDK/TEST/${n}`))).address);
+  const tree = airdropTree(id, 1n, [{ account: accounts[0]!, amount: third }, { account: accounts[1]!, amount: third }, { account: accounts[2]!, amount: roundAmount - 2n * third }]);
+  assert.equal(tree.total, roundAmount);
+  assert.equal(await fork.client.readContract({ address: airdrop, abi: airdropArt.abi, functionName: "leaf", args: [id, 1n, accounts[1], third] }), airdropLeaf(id, 1n, accounts[1]!, third));
+  const amountState = await readVault(fork.client, d, creatorVault);
+  assert.ok(amountState);
+  const setAmount = await signVaultSetAirdropAmount(creatorChain, amountState, { chainId: ROBINHOOD_CHAIN_ID, round: { airdrop, poolId: id, amount: tree.total } });
+  await send(creatorVault, ostraVaultAbi, "spend", [setAmount.action, setAmount.nextKeyRoot, setAmount.params, setAmount.signature]);
+  const startState = await readVault(fork.client, d, creatorVault);
+  assert.ok(startState);
+  const start = await signVaultStartAirdrop(creatorChain, startState, { chainId: ROBINHOOD_CHAIN_ID, start: { airdrop, poolId: id, root: tree.root } });
+  assert.deepEqual(decodeStartAirdropParams(start.params), { airdrop, poolId: id, root: tree.root });
+  await send(creatorVault, ostraVaultAbi, "spend", [start.action, start.nextKeyRoot, start.params, start.signature]);
+  for (const account of accounts) {
+    const c = tree.claims.get(account)!;
+    await send(airdrop, airdropArt.abi, "claim", [id, account, c.amount, c.proof]);
+    assert.equal(await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "balanceOf", args: [account] }), c.amount);
+  }
 
   // A buyer vault swaps USDG into its token vault during the anti-farmer period; the swap pays dividends.
   const buyerChain = await keychain("launch-buyer");

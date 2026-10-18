@@ -36,7 +36,8 @@ uint256 constant OSTRA_MAX_TX_MOVE_TICKS = 6_932;
 /// * the pool's buy or sell tax (at most 10% each; the post-graduation rate after graduation, nothing after the
 ///   tax end), shared among the pool's buckets: creator, holder dividends, burn, added liquidity and the floor bid
 ///   (OstraDispatcher);
-/// * on buys, the anti-snipe tax, falling linearly to zero over its duration, shared like the tax.
+/// * on buys, the anti-snipe tax, falling linearly to zero over its duration, shared like the tax; the creator's
+///   dev buy, made by OstraDevBuy in the launch transaction itself, pays the hook fee and the tax but no anti-snipe.
 /// A swap whose hookData is exactly abi.encode(referrer) pays half of the protocol's share of the hook fee to that
 /// referrer instead (referralOwed, claimed through OstraDispatcher.claimReferral); hookData of any other shape is
 /// ignored.
@@ -171,6 +172,10 @@ contract OstraHook is IHooks, Ownable2Step {
     address public locker;
     /// @notice OstraDispatcher: holds the claims this hook charges and pays them out; its swaps are not charged.
     address public dispatcher;
+    /// @notice OstraDevBuy: launches with the creator's dev buy, whose swap in the launch block pays no anti-snipe.
+    address public devBuy;
+    /// @notice OstraAirdrop: holds the tokens of the creators' airdrop rounds (a system account of every token).
+    address public airdrop;
 
     mapping(PoolId => PoolKey) private _keys;
     mapping(PoolId => PoolConfig) private _configs;
@@ -186,8 +191,10 @@ contract OstraHook is IHooks, Ownable2Step {
     mapping(address referrer => mapping(Currency => uint256)) public referralOwed;
     /// @dev The referrer of the swap being charged (address(0): none), set from its hookData in both callbacks.
     address private transient _referrer;
+    /// @dev The swap being charged is OstraDevBuy's, set in both callbacks.
+    bool private transient _devBuying;
 
-    event Initialized(address launchpad, address locker, address dispatcher);
+    event Initialized(address launchpad, address locker, address dispatcher, address devBuy, address airdrop);
     event PoolRegistered(PoolId indexed poolId, address indexed token, address creatorVault);
     event Charged(
         PoolId indexed poolId, bool buy, uint256 fee, uint256 hookFee, uint256 tax, uint256 antiSnipe
@@ -240,13 +247,18 @@ contract OstraHook is IHooks, Ownable2Step {
         );
     }
 
-    /// @notice Binds the hook to its launchpad, locker and dispatcher, once.
-    function initialize(address launchpad_, address locker_, address dispatcher_) external onlyOwner {
+    /// @notice Binds the hook to its launchpad, locker, dispatcher, dev buy and airdrop contracts, once.
+    function initialize(address launchpad_, address locker_, address dispatcher_, address devBuy_, address airdrop_)
+        external
+        onlyOwner
+    {
         if (launchpad != address(0)) revert AlreadyInitialized();
         launchpad = launchpad_;
         locker = locker_;
         dispatcher = dispatcher_;
-        emit Initialized(launchpad_, locker_, dispatcher_);
+        devBuy = devBuy_;
+        airdrop = airdrop_;
+        emit Initialized(launchpad_, locker_, dispatcher_, devBuy_, airdrop_);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -482,6 +494,7 @@ contract OstraHook is IHooks, Ownable2Step {
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
         _referrer = _referrerOf(hookData);
+        _devBuying = sender == devBuy;
         int128 fee = _beforeSwapFee(key, params);
         uint24 lp = _lpFee(key.toId(), params.zeroForOne, sender);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee, 0), lp | LPFeeLibrary.OVERRIDE_FEE_FLAG);
@@ -515,6 +528,7 @@ contract OstraHook is IHooks, Ownable2Step {
     ) external onlyPoolManager returns (bytes4, int128) {
         if (sender == dispatcher) return (IHooks.afterSwap.selector, 0);
         _referrer = _referrerOf(hookData);
+        _devBuying = sender == devBuy;
         return (IHooks.afterSwap.selector, _afterSwapFee(key, params, delta));
     }
 
@@ -611,7 +625,9 @@ contract OstraHook is IHooks, Ownable2Step {
     {
         bool graduated = _states[id].graduated;
         uint256 tax = _tax(c, graduated, buy);
-        uint256 snipe = buy ? _antiSnipe(c, graduated) : 0;
+        // OstraDevBuy only swaps inside its own launch: the dev buy, in the launch block, pays no anti-snipe.
+        bool devBuyAtLaunch = _devBuying && block.timestamp == c.launchedAt;
+        uint256 snipe = buy && !devBuyAtLaunch ? _antiSnipe(c, graduated) : 0;
         uint256 rate = HOOK_FEE_BPS + tax + snipe;
         fee = onTop ? (amount * rate) / (BPS - rate) : (amount * rate) / BPS;
         if (fee == 0) return 0;

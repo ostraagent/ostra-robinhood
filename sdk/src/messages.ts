@@ -35,6 +35,7 @@ import {
   hexToBytes,
   isAddress,
   keccak256,
+  numberToHex,
   stringToHex,
   zeroAddress,
   type Address,
@@ -42,8 +43,10 @@ import {
 } from "viem";
 import { BEACON_PROXY_CREATION_CODE, ostraVaultAbi } from "./abi.ts";
 import {
+  AIRDROP,
   CIRCUIT_BREAKER,
   CREATOR_SPLIT,
+  VAULT_SWAP_GAS,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
   POOL_SETTING,
@@ -124,15 +127,12 @@ function wotsSignature(value: Uint8Array): Hex {
 
 export type VaultAction = (typeof VAULT_ACTION)[keyof typeof VAULT_ACTION];
 
-/**
- * The params lengths OstraVault._checkParamsShape accepts per action: one per
- * action, but a Swap may carry its referrer as a sixth word (320 bytes).
- */
+/** The params lengths OstraVault._checkParamsShape accepts per action. */
 export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[]>> = {
   [VAULT_ACTION.TRANSFER]: [64],
   [VAULT_ACTION.OPEN_CHANNEL]: [192],
   [VAULT_ACTION.SET_CRANK_KEY]: [32],
-  [VAULT_ACTION.SWAP]: [288, 320],
+  [VAULT_ACTION.SWAP]: [352],
   [VAULT_ACTION.CONFIGURE_POOL]: [128],
   [VAULT_ACTION.CLAIM_DIVIDEND]: [32],
   [VAULT_ACTION.SET_GUARDIAN]: [64],
@@ -243,8 +243,15 @@ const POOL_KEY_TYPE = {
   ],
 } as const;
 
-const SWAP_PARAMS_TYPES = [POOL_KEY_TYPE, { type: "bool" }, { type: "uint128" }, { type: "uint128" }, { type: "address" }] as const;
-const SWAP_REFERRED_PARAMS_TYPES = [...SWAP_PARAMS_TYPES, { type: "address" }] as const;
+const SWAP_PARAMS_TYPES = [
+  POOL_KEY_TYPE,
+  { type: "bool" },
+  { type: "uint128" },
+  { type: "uint128" },
+  { type: "address" },
+  { type: "address" },
+  { type: "uint32" },
+] as const;
 
 /** A key the PoolManager accepts: sorted distinct currencies, a valid fee and a valid tick spacing. */
 function poolKey(k: PoolKey): PoolKey {
@@ -281,38 +288,43 @@ export type SwapParams = {
    * pool pays it half of the protocol's share of the hook fee (REFERRAL).
    */
   referrer?: Address;
+  /**
+   * The gas the swap gets, exactly (VAULT_SWAP_GAS; DEFAULT when left out). A
+   * swap that needs more fails and uses the spend: for a pool other than an
+   * Ostra pool, use a quote's gas with a margin.
+   */
+  swapGas?: bigint;
 };
 
 /**
  * Swap params: abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn,
- * uint128 minOut, address recipient), and with a referrer a sixth word,
- * address referrer (320 bytes).
+ * uint128 minOut, address recipient, address referrer, uint32 swapGas), 352
+ * bytes; referrer address(0) for none.
  */
 export function swapParams(p: SwapParams): Hex {
   if (typeof p.zeroForOne !== "boolean") throw new RangeError("zeroForOne must be a boolean");
-  const fields = [
+  const swapGas = p.swapGas ?? BigInt(VAULT_SWAP_GAS.DEFAULT);
+  if (swapGas < BigInt(VAULT_SWAP_GAS.MIN) || swapGas > BigInt(VAULT_SWAP_GAS.MAX)) {
+    throw new RangeError(`swapGas must be ${VAULT_SWAP_GAS.MIN}..${VAULT_SWAP_GAS.MAX}`);
+  }
+  return encodeAbiParameters(SWAP_PARAMS_TYPES, [
     poolKey(p.key),
     p.zeroForOne,
     positive(p.amountIn, U128_MAX, "amountIn"),
     uint(p.minOut, U128_MAX, "minOut"),
     nonZeroAddr(p.recipient, "recipient"),
-  ] as const;
-  if (p.referrer === undefined) return encodeAbiParameters(SWAP_PARAMS_TYPES, fields);
-  return encodeAbiParameters(SWAP_REFERRED_PARAMS_TYPES, [...fields, nonZeroAddr(p.referrer, "referrer")]);
+    p.referrer === undefined ? zeroAddress : nonZeroAddr(p.referrer, "referrer"),
+    Number(swapGas),
+  ]);
 }
 
 export function decodeSwapParams(params: Hex): SwapParams {
-  const len = (paramsFor(VAULT_ACTION.SWAP, params).length - 2) / 2;
-  let p: SwapParams;
-  if (len === 288) {
-    const [key, zeroForOne, amountIn, minOut, recipient] = decodeAbiParameters(SWAP_PARAMS_TYPES, params);
-    p = { key: { ...key }, zeroForOne, amountIn, minOut, recipient };
-  } else {
-    // The vault decodes the referrer word as an address and reverts on dirty upper bytes; viem drops them.
-    if (!/^0{24}$/.test(params.slice(2 + 288 * 2, 2 + 288 * 2 + 24))) throw new RangeError("referrer is not a clean address word");
-    const [key, zeroForOne, amountIn, minOut, recipient, referrer] = decodeAbiParameters(SWAP_REFERRED_PARAMS_TYPES, params);
-    p = { key: { ...key }, zeroForOne, amountIn, minOut, recipient, referrer };
-  }
+  paramsFor(VAULT_ACTION.SWAP, params);
+  // The vault decodes the referrer word as an address and reverts on dirty upper bytes; viem drops them.
+  if (!/^0{24}$/.test(params.slice(2 + 288 * 2, 2 + 288 * 2 + 24))) throw new RangeError("referrer is not a clean address word");
+  const [key, zeroForOne, amountIn, minOut, recipient, referrer, swapGas] = decodeAbiParameters(SWAP_PARAMS_TYPES, params);
+  const p: SwapParams = { key: { ...key }, zeroForOne, amountIn, minOut, recipient, swapGas: BigInt(swapGas) };
+  if (referrer !== zeroAddress) p.referrer = referrer;
   // viem does not range-check the other words either (dirty upper bytes in an address or a uint128) while the vault's
   // abi.decode reverts on them: the params must be exactly what swapParams encodes for what they decode to.
   if (swapParams(p).toLowerCase() !== params.toLowerCase()) throw new RangeError("swap params are not canonically encoded");
@@ -553,6 +565,43 @@ export async function signVaultSwap(keychain: WotsKeychain, state: VaultKeyState
 
 export function signVaultConfigurePool(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; configure: ConfigurePoolParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams(a.configure) });
+}
+
+/**
+ * An airdrop round's two ConfigurePool spends, whose `hook` is the OstraAirdrop
+ * contract: first its amount (the tree's total, airdropRoundAmountParams), then
+ * its start with the tree's root (startAirdropParams), so the vault calls
+ * airdrop.configure(poolId, AIRDROP.FIELD_ROUND_AMOUNT, amount) and
+ * airdrop.configure(poolId, AIRDROP.FIELD_START_ROUND, uint256(root)). Only the
+ * pool's creator vault, only while no round is open, and the start only while
+ * OstraAirdrop.available covers the amount.
+ */
+export type AirdropRoundAmountParams = { airdrop: Address; poolId: Hex; amount: bigint };
+
+export function airdropRoundAmountParams(p: AirdropRoundAmountParams): Hex {
+  return encodeAbiParameters(CONFIGURE_POOL_TYPES, [nonZeroAddr(p.airdrop, "airdrop"), bytes32(p.poolId, "poolId"), AIRDROP.FIELD_ROUND_AMOUNT, positive(p.amount, U256_MAX, "amount")]);
+}
+
+export function signVaultSetAirdropAmount(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; round: AirdropRoundAmountParams }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: airdropRoundAmountParams(a.round) });
+}
+
+export type StartAirdropParams = { airdrop: Address; poolId: Hex; root: Hex };
+
+export function startAirdropParams(p: StartAirdropParams): Hex {
+  const root = bytes32(p.root, "root");
+  if (BigInt(root) === 0n) throw new RangeError("root must not be zero");
+  return encodeAbiParameters(CONFIGURE_POOL_TYPES, [nonZeroAddr(p.airdrop, "airdrop"), bytes32(p.poolId, "poolId"), AIRDROP.FIELD_START_ROUND, BigInt(root)]);
+}
+
+export function decodeStartAirdropParams(params: Hex): StartAirdropParams {
+  const [airdrop, poolId, field, value] = decodeAbiParameters(CONFIGURE_POOL_TYPES, paramsFor(VAULT_ACTION.CONFIGURE_POOL, params));
+  if (field !== AIRDROP.FIELD_START_ROUND || value === 0n) throw new RangeError("not an airdrop round start");
+  return { airdrop, poolId, root: numberToHex(value, { size: 32 }) };
+}
+
+export function signVaultStartAirdrop(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; start: StartAirdropParams }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: startAirdropParams(a.start) });
 }
 
 export function signVaultSetCreatorShare(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; share: CreatorShareParams }): Promise<SignedSpend> {

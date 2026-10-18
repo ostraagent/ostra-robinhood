@@ -14,7 +14,11 @@ Contents:
   x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
   vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
   Uniswap v4 pool of the deployed PoolManager, with the vault itself as the swapper (what the pool's
-  hook sees); the output goes to the signed recipient, such as another vault. ConfigurePool is a
+  hook sees); the output goes to the signed recipient, such as another vault, with an optional
+  referrer as the hook's hookData and a signed gas for the swap, which it gets exactly. A swap that
+  fails inside the PoolManager (below its minimum, refused by the pool's hook or a token, or out of
+  its signed gas) moves nothing but uses the spend (`SwapFailed`), so the one-time key is never held
+  by a swap the market moved; a spend sent from inside another unlock reverts. ConfigurePool is a
   launch creator's change to its pool's rules (`OstraHook.configure`); ClaimDividend claims an
   `OstraToken`'s dividends owed to the vault, to the signed recipient (the owner's vault for the
   dividend token). A vault whose seed is lost is recovered by its guardians (other vaults): once the
@@ -49,9 +53,16 @@ Contents:
   refuses a swap that leaves the price further from where it was before the transaction's first
   swap, however the transaction splits it, or where the pool has no liquidity; a dispatch in the
   same transaction stops at its band. A swap whose hookData is `abi.encode(referrer)` (an OstraVault
-  Swap carries it as an optional sixth word) pays that referrer half of the protocol's share of the
+  Swap carries it as its referrer word) pays that referrer half of the protocol's share of the
   hook fee (0.15% of the quote leg), which anyone can pay out to it with
-  `OstraDispatcher.claimReferral`. A pool's quote is ETH or any ERC-20, a
+  `OstraDispatcher.claimReferral`. `OstraDevBuy` launches with the creator's dev buy in the same
+  transaction (the hook fee, the tax, the max buy, the max wallet and the circuit breaker apply, the
+  anti-snipe tax does not), at most 5% of the supply, into an `OstraVesting` clone that pays the
+  creator's token vault after a 7 to 365 day cliff, linearly over up to 365 days, and earns the
+  pool's dividends for the creator meanwhile. `OstraAirdrop` runs the creator's airdrop rounds: the
+  creator vault buys the tokens into it, sets a round's amount (at most 10% of the supply) and starts
+  it with a merkle root; anyone claims for an account for 7 days, then anyone closes the round and
+  what was not claimed is burned; one round at a time. A pool's quote is ETH or any ERC-20, a
   stock token among them; dividends in another ERC-20 are bought in an existing hookless pool or
   a launched Ostra pool. The LP fee is set per swap by `OstraFees`: 0.25%; 0.50% in a pool quoted
   in a Robinhood stock token while the NYSE is closed (weekends and the NYSE holidays of 2026 to

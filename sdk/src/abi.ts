@@ -179,6 +179,19 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "MAX_SWAP_GAS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MIN_RECOVERY_DELAY",
     "inputs": [],
     "outputs": [
@@ -186,6 +199,19 @@ export const ostraVaultAbi = [
         "name": "",
         "type": "uint32",
         "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_SWAP_GAS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "view"
@@ -1126,6 +1152,25 @@ export const ostraVaultAbi = [
   },
   {
     "type": "event",
+    "name": "SwapFailed",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "reason",
+        "type": "bytes4",
+        "indexed": false,
+        "internalType": "bytes4"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Swapped",
     "inputs": [
       {
@@ -1260,6 +1305,11 @@ export const ostraVaultAbi = [
   },
   {
     "type": "error",
+    "name": "PoolManagerUnlocked",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "RecoveryNotReady",
     "inputs": []
   },
@@ -1294,6 +1344,11 @@ export const ostraVaultAbi = [
         "internalType": "string"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "SwapOutOfGas",
+    "inputs": []
   },
   {
     "type": "error",

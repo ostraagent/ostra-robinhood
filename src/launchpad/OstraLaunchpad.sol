@@ -144,6 +144,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
             locker: address(locker),
             launchpad: address(this),
             dispatcher: HOOK.dispatcher(),
+            airdrop: HOOK.airdrop(),
             maxWallet: p.maxWallet,
             limitsDuration: p.limitsDuration,
             antiFarmerDuration: p.antiFarmerDuration,

@@ -12,8 +12,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///         because a Uniswap v4 hook only sees the router, never the wallet that ends up holding the tokens:
 /// * Max wallet: until the pool graduates (OstraHook calls releaseLimits) or LIMITS_END_AT, whichever is first,
 ///   no holder may end a transfer above MAX_WALLET. The PoolManager, the hook, the locker, the launchpad, the
-///   dispatcher, this contract and the dead address are the only accounts the rule does not apply to; there is no
-///   other list.
+///   dispatcher, the airdrop contract (OstraAirdrop, holding the creators' airdrop rounds), this contract and the
+///   dead address are the only accounts the rule does not apply to; there is no other list.
 /// * Anti-farmer: until ANTI_FARMER_END_AT the token enters the Uniswap v4 PoolManager only to pay what a swap in
 ///   the token's Ostra pool owes (OstraHook credits that exact amount) or from the hook, the locker and the
 ///   dispatcher, and it enters no pool of the Uniswap v2 or v3 kind (a contract whose token0() or token1() is
@@ -36,6 +36,8 @@ contract OstraToken is ERC20Burnable {
         address launchpad;
         /// @notice OstraDispatcher: distributes the dividends and settles the liquidity it adds.
         address dispatcher;
+        /// @notice OstraAirdrop: holds airdrop rounds for their recipients; no max wallet and no dividend shares.
+        address airdrop;
         uint256 maxWallet;
         /// @notice From the deployment block (so the token's CREATE2 address does not depend on the block).
         uint32 limitsDuration;
@@ -52,6 +54,7 @@ contract OstraToken is ERC20Burnable {
     address public immutable LOCKER;
     address public immutable LAUNCHPAD;
     address public immutable DISPATCHER;
+    address public immutable AIRDROP;
     /// @notice 0 = no max wallet.
     uint256 public immutable MAX_WALLET;
     uint40 public immutable LIMITS_END_AT;
@@ -94,6 +97,7 @@ contract OstraToken is ERC20Burnable {
         LOCKER = s.locker;
         LAUNCHPAD = s.launchpad;
         DISPATCHER = s.dispatcher;
+        AIRDROP = s.airdrop;
         MAX_WALLET = s.maxWallet;
         LIMITS_END_AT = uint40(block.timestamp) + s.limitsDuration;
         ANTI_FARMER_END_AT = uint40(block.timestamp) + s.antiFarmerDuration;
@@ -162,7 +166,8 @@ contract OstraToken is ERC20Burnable {
     /// @notice True for the accounts the max wallet and dividend shares never apply to.
     function isSystemAccount(address account) public view returns (bool) {
         return account == POOL_MANAGER || account == HOOK || account == LOCKER || account == LAUNCHPAD
-            || account == DISPATCHER || account == address(this) || account == DEAD || account == address(0);
+            || account == DISPATCHER || account == AIRDROP || account == address(this) || account == DEAD
+            || account == address(0);
     }
 
     // ---------------------------------------------------------------------------------------------

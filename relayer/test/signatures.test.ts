@@ -190,14 +190,14 @@ test("only Ostra WOTS calls are claims, and a malformed one is refused", async (
   }
 });
 
-test("spend Swap with a referrer (320 bytes of params): a claim escrowed like any spend", async () => {
+test("spend Swap with a referrer: a claim escrowed like any spend", async () => {
   const k = await keychain();
   try {
     const nonce = 5n;
     const state = vaultState(k.keys, nonce);
     const key = { currency0: at(0), currency1: d.token, fee: 0x800000, tickSpacing: 200, hooks: at(0x28cc) };
     const s = await signVaultSwap(k.keys, { vault, nonce, keyRoot: state.keyRoot }, { chainId: CHAIN, token: d.token, swap: { key, zeroForOne: false, amountIn: 10n, minOut: 1n, recipient: destination, referrer: at(0xaa03) } });
-    assert.equal((s.params.length - 2) / 2, 320);
+    assert.equal((s.params.length - 2) / 2, 352);
     const [claim] = claimsOf([spendCall(vault, s)]);
     assert.ok(claim !== undefined && claim.kind === "vault");
     assert.equal(claim.params, s.params);
@@ -206,7 +206,7 @@ test("spend Swap with a referrer (320 bytes of params): a claim escrowed like an
     const dirty = `${s.params.slice(0, 2 + 288 * 2)}01${s.params.slice(2 + 288 * 2 + 2)}` as Hex;
     assert.throws(() => claimsOf([spendCall(vault, { ...s, params: dirty })]), /referrer is not a clean address word/);
     // Any other length is still refused for a Swap.
-    assert.throws(() => claimsOf([spendCall(vault, { ...s, params: `${s.params}${"00".repeat(32)}` as Hex })]), /params must be 288 or 320 bytes/);
+    assert.throws(() => claimsOf([spendCall(vault, { ...s, params: `${s.params}${"00".repeat(32)}` as Hex })]), /params must be 352 bytes/);
   } finally {
     await k.done();
   }

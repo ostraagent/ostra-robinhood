@@ -18,13 +18,16 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 import {OstraVault} from "../src/OstraVault.sol";
 import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
+import {OstraAirdrop} from "../src/launchpad/OstraAirdrop.sol";
 import {OstraCreatorSplit} from "../src/launchpad/OstraCreatorSplit.sol";
+import {OstraDevBuy} from "../src/launchpad/OstraDevBuy.sol";
 import {OstraDispatcher} from "../src/launchpad/OstraDispatcher.sol";
 import {OstraFees} from "../src/launchpad/OstraFees.sol";
 import {OstraHook} from "../src/launchpad/OstraHook.sol";
 import {OstraLaunchpad} from "../src/launchpad/OstraLaunchpad.sol";
 import {OstraLocker} from "../src/launchpad/OstraLocker.sol";
 import {OstraToken} from "../src/launchpad/OstraToken.sol";
+import {OstraVesting} from "../src/launchpad/OstraVesting.sol";
 import {TestSwapRouter} from "./utils/TestSwapRouter.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 
@@ -139,6 +142,8 @@ contract LaunchpadForkTest is Test {
     OstraDispatcher internal dispatcher;
     OstraLocker internal locker;
     OstraLaunchpad internal launchpad;
+    OstraDevBuy internal devBuy;
+    OstraAirdrop internal airdrop;
     TestSwapRouter internal router;
 
     bytes32 internal constant MASTER = keccak256("OSTRA/EVM/TEST/master");
@@ -172,7 +177,9 @@ contract LaunchpadForkTest is Test {
         split = new OstraCreatorSplit(address(hook));
         dispatcher = new OstraDispatcher(POOL_MANAGER, address(hook), WETH, address(split), address(this));
         locker = new OstraLocker(POOL_MANAGER, address(launchpad), address(dispatcher));
-        hook.initialize(address(launchpad), address(locker), address(dispatcher));
+        devBuy = new OstraDevBuy(POOL_MANAGER, address(launchpad));
+        airdrop = new OstraAirdrop(address(hook));
+        hook.initialize(address(launchpad), address(locker), address(dispatcher), address(devBuy), address(airdrop));
         launchpad.setLocker(address(locker));
         router = new TestSwapRouter(POOL_MANAGER);
     }
@@ -596,7 +603,7 @@ contract LaunchpadForkTest is Test {
         OstraVault buyer = _vault(USDG, BUYER);
         OstraVault bunker = _vault(address(token), BUYER_TOKEN);
         deal(USDG, address(buyer), 100e6);
-        bytes memory params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(bunker));
+        bytes memory params = _swapParams(key, !tokenIs0, 20e6, 1, address(bunker));
         bytes32 next = WotsSigner.keyRoot(_seed(BUYER, 1));
         bytes memory signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
         uint256 g = gasleft();
@@ -780,6 +787,15 @@ contract LaunchpadForkTest is Test {
     // Creator settings and vault dividends
     // ---------------------------------------------------------------------------------------------
 
+    /// @dev OstraVault Swap params without a referrer, with 1M gas for the swap.
+    function _swapParams(PoolKey memory key, bool zeroForOne, uint128 amountIn, uint128 minOut, address recipient)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(key, zeroForOne, amountIn, minOut, recipient, address(0), uint32(1_000_000));
+    }
+
     function _configure(OstraVault creatorVault, PoolId id, uint8 field, uint256 value) internal {
         _spend(creatorVault, CREATOR, 4, abi.encode(address(hook), PoolId.unwrap(id), field, value));
     }
@@ -859,7 +875,7 @@ contract LaunchpadForkTest is Test {
         OstraVault buyer = _vault(USDG, BUYER);
         OstraVault bunker = _vault(address(token), BUYER_TOKEN);
         deal(USDG, address(buyer), 100e6);
-        _spend(buyer, BUYER, 3, abi.encode(key, Currency.unwrap(key.currency0) != address(token), uint128(20e6), uint128(1), address(bunker)));
+        _spend(buyer, BUYER, 3, _swapParams(key, Currency.unwrap(key.currency0) != address(token), 20e6, 1, address(bunker)));
         assertGe(token.balanceOf(address(bunker)), token.MIN_DIVIDEND_BALANCE());
 
         // Nothing owed yet: the signed claim reverts and keeps its key, to be sent again later.
@@ -1137,16 +1153,16 @@ contract LaunchpadForkTest is Test {
         OstraVault bunker = _vault(address(token), BUYER_TOKEN);
         deal(USDG, address(buyer), 100e6);
         vm.prank(relayer, relayer);
-        _spend(buyer, BUYER, 3, abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(bunker)));
+        _spend(buyer, BUYER, 3, _swapParams(key, !tokenIs0, 20e6, 1, address(bunker)));
         vm.warp(block.timestamp + 1);
         vm.recordLogs();
         vm.prank(relayer, relayer);
-        _spend(buyer, BUYER, 3, abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(bunker)));
+        _spend(buyer, BUYER, 3, _swapParams(key, !tokenIs0, 20e6, 1, address(bunker)));
         assertEq(_swapFee(), 2_500);
         uint128 sell = uint128(token.balanceOf(address(bunker)) / 4);
         vm.recordLogs();
         vm.prank(relayer, relayer);
-        _spend(bunker, BUYER_TOKEN, 3, abi.encode(key, tokenIs0, sell, uint128(1), address(buyer)));
+        _spend(bunker, BUYER_TOKEN, 3, _swapParams(key, tokenIs0, sell, 1, address(buyer)));
         assertEq(_swapFee(), 2_500);
     }
 
@@ -1748,18 +1764,20 @@ contract LaunchpadForkTest is Test {
         address referrer = makeAddr("agent referrer");
         bytes32 next = WotsSigner.keyRoot(_seed(BUYER, 1));
 
-        // A zero referrer, or a seventh word, is refused before anything moves.
-        bytes memory params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), address(0));
+        // A referrer word with dirty upper bytes, or an eighth word, is refused before anything moves.
+        bytes memory params =
+            abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), uint256(uint160(referrer)) | (1 << 160), uint32(1_000_000));
         bytes memory signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
-        vm.expectRevert(OstraVault.BadParams.selector);
+        vm.expectRevert();
         buyer.spend(3, next, params, signature);
-        params = abi.encodePacked(abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer), bytes32(0));
+        params = abi.encodePacked(abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer, uint32(1_000_000)), bytes32(0));
         signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
         vm.expectRevert(OstraVault.BadParams.selector);
         buyer.spend(3, next, params, signature);
+        assertEq(buyer.nonce(), 0);
 
-        params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer);
-        assertEq(params.length, 320);
+        params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer, uint32(1_000_000));
+        assertEq(params.length, 352);
         signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
         uint256 shares = _protocolShares(Currency.wrap(USDG));
         vm.recordLogs();
@@ -1814,5 +1832,362 @@ contract LaunchpadForkTest is Test {
         assertGt(moved, 800);
         assertLe(moved, 1_000);
         assertGt(hook.pending(id).burn + hook.pending(id).lp, 0, "what did not fit waits for the next dispatch");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Dev buy and vesting
+    // ---------------------------------------------------------------------------------------------
+
+    bytes32 internal constant CREATOR_TOKEN = keccak256("OSTRA/EVM/TEST/creator-token-vault");
+
+    function _dev(uint256 quoteIn, address beneficiary, address dividendRecipient)
+        internal
+        pure
+        returns (OstraDevBuy.DevBuy memory)
+    {
+        return OstraDevBuy.DevBuy({
+            quoteIn: quoteIn,
+            beneficiary: beneficiary,
+            dividendRecipient: dividendRecipient,
+            cliff: 7 days,
+            duration: 30 days
+        });
+    }
+
+    /// @dev The Charged event of the hook in the recorded logs: fee, tax and anti-snipe of the last one.
+    function _lastCharge() internal returns (uint256 fee, uint256 tax, uint256 snipe) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == OstraHook.Charged.selector) {
+                (, fee,, tax, snipe) = abi.decode(logs[i].data, (bool, uint256, uint256, uint256, uint256));
+            }
+        }
+    }
+
+    function test_aDevBuyIsMadeAtLaunchWithoutAntiSnipeAndVestsToTheCreatorsTokenVault() public {
+        (address token, PoolId id, address vesting, address tokenVault) = _launchWithDevBuy();
+        // While it vests, the dev buy earns dividends (in the token here) like any holder; anyone claims them to
+        // the creator's vault for the dividend token.
+        _dividendsReachTheVesting(id, OstraToken(token), vesting, tokenVault);
+        _vestsLinearlyAfterTheCliff(token, vesting, tokenVault);
+        // The creator's token vault, created at its predicted address, spends them with its own key.
+        assertEq(factory.createVault(token, WotsSigner.keyRoot(_seed(CREATOR_TOKEN, 0)), address(0)), tokenVault);
+        _spend(OstraVault(tokenVault), CREATOR_TOKEN, 0, abi.encode(makeAddr("out"), uint256(1e18)));
+        assertEq(IERC20(token).balanceOf(makeAddr("out")), 1e18);
+    }
+
+    function _launchWithDevBuy() internal returns (address token, PoolId id, address vesting, address tokenVault) {
+        OstraVault creatorVault = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(creatorVault), -375_400, bytes32(uint256(50)));
+        // The creator's token vault does not exist yet: its address follows from the token's, known before launch.
+        token = devBuy.tokenAddress(address(this), p);
+        tokenVault = factory.vaultAddress(token, WotsSigner.keyRoot(_seed(CREATOR_TOKEN, 0)), address(0));
+        deal(USDG, address(this), 100e6);
+        IERC20(USDG).approve(address(devBuy), 100e6);
+        vm.recordLogs();
+        uint256 g = gasleft();
+        address t;
+        (t, id, vesting) = devBuy.launch{value: launchpad.LAUNCH_FEE()}(p, _dev(100e6, tokenVault, tokenVault));
+        console.log("gas launch with a dev buy", g - gasleft());
+        assertEq(t, token);
+        // 100 USDG at a 3% buy tax: a 1 USDG hook fee and 3 USDG of tax, but no anti-snipe, which is at 50% now.
+        (uint256 fee, uint256 tax, uint256 snipe) = _lastCharge();
+        assertEq(fee, 4e6);
+        assertEq(tax, 3e6);
+        assertEq(snipe, 0);
+        (,, uint256 antiSnipeNow) = hook.rates(id);
+        assertEq(antiSnipeNow, 5_000);
+        assertGt(IERC20(token).balanceOf(vesting), 0);
+        assertEq(IERC20(USDG).balanceOf(address(this)), 0);
+        OstraVesting.Terms memory terms = OstraVesting(vesting).terms();
+        assertEq(terms.token, token);
+        assertEq(terms.beneficiary, tokenVault);
+        assertEq(terms.start, block.timestamp);
+        assertEq(terms.cliff, 7 days);
+        assertEq(terms.duration, 30 days);
+    }
+
+    /// @dev Nothing before the cliff ends, then linearly over 30 days, to the creator's token vault only.
+    function _vestsLinearlyAfterTheCliff(address token, address vesting, address tokenVault) internal {
+        OstraVesting.Terms memory terms = OstraVesting(vesting).terms();
+        uint256 bought = IERC20(token).balanceOf(vesting);
+        // The vault already holds the dividends it was paid in the token.
+        uint256 before = IERC20(token).balanceOf(tokenVault);
+        vm.expectRevert(OstraVesting.NothingVested.selector);
+        OstraVesting(vesting).release();
+        vm.warp(uint256(terms.start) + 7 days);
+        vm.expectRevert(OstraVesting.NothingVested.selector);
+        OstraVesting(vesting).release();
+        vm.warp(uint256(terms.start) + 7 days + 15 days);
+        vm.prank(makeAddr("anyone"));
+        OstraVesting(vesting).release();
+        assertEq(IERC20(token).balanceOf(tokenVault) - before, bought / 2);
+        vm.warp(uint256(terms.start) + 37 days);
+        OstraVesting(vesting).release();
+        assertEq(IERC20(token).balanceOf(tokenVault) - before, bought);
+        assertEq(IERC20(token).balanceOf(vesting), 0);
+    }
+
+    function _dividendsReachTheVesting(PoolId id, OstraToken token, address vesting, address recipient) internal {
+        PoolKey memory key = hook.poolKey(id);
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 1_000e6);
+        router.swap(key, !tokenIs0, -200e6, address(router));
+        router.swap(key, tokenIs0, -1_000_000e18, address(router));
+        dispatcher.dispatch(id);
+        uint256 owed = token.dividendOf(vesting);
+        assertGt(owed, 0);
+        uint256 before = token.balanceOf(recipient);
+        vm.prank(makeAddr("anyone"));
+        OstraVesting(vesting).claimDividends();
+        assertEq(token.balanceOf(recipient) - before, owed);
+    }
+
+    function test_aDevBuyStaysInItsBounds() public {
+        OstraVault creatorVault = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(creatorVault), -375_400, bytes32(uint256(51)));
+        uint256 fee = launchpad.LAUNCH_FEE();
+        address beneficiary = makeAddr("creator token vault");
+        deal(USDG, address(this), 10_000e6);
+        IERC20(USDG).approve(address(devBuy), type(uint256).max);
+        OstraDevBuy.DevBuy memory d = _dev(100e6, beneficiary, address(creatorVault));
+
+        d.cliff = 7 days - 1;
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "cliff"));
+        devBuy.launch{value: fee}(p, d);
+        d.cliff = 365 days + 1;
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "cliff"));
+        devBuy.launch{value: fee}(p, d);
+        d.cliff = 7 days;
+        d.duration = 365 days + 1;
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "duration"));
+        devBuy.launch{value: fee}(p, d);
+        d.duration = 0;
+        d.dividendRecipient = address(0);
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "dividendRecipient"));
+        devBuy.launch{value: fee}(p, d);
+        d.dividendRecipient = address(creatorVault);
+        d.beneficiary = address(0);
+        vm.expectRevert(abi.encodeWithSelector(OstraDevBuy.BadDevBuy.selector, "beneficiary"));
+        devBuy.launch{value: fee}(p, d);
+        d.beneficiary = beneficiary;
+        vm.expectRevert(OstraDevBuy.WrongValue.selector);
+        devBuy.launch{value: fee + 1}(p, d);
+        // The pool's max buy (10M tokens) binds the dev buy: 1,000 USDG buys about 20M.
+        d.quoteIn = 1_000e6;
+        vm.expectRevert();
+        devBuy.launch{value: fee}(p, d);
+        // Without a max buy or max wallet, the dev buy is still at most 5% of the supply.
+        p.maxBuy = 0;
+        p.maxWallet = 0;
+        d.quoteIn = 5_000e6;
+        vm.expectRevert(OstraDevBuy.DevBuyTooLarge.selector);
+        devBuy.launch{value: fee}(p, d);
+
+        // The launch salt is bound to the launching account: the same parameters from anyone else make another token.
+        assertTrue(devBuy.tokenAddress(address(this), p) != devBuy.tokenAddress(makeAddr("front-runner"), p));
+        // A dev buy with no vesting after the cliff: all of it at the cliff's end.
+        d.quoteIn = 100e6;
+        (address token,, address vesting) = devBuy.launch{value: fee}(p, d);
+        assertEq(token, devBuy.tokenAddress(address(this), p));
+        uint256 bought = IERC20(token).balanceOf(vesting);
+        vm.warp(block.timestamp + 7 days);
+        OstraVesting(vesting).release();
+        assertEq(IERC20(token).balanceOf(beneficiary), bought);
+    }
+
+    function test_anEthPoolsDevBuyIsPaidInEth() public {
+        OstraVault wethVault = _vault(WETH, CREATOR_WETH);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(address(0)), address(wethVault), -168_200, bytes32(uint256(52)));
+        p.dividendToken = WETH;
+        p.graduationThreshold = 1 ether;
+        uint256 fee = launchpad.LAUNCH_FEE();
+        OstraDevBuy.DevBuy memory d = _dev(0.001 ether, makeAddr("creator token vault"), address(wethVault));
+        vm.expectRevert(OstraDevBuy.WrongValue.selector);
+        devBuy.launch{value: fee}(p, d);
+        uint256 eth = address(this).balance;
+        (address token,, address vesting) = devBuy.launch{value: fee + 0.001 ether}(p, d);
+        assertEq(eth - address(this).balance, fee + 0.001 ether);
+        assertGt(IERC20(token).balanceOf(vesting), 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Airdrop
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev OpenZeppelin's commutative pair hash (MerkleProof).
+    function _pair(bytes32 a, bytes32 b) internal pure returns (bytes32) {
+        return a < b ? keccak256(abi.encodePacked(a, b)) : keccak256(abi.encodePacked(b, a));
+    }
+
+    /// @dev A four-leaf round: the root and each leaf's proof.
+    function _tree(PoolId id, uint256 number, address[4] memory accounts, uint256[4] memory amounts)
+        internal
+        view
+        returns (bytes32 root, bytes32[][] memory proofs)
+    {
+        bytes32[4] memory l;
+        for (uint256 i = 0; i < 4; ++i) {
+            l[i] = airdrop.leaf(id, number, accounts[i], amounts[i]);
+        }
+        bytes32 left = _pair(l[0], l[1]);
+        bytes32 right = _pair(l[2], l[3]);
+        root = _pair(left, right);
+        proofs = new bytes32[][](4);
+        for (uint256 i = 0; i < 4; ++i) {
+            proofs[i] = new bytes32[](2);
+            proofs[i][0] = l[i ^ 1];
+            proofs[i][1] = i < 2 ? right : left;
+        }
+    }
+
+    /// @dev The creator vault's two spends: the round's amount, then its root.
+    function _startRound(OstraVault creatorVault, PoolId id, uint256 amount, bytes32 root) internal {
+        _spend(creatorVault, CREATOR, 4, abi.encode(address(airdrop), PoolId.unwrap(id), uint8(1), amount));
+        _spend(creatorVault, CREATOR, 4, abi.encode(address(airdrop), PoolId.unwrap(id), uint8(0), uint256(root)));
+    }
+
+    struct Drop {
+        OstraToken token;
+        PoolKey key;
+        PoolId id;
+        bool tokenIs0;
+        OstraVault creatorVault;
+        uint256 held;
+        uint256 total;
+        address[4] accounts;
+        uint256[4] amounts;
+        bytes32 root;
+        bytes32[][] proofs;
+    }
+
+    function test_anAirdropRoundIsBoughtByTheCreatorClaimedForSevenDaysAndTheRestBurned() public {
+        Drop memory a = _fundAirdrop();
+        _startFirstRound(a);
+        _claimFirstRound(a);
+        _closeFirstRound(a);
+        // What the first round did not take waits for the next one, whose leaves are round 2's: round 1's proofs do
+        // not carry over.
+        assertEq(airdrop.available(a.id), a.held - a.total);
+        _startRound(a.creatorVault, a.id, a.held - a.total, a.root);
+        assertEq(airdrop.round(a.id).number, 2);
+        vm.expectRevert(OstraAirdrop.BadProof.selector);
+        airdrop.claim(a.id, a.accounts[2], a.amounts[2], a.proofs[2]);
+    }
+
+    function _fundAirdrop() internal returns (Drop memory a) {
+        (a.token, a.key, a.creatorVault) = _launchUsdg(bytes32(uint256(53)));
+        a.id = a.key.toId();
+        a.tokenIs0 = Currency.unwrap(a.key.currency0) == address(a.token);
+        vm.warp(block.timestamp + 601);
+        // No round without its amount, nor with more than is held.
+        _configureAirdropReverts(a, 0, 1, OstraAirdrop.NoRoundAmount.selector);
+        _spend(a.creatorVault, CREATOR, 4, abi.encode(address(airdrop), PoolId.unwrap(a.id), uint8(1), uint256(1e18)));
+        assertEq(airdrop.nextRoundAmount(a.id), 1e18);
+        _configureAirdropReverts(a, 0, 1, OstraAirdrop.NotEnoughTokens.selector);
+        // The creator vault buys the round with its own USDG, straight into the airdrop contract.
+        deal(USDG, address(a.creatorVault), 100e6);
+        _spend(a.creatorVault, CREATOR, 3, _swapParams(a.key, !a.tokenIs0, 100e6, 1, address(airdrop)));
+        a.held = a.token.balanceOf(address(airdrop));
+        assertGt(a.held, 0);
+        assertEq(airdrop.available(a.id), a.held);
+        assertEq(a.token.dividendSharesOf(address(airdrop)), 0, "a system account: no dividend shares");
+        a.accounts = [makeAddr("a"), makeAddr("b"), makeAddr("c"), makeAddr("d")];
+        a.amounts = [a.held / 4, a.held / 4, a.held / 4, a.held / 8];
+        a.total = a.amounts[0] + a.amounts[1] + a.amounts[2] + a.amounts[3];
+        (a.root, a.proofs) = _tree(a.id, 1, a.accounts, a.amounts);
+    }
+
+    function _configureAirdropReverts(Drop memory a, uint8 field, uint256 value, bytes4 err) internal {
+        uint64 n = a.creatorVault.nonce();
+        bytes memory params = abi.encode(address(airdrop), PoolId.unwrap(a.id), field, value);
+        bytes32 next = WotsSigner.keyRoot(_seed(CREATOR, n + 1));
+        bytes memory signature = WotsSigner.sign(_seed(CREATOR, n), a.creatorVault.spendMessage(4, next, params));
+        vm.expectRevert(err);
+        a.creatorVault.spend(4, next, params, signature);
+    }
+
+    function _startFirstRound(Drop memory a) internal {
+        // Only the pool's creator vault sets a round, with known fields, an amount within 10% and a root.
+        vm.expectRevert(OstraAirdrop.OnlyCreatorVault.selector);
+        airdrop.configure(PoolId.unwrap(a.id), 0, uint256(a.root));
+        _configureAirdropReverts(a, 2, 1, OstraAirdrop.BadField.selector);
+        _configureAirdropReverts(a, 1, 0, OstraAirdrop.BadAmount.selector);
+        _configureAirdropReverts(a, 1, airdrop.maxRoundAmount(a.id) + 1, OstraAirdrop.BadAmount.selector);
+        _spend(a.creatorVault, CREATOR, 4, abi.encode(address(airdrop), PoolId.unwrap(a.id), uint8(1), a.total));
+        _configureAirdropReverts(a, 0, 0, OstraAirdrop.BadRoot.selector);
+        _spend(a.creatorVault, CREATOR, 4, abi.encode(address(airdrop), PoolId.unwrap(a.id), uint8(0), uint256(a.root)));
+        OstraAirdrop.Round memory r = airdrop.round(a.id);
+        assertEq(r.number, 1);
+        assertEq(r.amount, a.total, "exactly what the tree shares out");
+        assertEq(r.endsAt, block.timestamp + 7 days);
+        assertTrue(r.open);
+        assertEq(airdrop.reserved(address(a.token)), a.total);
+        assertEq(airdrop.available(a.id), a.held - a.total);
+        assertEq(airdrop.nextRoundAmount(a.id), 0);
+    }
+
+    function _claimFirstRound(Drop memory a) internal {
+        // Anyone claims for an account, to that account, once; a wrong amount or proof is refused.
+        vm.prank(makeAddr("anyone"));
+        airdrop.claim(a.id, a.accounts[0], a.amounts[0], a.proofs[0]);
+        assertEq(a.token.balanceOf(a.accounts[0]), a.amounts[0]);
+        vm.expectRevert(OstraAirdrop.AlreadyClaimed.selector);
+        airdrop.claim(a.id, a.accounts[0], a.amounts[0], a.proofs[0]);
+        vm.expectRevert(OstraAirdrop.BadProof.selector);
+        airdrop.claim(a.id, a.accounts[1], a.amounts[1] + 1, a.proofs[1]);
+        vm.expectRevert(OstraAirdrop.BadProof.selector);
+        airdrop.claim(a.id, a.accounts[1], a.amounts[1], a.proofs[2]);
+        airdrop.claim(a.id, a.accounts[1], a.amounts[1], a.proofs[1]);
+        airdrop.claim(a.id, a.accounts[3], a.amounts[3], a.proofs[3]);
+        // One round at a time.
+        _configureAirdropReverts(a, 1, 1, OstraAirdrop.RoundOpen.selector);
+    }
+
+    function _closeFirstRound(Drop memory a) internal {
+        // It closes only after 7 days, and then nobody can claim; what was not claimed is burned.
+        vm.expectRevert(OstraAirdrop.ClaimPeriodNotOver.selector);
+        airdrop.close(a.id);
+        vm.warp(block.timestamp + 7 days);
+        vm.expectRevert(OstraAirdrop.ClaimPeriodOver.selector);
+        airdrop.claim(a.id, a.accounts[2], a.amounts[2], a.proofs[2]);
+        uint256 supply = a.token.totalSupply();
+        vm.prank(makeAddr("anyone"));
+        airdrop.close(a.id);
+        assertEq(supply - a.token.totalSupply(), a.amounts[2], "what was not claimed is burned");
+        assertEq(a.token.balanceOf(address(airdrop)), a.held - a.total);
+        assertEq(airdrop.reserved(address(a.token)), 0);
+        vm.expectRevert(OstraAirdrop.RoundNotOpen.selector);
+        airdrop.close(a.id);
+    }
+
+    function test_anAirdropRoundHoldsAtMostTenPercentOfTheSupply() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(54)));
+        p.maxBuy = 0;
+        p.maxWallet = 0;
+        p.graduationThreshold = 1_000_000e6;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        PoolKey memory key = hook.poolKey(id);
+        bool tokenIs0 = Currency.unwrap(key.currency0) == t;
+        vm.warp(block.timestamp + 601);
+        // 150M tokens bought into the airdrop contract: a round holds at most 100M (10%), the rest waits for the next.
+        deal(USDG, address(router), 1_000_000e6);
+        router.swap(key, !tokenIs0, 150_000_000e18, address(airdrop));
+        assertEq(IERC20(t).balanceOf(address(airdrop)), 150_000_000e18);
+        assertEq(airdrop.maxRoundAmount(id), 100_000_000e18);
+        uint64 n = v.nonce();
+        bytes memory params = abi.encode(address(airdrop), PoolId.unwrap(id), uint8(1), uint256(100_000_000e18 + 1));
+        bytes32 next = WotsSigner.keyRoot(_seed(CREATOR, n + 1));
+        bytes memory signature = WotsSigner.sign(_seed(CREATOR, n), v.spendMessage(4, next, params));
+        vm.expectRevert(OstraAirdrop.BadAmount.selector);
+        v.spend(4, next, params, signature);
+        _startRound(v, id, 100_000_000e18, bytes32(uint256(7)));
+        assertEq(airdrop.round(id).amount, 100_000_000e18);
+        vm.warp(block.timestamp + 7 days);
+        airdrop.close(id);
+        assertEq(IERC20(t).balanceOf(address(airdrop)), 50_000_000e18);
+        assertEq(airdrop.available(id), 50_000_000e18);
     }
 }

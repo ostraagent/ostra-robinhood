@@ -3,6 +3,7 @@
 
 export * from "./abi.ts";
 export * from "./aggregator.ts";
+export * from "./airdrop.ts";
 export * from "./backup.ts";
 export * from "./chain.ts";
 export * from "./constants.ts";

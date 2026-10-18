@@ -134,6 +134,49 @@ export const REFERRAL = {
 } as const;
 
 /**
+ * OstraVault Swap's signed `swapGas`: the gas its PoolManager call gets
+ * exactly, MIN..MAX; a swap that needs more fails (SwapFailed) and uses the
+ * spend. DEFAULT is about twice what a swap in an Ostra pool takes; a quote's
+ * gas with a margin is better for other pools.
+ */
+export const VAULT_SWAP_GAS = {
+  MIN: 100_000,
+  MAX: 10_000_000,
+  DEFAULT: 1_000_000,
+} as const;
+
+/**
+ * OstraDevBuy: a launch with the creator's dev buy in the same transaction
+ * (no anti-snipe; the hook fee, the tax, the max buy, the max wallet and the
+ * circuit breaker apply), at most MAX_BPS of the supply, held by an
+ * OstraVesting clone that pays the creator's token vault after a cliff of
+ * MIN_CLIFF..MAX_CLIFF seconds, linearly over at most MAX_VESTING seconds.
+ */
+export const DEV_BUY = {
+  MAX_BPS: 500,
+  MIN_CLIFF: 604_800,
+  MAX_CLIFF: 31_536_000,
+  MAX_VESTING: 31_536_000,
+} as const;
+
+/**
+ * OstraAirdrop: the creator vault buys a round into the airdrop contract (a
+ * Swap whose recipient is OstraAirdrop; for an ETH pool, bought elsewhere and
+ * sent there), sets the round's amount (FIELD_ROUND_AMOUNT: what the tree
+ * shares out, at most MAX_ROUND_BPS of the launch supply) and starts it
+ * (FIELD_START_ROUND, value = the merkle root, see airdropTree), with two
+ * ConfigurePool spends. The round reserves that amount of what the contract
+ * holds beyond open rounds (OstraAirdrop.available); claims run for
+ * CLAIM_PERIOD seconds, then anyone closes it and what was not claimed is burned.
+ */
+export const AIRDROP = {
+  FIELD_START_ROUND: 0,
+  FIELD_ROUND_AMOUNT: 1,
+  MAX_ROUND_BPS: 1_000,
+  CLAIM_PERIOD: 604_800,
+} as const;
+
+/**
  * OstraCreatorSplit: a pool's creator vault shares its creator payouts among up
  * to MAX_RECIPIENTS recipients and keeps the rest (FIELD_SHARE is its only
  * configure field; shares change at any time and apply to later payouts).
