@@ -40,4 +40,5 @@ export const multicall3Abi = parseAbi([
 /** Arbitrum NodeInterface (a virtual contract: callable with eth_call / eth_estimateGas only). */
 export const nodeInterfaceAbi = parseAbi([
   "function gasEstimateComponents(address to, bool contractCreation, bytes data) payable returns (uint64 gasEstimate, uint64 gasEstimateForL1, uint256 baseFee, uint256 l1BaseFeeEstimate)",
+  "function gasEstimateL1Component(address to, bool contractCreation, bytes data) payable returns (uint64 gasEstimateForL1, uint256 baseFee, uint256 l1BaseFeeEstimate)",
 ]);

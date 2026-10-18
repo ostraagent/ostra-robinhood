@@ -97,7 +97,7 @@ test("a preflight from the web app is answered with 204 and what it may send", a
 test("other origins and requests without an origin get no CORS permission", async () => {
   const { url, server } = await serve();
   try {
-    for (const origin of ["https://evil.example", "http://app.ostraagent.com", "https://app.ostraagent.com.evil.example", undefined]) {
+    for (const origin of ["https://evil.example", "http://app.ostraagent.xyz", "https://app.ostraagent.xyz.evil.example", "https://app.ostraagent.com", undefined]) {
       const headers: Record<string, string> = origin === undefined ? {} : { origin };
       const res = await fetch(`${url}/json`, { headers });
       assert.equal(res.status, 200, String(origin));

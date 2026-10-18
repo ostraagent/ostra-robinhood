@@ -1,5 +1,5 @@
 // CORS for the Ostra web app (design: web app, decided 17 Oct 2026). The web
-// app runs at https://app.ostraagent.com and calls the relayer, the
+// app runs at https://app.ostraagent.xyz and calls the relayer, the
 // aggregator, the AI gateway and the RPC proxy from the browser; only that
 // origin is allowed. Other sites' pages get no CORS headers, so browsers keep
 // them from reading the answers. Requests without an Origin (agents, servers)
@@ -13,7 +13,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 /** The web app's origin. */
-export const APP_ORIGIN = "https://app.ostraagent.com";
+export const APP_ORIGIN = "https://app.ostraagent.xyz";
 
 const ALLOWED_METHODS = "GET, POST";
 const ALLOWED_HEADERS = "Content-Type, PAYMENT-SIGNATURE";

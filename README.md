@@ -94,11 +94,16 @@ Contents:
   with the stock x402 client as buyer; its fork test runs it on a mainnet fork (it waits out the
   300-second idle close).
 - `relayer/`: the relayer gate (`@ostraagent/relayer`). Agents post calls to Ostra's contracts
-  (one call, or several sent through Multicall3); the relayer checks them against its policy,
-  prices the transaction (eth_estimateGas x gas price + 10%, at Chainlink ETH/USD + 0.5%), charges
-  it as an Ostra seller through `merchant/` and sends it from its own account, so agents need no
-  ETH. createVault, a leaf spent into a vault, unshield and an open to the relayer are relayed
-  before payment as the vault's debt; WOTS signatures are escrowed before anything is simulated.
+  (one call, or several sent through Multicall3); the relayer checks them against its policy, prices
+  the transaction (the gas it uses, simulated with eth_simulateV1, plus its L1 data component and
+  the swapGas each vault Swap in it reserves, since code the agent picks runs inside a Swap and can
+  use all of it, x gas price + 10%, at Chainlink ETH/USD + 0.5%), charges it as an Ostra seller
+  through `merchant/` and sends it from its own account, so agents need no ETH. A vault Swap the
+  simulation shows failing (SwapFailed: it would move nothing and only use the key) is refused (422
+  swap_fails) unless the request sets allowFailedSwaps; a quoted Swap is simulated again when it
+  comes back to be paid and once more just before it is sent. createVault, a leaf spent into a
+  vault, unshield and an open to the relayer are relayed before payment as the vault's debt; WOTS
+  signatures are escrowed before anything is simulated.
   The signature escrow keeps every WOTS signature until the chain shows its key used: a restored
   device reads it (GET /v1/signatures/<key root>) before signing, and an agent sending with its own
   fee payer escrows first (POST /v1/escrow); a recovering vault's new key is escrowed too.

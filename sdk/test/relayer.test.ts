@@ -4,8 +4,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { concat, decodeFunctionData, getAddress, hexToBytes, keccak256, type Hex } from "viem";
-import { MULTICALL3 } from "../src/constants.ts";
+import { concat, decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionData, getAddress, hexToBytes, keccak256, zeroAddress, type Hex, type Log } from "viem";
+import { ostraVaultAbi } from "../src/abi.ts";
+import { MULTICALL3, USDG, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE } from "../src/constants.ts";
+import { swapParams, transferParams } from "../src/messages.ts";
 import { multicall3Abi } from "../src/external-abi.ts";
 import {
   ETH_USD_DEVIATION_BPS,
@@ -14,11 +16,15 @@ import {
   RELAYER_MARGIN_BPS,
   RELAYER_QUOTE_TOLERANCE_BPS,
   checkFresh,
+  failedSwaps,
   maxAcceptedQuote,
   relayCalls,
   relayRequestBody,
   relayRequestHash,
+  relayGasCap,
   relayTransaction,
+  reservedSwapGas,
+  swapGasOf,
   weiToTokenUnits,
   withMargin,
 } from "../src/relayer.ts";
@@ -85,7 +91,50 @@ test("calls are checked and normalized; the body an agent posts reads back", () 
   assert.deepEqual(calls, [{ to: at(1), data: "0xabcdef01" }]);
   assert.deepEqual(JSON.parse(relayRequestBody(calls, { prepay: true, payer: at(3) })), { calls: [{ to: at(1), data: "0xabcdef01" }], prepay: true, payer: at(3) });
   assert.deepEqual(JSON.parse(relayRequestBody(calls)), { calls: [{ to: at(1), data: "0xabcdef01" }] });
+  assert.deepEqual(JSON.parse(relayRequestBody(calls, { allowFailedSwaps: true })), { calls: [{ to: at(1), data: "0xabcdef01" }], allowFailedSwaps: true });
   assert.throws(() => relayCalls(Array.from({ length: MAX_RELAY_CALLS + 1 }, () => ({ to: at(1), data: "0x12345678" }))), /at most 8 calls/);
   assert.throws(() => relayCalls([{ to: at(1), data: "0x123456" }]), /4-byte selector/);
   assert.throws(() => relayCalls([{ to: at(1), data: "0x12345678", value: "0x1" }]), /no ETH value/);
+});
+
+test("failed vault Swaps are read from SwapFailed, only from the vaults named", () => {
+  const poolId = keccak256("0x01");
+  const reason = "0x7c9c6e8f" as Hex;
+  const failed = (address: Hex): Log =>
+    ({
+      address,
+      topics: encodeEventTopics({ abi: ostraVaultAbi, eventName: "SwapFailed", args: { poolId } }),
+      data: encodeAbiParameters([{ type: "bytes4" }], [reason]),
+    }) as unknown as Log;
+  const swapped = {
+    address: at(1),
+    topics: encodeEventTopics({ abi: ostraVaultAbi, eventName: "Swapped", args: { poolId } }),
+    data: encodeAbiParameters([{ type: "bool" }, { type: "uint256" }, { type: "uint256" }, { type: "address" }], [false, 1n, 1n, at(9)]),
+  } as unknown as Log;
+  const logs = [swapped, failed(at(1)), failed(at(2))];
+  assert.deepEqual(failedSwaps(logs, [at(1).toLowerCase() as Hex]), [{ vault: at(1), poolId, reason }]);
+  assert.deepEqual(failedSwaps(logs, [at(1), at(2)]).map((f) => f.vault), [at(1), at(2)]);
+  // Any contract can emit the topic: one not among the vaults does not count.
+  assert.deepEqual(failedSwaps(logs, [at(3)]), []);
+  assert.deepEqual(failedSwaps([swapped], [at(1)]), []);
+});
+
+test("the gas the vault Swaps of a relay transaction reserve is added up (swapGas and its check's headroom); other calls reserve none", () => {
+  const key = { currency0: zeroAddress, currency1: USDG, fee: 500, tickSpacing: 10, hooks: zeroAddress };
+  const spend = (action: number, params: Hex) => encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256("0x02"), params, "0x00"] });
+  const swap = (swapGas?: bigint) => ({ to: at(1), data: spend(VAULT_ACTION.SWAP, swapParams({ key, zeroForOne: false, amountIn: 1n, minOut: 0n, recipient: at(9), swapGas })) });
+  const transfer = { to: at(2), data: spend(VAULT_ACTION.TRANSFER, transferParams({ to: at(9), amount: 1n })) };
+  const held = (g: bigint) => g + g / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE);
+  assert.equal(reservedSwapGas(relayTransaction([swap(252_000n)])), 252_000n + 4_001n + 30_000n);
+  assert.equal(reservedSwapGas(relayTransaction([swap()])), held(BigInt(VAULT_SWAP_GAS.DEFAULT)));
+  assert.equal(reservedSwapGas(relayTransaction([swap(250_000n), transfer, swap(300_000n)])), held(250_000n) + held(300_000n));
+  assert.deepEqual(swapGasOf(relayTransaction([swap(250_000n), transfer, swap(300_000n)])), [250_000n, 300_000n]);
+  assert.equal(reservedSwapGas(relayTransaction([transfer])), 0n);
+  assert.equal(reservedSwapGas({ to: at(3), data: "0xabcdef01" }), 0n);
+  // A Swap spend whose params do not decode, or a spend call that does not, reserves the most a Swap can sign.
+  assert.equal(reservedSwapGas(relayTransaction([{ to: at(1), data: spend(VAULT_ACTION.SWAP, "0x1234") }])), held(BigInt(VAULT_SWAP_GAS.MAX)));
+  assert.deepEqual(swapGasOf(relayTransaction([{ to: at(1), data: transfer.data.slice(0, 74) as Hex }, swap(250_000n)])), [BigInt(VAULT_SWAP_GAS.MAX), 250_000n]);
+  // The gas limit cap: the priced gas + the margin.
+  assert.equal(relayGasCap(100_000n), 110_000n);
+  assert.equal(relayGasCap(100_001n), withMargin(100_001n));
 });

@@ -26,7 +26,7 @@
 //      it answers 402 for the open and the debt, and the channel's first
 //      voucher pays both.
 //   5. A paid spend Transfer: 402 for its price (checked against the quote
-//      rule: estimate x gas price + 10% at ETH/USD + 0.5%), paid by voucher,
+//      rule: gas x gas price + 10% at ETH/USD + 0.5%), paid by voucher,
 //      sent; sent again, no second charge. Its WOTS signature was escrowed
 //      before it was simulated (GET /v1/signatures shows it under the vault's
 //      key root); another message signed with a key whose signature is
@@ -40,6 +40,13 @@
 //      paid from its credit alone; a voucher from another vault's channel
 //      cannot spend that credit (wrong_payer); the vault's own channel pays
 //      one base unit or more and the credit the rest.
+//   5e. A Swap of the prepaid vault, which holds no USDG, fails inside the
+//      PoolManager without reverting (SwapFailed): refused 422 swap_fails and
+//      not quoted; with allowFailedSwaps it answers 402, priced with the
+//      swapGas it reserves; quoted, it is
+//      simulated again when sent back without allowFailedSwaps and refused
+//      before any voucher; landed by a third party, it emits SwapFailed and
+//      moves nothing.
 //   6. requestClose of the vault's relayer channel through the relayer, paid
 //      from its credit; the keeper claims the last voucher on the
 //      WithdrawInitiated it watches, and the relayer's idle close (300 s)
@@ -103,11 +110,13 @@ import {
   FileWotsStore,
   MULTICALL3,
   USDG_DECIMALS,
+  VAULT_SWAP_GAS,
   WotsKeychain,
   assertRobinhoodChain,
   chainlinkEthUsd,
   closeDigest,
   decodeVaultSpendMessage,
+  failedSwaps,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
   parseDeployment,
@@ -120,6 +129,7 @@ import {
   robinhoodChain,
   signVaultOpenChannel,
   signVaultSetCrankKey,
+  signVaultSwap,
   signVaultTransfer,
   usdgAbi,
   vaultAddress,
@@ -579,7 +589,7 @@ async function main(): Promise<void> {
     const q1 = quoted(r1);
     const rule = (q: Record<string, unknown> | undefined) =>
       q !== undefined && BigInt(String(q.wei)) === BigInt(String(q.gas)) * BigInt(String(q.gasPrice)) && BigInt(String(q.amount)) === weiToTokenUnits(withMargin(BigInt(String(q.wei))), { answer: BigInt(String(q.ethUsd)), roundId: 0n, updatedAt: 0n }, decimals);
-    check(p1.first.status === 402 && q1 !== undefined && p1.price === BigInt(String(q1.amount)) && rule(q1), "a spend Transfer answers 402 for its price: estimate x gas price + 10% at ETH/USD + 0.5%", { price: p1.price, quote: q1 });
+    check(p1.first.status === 402 && q1 !== undefined && p1.price === BigInt(String(q1.amount)) && rule(q1), "a spend Transfer answers 402 for its price: gas x gas price + 10% at ETH/USD + 0.5%", { price: p1.price, quote: q1 });
     check(p1.second?.status === 200 && p1.second.body?.paid === p1.price?.toString() && (await balance(funder.address)) - fundsBefore === t, "paid by voucher, the transfer is sent", p1.second?.body);
     const r1Again = await post(r1);
     check(r1Again.status === 200 && r1Again.body?.repeated === true && r1Again.body?.txHash === p1.second?.body?.txHash, "the paid request sent again: the same transaction, no second charge", r1Again.body);
@@ -649,6 +659,35 @@ async function main(): Promise<void> {
     );
     creditLeft -= used;
 
+    // --- 5e. a vault Swap that fails is refused unless asked for ----------------------------------------
+    // The prepaid vault holds no USDG: its Swap fails inside the PoolManager (SwapFailed) without
+    // reverting, so sent it would only use the vault's key up.
+    const ethUsdg = { currency0: zeroAddress, currency1: token, fee: 500, tickSpacing: 10, hooks: zeroAddress };
+    const failingSwap = await vaultCall(otherKeys, otherVault, (st) =>
+      signVaultSwap(otherKeys, st, { chainId: d.chainId, token, swap: { key: ethUsdg, zeroForOne: false, amountIn: 10n ** BigInt(decimals), minOut: 0n, recipient: funder.address } }),
+    );
+    const swapBody = relayRequestBody([failingSwap], { payer: agentVault });
+    const swapRefused = await post(swapBody);
+    check(swapRefused.status === 422 && swapRefused.body?.error === "swap_fails" && quoted(swapBody) === undefined, "a vault Swap the simulation shows failing (SwapFailed) is refused 422 swap_fails and not quoted", swapRefused.body);
+    const swapAllowedBody = relayRequestBody([failingSwap], { payer: agentVault, allowFailedSwaps: true });
+    const swapAllowed = await post(swapAllowedBody);
+    const swapQuote = quoted(swapAllowedBody);
+    check(
+      swapAllowed.status === 402 && swapQuote !== undefined && rule(swapQuote) && BigInt(String(swapQuote.gas)) > BigInt(VAULT_SWAP_GAS.DEFAULT),
+      "asked for with allowFailedSwaps, the same Swap answers 402 for its price, which counts the swapGas it reserves",
+      { status: swapAllowed.status, quote: swapQuote },
+    );
+    const swapAgain = await post(swapBody);
+    check(swapAgain.status === 422 && swapAgain.body?.error === "swap_fails", "quoted, the Swap sent back without allowFailedSwaps is simulated again and refused before any voucher", swapAgain.body);
+    const swapNonce = (await readVault(client, d, otherVault))?.nonce;
+    const swapTx = await send(funder, otherVault, failingSwap.data);
+    const landedFail = failedSwaps((await client.getTransactionReceipt({ hash: swapTx })).logs, [otherVault]);
+    check(
+      landedFail.length === 1 && (await balance(otherVault)) === 0n && (await readVault(client, d, otherVault))?.nonce === (swapNonce ?? -1n) + 1n,
+      "landed by a third party, the Swap emits SwapFailed, moves nothing and uses the vault's key",
+      landedFail,
+    );
+
     // --- 6. requestClose through the relayer, paid from credit ----------------------------------------------
     const config = vaultChannelConfig(agentVault, token, openParams(grace, deposit));
     const before6 = await readChannel(client, d.batchSettlement, channel);
@@ -698,7 +737,7 @@ async function main(): Promise<void> {
     const sum = (names: string[], field: string) => ev.filter((e) => names.includes(String(e.event))).reduce((a, e) => a + BigInt(String(e[field] ?? "0")), 0n);
     check(sum(["relayer_channel_paid", "relayed", "paid_not_sent"], "amount") === paidTotal, "what the vault's channel paid equals the relayer's paid log", { logged: sum(["relayer_channel_paid", "relayed", "paid_not_sent"], "amount"), paidTotal });
     const quotes = ev.filter((e) => e.event === "quoted");
-    check(quotes.length > 0 && quotes.every((q) => rule(q)), "every quote follows the rule from its logged estimate, gas price and ETH/USD", quotes.length);
+    check(quotes.length > 0 && quotes.every((q) => rule(q)), "every quote follows the rule from its logged gas, gas price and ETH/USD", quotes.length);
     const gasSpent = ev
       .filter((e) => typeof e.gasUsed === "string" && typeof e.effectiveGasPrice === "string")
       .reduce((a, e) => a + BigInt(e.gasUsed as string) * BigInt(e.effectiveGasPrice as string), 0n);

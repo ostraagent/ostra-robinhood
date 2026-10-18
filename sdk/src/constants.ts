@@ -66,6 +66,9 @@ export const POOL_MAX_DEPOSIT = 250_000_000n;
 export const POOL_MAX_TOTAL = 2_500_000_000n;
 
 /** OstraVault spend actions. */
+/** OstraVault.SWAP_GAS_RESERVE: gas a Swap must have left beyond swapGas * 64 / 63 when it calls the PoolManager. */
+export const VAULT_SWAP_GAS_RESERVE = 30_000;
+
 export const VAULT_ACTION = {
   TRANSFER: 0,
   OPEN_CHANNEL: 1,

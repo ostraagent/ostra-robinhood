@@ -15,8 +15,9 @@
 //                  split with the relayer's vault as receiverAuthorizer, in
 //                  this token and chain, and at most RELAYER_QUOTE_TOLERANCE_BPS
 //                  above the price the agent computes itself with the
-//                  relayer's rules (its own eth_estimateGas and the same
-//                  Chainlink ETH/USD feed, @ostraagent/sdk relayer.ts).
+//                  relayer's rules (its own simulation of the gas used plus
+//                  the L1 data component, and the same Chainlink ETH/USD
+//                  feed, @ostraagent/sdk relayer.ts).
 //
 // The relayer channel: opened from the buyer vault on the relayer's terms
 // (receiver the relayer's split, receiverAuthorizer its vault, withdrawDelay
@@ -112,6 +113,13 @@ export type SendOptions = {
   openChannel?: OpenRelayerChannel;
   /** The reservation made before the vault spend in this request was signed. */
   reservation?: Reservation | null;
+  /**
+   * Relayed even if a vault Swap in it fails now (SwapFailed: it moves
+   * nothing and uses the key); the relayer refuses such a request otherwise
+   * (422 swap_fails). For a Swap signed earlier that must land before the
+   * key can sign anything else.
+   */
+  allowFailedSwaps?: boolean;
 };
 
 export interface Sender {
@@ -568,14 +576,14 @@ export class RelayerClient implements Sender {
     return maxAcceptedQuote(await this.#amountFor(VAULT_SPEND_GAS * (await this.#client.getGasPrice())));
   }
 
-  /** The most this agent pays for `calls`: its own price for them (eth_estimateGas from the relayer's account, Chainlink) plus the tolerance. */
+  /** The most this agent pays for `calls`: its own price for them (the gas they use, simulated from the relayer's account, plus the L1 data component; Chainlink) plus the tolerance. */
   async #maxAmount(calls: readonly RelayCall[]): Promise<bigint> {
     const facts = await this.facts();
     try {
       const m = await estimateRelay(this.#client, { relayer: facts.feePayer, ...relayTransaction(calls) });
       return maxAcceptedQuote(await this.#amountFor(m.wei));
     } catch (err) {
-      if (err instanceof RelaySimulationError) throw new RelayerError(422, "simulation_failed", err.message);
+      if (err instanceof RelaySimulationError) throw new RelayerError(err.reverted ? 422 : 503, err.code, err.message);
       throw err;
     }
   }
@@ -620,10 +628,11 @@ export class RelayerClient implements Sender {
     else this.#reserved.delete(reservation.channel);
   }
 
-  async #post(calls: readonly RelayCall[], extra: { prepay?: boolean; payer: Address | null }, headers: Record<string, string> = {}): Promise<Answer> {
+  async #post(calls: readonly RelayCall[], extra: { prepay?: boolean; payer: Address | null; allowFailedSwaps?: boolean }, headers: Record<string, string> = {}): Promise<Answer> {
     const body: Record<string, unknown> = { calls: calls.map((c) => ({ to: getAddress(c.to), data: c.data })) };
     if (extra.prepay === true) body.prepay = true;
     if (extra.payer !== null) body.payer = extra.payer;
+    if (extra.allowFailedSwaps === true) body.allowFailedSwaps = true;
     return this.#http("POST", "/v1/relay", JSON.stringify(body), headers);
   }
 
@@ -679,7 +688,7 @@ export class RelayerClient implements Sender {
    * channel more than this machine knew) is reconciled by the stock client
    * and paid once more.
    */
-  async #payFrom(c: RelayerChannel, calls: readonly RelayCall[], answer: Answer, maxAmount: bigint, prepay: boolean): Promise<Answer> {
+  async #payFrom(c: RelayerChannel, calls: readonly RelayCall[], answer: Answer, maxAmount: bigint, prepay: boolean, allowFailedSwaps = false): Promise<Answer> {
     let current = answer;
     for (let attempt = 0; attempt < 2; attempt++) {
       const http = this.#x402(c);
@@ -697,7 +706,7 @@ export class RelayerClient implements Sender {
       if (signed > BigInt(c.cumulative)) c.cumulative = signed.toString();
       c.lastUsedAt = now();
       await this.#save();
-      const paid = await this.#post(calls, { prepay, payer: await this.#payer() }, http.encodePaymentSignatureHeader(payload));
+      const paid = await this.#post(calls, { prepay, payer: await this.#payer(), allowFailedSwaps }, http.encodePaymentSignatureHeader(payload));
       const result = await http.processPaymentResult(payload, (name) => paid.headers.get(name), paid.status);
       if (paid.status === 402 && result.recovered) {
         current = paid;
@@ -801,7 +810,7 @@ export class RelayerClient implements Sender {
       const sent = await this.#serial(async () => {
         const c = await this.#channelFor(offered, reservation);
         if (c === null) return null;
-        return this.#payFrom(c, calls, answer, maxAmount, options.prepay === true);
+        return this.#payFrom(c, calls, answer, maxAmount, options.prepay === true, options.allowFailedSwaps === true);
       });
       if (sent !== null) return sent;
       if (reservation !== null) throw new Error("the reserved relayer channel can no longer pay this vault operation");
@@ -813,7 +822,7 @@ export class RelayerClient implements Sender {
   async send(calls: RelayCall[], options: SendOptions = {}): Promise<Hash> {
     await this.facts();
     for (let resend = 0; resend < MAX_RESENDS; resend++) {
-      let answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer() });
+      let answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true });
       let again = false;
       for (let step = 0; step < MAX_STEPS && !again; step++) {
         const b = answer.body;
@@ -834,7 +843,7 @@ export class RelayerClient implements Sender {
         if (answer.status === 403 && (error === "vault_in_debt" || error === "open_unpaid")) {
           if (options.reservation !== undefined && options.reservation !== null) throw new RelayerError(403, error, String(b?.message ?? error));
           await this.#ensureChannel(1n, options.openChannel, null);
-          answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer() });
+          answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true });
           continue;
         }
         if (answer.status === 409 && error === "not_sent") {

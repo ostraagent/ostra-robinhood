@@ -3,8 +3,12 @@
 //
 // Sends run one at a time (one nonce sequence). Each send is simulated first
 // at its own gas estimate (a request that reverts now is not sent and costs
-// nothing), signed locally, so its hash is known before the RPC sees it, and
-// then waited for:
+// nothing) and, when it holds vault Swaps that must not fail, simulated once
+// more for their SwapFailed (one that fails now is not sent). Its gas limit
+// is the estimate + 20%, at most the cap the gate gives (what the
+// transaction was priced at, relayGasCap): one that needs more now is not
+// sent. It is signed locally,
+// so its hash is known before the RPC sees it, and then waited for:
 //   * a receipt with status success: landed;
 //   * a reverted receipt: the gas is spent but nothing happened; reported as
 //     not sent (the gate's rule on Solana for a transaction that failed
@@ -21,7 +25,7 @@
 //     (SendUnknownError) and nothing is credited or charged back.
 
 import { createWalletClient, keccak256, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
-import { robinhoodChain } from "@ostraagent/sdk";
+import { failedSwaps, robinhoodChain, simulateRelay } from "@ostraagent/sdk";
 
 /** Wait for a receipt before replacing the transaction (Robinhood Chain confirms in about a second). */
 export const RECEIPT_TIMEOUT_MS = 60_000;
@@ -35,10 +39,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** The transaction certainly did not land and never will (reverted, refused before sending, or replaced). */
 export class NotSentError extends Error {
   readonly txHash: Hash | null;
-  constructor(message: string, txHash: Hash | null = null) {
+  /** True when it was not sent because it needs more gas now than the cap it was priced for. */
+  readonly overCap: boolean;
+  constructor(message: string, txHash: Hash | null = null, overCap = false) {
     super(message);
     this.name = "NotSentError";
     this.txHash = txHash;
+    this.overCap = overCap;
   }
 }
 
@@ -90,9 +97,14 @@ export class RelaySender {
     return this.#account.address;
   }
 
-  /** Sends `tx` after every earlier send has finished; resolves when it landed, throws NotSentError or SendUnknownError. */
-  send(tx: { to: Address; data: Hex }): Promise<Landed> {
-    const run = () => this.#send(tx);
+  /**
+   * Sends `tx` after every earlier send has finished; resolves when it landed,
+   * throws NotSentError or SendUnknownError. `refuseFailedSwaps`: vaults whose
+   * Swap in `tx` is not sent if it fails now (SwapFailed). `maxGas`: the
+   * highest gas limit it is sent with.
+   */
+  send(tx: { to: Address; data: Hex }, o: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint } = {}): Promise<Landed> {
+    const run = () => this.#send(tx, o.refuseFailedSwaps ?? [], o.maxGas);
     const p = this.#tail.then(run, run);
     this.#tail = p.catch(() => undefined);
     return p;
@@ -108,7 +120,7 @@ export class RelaySender {
     }
   }
 
-  async #send(tx: { to: Address; data: Hex }): Promise<Landed> {
+  async #send(tx: { to: Address; data: Hex }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined): Promise<Landed> {
     const account = this.#account;
     let gas: bigint;
     try {
@@ -116,6 +128,22 @@ export class RelaySender {
     } catch (err) {
       const e = err as { shortMessage?: string; message?: string };
       throw new NotSentError(`the transaction reverts now, so it was not sent: ${e.shortMessage ?? e.message ?? String(err)}`);
+    }
+    let limit = gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
+    if (maxGas !== undefined) {
+      if (gas > maxGas) throw new NotSentError(`the transaction needs ${gas} gas now, more than the ${maxGas} it was priced for, so it was not sent; sent again, it is priced anew`, null, true);
+      if (limit > maxGas) limit = maxGas;
+    }
+    if (refuseFailedSwaps.length !== 0) {
+      let failed: ReturnType<typeof failedSwaps>;
+      try {
+        failed = failedSwaps((await simulateRelay(this.#client, { relayer: account.address, to: tx.to, data: tx.data })).logs, refuseFailedSwaps);
+      } catch (err) {
+        throw new NotSentError(`its Swap could not be checked, so it was not sent: ${(err as Error).message}`);
+      }
+      if (failed.length !== 0) {
+        throw new NotSentError(`the Swap of ${failed.map((f) => `vault ${f.vault} (${f.reason})`).join(", ")} fails now, so it was not sent`);
+      }
     }
     const nonce = await this.#client.getTransactionCount({ address: account.address, blockTag: "pending" });
     const { maxFeePerGas, maxPriorityFeePerGas } = await this.#client.estimateFeesPerGas();
@@ -126,7 +154,7 @@ export class RelaySender {
       to: tx.to,
       data: tx.data,
       value: 0n,
-      gas: gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n,
+      gas: limit,
       nonce,
       maxFeePerGas,
       maxPriorityFeePerGas,

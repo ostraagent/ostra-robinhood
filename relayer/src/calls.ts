@@ -1,6 +1,6 @@
 // Reads a relay request's calls (the Solana relayer decoded a v1 transaction
 // and its instructions here, tx.ts). A request is {"calls": [{to, data}],
-// "prepay"?, "payer"?}; the relayer sends one call as it is and several
+// "prepay"?, "payer"?, "allowFailedSwaps"?}; the relayer sends one call as it is and several
 // through Multicall3 (sdk relayTransaction), and the request hash binds a
 // quote and a payment to exactly that transaction (sdk relayRequestHash).
 //

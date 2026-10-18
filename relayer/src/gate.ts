@@ -10,9 +10,24 @@
 //      cancelDeposit and closeDeposit on the deployment's pool. Nothing else
 //      is sent, so the relayer's account is never the caller of anything
 //      that gives a caller a role;
-//   3. prices the transaction: eth_estimateGas from the relayer x eth_gasPrice,
-//      + 10%, at Chainlink ETH/USD + 0.5% (@ostraagent/sdk relayer.ts, the
-//      same rules an agent checks the price with);
+//   3. prices the transaction: the gas it uses, simulated from the relayer
+//      (eth_simulateV1), with its L1 data component and the swapGas each
+//      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
+//      ETH/USD + 0.5% (@ostraagent/sdk relayer.ts, the same rules an agent
+//      checks the price with). A vault Swap the simulation shows failing
+//      (SwapFailed) is refused, 422 swap_fails, unless the request asks for
+//      it with allowFailedSwaps: such a spend moves nothing and is only worth
+//      sending to use the key up. A Swap quoted while it passed is simulated
+//      again when the request comes back to be paid, before the voucher is
+//      taken (one that reverts then is refused 422, a node that cannot
+//      simulate it 503), and once more just before it is sent
+//      (relayer/src/send.ts): the price can move in between. What moves in
+//      the moment between that last simulation and the block is the agent's
+//      (its minOut and swapGas). Every transaction is sent with a gas limit
+//      of at most what it was priced at plus the margin (relayGasCap): code
+//      that uses more gas when sent than simulated (a hook or a contract the
+//      agent picks) cannot make the relayer pay more than it was paid, and a
+//      transaction that needs more than that now is not sent;
 //   4. answers 402 with an x402 batch-settlement challenge for that price,
 //      paid to the relayer's OstraSplit with its vault as receiverAuthorizer
 //      (merchant/src/merchant.ts); a voucher for it pays, and only then is
@@ -34,7 +49,7 @@
 // the vault's debt. A vault in debt, or with such an open unpaid, gets nothing
 // else relayed but a spendLeaf into it while no open is unpaid.
 //
-// The request body is {"calls", "prepay"?, "payer"?}: `prepay` makes a
+// The request body is {"calls", "prepay"?, "payer"?, "allowFailedSwaps"?}: `prepay` makes a
 // createVault an ordinary paid request instead of a debt; `payer` names the
 // Ostra vault whose relayer channel pays. That vault's credit is taken off the
 // price (with a voucher from one of its channels, at least one base unit,
@@ -64,15 +79,21 @@ import { getAddress, isAddress, type Address, type PublicClient } from "viem";
 import {
   MAX_RELAY_CALLS,
   RelaySimulationError,
+  VAULT_ACTION,
   channelId,
   estimateRelay,
+  failedSwaps,
   readVault,
+  relayGasCap,
+  relayTransactionHash,
+  simulateRelay,
   vaultChannelConfig,
   weiToTokenUnits,
   withMargin,
   type Deployment,
   type EthUsd,
   type EthUsdSource,
+  type RelayMeasure,
 } from "@ostraagent/sdk";
 import { decodePaymentSignatureHeader, type HTTPResponseInstructions } from "@x402/core/http";
 import type { OstraMerchant } from "../../merchant/src/merchant.ts";
@@ -109,7 +130,7 @@ export type GateOptions = {
   escrow: SignatureEscrow;
   merchant: GateMerchant;
   /** Sends the relayed transactions (send.ts): the relayer's account. */
-  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }): Promise<Landed> };
+  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }, o?: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint }): Promise<Landed> };
   /** The relayer's Ostra vault: the receiverAuthorizer of its channels. */
   vault: Address;
   /** The Chainlink feed ETH/USD is read from (shown in the relayer's terms). */
@@ -122,7 +143,7 @@ export type GateOptions = {
 export type RelayInput = { body: string; req: IncomingMessage; ip: string };
 
 /** What the request body asks besides the calls. */
-type RelayRequest = { prepay: boolean; payer: Address | null };
+type RelayRequest = { prepay: boolean; payer: Address | null; allowFailedSwaps: boolean };
 
 const RELAY_DESCRIPTION = "Ostra relayer: one transaction";
 const DEBT_NOTE = "the vault owes this amount; it is paid with the first voucher of the vault's channel to the relayer, and nothing else is relayed for the vault until then";
@@ -161,6 +182,20 @@ export class QuoteError extends Error {
     this.name = "QuoteError";
     this.code = code;
   }
+}
+
+/** The vaults a request spends from with a Swap: only a vault Swap fails without reverting (SwapFailed), moving nothing and using the spend. */
+function swapVaults(tx: RelayTx): Address[] {
+  return tx.parsed.flatMap((c) => (c.fn === "spend" && c.action === VAULT_ACTION.SWAP ? [c.to] : []));
+}
+
+/** Throws swap_fails if a Swap of the vaults `swaps` fails among the simulated `logs`. */
+function refuseFailedSwaps(logs: RelayMeasure["logs"], swaps: readonly Address[]): void {
+  if (swaps.length === 0) return;
+  const failed = failedSwaps(logs, swaps);
+  if (failed.length === 0) return;
+  const which = failed.map((f) => `vault ${f.vault} in pool ${f.poolId} (${f.reason})`).join(", ");
+  throw new QuoteError("swap_fails", `the Swap of ${which} fails now and would move nothing; send it with allowFailedSwaps to use the spend up anyway`);
 }
 
 /** The calls are outside the relayer's policy (answered 422 refused, as a Kora refusal was). */
@@ -212,7 +247,7 @@ export class RelayerGate {
 
   async relay(input: RelayInput): Promise<Answer> {
     let tx: RelayTx;
-    let body: { calls?: unknown; prepay?: unknown; payer?: unknown };
+    let body: { calls?: unknown; prepay?: unknown; payer?: unknown; allowFailedSwaps?: unknown };
     try {
       body = JSON.parse(input.body) as typeof body;
       if (body === null || typeof body !== "object") throw new Error("the request must be a JSON object");
@@ -227,7 +262,12 @@ export class RelayerGate {
     try {
       if (body.prepay !== undefined && typeof body.prepay !== "boolean") throw new Error("prepay must be true or false");
       if (body.payer !== undefined && (typeof body.payer !== "string" || !isAddress(body.payer, { strict: false }))) throw new Error("payer must be a vault address");
-      request = { prepay: body.prepay === true, payer: body.payer === undefined ? null : getAddress(body.payer as string) };
+      if (body.allowFailedSwaps !== undefined && typeof body.allowFailedSwaps !== "boolean") throw new Error("allowFailedSwaps must be true or false");
+      request = {
+        prepay: body.prepay === true,
+        payer: body.payer === undefined ? null : getAddress(body.payer as string),
+        allowFailedSwaps: body.allowFailedSwaps === true,
+      };
     } catch (err) {
       return json(400, { error: "bad_transaction", message: (err as Error).message });
     }
@@ -350,12 +390,14 @@ export class RelayerGate {
     const early = this.#refusedUpfront(classified, input.ip, leafVault, openProblem);
     if (early !== null) return early;
 
+    // The vaults whose Swap in this request must not fail (SwapFailed); none with allowFailedSwaps.
+    const swaps = request.allowFailedSwaps ? [] : swapVaults(tx);
     let quote: Quote;
     try {
-      quote = await this.#quote(tx, classified, leafVault);
+      quote = await this.#quote(tx, classified, leafVault, swaps);
     } catch (err) {
       if (err instanceof PolicyRefusal) return json(422, { error: "refused", message: err.message });
-      if (err instanceof QuoteError) return json(err.code === "price_unavailable" ? 503 : 422, { error: err.code, message: err.message });
+      if (err instanceof QuoteError) return json(err.code === "price_unavailable" || err.code === "simulation_unavailable" ? 503 : 422, { error: err.code, message: err.message });
       throw err;
     }
 
@@ -378,7 +420,7 @@ export class RelayerGate {
         const ix = classified.ix;
         return await this.#serialized("debts", () => this.#openRelayerChannel(tx, ix, quote));
       }
-      return await this.#paid(tx, classified.vaults, quote, input, request.payer);
+      return await this.#paid(tx, classified.vaults, quote, input, request.payer, swaps);
     } catch (err) {
       if (err instanceof LedgerRefusal) return json(403, { error: err.code, message: err.message });
       throw err;
@@ -487,19 +529,33 @@ export class RelayerGate {
   // Quote
   // -------------------------------------------------------------------------
 
-  async #quote(tx: RelayTx, classified: Classified, leafVault: Address | null): Promise<Quote> {
+  async #quote(tx: RelayTx, classified: Classified, leafVault: Address | null, swaps: readonly Address[]): Promise<Quote> {
     const known = this.#o.ledger.view().quotes[tx.hash];
-    if (known !== undefined) return known;
+    if (known !== undefined) {
+      if (swaps.length !== 0) {
+        let logs: RelayMeasure["logs"];
+        try {
+          logs = (await simulateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data })).logs;
+        } catch (err) {
+          // A Swap that reverts now, or that the node cannot simulate, is refused before anything is charged.
+          if (err instanceof RelaySimulationError) throw new QuoteError(err.code, err.message);
+          throw err;
+        }
+        refuseFailedSwaps(logs, swaps);
+      }
+      return known;
+    }
     const problem = await this.#policyProblem(tx);
     if (problem !== null) throw new PolicyRefusal(problem);
 
-    let m: { gas: bigint; gasPrice: bigint; wei: bigint };
+    let m: RelayMeasure;
     try {
       m = await estimateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data });
     } catch (err) {
       if (err instanceof RelaySimulationError) throw new QuoteError(err.code, err.message);
       throw err;
     }
+    refuseFailedSwaps(m.logs, swaps);
 
     let amount: bigint;
     let price: EthUsd;
@@ -537,8 +593,24 @@ export class RelayerGate {
     return quote;
   }
 
-  #send(quote: Quote): Promise<Landed> {
-    return this.#o.sender.send({ to: getAddress(quote.to), data: quote.data as `0x${string}` });
+  /**
+   * Sends the quoted transaction with a gas limit of at most what it was priced at (relayGasCap); `swaps`: the
+   * vaults whose Swap in it must not fail (the sender checks it just before sending).
+   */
+  async #send(quote: Quote, swaps: readonly Address[] = []): Promise<Landed> {
+    const tx = { to: getAddress(quote.to), data: quote.data as `0x${string}` };
+    try {
+      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)) });
+    } catch (err) {
+      // Its quote no longer holds: the request sent again is priced anew.
+      if (err instanceof NotSentError && err.overCap) {
+        const hash = relayTransactionHash(tx);
+        await this.#o.ledger.update((data) => {
+          delete data.quotes[hash];
+        });
+      }
+      throw err;
+    }
   }
 
   #unknown(tx: RelayTx, err: SendUnknownError, headers: Record<string, string> = {}): Answer {
@@ -662,15 +734,15 @@ export class RelayerGate {
     return json(200, { txHash, paid: owed.toString() }, settled.headers);
   }
 
-  async #paid(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, payer: Address | null): Promise<Answer> {
+  async #paid(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, payer: Address | null, swaps: readonly Address[]): Promise<Answer> {
     // Credit belongs to a vault: the payer the request names, else the one vault the request acts for.
     const creditVault = payer ?? (vaults.length === 1 ? (vaults[0] as Address) : null);
-    if (creditVault === null) return this.#paidWithCredit(tx, vaults, quote, input, null);
+    if (creditVault === null) return this.#paidWithCredit(tx, vaults, quote, input, null, swaps);
     // A vault's credit is read and changed by one request at a time.
-    return this.#serialized(`credit:${creditVault}`, () => this.#paidWithCredit(tx, vaults, quote, input, creditVault));
+    return this.#serialized(`credit:${creditVault}`, () => this.#paidWithCredit(tx, vaults, quote, input, creditVault, swaps));
   }
 
-  async #paidWithCredit(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, creditVault: Address | null): Promise<Answer> {
+  async #paidWithCredit(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, creditVault: Address | null, swaps: readonly Address[]): Promise<Answer> {
     const view = this.#o.ledger.view();
     for (const v of vaults) {
       if (view.debts[v] !== undefined || view.opens[v] !== undefined) {
@@ -697,7 +769,7 @@ export class RelayerGate {
       // Paid from credit: nothing is charged, and the credit is used only if the transaction lands.
       let landed: Landed;
       try {
-        landed = await this.#send(quote);
+        landed = await this.#send(quote, swaps);
       } catch (err) {
         if (err instanceof SendUnknownError) return this.#unknown(tx, err);
         return json(409, { error: "not_sent", message: (err as Error).message, credit: { vault: creditVault, amount: plan.used.toString(), note: "unchanged" } });
@@ -725,7 +797,7 @@ export class RelayerGate {
     if (!settled.ok) return fromInstructions(settled.response);
     let landed: Landed;
     try {
-      landed = await this.#send(quote);
+      landed = await this.#send(quote, swaps);
     } catch (err) {
       if (err instanceof SendUnknownError) return this.#unknown(tx, err, settled.headers);
       if (!(err instanceof NotSentError)) this.#o.log("send_failed", { request: tx.hash, error: (err as Error).message });

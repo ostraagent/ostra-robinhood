@@ -18,6 +18,7 @@ import {
   concat,
   encodeAbiParameters,
   encodeDeployData,
+  encodeFunctionData,
   getAddress,
   getContractAddress,
   hexToBytes,
@@ -37,7 +38,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
 import { airdropLeaf, airdropTree } from "../src/airdrop.ts";
-import { CIRCUIT_BREAKER, DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { CIRCUIT_BREAKER, DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { usdgAbi } from "../src/external-abi.ts";
@@ -101,6 +102,7 @@ import {
   type PoolKey,
   type SwapParams,
 } from "../src/messages.ts";
+import { estimateRelay, failedSwaps, relayGasCap, simulateRelay } from "../src/relayer.ts";
 import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readRecovery, readVault } from "../src/reads.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
 import { WotsKeychain } from "../src/wots.ts";
@@ -368,8 +370,21 @@ test("a swap the SDK signs trades the vault's USDG on the deployed Uniswap v4 po
   await assert.rejects(() => signVaultSwap(chain, state, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { ...swap, zeroForOne: true } }), /not the vault's token/);
   const spend = await signVaultSwap(chain, state, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap });
   assert.equal(spend.action, VAULT_ACTION.SWAP);
+  const spendData = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [spend.action, spend.nextKeyRoot, spend.params, spend.signature] });
+  // Simulated, the gas the swap uses; eth_estimateGas is the limit it needs, which holds the signed swapGas. The
+  // relayer's price adds that swapGas to the gas used (no L1 component on anvil): code the agent picks may use it all.
+  const simulated = await simulateRelay(fork.client, { relayer: relayer.address, to: vault, data: spendData });
+  const limit = await fork.client.estimateGas({ account: relayer.address, to: vault, data: spendData });
+  assert.ok(limit > BigInt(VAULT_SWAP_GAS.DEFAULT) && simulated.gasUsed < limit / 2n, `used ${simulated.gasUsed}, limit ${limit}`);
+  const measured = await estimateRelay(fork.client, { relayer: relayer.address, to: vault, data: spendData });
+  const swapGas = BigInt(VAULT_SWAP_GAS.DEFAULT);
+  assert.equal(measured.gas, simulated.gasUsed + swapGas + swapGas / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE));
+  // The relayer's gas limit cap for it holds the limit the swap needs.
+  assert.ok(relayGasCap(measured.gas) >= limit);
+  assert.deepEqual(failedSwaps(simulated.logs, [vault]), []);
   const ethBefore = await fork.client.getBalance({ address: to });
   const receipt = await send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]);
+  assert.equal(receipt.gasUsed, simulated.gasUsed, "the simulated gas is what the receipt shows");
   const [swapped] = parseEventLogs({ abi: ostraVaultAbi, logs: receipt.logs, eventName: "Swapped" });
   assert.ok(swapped);
   assert.equal(swapped.args.poolId, poolId(ETH_USDG));
@@ -384,6 +399,19 @@ test("a swap the SDK signs trades the vault's USDG on the deployed Uniswap v4 po
   assert.equal(after1?.nonce, 1n);
   assert.equal(after1?.keyRoot, bytesToHex(chain.keyRoot(1n)));
   await assert.rejects(() => send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]), "the used signature never works again");
+  // More than the vault holds: the swap fails inside the PoolManager without reverting. The simulation shows its
+  // SwapFailed, which the relayer refuses unless asked; landed, it moves nothing and uses the key.
+  const failing = await signVaultSwap(chain, after1!, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { ...swap, amountIn: 100_000_000n } });
+  const failingData = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [failing.action, failing.nextKeyRoot, failing.params, failing.signature] });
+  const failingMeasured = await simulateRelay(fork.client, { relayer: relayer.address, to: vault, data: failingData });
+  const [simulatedFail] = failedSwaps(failingMeasured.logs, [vault]);
+  assert.equal(simulatedFail?.poolId, poolId(ETH_USDG));
+  assert.deepEqual(failedSwaps(failingMeasured.logs, [to]), [], "only the vaults named count");
+  const failedReceipt = await send(vault, ostraVaultAbi, "spend", [failing.action, failing.nextKeyRoot, failing.params, failing.signature]);
+  assert.deepEqual(failedSwaps(failedReceipt.logs, [vault]), [simulatedFail]);
+  assert.equal(failedReceipt.gasUsed, failingMeasured.gasUsed);
+  assert.equal(await balance(vault), 40_000_000n);
+  assert.equal((await readVault(fork.client, d, vault))?.nonce, 2n);
 });
 
 /** A Foundry artifact of the build the fork deploys from (../out). */

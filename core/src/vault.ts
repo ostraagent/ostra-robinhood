@@ -493,9 +493,10 @@ export class VaultService {
       const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.SET_CRANK_KEY, nextKeyRoot, params, signature })], { reservation });
       return { operation: "set_crank", txHash, crank };
     }
-    // Any other action: the same signed bytes again.
+    // Any other action: the same signed bytes again. A Swap among them is sent even if it fails now: the key
+    // already signed it, so nothing else can be signed with it until it lands.
     const s = decodeVaultSpendMessage(message);
-    const txHash = await sender.send([spendCall(vault, { action: s.action, nextKeyRoot: s.nextKeyRoot, params: s.params, signature })], { reservation });
+    const txHash = await sender.send([spendCall(vault, { action: s.action, nextKeyRoot: s.nextKeyRoot, params: s.params, signature })], { reservation, allowFailedSwaps: true });
     return { operation: "vault_spend", txHash, action: s.action };
   }
 
