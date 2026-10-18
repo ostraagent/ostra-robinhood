@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -101,6 +102,16 @@ struct ExactInputSingleParams {
     uint128 amountOutMinimum;
     uint256 minHopPriceX36;
     bytes hookData;
+}
+
+/// @notice One transaction: a router swap, then a dispatch of the pool (anyone may call it).
+contract SwapThenDispatch {
+    function run(TestSwapRouter router, OstraDispatcher dispatcher, PoolKey memory key, bool zeroForOne, int256 amount)
+        external
+    {
+        router.swap(key, zeroForOne, amount, address(router));
+        dispatcher.dispatch(key.toId());
+    }
 }
 
 /// @notice The Ostra launchpad, locker, token and hook on a fork of Robinhood Chain mainnet, against the deployed
@@ -325,6 +336,13 @@ contract LaunchpadForkTest is Test {
         vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "antiSnipe"));
         launchpad.launch{value: fee}(p);
         p.antiSnipeBps = 5_000;
+        p.maxTxMoveTicks = 999;
+        vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "maxTxMove"));
+        launchpad.launch{value: fee}(p);
+        p.maxTxMoveTicks = 6_933;
+        vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "maxTxMove"));
+        launchpad.launch{value: fee}(p);
+        p.maxTxMoveTicks = 0;
         p.creatorVault = address(_vault(WETH, CREATOR_WETH));
         vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "creatorVault"));
         launchpad.launch{value: fee}(p);
@@ -786,7 +804,7 @@ contract LaunchpadForkTest is Test {
         _configureReverts(creatorVault, id, 0, 300, OstraHook.NotInTradersFavour.selector);
         _configureReverts(creatorVault, id, 1, 501, OstraHook.NotInTradersFavour.selector);
         _configureReverts(creatorVault, id, 6, 9_000_000e18, OstraHook.NotInTradersFavour.selector);
-        _configureReverts(creatorVault, id, 9, 0, OstraHook.BadField.selector);
+        _configureReverts(creatorVault, id, 10, 0, OstraHook.BadField.selector);
 
         // Lower taxes; a lowered tax pulls its post-graduation tax down with it, so graduating never raises it.
         {
@@ -1521,5 +1539,280 @@ contract LaunchpadForkTest is Test {
         p.dividendKey.hooks = IHooks(address(hook));
         vm.expectRevert(abi.encodeWithSelector(OstraLaunchpad.BadParams.selector, "dividendKey"));
         launchpad.launch{value: fee}(p);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Circuit breaker
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev A USDG pool with the circuit breaker at `cap` ticks, no max buy or max wallet (the test router holds what
+    ///      it trades) and the launch rules for the whole test. The token is currency1 here: a buy lowers the tick.
+    function _breakerPool(bytes32 salt, uint16 cap)
+        internal
+        returns (PoolKey memory key, PoolId id, bool tokenIs0, OstraVault creatorVault)
+    {
+        creatorVault = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(creatorVault), -375_400, salt);
+        p.maxBuy = 0;
+        p.maxWallet = 0;
+        p.graduationThreshold = 100_000e6;
+        p.maxTxMoveTicks = cap;
+        address t;
+        (t, id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        key = hook.poolKey(id);
+        tokenIs0 = Currency.unwrap(key.currency0) == t;
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 1_000_000e6);
+    }
+
+    function _expectPriceMoveTooLarge() internal {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.afterSwap.selector,
+                abi.encodeWithSelector(OstraHook.PriceMoveTooLarge.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+    }
+
+    function _repeat(bool zeroForOne, int256 amount, uint256 n)
+        internal
+        pure
+        returns (bool[] memory directions, int256[] memory amounts)
+    {
+        directions = new bool[](n);
+        amounts = new int256[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            directions[i] = zeroForOne;
+            amounts[i] = amount;
+        }
+    }
+
+    /// forge-config: default.isolate = true
+    function test_theCircuitBreakerStopsOneTransactionMovingThePriceTooFar() public {
+        (PoolKey memory key, PoolId id, bool tokenIs0,) = _breakerPool(bytes32(uint256(40)), 2_231);
+        int24 start = _tickOf(id);
+        (int24 lower, int24 upper) = hook.txMoveBand(id);
+        assertEq(lower, start - 2_231);
+        assertEq(upper, start + 2_231);
+
+        // 60M tokens bought in one swap move the price about 2,780 ticks: refused.
+        _expectPriceMoveTooLarge();
+        router.swap(key, !tokenIs0, 60_000_000e18, address(router));
+        // The same buy split into six swaps of one transaction: refused, the move counts from its first swap.
+        (bool[] memory directions, int256[] memory amounts) = _repeat(!tokenIs0, 10_000_000e18, 6);
+        _expectPriceMoveTooLarge();
+        router.swaps(key, directions, amounts, address(router));
+        assertEq(_tickOf(id), start);
+
+        // A transaction that ends back within the band may go anywhere in it: a buy, a sell and a buy again.
+        directions = new bool[](3);
+        amounts = new int256[](3);
+        (directions[0], amounts[0]) = (!tokenIs0, int256(40_000_000e18));
+        (directions[1], amounts[1]) = (tokenIs0, -int256(40_000_000e18));
+        (directions[2], amounts[2]) = (!tokenIs0, int256(30_000_000e18));
+        uint256 g = gasleft();
+        router.swaps(key, directions, amounts, address(router));
+        console.log("gas three swaps in one transaction with the circuit breaker", g - gasleft());
+        int24 afterOne = _tickOf(id);
+        assertLt(afterOne, start);
+        assertLe(start - afterOne, 2_231);
+
+        // Separate transactions are not limited: three more buys of 10M each, then the band follows the price.
+        for (uint256 i = 0; i < 3; ++i) {
+            router.swap(key, !tokenIs0, 10_000_000e18, address(router));
+        }
+        int24 now_ = _tickOf(id);
+        assertGt(start - now_, 2_231, "past the band of the first transaction");
+        (lower, upper) = hook.txMoveBand(id);
+        assertEq(lower, now_ - 2_231);
+        assertEq(upper, now_ + 2_231);
+
+        // A dump of everything bought in one sell is refused; small sells pass, and so does selling it over
+        // several transactions.
+        uint256 held = IERC20(Currency.unwrap(tokenIs0 ? key.currency0 : key.currency1)).balanceOf(address(router));
+        _expectPriceMoveTooLarge();
+        router.swap(key, tokenIs0, -int256(held), address(router));
+        router.swap(key, tokenIs0, -1_000_000e18, address(router));
+        for (uint256 i = 0; i < 4; ++i) {
+            router.swap(key, tokenIs0, -int256((held - 1_000_000e18) / 4), address(router));
+        }
+        assertGt(_tickOf(id), now_ + 2_231);
+    }
+
+    function test_theCreatorCanOnlyLoosenOrTurnOffTheCircuitBreaker() public {
+        (, PoolId id,, OstraVault creatorVault) = _breakerPool(bytes32(uint256(41)), 2_231);
+        assertEq(hook.poolConfig(id).maxTxMoveTicks, 2_231);
+        _configureReverts(creatorVault, id, 9, 2_231, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 9, 1_000, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 9, 6_933, OstraHook.NotInTradersFavour.selector);
+        _configure(creatorVault, id, 9, 6_932);
+        assertEq(hook.poolConfig(id).maxTxMoveTicks, 6_932);
+        _configure(creatorVault, id, 9, 0);
+        assertEq(hook.poolConfig(id).maxTxMoveTicks, 0);
+        (int24 lower, int24 upper) = hook.txMoveBand(id);
+        assertEq(lower, TickMath.MIN_TICK);
+        assertEq(upper, TickMath.MAX_TICK);
+        // Off stays off.
+        _configureReverts(creatorVault, id, 9, 3_000, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 9, 0, OstraHook.NotInTradersFavour.selector);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Referral
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev The hook fee of the last Charged event in the recorded logs.
+    function _lastHookFee() internal returns (uint256 hookFee) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == OstraHook.Charged.selector) {
+                (, , hookFee,,) = abi.decode(logs[i].data, (bool, uint256, uint256, uint256, uint256));
+            }
+        }
+    }
+
+    /// @dev The protocol's 30% of `hookFee`, and the hook's books of it: what referrers, the protocol and the buyback
+    ///      were owed in USDG, against `before`.
+    function _protocolPart(uint256 hookFee) internal pure returns (uint256) {
+        return hookFee - (hookFee * 7_000) / 10_000;
+    }
+
+    function _assertReferral(address referrer, uint256 referredBefore, uint256 sharesBefore, uint256 hookFee) internal view {
+        Currency usdg = Currency.wrap(USDG);
+        uint256 part = _protocolPart(hookFee);
+        uint256 referral = part / 2;
+        assertEq(hook.referralOwed(referrer, usdg) - referredBefore, referral, "half of the protocol's share");
+        uint256 rest = part - referral;
+        (uint128 protocol, uint128 buyback) = hook.protocolShare(usdg);
+        uint256 bookedBefore = sharesBefore;
+        assertEq(uint256(protocol) + buyback - ((bookedBefore >> 128) + uint128(bookedBefore)), rest);
+        assertEq(uint256(buyback) - uint128(bookedBefore), rest / 2, "the rest is shared with the buyback as before");
+    }
+
+    function test_aReferredSwapPaysHalfTheProtocolShareToItsReferrer() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(42)));
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        Currency usdg = Currency.wrap(USDG);
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 10_000e6);
+        address referrer = makeAddr("referrer");
+        bytes memory referral = abi.encode(referrer);
+
+        // An exact-input buy of 100 USDG: the hook fee is 1 USDG, the protocol's 0.3 USDG, the referrer's 0.15 USDG.
+        uint256 shares = _protocolShares(usdg);
+        router.swapWithData(key, !tokenIs0, -100e6, address(router), referral);
+        assertEq(hook.referralOwed(referrer, usdg), 0.15e6);
+        (uint128 protocol, uint128 buyback) = hook.protocolShare(usdg);
+        assertEq(uint256(protocol) - (shares >> 128), 0.075e6);
+        assertEq(uint256(buyback) - uint128(shares), 0.075e6);
+
+        // An exact-input sell: charged in afterSwap, the referrer is read there too.
+        shares = _protocolShares(usdg);
+        uint256 referred = hook.referralOwed(referrer, usdg);
+        vm.recordLogs();
+        router.swapWithData(key, tokenIs0, -1_000_000e18, address(router), referral);
+        _assertReferral(referrer, referred, shares, _lastHookFee());
+
+        // hookData of any other shape is no referrer: the whole protocol share stays with the protocol.
+        referred = hook.referralOwed(referrer, usdg);
+        shares = _protocolShares(usdg);
+        router.swapWithData(key, !tokenIs0, -100e6, address(router), abi.encode(referrer, uint256(1)));
+        router.swapWithData(key, !tokenIs0, -100e6, address(router), abi.encode(uint256(uint160(referrer)) | (1 << 160)));
+        assertEq(hook.referralOwed(referrer, usdg), referred);
+        (protocol, buyback) = hook.protocolShare(usdg);
+        assertEq(uint256(protocol) + buyback - ((shares >> 128) + uint128(shares)), 2 * 0.3e6);
+
+        // Anyone may claim for the referrer; it is paid, and only it.
+        vm.prank(makeAddr("anyone"));
+        dispatcher.claimReferral(referrer, usdg);
+        assertEq(IERC20(USDG).balanceOf(referrer), referred);
+        assertEq(hook.referralOwed(referrer, usdg), 0);
+        vm.expectRevert(OstraDispatcher.NothingToClaim.selector);
+        dispatcher.claimReferral(referrer, usdg);
+        vm.expectRevert(OstraHook.OnlyDispatcher.selector);
+        hook.takeReferral(referrer, usdg);
+        // After a dispatch (the locked positions' LP fees), the protocol and the buyback are paid what they are owed.
+        dispatcher.dispatch(key.toId());
+        _claimProtocolAndBuyback();
+    }
+
+    function test_aVaultSwapCarriesItsReferrer() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(43)));
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        vm.warp(block.timestamp + 601);
+        OstraVault buyer = _vault(USDG, BUYER);
+        deal(USDG, address(buyer), 100e6);
+        address referrer = makeAddr("agent referrer");
+        bytes32 next = WotsSigner.keyRoot(_seed(BUYER, 1));
+
+        // A zero referrer, or a seventh word, is refused before anything moves.
+        bytes memory params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), address(0));
+        bytes memory signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
+        vm.expectRevert(OstraVault.BadParams.selector);
+        buyer.spend(3, next, params, signature);
+        params = abi.encodePacked(abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer), bytes32(0));
+        signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
+        vm.expectRevert(OstraVault.BadParams.selector);
+        buyer.spend(3, next, params, signature);
+
+        params = abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(buyer), referrer);
+        assertEq(params.length, 320);
+        signature = WotsSigner.sign(_seed(BUYER, 0), buyer.spendMessage(3, next, params));
+        uint256 shares = _protocolShares(Currency.wrap(USDG));
+        vm.recordLogs();
+        uint256 g = gasleft();
+        buyer.spend(3, next, params, signature);
+        console.log("gas vault Swap with a referrer (Ostra pool)", g - gasleft());
+        _assertReferral(referrer, 0, shares, _lastHookFee());
+        assertEq(hook.referralOwed(referrer, Currency.wrap(USDG)), 0.03e6, "20 USDG in: a 0.2 USDG hook fee, 0.06 for the protocol");
+        assertGt(token.balanceOf(address(buyer)), 0);
+    }
+
+    /// forge-config: default.isolate = true
+    function test_thePriceCannotBeWalkedThroughEmptyTicksForFree() public {
+        (PoolKey memory key, PoolId id, bool tokenIs0,) = _breakerPool(bytes32(uint256(44)), 1_000);
+        int24 start = _tickOf(id);
+        (int24 lower, int24 upper) = hook.txMoveBand(id);
+        // A 1-wei sell stopped at the band's edge, on the side where the launch put no liquidity: it would move the
+        // price 1,000 ticks for nothing, and ten of them would leave every later swap too large. Refused.
+        uint160 edge = TickMath.getSqrtPriceAtTick(tokenIs0 ? lower + 1 : upper);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.afterSwap.selector,
+                abi.encodeWithSelector(OstraHook.NoLiquidityAtPrice.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        router.swapToLimit(key, tokenIs0, -1, edge, address(router));
+        assertEq(_tickOf(id), start);
+        // Buys go on as usual.
+        router.swap(key, !tokenIs0, -1e6, address(router));
+        assertGt(IERC20(Currency.unwrap(tokenIs0 ? key.currency0 : key.currency1)).balanceOf(address(router)), 0);
+    }
+
+    /// forge-config: default.isolate = true
+    function test_aDispatchInTheSameTransactionStaysInTheBand() public {
+        (PoolKey memory key, PoolId id, bool tokenIs0,) = _breakerPool(bytes32(uint256(45)), 1_000);
+        // Buckets to convert, booked over separate transactions.
+        for (uint256 i = 0; i < 12; ++i) {
+            router.swap(key, !tokenIs0, 15_000_000e18, address(router));
+            router.swap(key, tokenIs0, -15_000_000e18, address(router));
+        }
+        assertGt(hook.pending(id).burn, 0);
+        int24 start = _tickOf(id);
+        // A buy that takes the price close to the band's edge, then a dispatch whose conversion buys (burn, LP) would
+        // take it past: the dispatch stops at the edge and books the rest back for later.
+        SwapThenDispatch bundle = new SwapThenDispatch();
+        bundle.run(router, dispatcher, key, !tokenIs0, 19_000_000e18);
+        int256 moved = int256(_tickOf(id)) - int256(start);
+        if (moved < 0) moved = -moved;
+        assertGt(moved, 800);
+        assertLe(moved, 1_000);
+        assertGt(hook.pending(id).burn + hook.pending(id).lp, 0, "what did not fit waits for the next dispatch");
     }
 }

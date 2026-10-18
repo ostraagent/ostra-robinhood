@@ -42,6 +42,7 @@ import {
 } from "viem";
 import { BEACON_PROXY_CREATION_CODE, ostraVaultAbi } from "./abi.ts";
 import {
+  CIRCUIT_BREAKER,
   CREATOR_SPLIT,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
@@ -123,25 +124,33 @@ function wotsSignature(value: Uint8Array): Hex {
 
 export type VaultAction = (typeof VAULT_ACTION)[keyof typeof VAULT_ACTION];
 
-/** Exact params length OstraVault._checkParamsShape requires per action. */
-export const SPEND_PARAMS_LEN: Readonly<Record<VaultAction, number>> = {
-  [VAULT_ACTION.TRANSFER]: 64,
-  [VAULT_ACTION.OPEN_CHANNEL]: 192,
-  [VAULT_ACTION.SET_CRANK_KEY]: 32,
-  [VAULT_ACTION.SWAP]: 288,
-  [VAULT_ACTION.CONFIGURE_POOL]: 128,
-  [VAULT_ACTION.CLAIM_DIVIDEND]: 32,
-  [VAULT_ACTION.SET_GUARDIAN]: 64,
-  [VAULT_ACTION.SET_RECOVERY_POLICY]: 64,
-  [VAULT_ACTION.SUPPORT_RECOVERY]: 64,
+/**
+ * The params lengths OstraVault._checkParamsShape accepts per action: one per
+ * action, but a Swap may carry its referrer as a sixth word (320 bytes).
+ */
+export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[]>> = {
+  [VAULT_ACTION.TRANSFER]: [64],
+  [VAULT_ACTION.OPEN_CHANNEL]: [192],
+  [VAULT_ACTION.SET_CRANK_KEY]: [32],
+  [VAULT_ACTION.SWAP]: [288, 320],
+  [VAULT_ACTION.CONFIGURE_POOL]: [128],
+  [VAULT_ACTION.CLAIM_DIVIDEND]: [32],
+  [VAULT_ACTION.SET_GUARDIAN]: [64],
+  [VAULT_ACTION.SET_RECOVERY_POLICY]: [64],
+  [VAULT_ACTION.SUPPORT_RECOVERY]: [64],
 };
 
-function paramsFor(action: number, params: Hex): Hex {
-  const len = SPEND_PARAMS_LEN[action as VaultAction];
-  if (len === undefined) throw new RangeError(`unknown vault action ${action}`);
-  if (!/^0x([0-9a-fA-F]{2})*$/.test(params) || (params.length - 2) / 2 !== len) {
-    throw new RangeError(`action ${action} params must be ${len} bytes`);
+/** Throws unless `params` (hex) has a length OstraVault accepts for `action`. */
+export function checkSpendParamsLength(action: number, params: Hex): void {
+  const lengths = SPEND_PARAMS_LENGTHS[action as VaultAction];
+  if (lengths === undefined) throw new RangeError(`unknown vault action ${action}`);
+  if (!/^0x([0-9a-fA-F]{2})*$/.test(params) || !lengths.includes((params.length - 2) / 2)) {
+    throw new RangeError(`action ${action} params must be ${lengths.join(" or ")} bytes`);
   }
+}
+
+function paramsFor(action: number, params: Hex): Hex {
+  checkSpendParamsLength(action, params);
   return params;
 }
 
@@ -235,6 +244,7 @@ const POOL_KEY_TYPE = {
 } as const;
 
 const SWAP_PARAMS_TYPES = [POOL_KEY_TYPE, { type: "bool" }, { type: "uint128" }, { type: "uint128" }, { type: "address" }] as const;
+const SWAP_REFERRED_PARAMS_TYPES = [...SWAP_PARAMS_TYPES, { type: "address" }] as const;
 
 /** A key the PoolManager accepts: sorted distinct currencies, a valid fee and a valid tick spacing. */
 function poolKey(k: PoolKey): PoolKey {
@@ -266,23 +276,56 @@ export type SwapParams = {
   minOut: bigint;
   /** Receives the output (another vault, for example); native ETH only to a recipient that accepts it. */
   recipient: Address;
+  /**
+   * The swap's referrer, passed to the pool's hook as its hookData: an Ostra
+   * pool pays it half of the protocol's share of the hook fee (REFERRAL).
+   */
+  referrer?: Address;
 };
 
-/** Swap params: abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn, uint128 minOut, address recipient). */
+/**
+ * Swap params: abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn,
+ * uint128 minOut, address recipient), and with a referrer a sixth word,
+ * address referrer (320 bytes).
+ */
 export function swapParams(p: SwapParams): Hex {
   if (typeof p.zeroForOne !== "boolean") throw new RangeError("zeroForOne must be a boolean");
-  return encodeAbiParameters(SWAP_PARAMS_TYPES, [
+  const fields = [
     poolKey(p.key),
     p.zeroForOne,
     positive(p.amountIn, U128_MAX, "amountIn"),
     uint(p.minOut, U128_MAX, "minOut"),
     nonZeroAddr(p.recipient, "recipient"),
-  ]);
+  ] as const;
+  if (p.referrer === undefined) return encodeAbiParameters(SWAP_PARAMS_TYPES, fields);
+  return encodeAbiParameters(SWAP_REFERRED_PARAMS_TYPES, [...fields, nonZeroAddr(p.referrer, "referrer")]);
 }
 
 export function decodeSwapParams(params: Hex): SwapParams {
-  const [key, zeroForOne, amountIn, minOut, recipient] = decodeAbiParameters(SWAP_PARAMS_TYPES, paramsFor(VAULT_ACTION.SWAP, params));
-  return { key: { ...key }, zeroForOne, amountIn, minOut, recipient };
+  const len = (paramsFor(VAULT_ACTION.SWAP, params).length - 2) / 2;
+  let p: SwapParams;
+  if (len === 288) {
+    const [key, zeroForOne, amountIn, minOut, recipient] = decodeAbiParameters(SWAP_PARAMS_TYPES, params);
+    p = { key: { ...key }, zeroForOne, amountIn, minOut, recipient };
+  } else {
+    // The vault decodes the referrer word as an address and reverts on dirty upper bytes; viem drops them.
+    if (!/^0{24}$/.test(params.slice(2 + 288 * 2, 2 + 288 * 2 + 24))) throw new RangeError("referrer is not a clean address word");
+    const [key, zeroForOne, amountIn, minOut, recipient, referrer] = decodeAbiParameters(SWAP_REFERRED_PARAMS_TYPES, params);
+    p = { key: { ...key }, zeroForOne, amountIn, minOut, recipient, referrer };
+  }
+  // viem does not range-check the other words either (dirty upper bytes in an address or a uint128) while the vault's
+  // abi.decode reverts on them: the params must be exactly what swapParams encodes for what they decode to.
+  if (swapParams(p).toLowerCase() !== params.toLowerCase()) throw new RangeError("swap params are not canonically encoded");
+  return p;
+}
+
+/**
+ * The hookData of a swap on an Ostra pool that pays `referrer` (REFERRAL):
+ * abi.encode(address referrer), for routers that pass hookData (the Universal
+ * Router's V4 swaps); an OstraVault Swap carries it with SwapParams.referrer.
+ */
+export function referralHookData(referrer: Address): Hex {
+  return encodeAbiParameters([{ type: "address" }], [nonZeroAddr(referrer, "referrer")]);
 }
 
 /** The currency a swap spends: currency0 when zeroForOne, else currency1. */
@@ -297,7 +340,7 @@ export function swapOutput(p: Pick<SwapParams, "key" | "zeroForOne">): Address {
 
 export type PoolSetting = (typeof POOL_SETTING)[keyof typeof POOL_SETTING];
 
-/** The largest value per OstraHook.configure field: the width of the PoolConfig member it sets. */
+/** The largest value per OstraHook.configure field: the width of the PoolConfig member it sets, or the hook's own bound. */
 const POOL_SETTING_MAX: Readonly<Record<PoolSetting, bigint>> = {
   [POOL_SETTING.BUY_TAX]: 0xffffn,
   [POOL_SETTING.SELL_TAX]: 0xffffn,
@@ -308,6 +351,7 @@ const POOL_SETTING_MAX: Readonly<Record<PoolSetting, bigint>> = {
   [POOL_SETTING.MAX_BUY]: U128_MAX,
   [POOL_SETTING.RELEASE_LIMITS]: 0n,
   [POOL_SETTING.VOLATILITY_FEE]: 0n,
+  [POOL_SETTING.MAX_TX_MOVE]: BigInt(CIRCUIT_BREAKER.MAX_TICKS),
 };
 
 /**

@@ -44,7 +44,14 @@ Contents:
   and the dispatcher add liquidity and the max buy and the token's max wallet apply. During the
   anti-farmer period the token enters no other v4 pool and no Uniswap v2 or v3 style pool. The
   creator vault can change the rules only in the traders' favour (lower taxes, earlier tax end,
-  higher max buy, limits released, volatility fee off). A pool's quote is ETH or any ERC-20, a
+  higher max buy, limits released, volatility fee off, a looser or no circuit breaker). The circuit
+  breaker, chosen at launch (off, or 1,000 to 6,932 ticks; Ostra's default 2,231, -20% / +25%),
+  refuses a swap that leaves the price further from where it was before the transaction's first
+  swap, however the transaction splits it, or where the pool has no liquidity; a dispatch in the
+  same transaction stops at its band. A swap whose hookData is `abi.encode(referrer)` (an OstraVault
+  Swap carries it as an optional sixth word) pays that referrer half of the protocol's share of the
+  hook fee (0.15% of the quote leg), which anyone can pay out to it with
+  `OstraDispatcher.claimReferral`. A pool's quote is ETH or any ERC-20, a
   stock token among them; dividends in another ERC-20 are bought in an existing hookless pool or
   a launched Ostra pool. The LP fee is set per swap by `OstraFees`: 0.25%; 0.50% in a pool quoted
   in a Robinhood stock token while the NYSE is closed (weekends and the NYSE holidays of 2026 to

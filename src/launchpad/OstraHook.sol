@@ -7,6 +7,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -21,6 +22,10 @@ import {OstraToken} from "./OstraToken.sol";
 ///      the same way.
 uint256 constant OSTRA_CREATOR_FEE_SHARE_BPS = 7_000;
 uint256 constant OSTRA_BUYBACK_SHARE_BPS = 5_000;
+/// @dev The circuit breaker's bounds for a pool's maxTxMoveTicks (0: off), file-level so that OstraLaunchpad checks
+///      them at launch: 1,000 ticks is a move of about 10%, 6,932 a halving or a doubling of the price.
+uint256 constant OSTRA_MIN_TX_MOVE_TICKS = 1_000;
+uint256 constant OSTRA_MAX_TX_MOVE_TICKS = 6_932;
 
 /// @title OstraHook
 /// @notice The one Uniswap v4 hook of every pool OstraLaunchpad creates (design v0.4, "Hook Ostra di Robinhood
@@ -32,6 +37,16 @@ uint256 constant OSTRA_BUYBACK_SHARE_BPS = 5_000;
 ///   tax end), shared among the pool's buckets: creator, holder dividends, burn, added liquidity and the floor bid
 ///   (OstraDispatcher);
 /// * on buys, the anti-snipe tax, falling linearly to zero over its duration, shared like the tax.
+/// A swap whose hookData is exactly abi.encode(referrer) pays half of the protocol's share of the hook fee to that
+/// referrer instead (referralOwed, claimed through OstraDispatcher.claimReferral); hookData of any other shape is
+/// ignored.
+/// The circuit breaker: a pool whose creator chose maxTxMoveTicks (at launch: 0, off, or MIN_TX_MOVE_TICKS to
+/// MAX_TX_MOVE_TICKS; Ostra's launch default is 2,231 ticks, -20% / +25%) refuses a swap that leaves the price
+/// further than that from where it was before the transaction's first swap on the pool, so one transaction cannot
+/// crash or pump it however it splits its swaps; separate transactions are not limited (txMoveBand). It also refuses
+/// a swap that leaves the price where the pool has no liquidity: a price moved through empty ticks costs nothing,
+/// and could otherwise be walked away, one free transaction at a time, until every swap back is too large. The band
+/// is the whole transaction's: swaps of several users in one transaction (a bundle) share it.
 /// The LP fee, the pools' dynamic Uniswap v4 fee, is set on every swap from OstraFees: 0.25%; 0.50% for a pool
 /// quoted in a stock token while its market is closed (weekends, NYSE holidays); with the volatility fee the
 /// creator may choose at launch, up to 1% as the price moves away from its 60-second EMA; plus the MEV surcharge
@@ -75,6 +90,16 @@ contract OstraHook is IHooks, Ownable2Step {
     uint8 public constant FIELD_RELEASE_LIMITS = 7;
     /// @notice Value 0: turns the pool's volatility fee off (the LP fee is then OstraFees' session fee only).
     uint8 public constant FIELD_VOLATILITY_FEE = 8;
+    /// @notice The circuit breaker only loosens: a higher maxTxMoveTicks (at most MAX_TX_MOVE_TICKS), or 0 (off).
+    uint8 public constant FIELD_MAX_TX_MOVE = 9;
+
+    uint256 public constant MIN_TX_MOVE_TICKS = OSTRA_MIN_TX_MOVE_TICKS;
+    uint256 public constant MAX_TX_MOVE_TICKS = OSTRA_MAX_TX_MOVE_TICKS;
+    /// @notice A swap's referrer receives this share of the protocol's part of its hook fee (half: 0.15% of the
+    ///         quote leg); the protocol's remaining part is shared with the buyback as without a referrer.
+    uint256 public constant REFERRAL_SHARE_BPS = 5_000;
+    /// @dev Seed of the transient slot holding a pool's tick before the transaction's first swap on it.
+    bytes32 private constant TX_START_TICK_SEED = keccak256("OSTRA/HOOK/TX_START_TICK");
 
     struct PoolConfig {
         address token;
@@ -106,6 +131,8 @@ contract OstraHook is IHooks, Ownable2Step {
         bool stockQuote;
         /// @notice The creator chose the volatility fee (it can only be turned off).
         bool volatilityFee;
+        /// @notice The circuit breaker: how far, in ticks, one transaction's swaps may move the price (0: off).
+        uint16 maxTxMoveTicks;
     }
 
     struct PoolState {
@@ -154,6 +181,11 @@ contract OstraHook is IHooks, Ownable2Step {
     mapping(PoolId => uint256) public feeState;
     /// @notice The protocol's share per currency, until the dispatcher takes it (takeProtocolShare).
     mapping(Currency => ProtocolShare) public protocolShare;
+    /// @notice What referrers are owed per currency, as the dispatcher's claims, until they claim it
+    ///         (OstraDispatcher.claimReferral).
+    mapping(address referrer => mapping(Currency => uint256)) public referralOwed;
+    /// @dev The referrer of the swap being charged (address(0): none), set from its hookData in both callbacks.
+    address private transient _referrer;
 
     event Initialized(address launchpad, address locker, address dispatcher);
     event PoolRegistered(PoolId indexed poolId, address indexed token, address creatorVault);
@@ -164,6 +196,8 @@ contract OstraHook is IHooks, Ownable2Step {
     event PoolConfigured(PoolId indexed poolId, uint8 field, uint256 value);
     /// @notice A swap's LP fee was above OstraFees.BASE_LP_FEE or carried an MEV surcharge (pips, 1e6 = 100%).
     event LpFeeCharged(PoolId indexed poolId, uint24 lpFee, uint24 mevSurcharge);
+    /// @notice A swap's referrer was owed `amount` of the pool's quote.
+    event Referred(PoolId indexed poolId, address indexed referrer, uint256 amount);
 
     error AlreadyInitialized();
     error OnlyPoolManager();
@@ -178,6 +212,8 @@ contract OstraHook is IHooks, Ownable2Step {
     error OnlyCreatorVault();
     error NotInTradersFavour();
     error BadField();
+    error PriceMoveTooLarge();
+    error NoLiquidityAtPrice();
 
     constructor(address poolManager, address weth, address fees, address admin) Ownable(admin) {
         POOL_MANAGER = IPoolManager(poolManager);
@@ -274,6 +310,29 @@ contract OstraHook is IHooks, Ownable2Step {
         return (s.protocol, s.buyback);
     }
 
+    /// @notice Hands the dispatcher what `referrer` is owed in `currency`, and books it as paid.
+    function takeReferral(address referrer, Currency currency) external returns (uint256 amount) {
+        if (msg.sender != dispatcher) revert OnlyDispatcher();
+        amount = referralOwed[referrer][currency];
+        delete referralOwed[referrer][currency];
+    }
+
+    /// @notice The ticks the pool's price may end a swap between in this transaction: maxTxMoveTicks either side of
+    ///         the tick before its first swap on the pool, or of the current tick before any (outside a transaction,
+    ///         what the next transaction may do). The whole tick range when the circuit breaker is off. A swap down to
+    ///         the price of `lower` may end one tick below it (v4 sets the tick below a crossed boundary): a price
+    ///         limit for a swap down stops at lower + 1.
+    function txMoveBand(PoolId id) external view returns (int24 lower, int24 upper) {
+        int256 cap = int256(uint256(_configs[id].maxTxMoveTicks));
+        if (cap == 0) return (TickMath.MIN_TICK, TickMath.MAX_TICK);
+        (bool set, int24 start) = _txStartTick(id);
+        if (!set) start = _tick(id);
+        int256 lo = int256(start) - cap;
+        int256 hi = int256(start) + cap;
+        lower = lo < TickMath.MIN_TICK ? TickMath.MIN_TICK : int24(lo);
+        upper = hi > TickMath.MAX_TICK ? TickMath.MAX_TICK : int24(hi);
+    }
+
     function dividendKey(PoolId id) external view returns (PoolKey memory) {
         return _dividendKeys[id];
     }
@@ -341,6 +400,12 @@ contract OstraHook is IHooks, Ownable2Step {
         } else if (field == FIELD_VOLATILITY_FEE) {
             if (value != 0 || !c.volatilityFee) revert NotInTradersFavour();
             c.volatilityFee = false;
+        } else if (field == FIELD_MAX_TX_MOVE) {
+            uint256 current = c.maxTxMoveTicks;
+            if (current == 0 || (value != 0 && (value <= current || value > MAX_TX_MOVE_TICKS))) {
+                revert NotInTradersFavour();
+            }
+            c.maxTxMoveTicks = uint16(value);
         } else {
             revert BadField();
         }
@@ -402,15 +467,21 @@ contract OstraHook is IHooks, Ownable2Step {
         return c.tokenIs0 ? key.currency1 : key.currency0;
     }
 
-    function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
+    function beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata hookData
+    ) external onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
+        bool breaker = _configs[key.toId()].maxTxMoveTicks != 0;
+        if (breaker) _recordTxStartTick(key.toId());
         // The dispatcher's conversions pay nothing: no hook fee, tax or LP fee, and they leave the fee state alone.
+        // The circuit breaker counts them from the transaction's start but does not check them: OstraDispatcher
+        // stops each within the band (txMoveBand).
         if (sender == dispatcher) {
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
+        _referrer = _referrerOf(hookData);
         int128 fee = _beforeSwapFee(key, params);
         uint24 lp = _lpFee(key.toId(), params.zeroForOne, sender);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee, 0), lp | LPFeeLibrary.OVERRIDE_FEE_FLAG);
@@ -440,10 +511,60 @@ contract OstraHook is IHooks, Ownable2Step {
         PoolKey calldata key,
         IPoolManager.SwapParams calldata params,
         BalanceDelta delta,
-        bytes calldata
+        bytes calldata hookData
     ) external onlyPoolManager returns (bytes4, int128) {
         if (sender == dispatcher) return (IHooks.afterSwap.selector, 0);
+        _referrer = _referrerOf(hookData);
         return (IHooks.afterSwap.selector, _afterSwapFee(key, params, delta));
+    }
+
+    /// @dev The referrer in a swap's hookData: exactly abi.encode(address); anything else is no referrer.
+    function _referrerOf(bytes calldata hookData) private pure returns (address) {
+        if (hookData.length != 32) return address(0);
+        uint256 word = uint256(bytes32(hookData));
+        if (word >> 160 != 0) return address(0);
+        return address(uint160(word));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Circuit breaker
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Bit 24 marks the slot as set, so that tick 0 is told from no swap yet.
+    function _txStartSlot(PoolId id) private pure returns (bytes32) {
+        return keccak256(abi.encode(TX_START_TICK_SEED, id));
+    }
+
+    function _recordTxStartTick(PoolId id) private {
+        bytes32 slot = _txStartSlot(id);
+        uint256 word;
+        assembly ("memory-safe") {
+            word := tload(slot)
+        }
+        if (word != 0) return;
+        int24 tick = _tick(id);
+        assembly ("memory-safe") {
+            tstore(slot, or(shl(24, 1), and(tick, 0xffffff)))
+        }
+    }
+
+    function _txStartTick(PoolId id) private view returns (bool set, int24 tick) {
+        bytes32 slot = _txStartSlot(id);
+        uint256 word;
+        assembly ("memory-safe") {
+            word := tload(slot)
+        }
+        set = word != 0;
+        tick = int24(uint24(word));
+    }
+
+    /// @dev After a swap: the price may end at most maxTxMoveTicks from the tick before the transaction's first swap,
+    ///      and only where the pool has liquidity.
+    function _checkTxMove(PoolId id, uint256 cap) private view {
+        (, int24 start) = _txStartTick(id);
+        int256 moved = int256(_tick(id)) - int256(start);
+        if (moved > int256(cap) || -moved > int256(cap)) revert PriceMoveTooLarge();
+        if (_liquidity(id) == 0) revert NoLiquidityAtPrice();
     }
 
     /// @dev Exact input buy: the fee is part of what the buyer pays. Exact output sell: the fee comes on top of
@@ -469,6 +590,7 @@ contract OstraHook is IHooks, Ownable2Step {
         (bool buy, bool quoteSpecified) = _sides(c, params);
         if (!quoteSpecified) fee = _afterCharge(id, key, c, buy, delta, params.amountSpecified > 0);
         _afterTrade(id, c, buy, delta);
+        if (c.maxTxMoveTicks != 0) _checkTxMove(id, c.maxTxMoveTicks);
     }
 
     function _afterCharge(PoolId id, PoolKey calldata key, PoolConfig memory c, bool buy, BalanceDelta delta, bool onTop)
@@ -510,10 +632,19 @@ contract OstraHook is IHooks, Ownable2Step {
     }
 
     /// @dev The hook fee: 70% creator, 30% protocol, half of it for buyback (OstraDispatcher shares the locked
-    ///      positions' LP fees the same way).
+    ///      positions' LP fees the same way); with a referrer, half of the protocol's 30% goes to the referrer first.
     function _shareFee(PoolId id, Currency quote, uint256 amount) private {
         uint256 creator = (amount * CREATOR_FEE_SHARE_BPS) / BPS;
         uint256 protocol = amount - creator;
+        address referrer = _referrer;
+        if (referrer != address(0)) {
+            uint256 referral = (protocol * REFERRAL_SHARE_BPS) / BPS;
+            if (referral != 0) {
+                referralOwed[referrer][quote] += referral;
+                protocol -= referral;
+                emit Referred(id, referrer, referral);
+            }
+        }
         uint256 buyback = (protocol * BUYBACK_SHARE_BPS) / BPS;
         _pending[id].creator += uint128(creator);
         ProtocolShare storage s = protocolShare[quote];
@@ -575,7 +706,16 @@ contract OstraHook is IHooks, Ownable2Step {
 
     /// @dev slot0 of the pool (v4-core StateLibrary.getSlot0, read the same way: pools mapping at slot 6).
     function _slot0(PoolId id) private view returns (bytes32) {
-        return POOL_MANAGER.extsload(keccak256(abi.encodePacked(PoolId.unwrap(id), bytes32(uint256(6)))));
+        return POOL_MANAGER.extsload(_stateSlot(id));
+    }
+
+    /// @dev The pool's active liquidity (StateLibrary.getLiquidity: the state slot + LIQUIDITY_OFFSET, 3).
+    function _liquidity(PoolId id) private view returns (uint128) {
+        return uint128(uint256(POOL_MANAGER.extsload(bytes32(uint256(_stateSlot(id)) + 3))));
+    }
+
+    function _stateSlot(PoolId id) private pure returns (bytes32) {
+        return keccak256(abi.encodePacked(PoolId.unwrap(id), bytes32(uint256(6))));
     }
 
     // ---------------------------------------------------------------------------------------------

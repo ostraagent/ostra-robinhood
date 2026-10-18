@@ -52,7 +52,11 @@ interface IOstraRecovery {
 ///                  Uniswap v4 pool `key`, which must have this vault's token on its input side. The vault
 ///                  unlocks the PoolManager itself, so the swap's sender (what the pool's hook sees) is this
 ///                  vault. At least `minOut` of the other currency goes to `recipient` (another vault, for
-///                  example); native ETH only to a recipient that accepts it.
+///                  example); native ETH only to a recipient that accepts it. The params may carry a sixth word,
+///                  abi.encode(..., address referrer) (320 bytes): the swap's hookData is then abi.encode(referrer),
+///                  which an OstraHook pool pays a referral on (OstraHook.referralOwed). The pool's hook may refuse
+///                  the swap (an Ostra pool's circuit breaker refuses one that moves its price too far): quote it
+///                  before signing, since a refused spend can only be sent again with the same bytes.
 /// * 4 ConfigurePool: params abi.encode(address hook, bytes32 poolId, uint8 field, uint256 value). Calls
 ///                  hook.configure(poolId, field, value) as this vault: an OstraHook lets a pool's creator vault
 ///                  change the pool's rules, and only in the traders' favour (OstraHook.configure).
@@ -268,7 +272,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         } else if (action == ACTION_SET_CRANK_KEY) {
             if (params.length != 32) revert BadParams();
         } else if (action == ACTION_SWAP) {
-            if (params.length != 288) revert BadParams();
+            if (params.length != 288 && params.length != 320) revert BadParams();
         } else if (action == ACTION_CONFIGURE_POOL) {
             if (params.length != 128) revert BadParams();
         } else if (action == ACTION_CLAIM_DIVIDEND) {
@@ -337,6 +341,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             abi.decode(params, (PoolKey, bool, uint128, uint128, address));
         if (amountIn == 0) revert ZeroAmount();
         if (recipient == address(0)) revert BadParams();
+        // The optional sixth word, the swap's referrer, goes to the pool's hook as its hookData.
+        if (params.length == 320 && abi.decode(params[288:], (address)) == address(0)) revert BadParams();
         Currency input = zeroForOne ? key.currency0 : key.currency1;
         if (Currency.unwrap(input) != address(token)) revert WrongToken();
         _swapPending = true;
@@ -360,7 +366,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
                 amountSpecified: -int256(uint256(amountIn)),
                 sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
-            ""
+            data[288:]
         );
         (int128 inDelta, int128 outDelta) =
             zeroForOne ? (delta.amount0(), delta.amount1()) : (delta.amount1(), delta.amount0());

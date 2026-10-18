@@ -15,7 +15,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
-import {OstraHook} from "./OstraHook.sol";
+import {OSTRA_MAX_TX_MOVE_TICKS, OSTRA_MIN_TX_MOVE_TICKS, OstraHook} from "./OstraHook.sol";
 import {OstraLocker} from "./OstraLocker.sol";
 import {OstraToken} from "./OstraToken.sol";
 
@@ -91,6 +91,8 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         uint128 graduationThreshold;
         /// @notice The LP fee follows the price's distance from its 60-second EMA, up to 1% (OstraFees).
         bool volatilityFee;
+        /// @notice The circuit breaker (OstraHook): 0, off, or OSTRA_MIN_TX_MOVE_TICKS to OSTRA_MAX_TX_MOVE_TICKS.
+        uint16 maxTxMoveTicks;
     }
 
     IPoolManager public immutable POOL_MANAGER;
@@ -209,6 +211,8 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         if ((p.antiSnipeBps == 0) != (p.antiSnipeDuration == 0)) revert BadParams("antiSnipe");
         if (p.maxBuy > SUPPLY || p.maxWallet > SUPPLY) revert BadParams("limits");
         if (p.antiFarmerDuration > MAX_ANTI_FARMER_DURATION) revert BadParams("antiFarmer");
+        uint256 move = p.maxTxMoveTicks;
+        if (move != 0 && (move < OSTRA_MIN_TX_MOVE_TICKS || move > OSTRA_MAX_TX_MOVE_TICKS)) revert BadParams("maxTxMove");
         if (p.graduationKind == HOOK.GRADUATION_TOKENS_SOLD()) {
             if (p.graduationThreshold == 0 || p.graduationThreshold > 10_000) revert BadParams("graduation");
         } else if (p.graduationKind == HOOK.GRADUATION_QUOTE_RAISED()) {
@@ -295,6 +299,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         c.dividendToken = p.dividendToken == address(this) ? token : p.dividendToken;
         c.stockQuote = isStockToken(Currency.unwrap(p.quote));
         c.volatilityFee = p.volatilityFee;
+        c.maxTxMoveTicks = p.maxTxMoveTicks;
     }
 
     /// @notice True when `token` is a Robinhood stock token: its ACCESS_CONTROLLED_REGISTRY() is

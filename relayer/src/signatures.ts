@@ -38,9 +38,11 @@ import { join } from "node:path";
 import { bytesToHex, getAddress, hexToBytes, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
   DEPOSIT_STATUS,
-  SPEND_PARAMS_LEN,
+  SPEND_PARAMS_LENGTHS,
+  VAULT_ACTION,
   WOTS_SIGNATURE_LEN,
   approvalMessage,
+  decodeSwapParams,
   leafMessage,
   ostraPoolAbi,
   ostraVaultAbi,
@@ -113,9 +115,17 @@ export function wotsClaims(parsed: readonly ParsedCall[], calls: readonly { to: 
       return signature;
     };
     if (c.fn === "spend") {
-      const len = SPEND_PARAMS_LEN[c.action as VaultAction];
-      if (len === undefined) throw new Error(`calls[${i}]: unknown vault action ${c.action}`);
-      if ((c.params.length - 2) / 2 !== len) throw new Error(`calls[${i}]: action ${c.action} params must be ${len} bytes`);
+      const lengths = SPEND_PARAMS_LENGTHS[c.action as VaultAction];
+      if (lengths === undefined) throw new Error(`calls[${i}]: unknown vault action ${c.action}`);
+      if (!lengths.includes((c.params.length - 2) / 2)) throw new Error(`calls[${i}]: action ${c.action} params must be ${lengths.join(" or ")} bytes`);
+      // A referred Swap whose referrer word the vault would refuse could never land: refuse it before escrow.
+      if (c.action === VAULT_ACTION.SWAP) {
+        try {
+          decodeSwapParams(c.params);
+        } catch (err) {
+          throw new Error(`calls[${i}]: malformed Swap params: ${(err as Error).message}`);
+        }
+      }
       out.push({ kind: "vault", account: c.to, nextKeyRoot: c.nextKeyRoot, action: c.action as VaultAction, params: c.params, call, signature: sig(c.signature, "spend") });
     } else if (c.fn === "spendLeaf" && c.to === d.pool) {
       out.push({ kind: "leaf", account: c.to, batchId: c.batchId, leafIndex: c.leafIndex, destination: c.destination, call, signature: sig(c.signature, "leaf") });

@@ -23,6 +23,19 @@ async function rpc(method: string, params: unknown[]): Promise<unknown> {
   return body.result;
 }
 
+/** Waits until anvil's pool holds, at `nonce`, the sender's replacement: a transfer from the account to itself. */
+async function replacementPending(nonce: number): Promise<void> {
+  const self = account.address.toLowerCase();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const pool = (await rpc("txpool_content", [])) as { pending?: Record<string, Record<string, { to?: string | null; nonce: string }>> };
+    const mine = Object.entries(pool.pending ?? {}).find(([from]) => from.toLowerCase() === self)?.[1] ?? {};
+    if (Object.values(mine).some((tx) => Number(tx.nonce) === nonce && tx.to?.toLowerCase() === self)) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`the replacement at nonce ${nonce} did not reach anvil's pool`);
+}
+
 const transfer = (amount: bigint) => ({ to: USDG, data: encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [fork.accounts[2]!.address, amount] }) });
 
 before(async () => {
@@ -67,8 +80,9 @@ test("without a receipt, the transaction is replaced at its nonce: not sent", as
   await rpc("evm_setAutomine", [false]);
   try {
     const sending = sender.send(transfer(1n));
-    // Let the receipt wait run out and the replacement reach the pool, then mine one block.
-    await new Promise((r) => setTimeout(r, 4_000));
+    // Mine only once the replacement (a zero-value transfer to itself) holds the nonce in anvil's pool: a fixed wait
+    // would mine the original under load.
+    await replacementPending(nonce);
     await rpc("evm_mine", []);
     await assert.rejects(sending, (err: unknown) => err instanceof NotSentError && /was replaced at nonce/.test(err.message));
   } finally {

@@ -10,9 +10,9 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
-/// @notice A plain client of the deployed PoolManager for the fork tests: swaps (exact input or exact output) and
-///         adds liquidity, paying from its own balance after the PoolManager call (flash accounting), like the
-///         Uniswap routers. It sends what it receives to `recipient`.
+/// @notice A plain client of the deployed PoolManager for the fork tests: swaps (exact input or exact output; one or
+///         several in one transaction; with hookData) and adds liquidity, paying from its own balance after each
+///         PoolManager call (flash accounting), like the Uniswap routers. It sends what it receives to `recipient`.
 contract TestSwapRouter is IUnlockCallback {
     using SafeERC20 for IERC20;
 
@@ -28,10 +28,62 @@ contract TestSwapRouter is IUnlockCallback {
         external
         returns (BalanceDelta)
     {
+        return _swaps(key, _one(zeroForOne), _one(amountSpecified), recipient, "", 0);
+    }
+
+    /// @notice A swap that stops at `sqrtPriceLimitX96` instead of the extreme price.
+    function swapToLimit(
+        PoolKey memory key,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        address recipient
+    ) external returns (BalanceDelta) {
+        return _swaps(key, _one(zeroForOne), _one(amountSpecified), recipient, "", sqrtPriceLimitX96);
+    }
+
+    function swapWithData(
+        PoolKey memory key,
+        bool zeroForOne,
+        int256 amountSpecified,
+        address recipient,
+        bytes memory hookData
+    ) external returns (BalanceDelta) {
+        return _swaps(key, _one(zeroForOne), _one(amountSpecified), recipient, hookData, 0);
+    }
+
+    /// @notice Several swaps on one pool within one unlock, so within one transaction; returns the last delta.
+    function swaps(PoolKey memory key, bool[] memory zeroForOne, int256[] memory amountSpecified, address recipient)
+        external
+        returns (BalanceDelta)
+    {
+        return _swaps(key, zeroForOne, amountSpecified, recipient, "", 0);
+    }
+
+    function _swaps(
+        PoolKey memory key,
+        bool[] memory zeroForOne,
+        int256[] memory amountSpecified,
+        address recipient,
+        bytes memory hookData,
+        uint160 limit
+    ) private returns (BalanceDelta) {
         return abi.decode(
-            POOL_MANAGER.unlock(abi.encode(uint8(1), abi.encode(key, zeroForOne, amountSpecified, recipient))),
+            POOL_MANAGER.unlock(
+                abi.encode(uint8(1), abi.encode(key, zeroForOne, amountSpecified, recipient, hookData, limit))
+            ),
             (BalanceDelta)
         );
+    }
+
+    function _one(bool b) private pure returns (bool[] memory list) {
+        list = new bool[](1);
+        list[0] = b;
+    }
+
+    function _one(int256 a) private pure returns (int256[] memory list) {
+        list = new int256[](1);
+        list[0] = a;
     }
 
     function addLiquidity(PoolKey memory key, int24 tickLower, int24 tickUpper, int256 liquidity)
@@ -50,18 +102,28 @@ contract TestSwapRouter is IUnlockCallback {
         PoolKey memory key;
         address recipient = address(this);
         if (op == 1) {
-            bool zeroForOne;
-            int256 amountSpecified;
-            (key, zeroForOne, amountSpecified, recipient) = abi.decode(args, (PoolKey, bool, int256, address));
-            delta = POOL_MANAGER.swap(
-                key,
-                IPoolManager.SwapParams({
-                    zeroForOne: zeroForOne,
-                    amountSpecified: amountSpecified,
-                    sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-                }),
-                ""
-            );
+            bool[] memory zeroForOne;
+            int256[] memory amountSpecified;
+            bytes memory hookData;
+            uint160 limit;
+            (key, zeroForOne, amountSpecified, recipient, hookData, limit) =
+                abi.decode(args, (PoolKey, bool[], int256[], address, bytes, uint160));
+            for (uint256 i = 0; i < zeroForOne.length; ++i) {
+                uint160 extreme = zeroForOne[i] ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+                delta = POOL_MANAGER.swap(
+                    key,
+                    IPoolManager.SwapParams({
+                        zeroForOne: zeroForOne[i],
+                        amountSpecified: amountSpecified[i],
+                        sqrtPriceLimitX96: limit == 0 ? extreme : limit
+                    }),
+                    hookData
+                );
+                if (i + 1 < zeroForOne.length) {
+                    _settle(key.currency0, delta.amount0(), recipient);
+                    _settle(key.currency1, delta.amount1(), recipient);
+                }
+            }
         } else {
             int24 lower;
             int24 upper;

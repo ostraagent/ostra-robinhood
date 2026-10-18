@@ -93,7 +93,8 @@ export const DEFAULT_RECOVERY_THRESHOLD = 2;
  * max buy only higher or 0 (none), RELEASE_LIMITS (value 0) ends the max buy and
  * the max wallet now, VOLATILITY_FEE (value 0) turns the volatility LP fee off
  * for good (the pool pays the base LP fee, or the closed-market fee in a stock
- * pool).
+ * pool), MAX_TX_MOVE only loosens the circuit breaker (more ticks, at most
+ * CIRCUIT_BREAKER.MAX_TICKS) or turns it off for good (0).
  */
 export const POOL_SETTING = {
   BUY_TAX: 0,
@@ -105,6 +106,31 @@ export const POOL_SETTING = {
   MAX_BUY: 6,
   RELEASE_LIMITS: 7,
   VOLATILITY_FEE: 8,
+  MAX_TX_MOVE: 9,
+} as const;
+
+/**
+ * OstraHook's circuit breaker: a pool's maxTxMoveTicks (launch parameter) is
+ * how far one transaction's swaps may move its price from where it was before
+ * the first of them; 0 is off. At launch 0 or MIN_TICKS..MAX_TICKS (1,000 ticks
+ * is about a 10% move, 6,932 a halving or doubling); DEFAULT_TICKS, 2,231
+ * (-20% / +25%), is Ostra's default, the one a launch should propose
+ * (OstraHook.txMoveBand gives the band a transaction may end in).
+ */
+export const CIRCUIT_BREAKER = {
+  DEFAULT_TICKS: 2_231,
+  MIN_TICKS: 1_000,
+  MAX_TICKS: 6_932,
+} as const;
+
+/**
+ * A swap on an Ostra pool whose hookData is abi.encode(referrer) pays its
+ * referrer SHARE_BPS of the protocol's part of the hook fee (half of 0.3%:
+ * 0.15% of the quote leg), claimed by anyone for the referrer through
+ * OstraDispatcher.claimReferral (paid in the pool's quote; WETH for ETH).
+ */
+export const REFERRAL = {
+  SHARE_BPS: 5_000,
 } as const;
 
 /**

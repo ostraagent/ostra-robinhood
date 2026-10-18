@@ -36,7 +36,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
-import { DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { CIRCUIT_BREAKER, DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { usdgAbi } from "../src/external-abi.ts";
@@ -67,6 +67,7 @@ import {
   openChannelParams,
   poolId,
   recoveryKeyRoot,
+  referralHookData,
   setCrankParams,
   setGuardianParams,
   setRecoveryPolicyParams,
@@ -207,6 +208,7 @@ test("spend messages are the vault's own, for every action, and decode back", as
     { action: VAULT_ACTION.SET_GUARDIAN, params: setGuardianParams({ guardian: fork.accounts[3]!.address, enabled: true }) },
     { action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams({ threshold: 2, delay: DEFAULT_RECOVERY_DELAY }) },
     { action: VAULT_ACTION.SUPPORT_RECOVERY, params: supportRecoveryParams({ vault: fork.accounts[2]!.address, newKeyRoot: next }) },
+    { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address }) },
   ];
   for (const c of cases) {
     const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
@@ -223,6 +225,10 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.deepEqual(decodeSetGuardianParams(cases[7]!.params), { guardian: fork.accounts[3]!.address, enabled: true });
   assert.deepEqual(decodeSetRecoveryPolicyParams(cases[8]!.params), { threshold: 2, delay: DEFAULT_RECOVERY_DELAY });
   assert.deepEqual(decodeSupportRecoveryParams(cases[9]!.params), { vault: fork.accounts[2]!.address, newKeyRoot: next });
+  // A Swap with a referrer: 320 bytes, the referrer as the sixth word (the hook's hookData).
+  assert.equal((cases[10]!.params.length - 2) / 2, 320);
+  assert.deepEqual(decodeSwapParams(cases[10]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address, referrer: fork.accounts[3]!.address });
+  assert.equal(`0x${cases[10]!.params.slice(2 + 288 * 2)}`, referralHookData(fork.accounts[3]!.address));
   // What the vault would refuse, the SDK never signs.
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
   assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
@@ -240,11 +246,21 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => swapParams({ ...swap, amountIn: 0n }), /greater than zero/);
   assert.throws(() => swapParams({ ...swap, amountIn: 1n << 128n }), /amountIn out of range/);
   assert.throws(() => swapParams({ ...swap, recipient: zeroAddress }), /zero address/);
+  assert.throws(() => swapParams({ ...swap, referrer: zeroAddress }), /referrer must not be the zero address/);
+  assert.throws(() => decodeSwapParams(`${swapParams(swap)}${"00".repeat(32)}` as Hex), /referrer must not be the zero address/);
+  assert.throws(() => decodeSwapParams(`${swapParams(swap)}${"00".repeat(64)}` as Hex), /288 or 320 bytes/);
+  assert.throws(() => referralHookData(zeroAddress), /zero address/);
+  const referred = swapParams({ ...swap, referrer: fork.accounts[3]!.address });
+  assert.throws(() => decodeSwapParams(`${referred.slice(0, 2 + 288 * 2)}01${referred.slice(2 + 288 * 2 + 2)}` as Hex), /not a clean address word/);
+  // Dirty upper bytes in the recipient word (the ninth) decode in viem but not in the vault: refused.
+  const plain = swapParams(swap);
+  assert.throws(() => decodeSwapParams(`${plain.slice(0, 2 + 8 * 64)}01${plain.slice(2 + 8 * 64 + 2)}` as Hex), /not canonically encoded/);
   assert.doesNotThrow(() => swapParams({ ...swap, key: { ...ETH_USDG, fee: 0x800000 } }));
   const setting = { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.BUY_TAX, value: 0n } as const;
   assert.throws(() => configurePoolParams({ ...setting, hook: zeroAddress }), /zero address/);
   assert.throws(() => configurePoolParams({ ...setting, poolId: "0x1234" }), /poolId must be 32 bytes/);
-  assert.throws(() => configurePoolParams({ ...setting, field: 9 as never }), /unknown pool setting/);
+  assert.throws(() => configurePoolParams({ ...setting, field: 10 as never }), /unknown pool setting/);
+  assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.MAX_TX_MOVE, value: BigInt(CIRCUIT_BREAKER.MAX_TICKS) + 1n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, value: 0x10000n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.TAX_END_AT, value: 1n << 40n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.RELEASE_LIMITS, value: 1n }), /value out of range/);
@@ -421,7 +437,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
     creatorBucketBps: 2_500, dividendBucketBps: 2_500, burnBucketBps: 2_500, lpBucketBps: 2_500, floorBucketBps: 0,
     dividendToken: USDG, dividendKey: noKey, minDividendBalance: 10n ** 18n,
     antiSnipeBps: 0, antiSnipeDuration: 0, maxBuy: 0n, maxWallet: 0n, limitsDuration: 0, antiFarmerDuration: 86_400,
-    graduationKind: 2, graduationThreshold: 1_000_000_000_000n, volatilityFee: true,
+    graduationKind: 2, graduationThreshold: 1_000_000_000_000n, volatilityFee: true, maxTxMoveTicks: CIRCUIT_BREAKER.DEFAULT_TICKS,
   };
   const predicted = (await fork.client.readContract({ address: launchpad, abi: launchpadArt.abi, functionName: "tokenAddress", args: [relayer.address, params] })) as Address;
   const launchHash = await fork.wallet(relayer).writeContract({ address: launchpad, abi: launchpadArt.abi, functionName: "launch", args: [params], value: 200_000_000_000_000n, account: relayer, chain: fork.client.chain });
@@ -433,7 +449,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   assert.equal(token, predicted);
   const key = (await fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolKey", args: [id] })) as PoolKey;
   assert.equal(poolId(key), id);
-  const config = () => fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolConfig", args: [id] }) as Promise<{ buyTaxBps: number; postBuyTaxBps: number; volatilityFee: boolean }>;
+  const config = () => fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolConfig", args: [id] }) as Promise<{ buyTaxBps: number; postBuyTaxBps: number; volatilityFee: boolean; maxTxMoveTicks: number }>;
 
   // ConfigurePool: the creator vault lowers the buy tax from 3% to 0.5% (the post-graduation 1% follows it down).
   const creatorState = await readVault(fork.client, d, creatorVault);
@@ -452,6 +468,14 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const off = await signVaultConfigurePool(creatorChain, creatorNext, { chainId: ROBINHOOD_CHAIN_ID, configure: { hook, poolId: id, field: POOL_SETTING.VOLATILITY_FEE, value: 0n } });
   await send(creatorVault, ostraVaultAbi, "spend", [off.action, off.nextKeyRoot, off.params, off.signature]);
   assert.equal((await config()).volatilityFee, false);
+
+  // ConfigurePool: the creator vault loosens the circuit breaker from the default 2,231 ticks to 3,000.
+  assert.equal((await config()).maxTxMoveTicks, CIRCUIT_BREAKER.DEFAULT_TICKS);
+  const looser = await readVault(fork.client, d, creatorVault);
+  assert.ok(looser);
+  const loosen = await signVaultConfigurePool(creatorChain, looser, { chainId: ROBINHOOD_CHAIN_ID, configure: { hook, poolId: id, field: POOL_SETTING.MAX_TX_MOVE, value: 3_000n } });
+  await send(creatorVault, ostraVaultAbi, "spend", [loosen.action, loosen.nextKeyRoot, loosen.params, loosen.signature]);
+  assert.equal((await config()).maxTxMoveTicks, 3_000);
 
   // A creator split share the SDK signs: 25% of the creator payouts to a teammate's address.
   const splitArt = artifact("OstraCreatorSplit.sol", "OstraCreatorSplit");
@@ -473,9 +497,15 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   await fork.dealUsdg(buyer, 100_000_000n);
   const buyerState = await readVault(fork.client, d, buyer);
   assert.ok(buyerState);
-  const swap = await signVaultSwap(buyerChain, buyerState, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { key, zeroForOne: getAddress(key.currency0) === USDG, amountIn: 20_000_000n, minOut: 1n, recipient: holder } });
+  // The swap carries a referrer, an agent's address: it is owed 0.15% of the 20 USDG, and anyone may pay it out.
+  const referrer = privateKeyToAccount(keccak256(stringToHex("OSTRA/SDK/TEST/referrer"))).address;
+  const swap = await signVaultSwap(buyerChain, buyerState, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { key, zeroForOne: getAddress(key.currency0) === USDG, amountIn: 20_000_000n, minOut: 1n, recipient: holder, referrer } });
   await send(buyer, ostraVaultAbi, "spend", [swap.action, swap.nextKeyRoot, swap.params, swap.signature]);
-  await send(dispatcher, artifact("OstraDispatcher.sol", "OstraDispatcher").abi, "dispatch", [id]);
+  assert.equal(await fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "referralOwed", args: [referrer, USDG] }), 30_000n);
+  const dispatcherAbi = artifact("OstraDispatcher.sol", "OstraDispatcher").abi;
+  await send(dispatcher, dispatcherAbi, "claimReferral", [referrer, USDG]);
+  assert.equal(await balance(referrer), 30_000n);
+  await send(dispatcher, dispatcherAbi, "dispatch", [id]);
   const owed = (await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "dividendOf", args: [holder] })) as bigint;
   assert.ok(owed > 0n);
 

@@ -86,6 +86,7 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
     uint8 private constant OP_DISPATCH = 1;
     uint8 private constant OP_CLAIM_PROTOCOL = 2;
     uint8 private constant OP_CLAIM_BUYBACK = 3;
+    uint8 private constant OP_CLAIM_REFERRAL = 4;
 
     event Dispatched(
         PoolId indexed poolId, uint256 creatorPaid, uint256 dividends, uint256 burned, uint256 liquidity
@@ -98,6 +99,7 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
     event DividendsDeferred(PoolId indexed poolId, uint256 amount);
     event ProtocolClaimed(Currency indexed currency, address to, uint256 amount);
     event BuybackClaimed(Currency indexed currency, address to, uint256 amount);
+    event ReferralClaimed(address indexed referrer, Currency indexed currency, uint256 amount);
 
     error OnlyPoolManager();
     error NotRegistered();
@@ -145,11 +147,23 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
         POOL_MANAGER.unlock(abi.encode(OP_CLAIM_BUYBACK, abi.encode(currency, to)));
     }
 
+    /// @notice Pays `referrer` what its referred swaps earned in `currency` (OstraHook.referralOwed; WETH for ETH).
+    ///         Anyone may call it; the payout only ever goes to `referrer`.
+    function claimReferral(address referrer, Currency currency) external nonReentrant {
+        if (HOOK.referralOwed(referrer, currency) == 0) revert NothingToClaim();
+        POOL_MANAGER.unlock(abi.encode(OP_CLAIM_REFERRAL, abi.encode(currency, referrer)));
+    }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(POOL_MANAGER)) revert OnlyPoolManager();
         (uint8 op, bytes memory args) = abi.decode(data, (uint8, bytes));
         if (op == OP_DISPATCH) {
             _dispatch(abi.decode(args, (PoolId)));
+        } else if (op == OP_CLAIM_REFERRAL) {
+            (Currency currency, address referrer) = abi.decode(args, (Currency, address));
+            uint256 amount = HOOK.takeReferral(referrer, currency);
+            emit ReferralClaimed(referrer, currency, amount);
+            _payOut(currency, amount, referrer);
         } else {
             (Currency currency, address to) = abi.decode(args, (Currency, address));
             (uint256 protocol, uint256 buyback) = HOOK.takeProtocolShare(currency);
@@ -270,6 +284,7 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
     {
         bool zeroForOne = c.tokenIs0;
         uint160 limit = _limit(key, zeroForOne);
+        if (limit == 0) return (0, 0);
         FloorBid memory f = floorBid[id];
         if (f.liquidity != 0) {
             // tokenIs0: a sell lowers the price toward the bid's upper tick; otherwise it raises it toward the lower.
@@ -285,8 +300,9 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
         private
         returns (uint256 spent, uint256 got)
     {
-        // v4 refuses a zero-amount swap: a bucket of 1 wei halved, for one, must not stop the dispatch.
-        if (amount == 0) return (0, 0);
+        // v4 refuses a zero-amount swap: a bucket of 1 wei halved, for one, must not stop the dispatch. Limit 0: the
+        // circuit breaker's band leaves no room this transaction.
+        if (amount == 0 || limit == 0) return (0, 0);
         BalanceDelta d = POOL_MANAGER.swap(
             key, IPoolManager.SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}), ""
         );
@@ -534,13 +550,11 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
         returns (uint256 spent, uint256 got)
     {
         bool zeroForOne = Currency.unwrap(dk.currency0) == Currency.unwrap(quote);
+        uint160 limit = _limit(dk, zeroForOne);
+        if (limit == 0) return (0, 0);
         BalanceDelta d = POOL_MANAGER.swap(
             dk,
-            IPoolManager.SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: -int256(amount),
-                sqrtPriceLimitX96: _limit(dk, zeroForOne)
-            }),
+            IPoolManager.SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}),
             ""
         );
         int128 in_ = zeroForOne ? d.amount0() : d.amount1();
@@ -583,14 +597,24 @@ contract OstraDispatcher is IUnlockCallback, Ownable2Step, ReentrancyGuardTransi
     // Pool math
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev The sqrt price a dispatch swap may move the pool to: MAX_DISPATCH_SQRT_MOVE_BPS from where it is.
+    /// @dev The sqrt price a dispatch swap may move the pool to: MAX_DISPATCH_SQRT_MOVE_BPS from where it is, and in an
+    ///      Ostra pool no further than the circuit breaker's band for this transaction (OstraHook.txMoveBand), so a
+    ///      dispatch in the same transaction as a swap never takes the price past it. 0: no room left in the band.
     function _limit(PoolKey memory key, bool zeroForOne) private view returns (uint160 limit) {
-        uint256 sqrtPrice = _sqrtPrice(key.toId());
+        PoolId id = key.toId();
+        uint256 sqrtPrice = _sqrtPrice(id);
         limit = zeroForOne
             ? uint160((sqrtPrice * (BPS - MAX_DISPATCH_SQRT_MOVE_BPS)) / BPS)
             : uint160((sqrtPrice * (BPS + MAX_DISPATCH_SQRT_MOVE_BPS)) / BPS);
         if (limit <= TickMath.MIN_SQRT_PRICE) limit = TickMath.MIN_SQRT_PRICE + 1;
         if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
+        if (address(key.hooks) == address(HOOK)) {
+            (int24 lower, int24 upper) = HOOK.txMoveBand(id);
+            // A swap down to the lower edge's price may end one tick below it: stop one tick inside.
+            uint160 edge = zeroForOne ? TickMath.getSqrtPriceAtTick(lower + 1) : TickMath.getSqrtPriceAtTick(upper);
+            if (zeroForOne ? edge > limit : edge < limit) limit = edge;
+            if (zeroForOne ? limit >= sqrtPrice : limit <= sqrtPrice) return 0;
+        }
     }
 
     /// @dev The pool's state slot in the PoolManager (v4-core StateLibrary: pools mapping at slot 6).
