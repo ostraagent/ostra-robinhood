@@ -48,6 +48,39 @@ export async function readVault(client: PublicClient, d: Deployment, vault: Addr
   return { vault: expected, token: getAddress(token), initialKeyRoot, initialCrank: getAddress(initialCrank), keyRoot, nonce, crank: crank === zeroAddress ? null : getAddress(crank) };
 }
 
+export type RecoveryState = {
+  guardianCount: number;
+  /** 0 = recovery off. */
+  threshold: number;
+  /** Seconds a recovery waits once the threshold is reached. */
+  delay: number;
+  /** Advances with every spend and every finished recovery. */
+  round: number;
+  /** The recovery waiting in the current round, if any. */
+  pending: { newKeyRoot: Hex; executableAt: bigint } | null;
+};
+
+/** The recovery settings and state of a vault (OstraVault guardian recovery). */
+export async function readRecovery(client: PublicClient, vault: Address): Promise<RecoveryState> {
+  const read = <T>(functionName: "guardianCount" | "recoveryThreshold" | "recoveryDelay" | "recoveryRound" | "pendingRecovery") =>
+    client.readContract({ address: vault, abi: ostraVaultAbi, functionName }) as Promise<T>;
+  const [guardianCount, threshold, delay, round, pending] = await Promise.all([
+    read<number>("guardianCount"),
+    read<number>("recoveryThreshold"),
+    read<number>("recoveryDelay"),
+    read<number>("recoveryRound"),
+    read<readonly [number, bigint, Hex]>("pendingRecovery"),
+  ]);
+  const [pendingRound, executableAt, newKeyRoot] = pending;
+  return {
+    guardianCount,
+    threshold,
+    delay,
+    round,
+    pending: executableAt !== 0n && pendingRound === round ? { newKeyRoot, executableAt } : null,
+  };
+}
+
 export type PoolState = {
   pool: Address;
   token: Address;

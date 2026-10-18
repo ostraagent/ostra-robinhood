@@ -211,7 +211,13 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(6, bytes32(0), "", signature);
+        vault.spend(9, bytes32(0), "", signature);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(6, bytes32(0), new bytes(32), signature);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(7, bytes32(0), new bytes(96), signature);
+        vm.expectRevert(OstraVault.BadParams.selector);
+        vault.spend(8, bytes32(0), new bytes(32), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(3, bytes32(0), new bytes(256), signature);
         vm.expectRevert(OstraVault.BadParams.selector);
@@ -622,5 +628,153 @@ contract VaultForkTest is Test {
         vault.spend(3, next, params, signature);
         assertEq(vault.nonce(), 0);
         assertEq(usdg.balanceOf(address(vault)), 100e6);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Recovery by guardians
+    // ---------------------------------------------------------------------------------------------
+
+    bytes32 internal constant OWNER = keccak256("OSTRA/EVM/TEST/owner-vault");
+    bytes32 internal constant NEW_SEED = keccak256("OSTRA/EVM/TEST/owner-new-seed");
+    bytes32 internal constant G1 = keccak256("OSTRA/EVM/TEST/guardian-1");
+    bytes32 internal constant G2 = keccak256("OSTRA/EVM/TEST/guardian-2");
+    bytes32 internal constant G3 = keccak256("OSTRA/EVM/TEST/guardian-3");
+
+    /// @dev An owner vault with three guardian vaults, 2 of 3, a 3-day delay.
+    function _guarded() internal returns (OstraVault owner, OstraVault[3] memory g) {
+        owner = _vault(OWNER, address(0));
+        g = [_vault(G1, address(0)), _vault(G2, address(0)), _vault(G3, address(0))];
+        for (uint256 i = 0; i < 3; ++i) {
+            _spend(owner, OWNER, 6, abi.encode(address(g[i]), true));
+        }
+        _spend(owner, OWNER, 7, abi.encode(uint8(2), uint32(3 days)));
+        assertEq(owner.guardianCount(), 3);
+        assertEq(owner.recoveryThreshold(), 2);
+        assertEq(owner.recoveryDelay(), 3 days);
+        assertTrue(owner.isGuardian(address(g[1])));
+    }
+
+    function _support(OstraVault guardian, bytes32 keychain, OstraVault owner, bytes32 newRoot) internal {
+        _spend(guardian, keychain, 8, abi.encode(address(owner), newRoot));
+    }
+
+    function test_guardiansMoveALostVaultToANewSeed() public {
+        (OstraVault owner, OstraVault[3] memory g) = _guarded();
+        _fund(address(owner), 100e6);
+        // The new seed's key at the vault's current nonce: the nonce runs on after the recovery.
+        uint64 n = owner.nonce();
+        bytes32 newRoot = _root(NEW_SEED, n);
+        uint32 round = owner.recoveryRound();
+
+        _support(g[0], G1, owner, newRoot);
+        assertEq(owner.recoverySupport(keccak256(abi.encode(round, newRoot))), 1);
+        (, uint64 executableAt,) = owner.pendingRecovery();
+        assertEq(executableAt, 0, "one support is below the threshold");
+        // A guardian supports a root once.
+        (bytes32 next, bytes memory signature) = _sign(g[0], G1, 8, abi.encode(address(owner), newRoot));
+        vm.expectRevert(OstraVault.AlreadySupported.selector);
+        g[0].spend(8, next, abi.encode(address(owner), newRoot), signature);
+
+        (next, signature) = _sign(g[1], G2, 8, abi.encode(address(owner), newRoot));
+        uint256 gas = gasleft();
+        g[1].spend(8, next, abi.encode(address(owner), newRoot), signature);
+        console.log("gas spend SupportRecovery that starts the recovery", gas - gasleft());
+        bytes32 pendingRoot;
+        (, executableAt, pendingRoot) = owner.pendingRecovery();
+        assertEq(executableAt, block.timestamp + 3 days);
+        assertEq(pendingRoot, newRoot);
+        vm.expectRevert(OstraVault.RecoveryNotReady.selector);
+        owner.finishRecovery();
+
+        vm.warp(block.timestamp + 3 days);
+        address anyone = makeAddr("anyone");
+        vm.prank(anyone);
+        gas = gasleft();
+        owner.finishRecovery();
+        console.log("gas finishRecovery", gas - gasleft());
+        assertEq(owner.keyRoot(), newRoot);
+        assertEq(owner.nonce(), n);
+        vm.expectRevert(OstraVault.NoRecovery.selector);
+        owner.finishRecovery();
+
+        // The lost seed can no longer spend; the new one can, from the same nonce.
+        (next, signature) = _sign(owner, OWNER, 0, abi.encode(makeAddr("thief"), uint256(1e6)));
+        vm.expectRevert(OstraVault.WotsSignatureInvalid.selector);
+        owner.spend(0, next, abi.encode(makeAddr("thief"), uint256(1e6)), signature);
+        address to = makeAddr("recovered");
+        _spend(owner, NEW_SEED, 0, abi.encode(to, uint256(40e6)));
+        assertEq(usdg.balanceOf(to), 40e6);
+        assertEq(usdg.balanceOf(address(owner)), 60e6);
+    }
+
+    function test_anOwnerSpendCancelsARecoveryAndEverySupport() public {
+        (OstraVault owner, OstraVault[3] memory g) = _guarded();
+        bytes32 newRoot = _root(NEW_SEED, owner.nonce());
+        _support(g[0], G1, owner, newRoot);
+        _support(g[1], G2, owner, newRoot);
+        (, uint64 executableAt,) = owner.pendingRecovery();
+        assertGt(executableAt, 0);
+        // The owner still holds the key: any spend (here the same policy again) cancels the recovery.
+        _spend(owner, OWNER, 7, abi.encode(uint8(2), uint32(3 days)));
+        vm.warp(block.timestamp + 3 days);
+        vm.expectRevert(OstraVault.NoRecovery.selector);
+        owner.finishRecovery();
+        // Supports from the cancelled round never count again: a third guardian alone starts nothing.
+        bytes32 again = _root(NEW_SEED, owner.nonce());
+        _support(g[2], G3, owner, again);
+        assertEq(owner.recoverySupport(keccak256(abi.encode(owner.recoveryRound(), again))), 1);
+        (uint32 pendingRound,,) = owner.pendingRecovery();
+        assertTrue(pendingRound != owner.recoveryRound(), "the started recovery belongs to a cancelled round");
+        vm.expectRevert(OstraVault.NoRecovery.selector);
+        owner.finishRecovery();
+    }
+
+    function test_recoverySettingsStayInBounds() public {
+        OstraVault owner = _vault(OWNER, address(0));
+        OstraVault guardian = _vault(G1, address(0));
+        // No guardian yet: recovery is off, and nobody else may support.
+        vm.expectRevert(OstraVault.NotGuardian.selector);
+        owner.supportRecovery(bytes32(uint256(1)));
+        _spend(owner, OWNER, 6, abi.encode(address(guardian), true));
+        vm.prank(address(guardian));
+        vm.expectRevert(OstraVault.RecoveryOff.selector);
+        owner.supportRecovery(bytes32(uint256(1)));
+
+        bytes[6] memory bad = [
+            abi.encode(uint8(1), uint32(36 hours - 1)),
+            abi.encode(uint8(1), uint32(14 days + 1)),
+            abi.encode(uint8(2), uint32(3 days)),
+            abi.encode(uint8(0), uint32(1)),
+            abi.encode(uint8(1), uint32(0)),
+            abi.encode(uint8(3), uint32(36 hours))
+        ];
+        for (uint256 i = 0; i < bad.length; ++i) {
+            (bytes32 next, bytes memory signature) = _sign(owner, OWNER, 7, bad[i]);
+            vm.expectRevert(OstraVault.BadParams.selector);
+            owner.spend(7, next, bad[i], signature);
+        }
+        _spend(owner, OWNER, 7, abi.encode(uint8(1), uint32(36 hours)));
+        _spend(owner, OWNER, 7, abi.encode(uint8(1), uint32(14 days)));
+
+        bytes[4] memory badGuardian = [
+            abi.encode(address(0), true),
+            abi.encode(address(owner), true),
+            abi.encode(address(guardian), true),
+            abi.encode(address(guardian), false)
+        ];
+        for (uint256 i = 0; i < badGuardian.length; ++i) {
+            (bytes32 next, bytes memory signature) = _sign(owner, OWNER, 6, badGuardian[i]);
+            vm.expectRevert(OstraVault.BadParams.selector);
+            owner.spend(6, next, badGuardian[i], signature);
+        }
+        // Turning recovery off first lets the last guardian go.
+        _spend(owner, OWNER, 7, abi.encode(uint8(0), uint32(0)));
+        _spend(owner, OWNER, 6, abi.encode(address(guardian), false));
+        assertEq(owner.guardianCount(), 0);
+        assertFalse(owner.isGuardian(address(guardian)));
+        // A guardian vault never supports its own recovery or a zero root.
+        (bytes32 n2, bytes memory sig2) = _sign(guardian, G1, 8, abi.encode(address(guardian), bytes32(uint256(1))));
+        vm.expectRevert(OstraVault.BadParams.selector);
+        guardian.spend(8, n2, abi.encode(address(guardian), bytes32(uint256(1))), sig2);
     }
 }

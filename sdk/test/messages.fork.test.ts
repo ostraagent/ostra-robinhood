@@ -4,8 +4,8 @@
 // encoding is compared with the contract's own view function, and every signed
 // call the SDK builds is sent and must land (a vault transfer, a channel open
 // and its close request, a crank change, a swap on a deployed v4 pool, a pool
-// setting and a dividend claim on an Ostra launch, and a relayed deposit
-// through approval, seal and leaf spend).
+// setting and a dividend claim on an Ostra launch, a guardian recovery to a
+// new seed, and a relayed deposit through approval, seal and leaf spend).
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -36,7 +36,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
-import { POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { usdgAbi } from "../src/external-abi.ts";
@@ -51,6 +51,9 @@ import {
   decodeClaimDividendParams,
   decodeConfigurePoolParams,
   decodeOpenChannelParams,
+  decodeSetGuardianParams,
+  decodeSetRecoveryPolicyParams,
+  decodeSupportRecoveryParams,
   decodeSetCrankParams,
   decodeSwapParams,
   decodeTransferParams,
@@ -61,17 +64,24 @@ import {
   leafMessage,
   openChannelParams,
   poolId,
+  recoveryKeyRoot,
   setCrankParams,
+  setGuardianParams,
+  setRecoveryPolicyParams,
   signApproveBatch,
   signSpendLeaf,
   signVaultClaimDividend,
   signVaultConfigurePool,
   signVaultOpenChannel,
   signVaultSetCrankKey,
+  signVaultSetGuardian,
+  signVaultSetRecoveryPolicy,
+  signVaultSupportRecovery,
   signVaultSwap,
   signVaultTransfer,
   swapInput,
   swapOutput,
+  supportRecoveryParams,
   swapParams,
   transferParams,
   vaultAddress,
@@ -83,7 +93,7 @@ import {
   type PoolKey,
   type SwapParams,
 } from "../src/messages.ts";
-import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readVault } from "../src/reads.ts";
+import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readRecovery, readVault } from "../src/reads.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
 import { WotsKeychain } from "../src/wots.ts";
 import { deployOnFork, OUT_DIR, startFork, type Fork } from "./fork.ts";
@@ -191,6 +201,9 @@ test("spend messages are the vault's own, for every action, and decode back", as
     { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address }) },
     { action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams({ hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.MAX_BUY, value: 5n }) },
     { action: VAULT_ACTION.CLAIM_DIVIDEND, params: claimDividendParams(fork.accounts[2]!.address) },
+    { action: VAULT_ACTION.SET_GUARDIAN, params: setGuardianParams({ guardian: fork.accounts[3]!.address, enabled: true }) },
+    { action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams({ threshold: 2, delay: DEFAULT_RECOVERY_DELAY }) },
+    { action: VAULT_ACTION.SUPPORT_RECOVERY, params: supportRecoveryParams({ vault: fork.accounts[2]!.address, newKeyRoot: next }) },
   ];
   for (const c of cases) {
     const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
@@ -204,6 +217,9 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.deepEqual(decodeSwapParams(cases[4]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address });
   assert.deepEqual(decodeConfigurePoolParams(cases[5]!.params), { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.MAX_BUY, value: 5n });
   assert.equal(decodeClaimDividendParams(cases[6]!.params), fork.accounts[2]!.address);
+  assert.deepEqual(decodeSetGuardianParams(cases[7]!.params), { guardian: fork.accounts[3]!.address, enabled: true });
+  assert.deepEqual(decodeSetRecoveryPolicyParams(cases[8]!.params), { threshold: 2, delay: DEFAULT_RECOVERY_DELAY });
+  assert.deepEqual(decodeSupportRecoveryParams(cases[9]!.params), { vault: fork.accounts[2]!.address, newKeyRoot: next });
   // What the vault would refuse, the SDK never signs.
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
   assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
@@ -230,6 +246,13 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.TAX_END_AT, value: 1n << 40n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.RELEASE_LIMITS, value: 1n }), /value out of range/);
   assert.throws(() => claimDividendParams(zeroAddress), /zero address/);
+  assert.throws(() => setGuardianParams({ guardian: zeroAddress, enabled: true }), /zero address/);
+  assert.throws(() => setRecoveryPolicyParams({ threshold: 1, delay: MIN_RECOVERY_DELAY - 1 }), /delay/);
+  assert.throws(() => setRecoveryPolicyParams({ threshold: 1, delay: 1_209_601 }), /delay/);
+  assert.throws(() => setRecoveryPolicyParams({ threshold: 0, delay: 1 }), /delay/);
+  assert.throws(() => setRecoveryPolicyParams({ threshold: 256, delay: MIN_RECOVERY_DELAY }), /threshold/);
+  assert.doesNotThrow(() => setRecoveryPolicyParams({ threshold: 0, delay: 0 }));
+  assert.throws(() => supportRecoveryParams({ vault: fork.accounts[2]!.address, newKeyRoot: `0x${"00".repeat(32)}` }), /newKeyRoot must not be zero/);
 });
 
 test("a transfer the SDK signs moves USDG once and rotates the key", async () => {
@@ -434,6 +457,56 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   assert.equal((await balance(buyer)) - usdgBefore, owed);
   assert.equal(await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "dividendOf", args: [holder] }), 0n);
   assert.equal((await readVault(fork.client, d, holder))?.nonce, 1n);
+});
+
+test("a guardian recovery the SDK signs moves a lost vault to a new seed", async () => {
+  // The owner's vault, two guardian vaults (2 of 2 here), and the seed the owner starts over with.
+  const lost = await keychain("recovery-owner");
+  const g1 = await keychain("recovery-guardian-1");
+  const g2 = await keychain("recovery-guardian-2");
+  const fresh = await keychain("recovery-new-seed");
+  const vault = await createVault(lost, zeroAddress);
+  const guardian1 = await createVault(g1, zeroAddress);
+  const guardian2 = await createVault(g2, zeroAddress);
+  await fork.dealUsdg(vault, 30_000_000n);
+  const spendWith = async (chain: WotsKeychain, v: Address, sign: (state: NonNullable<Awaited<ReturnType<typeof readVault>>>) => Promise<{ action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }>) => {
+    const state = await readVault(fork.client, d, v);
+    assert.ok(state);
+    const s = await sign(state);
+    return send(v, ostraVaultAbi, "spend", [s.action, s.nextKeyRoot, s.params, s.signature]);
+  };
+  for (const guardian of [guardian1, guardian2]) {
+    await spendWith(lost, vault, (st) => signVaultSetGuardian(lost, st, { chainId: ROBINHOOD_CHAIN_ID, guardian, enabled: true }));
+  }
+  await spendWith(lost, vault, (st) => signVaultSetRecoveryPolicy(lost, st, { chainId: ROBINHOOD_CHAIN_ID, threshold: 2, delay: DEFAULT_RECOVERY_DELAY }));
+  let r = await readRecovery(fork.client, vault);
+  assert.deepEqual({ guardianCount: r.guardianCount, threshold: r.threshold, delay: r.delay, pending: r.pending }, { guardianCount: 2, threshold: 2, delay: DEFAULT_RECOVERY_DELAY, pending: null });
+
+  // The seed is lost. The new seed's key at the vault's nonce is what the guardians support.
+  const nonce = (await readVault(fork.client, d, vault))!.nonce;
+  const newKeyRoot = recoveryKeyRoot(fresh, nonce);
+  await assert.rejects(() => signVaultSupportRecovery(g1, { vault: guardian1, nonce: 0n, keyRoot: bytesToHex(g1.keyRoot(0n)) }, { chainId: ROBINHOOD_CHAIN_ID, vault: guardian1, newKeyRoot }), /own recovery/);
+  await spendWith(g1, guardian1, (st) => signVaultSupportRecovery(g1, st, { chainId: ROBINHOOD_CHAIN_ID, vault, newKeyRoot }));
+  assert.equal((await readRecovery(fork.client, vault)).pending, null);
+  const started = await spendWith(g2, guardian2, (st) => signVaultSupportRecovery(g2, st, { chainId: ROBINHOOD_CHAIN_ID, vault, newKeyRoot }));
+  const [event] = parseEventLogs({ abi: ostraVaultAbi, logs: started.logs, eventName: "RecoveryStarted" });
+  assert.ok(event);
+  assert.equal(event.args.newKeyRoot, newKeyRoot);
+  r = await readRecovery(fork.client, vault);
+  assert.equal(r.pending?.newKeyRoot, newKeyRoot);
+
+  await fork.increaseTime(DEFAULT_RECOVERY_DELAY);
+  await send(vault, ostraVaultAbi, "finishRecovery", []);
+  const after1 = await readVault(fork.client, d, vault);
+  assert.equal(after1?.keyRoot, newKeyRoot);
+  assert.equal(after1?.nonce, nonce);
+  assert.equal((await readRecovery(fork.client, vault)).pending, null);
+
+  // The new seed spends the vault from the same nonce.
+  const to = fork.accounts[3]!.address;
+  const before = await balance(to);
+  await spendWith(fresh, vault, (st) => signVaultTransfer(fresh, st, { chainId: ROBINHOOD_CHAIN_ID, to, amount: 30_000_000n }));
+  assert.equal((await balance(to)) - before, 30_000_000n);
 });
 
 test("a crank change the SDK signs lands", async () => {

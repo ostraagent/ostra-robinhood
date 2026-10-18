@@ -2,7 +2,8 @@
 // byte the same way (test/messages.fork.test.ts compares each with the
 // contract's own view function on a fork of chain 4663):
 //   * OstraVault: spendMessage, the spend params (Transfer, OpenChannel,
-//     SetCrankKey, Swap, ConfigurePool, ClaimDividend), closeDigest (EIP-712
+//     SetCrankKey, Swap, ConfigurePool, ClaimDividend, SetGuardian,
+//     SetRecoveryPolicy, SupportRecovery), closeDigest (EIP-712
 //     CloseRequest), and the vault address OstraVaultFactory creates;
 //   * Uniswap v4: the pool id of a pool key (PoolIdLibrary.toId);
 //   * OstraPool: depositKey, depositNonce (the EIP-3009 nonce a relayed
@@ -41,6 +42,8 @@ import {
 } from "viem";
 import { BEACON_PROXY_CREATION_CODE, ostraVaultAbi } from "./abi.ts";
 import {
+  MAX_RECOVERY_DELAY,
+  MIN_RECOVERY_DELAY,
   POOL_SETTING,
   ROBINHOOD_CHAIN_ID,
   USDG_EIP712_DOMAIN,
@@ -127,6 +130,9 @@ export const SPEND_PARAMS_LEN: Readonly<Record<VaultAction, number>> = {
   [VAULT_ACTION.SWAP]: 288,
   [VAULT_ACTION.CONFIGURE_POOL]: 128,
   [VAULT_ACTION.CLAIM_DIVIDEND]: 32,
+  [VAULT_ACTION.SET_GUARDIAN]: 64,
+  [VAULT_ACTION.SET_RECOVERY_POLICY]: 64,
+  [VAULT_ACTION.SUPPORT_RECOVERY]: 64,
 };
 
 function paramsFor(action: number, params: Hex): Hex {
@@ -341,6 +347,56 @@ export function decodeClaimDividendParams(params: Hex): Address {
   return recipient;
 }
 
+/** SetGuardian params: abi.encode(address guardian, bool enabled). The guardian should be another Ostra vault. */
+export function setGuardianParams(a: { guardian: Address; enabled: boolean }): Hex {
+  if (typeof a.enabled !== "boolean") throw new RangeError("enabled must be a boolean");
+  return encodeAbiParameters([{ type: "address" }, { type: "bool" }], [nonZeroAddr(a.guardian, "guardian"), a.enabled]);
+}
+
+export function decodeSetGuardianParams(params: Hex): { guardian: Address; enabled: boolean } {
+  const [guardian, enabled] = decodeAbiParameters([{ type: "address" }, { type: "bool" }], paramsFor(VAULT_ACTION.SET_GUARDIAN, params));
+  return { guardian, enabled };
+}
+
+/**
+ * SetRecoveryPolicy params: abi.encode(uint8 threshold, uint32 delay).
+ * threshold 0 with delay 0 turns recovery off; otherwise delay is
+ * MIN_RECOVERY_DELAY..MAX_RECOVERY_DELAY seconds. Whether threshold fits the
+ * vault's guardian count is read from the chain (readRecovery) before signing.
+ */
+export function setRecoveryPolicyParams(a: { threshold: number; delay: number }): Hex {
+  if (!Number.isInteger(a.threshold) || a.threshold < 0 || a.threshold > 255) throw new RangeError("threshold must be 0..255");
+  if (!Number.isInteger(a.delay)) throw new RangeError("delay must be whole seconds");
+  if (a.threshold === 0 ? a.delay !== 0 : a.delay < MIN_RECOVERY_DELAY || a.delay > MAX_RECOVERY_DELAY) {
+    throw new RangeError(`delay must be 0 with threshold 0, else ${MIN_RECOVERY_DELAY}..${MAX_RECOVERY_DELAY} seconds`);
+  }
+  return encodeAbiParameters([{ type: "uint8" }, { type: "uint32" }], [a.threshold, a.delay]);
+}
+
+export function decodeSetRecoveryPolicyParams(params: Hex): { threshold: number; delay: number } {
+  const [threshold, delay] = decodeAbiParameters([{ type: "uint8" }, { type: "uint32" }], paramsFor(VAULT_ACTION.SET_RECOVERY_POLICY, params));
+  return { threshold, delay };
+}
+
+/**
+ * SupportRecovery params: abi.encode(address vault, bytes32 newKeyRoot),
+ * signed by a guardian's own vault. newKeyRoot is recoveryKeyRoot: the new
+ * seed's key at the recovered vault's current nonce, which the recovery keeps.
+ */
+export function supportRecoveryParams(a: { vault: Address; newKeyRoot: Hex }): Hex {
+  return encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [nonZeroAddr(a.vault, "vault"), nonZero32(a.newKeyRoot, "newKeyRoot")]);
+}
+
+export function decodeSupportRecoveryParams(params: Hex): { vault: Address; newKeyRoot: Hex } {
+  const [vault, newKeyRoot] = decodeAbiParameters([{ type: "address" }, { type: "bytes32" }], paramsFor(VAULT_ACTION.SUPPORT_RECOVERY, params));
+  return { vault, newKeyRoot };
+}
+
+/** The key root a recovery moves a vault to: key `nonce` (the vault's current nonce) of the new seed's keychain. */
+export function recoveryKeyRoot(newKeychain: WotsKeychain, vaultNonce: bigint): Hex {
+  return bytesToHex(newKeychain.keyRoot(uint(vaultNonce, U64_MAX, "vaultNonce")));
+}
+
 export type VaultSpend = {
   chainId: number;
   vault: Address;
@@ -428,6 +484,20 @@ export function signVaultConfigurePool(keychain: WotsKeychain, state: VaultKeySt
 
 export function signVaultClaimDividend(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; recipient: Address }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CLAIM_DIVIDEND, params: claimDividendParams(a.recipient) });
+}
+
+export function signVaultSetGuardian(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; guardian: Address; enabled: boolean }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_GUARDIAN, params: setGuardianParams(a) });
+}
+
+export function signVaultSetRecoveryPolicy(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; threshold: number; delay: number }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams(a) });
+}
+
+/** Signed by the guardian's own vault key: supports moving `vault` to `newKeyRoot`. */
+export async function signVaultSupportRecovery(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; vault: Address; newKeyRoot: Hex }): Promise<SignedSpend> {
+  if (addr(a.vault, "vault") === addr(state.vault, "guardian vault")) throw new RangeError("a vault cannot support its own recovery");
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SUPPORT_RECOVERY, params: supportRecoveryParams(a) });
 }
 
 // ---------------------------------------------------------------------------

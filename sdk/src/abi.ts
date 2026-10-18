@@ -75,6 +75,45 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "ACTION_SET_GUARDIAN",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "ACTION_SET_RECOVERY_POLICY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "ACTION_SUPPORT_RECOVERY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "ACTION_SWAP",
     "inputs": [],
     "outputs": [
@@ -121,6 +160,32 @@ export const ostraVaultAbi = [
         "name": "",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_RECOVERY_DELAY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_RECOVERY_DELAY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "stateMutability": "view"
@@ -406,6 +471,26 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "finishRecovery",
+    "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "guardianCount",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "initialCrank",
     "inputs": [],
     "outputs": [
@@ -455,6 +540,25 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "isGuardian",
+    "inputs": [
+      {
+        "name": "guardian",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "keyRoot",
     "inputs": [],
     "outputs": [
@@ -475,6 +579,87 @@ export const ostraVaultAbi = [
         "name": "",
         "type": "uint64",
         "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "pendingRecovery",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "round",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "executableAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "newKeyRoot",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "recoveryDelay",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "recoveryRound",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "recoverySupport",
+    "inputs": [
+      {
+        "name": "proposal",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "recoveryThreshold",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
       }
     ],
     "stateMutability": "view"
@@ -658,6 +843,43 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "supportRecovery",
+    "inputs": [
+      {
+        "name": "newKeyRoot",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "supportedBy",
+    "inputs": [
+      {
+        "name": "proposal",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "guardian",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "token",
     "inputs": [],
     "outputs": [
@@ -753,6 +975,25 @@ export const ostraVaultAbi = [
   },
   {
     "type": "event",
+    "name": "GuardianSet",
+    "inputs": [
+      {
+        "name": "guardian",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "enabled",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Initialized",
     "inputs": [
       {
@@ -760,6 +1001,100 @@ export const ostraVaultAbi = [
         "type": "uint64",
         "indexed": false,
         "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Recovered",
+    "inputs": [
+      {
+        "name": "round",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "newKeyRoot",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryPolicySet",
+    "inputs": [
+      {
+        "name": "threshold",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "delay",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryStarted",
+    "inputs": [
+      {
+        "name": "round",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "newKeyRoot",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "executableAt",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoverySupported",
+    "inputs": [
+      {
+        "name": "round",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "newKeyRoot",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "guardian",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "support",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
       }
     ],
     "anonymous": false
@@ -825,6 +1160,11 @@ export const ostraVaultAbi = [
       }
     ],
     "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "AlreadySupported",
+    "inputs": []
   },
   {
     "type": "error",
@@ -900,12 +1240,32 @@ export const ostraVaultAbi = [
   },
   {
     "type": "error",
+    "name": "NoRecovery",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotGuardian",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NotInitializing",
     "inputs": []
   },
   {
     "type": "error",
     "name": "NotThisVault",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RecoveryNotReady",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RecoveryOff",
     "inputs": []
   },
   {

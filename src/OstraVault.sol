@@ -29,6 +29,11 @@ interface IOstraDividends {
     function claimTo(address recipient) external returns (uint256 amount);
 }
 
+/// @notice What a SupportRecovery spend calls (OstraVault.supportRecovery of the vault being recovered).
+interface IOstraRecovery {
+    function supportRecovery(bytes32 newKeyRoot) external;
+}
+
 /// @title OstraVault
 /// @notice Holds one token for an agent and spends it only with a rotating WOTS one-time key, the
 ///         Robinhood Chain port of the Ostra Solana program's Vault (program/src/instructions/vault.rs
@@ -54,10 +59,22 @@ interface IOstraDividends {
 /// * 5 ClaimDividend: params abi.encode(address recipient). Claims the dividends this vault's token (an
 ///                  OstraToken) owes this vault, to `recipient` (the owner's vault for the dividend token: this vault
 ///                  only spends its own token). Reverts while nothing is owed, so the signed spend can be sent later.
+/// * 6 SetGuardian: params abi.encode(address guardian, bool enabled). Adds or removes a guardian of this vault (any
+///                  account; another OstraVault keeps the recovery post-quantum). Removing one may not leave fewer
+///                  guardians than the threshold.
+/// * 7 SetRecoveryPolicy: params abi.encode(uint8 threshold, uint32 delay). threshold 0 turns recovery off (delay
+///                  0); otherwise 1..guardians and MIN_RECOVERY_DELAY <= delay <= MAX_RECOVERY_DELAY.
+/// * 8 SupportRecovery: params abi.encode(address vault, bytes32 newKeyRoot). Calls vault.supportRecovery(newKeyRoot)
+///                  as this vault, a guardian of `vault`.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
 ///                 resubmitted with the same bytes, never signed again.
+///
+/// Recovery (when the owner has lost the seed): once `recoveryThreshold` guardians support the same new key root,
+/// the recovery waits `recoveryDelay`; then anyone may finish it and the vault's key becomes that root (the nonce runs
+/// on). Every spend, signed by the current key, cancels a recovery under way and every support gathered so far: an
+/// owner who still holds the key always wins, and a stale support never counts again.
 ///
 /// Channels the vault pays (payer = vault):
 /// * requestClose: starts the timed withdrawal of `amount`, signed by the channel's payerAuthorizer (the
@@ -76,6 +93,14 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_SWAP = 3;
     uint8 public constant ACTION_CONFIGURE_POOL = 4;
     uint8 public constant ACTION_CLAIM_DIVIDEND = 5;
+    uint8 public constant ACTION_SET_GUARDIAN = 6;
+    uint8 public constant ACTION_SET_RECOVERY_POLICY = 7;
+    uint8 public constant ACTION_SUPPORT_RECOVERY = 8;
+
+    /// @notice Shortest recovery delay: Argent's 36-hour security period, the shortest in the deployed wallets surveyed.
+    uint32 public constant MIN_RECOVERY_DELAY = 36 hours;
+    /// @notice Longest recovery delay: the longest window in the deployed recovery designs surveyed (14 days).
+    uint32 public constant MAX_RECOVERY_DELAY = 14 days;
 
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
@@ -96,8 +121,29 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     /// @notice Key that may claim and refund on channels paid to this vault and request closes on channels
     ///         this vault pays. address(0) = none.
     address public crank;
+    /// @notice Advances with every spend and every finished recovery: supports and a pending recovery of an
+    ///         earlier round never count. Shares the slot of nonce and crank, which every spend writes anyway.
+    uint32 public recoveryRound;
     /// @notice Close requests used per channel this vault pays, so a close signature works once.
     mapping(bytes32 channelId => uint256) public closeNonce;
+
+    mapping(address guardian => bool) public isGuardian;
+    uint8 public guardianCount;
+    /// @notice Supports needed to start a recovery; 0 = recovery off.
+    uint8 public recoveryThreshold;
+    uint32 public recoveryDelay;
+    /// @notice Supports per (round, new key root), and who gave them.
+    mapping(bytes32 proposal => uint256) public recoverySupport;
+    mapping(bytes32 proposal => mapping(address guardian => bool)) public supportedBy;
+
+    struct PendingRecovery {
+        uint32 round;
+        uint64 executableAt;
+        bytes32 newKeyRoot;
+    }
+
+    /// @notice The recovery that reached its threshold; it counts only while its round is the current one.
+    PendingRecovery public pendingRecovery;
 
     bytes32 private transient _expectedChannel;
     uint256 private transient _expectedAmount;
@@ -108,6 +154,11 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     event ChannelOpened(bytes32 indexed channelId, uint128 amount);
     event CloseRequested(bytes32 indexed channelId, uint128 amount, address authorizer);
     event Swapped(bytes32 indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut, address recipient);
+    event GuardianSet(address indexed guardian, bool enabled);
+    event RecoveryPolicySet(uint8 threshold, uint32 delay);
+    event RecoverySupported(uint32 indexed round, bytes32 indexed newKeyRoot, address indexed guardian, uint256 support);
+    event RecoveryStarted(uint32 indexed round, bytes32 indexed newKeyRoot, uint64 executableAt);
+    event Recovered(uint32 indexed round, bytes32 indexed newKeyRoot);
 
     error BadAction();
     error BadParams();
@@ -122,6 +173,11 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     error UnexpectedCallback();
     error BadSwapDelta();
     error InsufficientOutput();
+    error NotGuardian();
+    error RecoveryOff();
+    error AlreadySupported();
+    error NoRecovery();
+    error RecoveryNotReady();
 
     constructor(address batchSettlement, address poolManager) EIP712("Ostra Vault", "1") {
         BATCH_SETTLEMENT = IX402BatchSettlement(batchSettlement);
@@ -163,6 +219,10 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         uint64 spent = nonce;
         keyRoot = nextKeyRoot;
         nonce = spent + 1;
+        // The owner holds the key: a recovery under way and every support gathered so far stop counting.
+        unchecked {
+            ++recoveryRound;
+        }
         emit Spent(spent, action, nextKeyRoot);
 
         if (action == ACTION_TRANSFER) {
@@ -182,10 +242,20 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
                 abi.decode(params, (address, bytes32, uint8, uint256));
             if (hook == address(0)) revert BadParams();
             IOstraPoolSettings(hook).configure(poolId, field, value);
-        } else {
+        } else if (action == ACTION_CLAIM_DIVIDEND) {
             address recipient = abi.decode(params, (address));
             if (recipient == address(0)) revert BadParams();
             if (IOstraDividends(address(token)).claimTo(recipient) == 0) revert ZeroAmount();
+        } else if (action == ACTION_SET_GUARDIAN) {
+            (address guardian, bool enabled) = abi.decode(params, (address, bool));
+            _setGuardian(guardian, enabled);
+        } else if (action == ACTION_SET_RECOVERY_POLICY) {
+            (uint8 threshold, uint32 delay) = abi.decode(params, (uint8, uint32));
+            _setRecoveryPolicy(threshold, delay);
+        } else {
+            (address vault, bytes32 newKeyRoot) = abi.decode(params, (address, bytes32));
+            if (vault == address(0) || vault == address(this) || newKeyRoot == bytes32(0)) revert BadParams();
+            IOstraRecovery(vault).supportRecovery(newKeyRoot);
         }
     }
 
@@ -202,6 +272,10 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 128) revert BadParams();
         } else if (action == ACTION_CLAIM_DIVIDEND) {
             if (params.length != 32) revert BadParams();
+        } else if (action == ACTION_SET_GUARDIAN || action == ACTION_SET_RECOVERY_POLICY) {
+            if (params.length != 64) revert BadParams();
+        } else if (action == ACTION_SUPPORT_RECOVERY) {
+            if (params.length != 64) revert BadParams();
         } else {
             revert BadAction();
         }
@@ -304,6 +378,73 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         }
         if (received > 0) POOL_MANAGER.take(zeroForOne ? key.currency1 : key.currency0, recipient, received);
         return abi.encode(paid, received);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Recovery
+    // ---------------------------------------------------------------------------------------------
+
+    function _setGuardian(address guardian, bool enabled) private {
+        if (guardian == address(0) || guardian == address(this) || isGuardian[guardian] == enabled) revert BadParams();
+        isGuardian[guardian] = enabled;
+        uint8 count = guardianCount;
+        if (enabled) {
+            if (count == type(uint8).max) revert BadParams();
+            guardianCount = count + 1;
+        } else {
+            if (count - 1 < recoveryThreshold) revert BadParams();
+            guardianCount = count - 1;
+        }
+        emit GuardianSet(guardian, enabled);
+    }
+
+    function _setRecoveryPolicy(uint8 threshold, uint32 delay) private {
+        if (threshold == 0) {
+            if (delay != 0) revert BadParams();
+        } else if (threshold > guardianCount || delay < MIN_RECOVERY_DELAY || delay > MAX_RECOVERY_DELAY) {
+            revert BadParams();
+        }
+        recoveryThreshold = threshold;
+        recoveryDelay = delay;
+        emit RecoveryPolicySet(threshold, delay);
+    }
+
+    /// @notice A guardian's support for moving this vault to `newKeyRoot` (the first key of a new seed). The
+    ///         support that reaches the threshold starts the recovery delay.
+    function supportRecovery(bytes32 newKeyRoot) external nonReentrant {
+        if (!isGuardian[msg.sender]) revert NotGuardian();
+        uint8 threshold = recoveryThreshold;
+        if (threshold == 0) revert RecoveryOff();
+        if (newKeyRoot == bytes32(0)) revert BadParams();
+        uint32 round = recoveryRound;
+        bytes32 proposal = keccak256(abi.encode(round, newKeyRoot));
+        if (supportedBy[proposal][msg.sender]) revert AlreadySupported();
+        supportedBy[proposal][msg.sender] = true;
+        uint256 support = recoverySupport[proposal] + 1;
+        recoverySupport[proposal] = support;
+        emit RecoverySupported(round, newKeyRoot, msg.sender, support);
+        if (support == threshold) {
+            PendingRecovery memory p = pendingRecovery;
+            // One recovery per round: the first proposal to reach the threshold is the one that waits.
+            if (p.round == round && p.executableAt != 0) return;
+            uint64 executableAt = uint64(block.timestamp) + recoveryDelay;
+            pendingRecovery = PendingRecovery({round: round, executableAt: executableAt, newKeyRoot: newKeyRoot});
+            emit RecoveryStarted(round, newKeyRoot, executableAt);
+        }
+    }
+
+    /// @notice Finishes a recovery whose delay is over; anyone may call it. The vault's key becomes the new root.
+    function finishRecovery() external nonReentrant {
+        PendingRecovery memory p = pendingRecovery;
+        uint32 round = recoveryRound;
+        if (p.executableAt == 0 || p.round != round) revert NoRecovery();
+        if (block.timestamp < p.executableAt) revert RecoveryNotReady();
+        delete pendingRecovery;
+        keyRoot = p.newKeyRoot;
+        unchecked {
+            recoveryRound = round + 1;
+        }
+        emit Recovered(round, p.newKeyRoot);
     }
 
     // ---------------------------------------------------------------------------------------------

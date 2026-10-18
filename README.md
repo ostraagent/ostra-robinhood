@@ -8,7 +8,8 @@ Contents:
 - `src/Wots.sol`, `src/LtHash.sol`: the WOTS verifier and the LtHash accumulator, byte-compatible
   with the Solana program and the Ostra TypeScript SDK, tested against vectors made by that SDK.
 - `src/OstraVault.sol`, `src/OstraVaultFactory.sol`: vaults spent only with rotating WOTS keys
-  (Transfer, OpenChannel, SetCrankKey, Swap, ConfigurePool, ClaimDividend), as beacon proxies at addresses fixed by token, initial
+  (Transfer, OpenChannel, SetCrankKey, Swap, ConfigurePool, ClaimDividend, SetGuardian,
+  SetRecoveryPolicy, SupportRecovery), as beacon proxies at addresses fixed by token, initial
   key root and initial crank. Channels are x402 batch-settlement channels on the deployed
   x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
   vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
@@ -16,7 +17,9 @@ Contents:
   hook sees); the output goes to the signed recipient, such as another vault. ConfigurePool is a
   launch creator's change to its pool's rules (`OstraHook.configure`); ClaimDividend claims an
   `OstraToken`'s dividends owed to the vault, to the signed recipient (the owner's vault for the
-  dividend token).
+  dividend token). A vault whose seed is lost is recovered by its guardians (other vaults): once the
+  threshold supports the same new key root, the recovery waits its delay (36 hours to 14 days) and
+  anyone finishes it; any spend by the current key cancels it.
   `lib/v4-core` is `src/` and `licenses/` of Uniswap v4-core v4.0.0 (commit e50237c), the release
   whose PoolManager runs on chain 4663.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)

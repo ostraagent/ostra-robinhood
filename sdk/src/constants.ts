@@ -66,7 +66,25 @@ export const POOL_MAX_DEPOSIT = 250_000_000n;
 export const POOL_MAX_TOTAL = 2_500_000_000n;
 
 /** OstraVault spend actions. */
-export const VAULT_ACTION = { TRANSFER: 0, OPEN_CHANNEL: 1, SET_CRANK_KEY: 2, SWAP: 3, CONFIGURE_POOL: 4, CLAIM_DIVIDEND: 5 } as const;
+export const VAULT_ACTION = {
+  TRANSFER: 0,
+  OPEN_CHANNEL: 1,
+  SET_CRANK_KEY: 2,
+  SWAP: 3,
+  CONFIGURE_POOL: 4,
+  CLAIM_DIVIDEND: 5,
+  SET_GUARDIAN: 6,
+  SET_RECOVERY_POLICY: 7,
+  SUPPORT_RECOVERY: 8,
+} as const;
+
+/** OstraVault.MIN_RECOVERY_DELAY and MAX_RECOVERY_DELAY, in seconds (36 hours, 14 days). */
+export const MIN_RECOVERY_DELAY = 129_600;
+export const MAX_RECOVERY_DELAY = 1_209_600;
+/** Defaults the SDK proposes (design v0.4): a 3-day delay (Candide's Safe recovery module default), 2 of 3 guardians. */
+export const DEFAULT_RECOVERY_DELAY = 259_200;
+export const DEFAULT_RECOVERY_GUARDIANS = 3;
+export const DEFAULT_RECOVERY_THRESHOLD = 2;
 
 /**
  * OstraHook.configure fields (its FIELD_ constants), what a ConfigurePool spend
