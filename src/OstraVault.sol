@@ -19,6 +19,16 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Wots} from "./Wots.sol";
 import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 
+/// @notice What a ConfigurePool spend calls (OstraHook.configure; PoolId is a bytes32).
+interface IOstraPoolSettings {
+    function configure(bytes32 poolId, uint8 field, uint256 value) external;
+}
+
+/// @notice What a ClaimDividend spend calls (OstraToken.claimTo).
+interface IOstraDividends {
+    function claimTo(address recipient) external returns (uint256 amount);
+}
+
 /// @title OstraVault
 /// @notice Holds one token for an agent and spends it only with a rotating WOTS one-time key, the
 ///         Robinhood Chain port of the Ostra Solana program's Vault (program/src/instructions/vault.rs
@@ -38,6 +48,12 @@ import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 ///                  unlocks the PoolManager itself, so the swap's sender (what the pool's hook sees) is this
 ///                  vault. At least `minOut` of the other currency goes to `recipient` (another vault, for
 ///                  example); native ETH only to a recipient that accepts it.
+/// * 4 ConfigurePool: params abi.encode(address hook, bytes32 poolId, uint8 field, uint256 value). Calls
+///                  hook.configure(poolId, field, value) as this vault: an OstraHook lets a pool's creator vault
+///                  change the pool's rules, and only in the traders' favour (OstraHook.configure).
+/// * 5 ClaimDividend: params abi.encode(address recipient). Claims the dividends this vault's token (an
+///                  OstraToken) owes this vault, to `recipient` (the owner's vault for the dividend token: this vault
+///                  only spends its own token). Reverts while nothing is owed, so the signed spend can be sent later.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
@@ -58,6 +74,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_OPEN_CHANNEL = 1;
     uint8 public constant ACTION_SET_CRANK_KEY = 2;
     uint8 public constant ACTION_SWAP = 3;
+    uint8 public constant ACTION_CONFIGURE_POOL = 4;
+    uint8 public constant ACTION_CLAIM_DIVIDEND = 5;
 
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
@@ -157,8 +175,17 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             address newCrank = abi.decode(params, (address));
             crank = newCrank;
             emit CrankChanged(newCrank);
-        } else {
+        } else if (action == ACTION_SWAP) {
             _swap(params);
+        } else if (action == ACTION_CONFIGURE_POOL) {
+            (address hook, bytes32 poolId, uint8 field, uint256 value) =
+                abi.decode(params, (address, bytes32, uint8, uint256));
+            if (hook == address(0)) revert BadParams();
+            IOstraPoolSettings(hook).configure(poolId, field, value);
+        } else {
+            address recipient = abi.decode(params, (address));
+            if (recipient == address(0)) revert BadParams();
+            if (IOstraDividends(address(token)).claimTo(recipient) == 0) revert ZeroAmount();
         }
     }
 
@@ -171,6 +198,10 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 32) revert BadParams();
         } else if (action == ACTION_SWAP) {
             if (params.length != 288) revert BadParams();
+        } else if (action == ACTION_CONFIGURE_POOL) {
+            if (params.length != 128) revert BadParams();
+        } else if (action == ACTION_CLAIM_DIVIDEND) {
+            if (params.length != 32) revert BadParams();
         } else {
             revert BadAction();
         }

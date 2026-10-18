@@ -66,7 +66,25 @@ export const POOL_MAX_DEPOSIT = 250_000_000n;
 export const POOL_MAX_TOTAL = 2_500_000_000n;
 
 /** OstraVault spend actions. */
-export const VAULT_ACTION = { TRANSFER: 0, OPEN_CHANNEL: 1, SET_CRANK_KEY: 2, SWAP: 3 } as const;
+export const VAULT_ACTION = { TRANSFER: 0, OPEN_CHANNEL: 1, SET_CRANK_KEY: 2, SWAP: 3, CONFIGURE_POOL: 4, CLAIM_DIVIDEND: 5 } as const;
+
+/**
+ * OstraHook.configure fields (its FIELD_ constants), what a ConfigurePool spend
+ * changes. Every change is in the traders' favour or the hook reverts: taxes
+ * and anti-snipe (bps) only lower, the tax end only earlier (unix seconds), the
+ * max buy only higher or 0 (none), RELEASE_LIMITS (value 0) ends the max buy and
+ * the max wallet now.
+ */
+export const POOL_SETTING = {
+  BUY_TAX: 0,
+  SELL_TAX: 1,
+  POST_BUY_TAX: 2,
+  POST_SELL_TAX: 3,
+  TAX_END_AT: 4,
+  ANTI_SNIPE: 5,
+  MAX_BUY: 6,
+  RELEASE_LIMITS: 7,
+} as const;
 
 /** OstraPool deposit statuses, by their on-chain number. */
 export const DEPOSIT_STATUS = ["none", "pending", "consumed", "cancelled", "closed"] as const;

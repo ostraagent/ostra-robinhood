@@ -14,11 +14,13 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///   no holder may end a transfer above MAX_WALLET. The PoolManager, the hook, the locker, the launchpad, this
 ///   contract and the dead address are the only accounts the rule does not apply to; there is no other list.
 /// * Anti-farmer: until ANTI_FARMER_END_AT the token enters the Uniswap v4 PoolManager only to pay what a swap in
-///   the token's Ostra pool owes (OstraHook credits that exact amount) or from the hook and the locker, so the
-///   token's v4 liquidity and trading stay in the Ostra pool. Pools on other exchanges are not covered.
+///   the token's Ostra pool owes (OstraHook credits that exact amount) or from the hook and the locker, and it
+///   enters no pool of the Uniswap v2 or v3 kind (a contract whose token0() or token1() is this token: Uniswap v2
+///   pairs, v3 pools and their forks), so the token's liquidity and trading stay in the Ostra pool.
 /// * Dividends: when DIVIDEND_TOKEN is set, every holder with at least MIN_DIVIDEND_BALANCE earns a share of what
-///   the hook distributes, in proportion to its balance. Anyone may pay a holder what it has earned (claim); it
-///   always goes to the holder itself.
+///   the hook distributes, in proportion to its balance. A holder claims what it has earned to any recipient
+///   (claimTo); an OstraVault holding the token claims through its ClaimDividend spend, to its owner's vault for
+///   the dividend token, since a vault only ever spends its own token.
 contract OstraToken is ERC20Burnable {
     using SafeERC20 for IERC20;
 
@@ -31,8 +33,9 @@ contract OstraToken is ERC20Burnable {
         address locker;
         address launchpad;
         uint256 maxWallet;
-        uint40 limitsEndAt;
-        uint40 antiFarmerEndAt;
+        /// @notice From the deployment block (so the token's CREATE2 address does not depend on the block).
+        uint32 limitsDuration;
+        uint32 antiFarmerDuration;
         address dividendToken;
         uint256 minDividendBalance;
     }
@@ -64,15 +67,20 @@ contract OstraToken is ERC20Burnable {
     /// @dev What the token may still move into the PoolManager in this transaction during the anti-farmer period.
     uint256 private transient _poolManagerCredit;
 
+    /// @dev Gas a pool probe (token0() or token1()) may use: a Uniswap v2 pair reads one storage slot, a v3 pool an
+    ///      immutable; a contract that needs more is not treated as a pool.
+    uint256 private constant POOL_PROBE_GAS = 20_000;
+
     event LimitsReleased();
     event DividendsDistributed(uint256 amount);
-    event DividendClaimed(address indexed holder, uint256 amount);
+    event DividendClaimed(address indexed holder, address indexed recipient, uint256 amount);
 
     error OnlyHook();
     error MaxWalletExceeded(address holder);
     error AntiFarmer();
     error NoDividends();
     error NoShares();
+    error ZeroRecipient();
 
     constructor(Settings memory s) ERC20(s.name, s.symbol) {
         POOL_MANAGER = s.poolManager;
@@ -80,8 +88,8 @@ contract OstraToken is ERC20Burnable {
         LOCKER = s.locker;
         LAUNCHPAD = s.launchpad;
         MAX_WALLET = s.maxWallet;
-        LIMITS_END_AT = s.limitsEndAt;
-        ANTI_FARMER_END_AT = s.antiFarmerEndAt;
+        LIMITS_END_AT = uint40(block.timestamp) + s.limitsDuration;
+        ANTI_FARMER_END_AT = uint40(block.timestamp) + s.antiFarmerDuration;
         // The launchpad cannot name this token's address before it exists: its own address stands for it.
         DIVIDEND_TOKEN = s.dividendToken == s.launchpad ? address(this) : s.dividendToken;
         MIN_DIVIDEND_BALANCE = s.minDividendBalance;
@@ -127,16 +135,18 @@ contract OstraToken is ERC20Burnable {
         return uint256(accumulated) / MAGNITUDE - withdrawnDividendOf[holder];
     }
 
-    /// @notice Pays `holder` the dividends it has earned; anyone may call, the tokens only go to the holder.
-    function claim(address holder) external returns (uint256 amount) {
-        amount = dividendOf(holder);
+    /// @notice Pays the caller's earned dividends to `recipient`. Only the holder itself can claim: a holder that
+    ///         is a contract decides where its dividends go (an OstraVault cannot spend any token but its own).
+    function claimTo(address recipient) external returns (uint256 amount) {
+        if (recipient == address(0)) revert ZeroRecipient();
+        amount = dividendOf(msg.sender);
         if (amount == 0) return 0;
-        withdrawnDividendOf[holder] += amount;
-        emit DividendClaimed(holder, amount);
+        withdrawnDividendOf[msg.sender] += amount;
+        emit DividendClaimed(msg.sender, recipient, amount);
         if (DIVIDEND_TOKEN == address(this)) {
-            _transfer(address(this), holder, amount);
+            _transfer(address(this), recipient, amount);
         } else {
-            IERC20(DIVIDEND_TOKEN).safeTransfer(holder, amount);
+            IERC20(DIVIDEND_TOKEN).safeTransfer(recipient, amount);
         }
     }
 
@@ -151,10 +161,16 @@ contract OstraToken is ERC20Burnable {
     // ---------------------------------------------------------------------------------------------
 
     function _update(address from, address to, uint256 value) internal override {
-        if (to == POOL_MANAGER && block.timestamp < ANTI_FARMER_END_AT && from != HOOK && from != LOCKER) {
-            uint256 credit = _poolManagerCredit;
-            if (value > credit) revert AntiFarmer();
-            _poolManagerCredit = credit - value;
+        if (block.timestamp < ANTI_FARMER_END_AT) {
+            if (to == POOL_MANAGER) {
+                if (from != HOOK && from != LOCKER) {
+                    uint256 credit = _poolManagerCredit;
+                    if (value > credit) revert AntiFarmer();
+                    _poolManagerCredit = credit - value;
+                }
+            } else if (to.code.length != 0 && !isSystemAccount(to) && _isPoolOfThisToken(to)) {
+                revert AntiFarmer();
+            }
         }
         super._update(from, to, value);
         if (MAX_WALLET != 0 && !limitsReleased && block.timestamp < LIMITS_END_AT && !isSystemAccount(to)) {
@@ -163,6 +179,21 @@ contract OstraToken is ERC20Burnable {
         if (DIVIDEND_TOKEN != address(0)) {
             _setDividendShares(from);
             _setDividendShares(to);
+        }
+    }
+
+    /// @dev Whether `account` answers token0() or token1() with this token, as Uniswap v2 pairs and v3 pools do.
+    function _isPoolOfThisToken(address account) private view returns (bool) {
+        return _probe(account, 0x0dfe1681) || _probe(account, 0xd21220a7); // token0(), token1()
+    }
+
+    /// @dev Static call of a no-argument getter with bounded gas, reading at most one word back.
+    function _probe(address account, bytes4 selector) private view returns (bool isThis) {
+        address self = address(this);
+        assembly ("memory-safe") {
+            mstore(0x00, selector)
+            let ok := staticcall(POOL_PROBE_GAS, account, 0x00, 0x04, 0x00, 0x20)
+            isThis := and(ok, and(gt(returndatasize(), 0x1f), eq(mload(0x00), self)))
         }
     }
 

@@ -8,12 +8,15 @@ Contents:
 - `src/Wots.sol`, `src/LtHash.sol`: the WOTS verifier and the LtHash accumulator, byte-compatible
   with the Solana program and the Ostra TypeScript SDK, tested against vectors made by that SDK.
 - `src/OstraVault.sol`, `src/OstraVaultFactory.sol`: vaults spent only with rotating WOTS keys
-  (Transfer, OpenChannel, SetCrankKey, Swap), as beacon proxies at addresses fixed by token, initial
+  (Transfer, OpenChannel, SetCrankKey, Swap, ConfigurePool, ClaimDividend), as beacon proxies at addresses fixed by token, initial
   key root and initial crank. Channels are x402 batch-settlement channels on the deployed
   x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
   vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
   Uniswap v4 pool of the deployed PoolManager, with the vault itself as the swapper (what the pool's
-  hook sees); the output goes to the signed recipient, such as another vault.
+  hook sees); the output goes to the signed recipient, such as another vault. ConfigurePool is a
+  launch creator's change to its pool's rules (`OstraHook.configure`); ClaimDividend claims an
+  `OstraToken`'s dividends owed to the vault, to the signed recipient (the owner's vault for the
+  dividend token).
   `lib/v4-core` is `src/` and `licenses/` of Uniswap v4-core v4.0.0 (commit e50237c), the release
   whose PoolManager runs on chain 4663.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)
@@ -27,8 +30,12 @@ Contents:
   one hook, charges every swap 1% hook fee (70% creator, 30% protocol, half of that for the OSTRA
   buyback) plus the pool's buy or sell tax and anti-snipe tax in the quote, and pays them out
   (creator vault, burn, added liquidity, holder dividends) in `dispatch`. Before graduation only
-  the locker adds liquidity and the max buy and the token's max wallet apply.
-  `test/Launchpad.fork.t.sol` runs it against the real PoolManager, USDG, WETH and AAPL pools.
+  the locker adds liquidity and the max buy and the token's max wallet apply. During the
+  anti-farmer period the token enters no other v4 pool and no Uniswap v2 or v3 style pool. The
+  creator vault can change the rules only in the traders' favour (lower taxes, earlier tax end,
+  higher max buy, limits released). `test/Launchpad.fork.t.sol` runs it against the real
+  PoolManager, USDG, WETH and AAPL pools, Uniswap v2 and v3 factories, the v3 position manager and
+  Universal Router 2.1.2.
 - `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the

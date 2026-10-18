@@ -42,6 +42,9 @@ interface IWETH9 {
 /// the creator's vault. Every amount charged is in the Charged event, and every rate is readable (rates).
 /// Before graduation only the locker adds liquidity, buys are capped at the pool's max buy, and the token's
 /// max wallet applies; graduation happens once, when the pool's threshold is reached, and lifts all three.
+/// The creator's vault (an OstraVault, through its ConfigurePool spend) may change a pool's rules only in the
+/// traders' favour: lower taxes or anti-snipe, an earlier tax end, a higher or no max buy, or the launch limits
+/// released now (configure). Nothing can raise a rate or tighten a limit after launch.
 contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -60,6 +63,17 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
 
     uint8 public constant GRADUATION_TOKENS_SOLD = 1;
     uint8 public constant GRADUATION_QUOTE_RAISED = 2;
+
+    /// @notice configure fields. Taxes and anti-snipe (bps) only go down, the tax end only earlier, the max buy
+    ///         only up or to 0 (no max buy); RELEASE_LIMITS (value 0) ends the max buy and the max wallet now.
+    uint8 public constant FIELD_BUY_TAX = 0;
+    uint8 public constant FIELD_SELL_TAX = 1;
+    uint8 public constant FIELD_POST_BUY_TAX = 2;
+    uint8 public constant FIELD_POST_SELL_TAX = 3;
+    uint8 public constant FIELD_TAX_END_AT = 4;
+    uint8 public constant FIELD_ANTI_SNIPE = 5;
+    uint8 public constant FIELD_MAX_BUY = 6;
+    uint8 public constant FIELD_RELEASE_LIMITS = 7;
 
     struct PoolConfig {
         address token;
@@ -133,6 +147,7 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
         PoolId indexed poolId, uint256 creatorPaid, uint256 dividends, uint256 burned, uint256 liquidity
     );
     event ProtocolClaimed(Currency indexed currency, address to, uint256 amount);
+    event PoolConfigured(PoolId indexed poolId, uint8 field, uint256 value);
 
     error AlreadyInitialized();
     error OnlyPoolManager();
@@ -144,6 +159,9 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     error MaxBuyExceeded();
     error HookNotImplemented();
     error NothingToClaim();
+    error OnlyCreatorVault();
+    error NotInTradersFavour();
+    error BadField();
 
     constructor(address poolManager, address weth, address admin) Ownable(admin) {
         POOL_MANAGER = IPoolManager(poolManager);
@@ -236,6 +254,54 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
         uint256 end = uint256(c.launchedAt) + c.antiSnipeDuration;
         if (block.timestamp >= end) return 0;
         return (uint256(c.antiSnipeBps) * (end - block.timestamp)) / c.antiSnipeDuration;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Creator settings
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice Changes one of the pool's rules in the traders' favour (see the FIELD_ constants). Only the pool's
+    ///         creator vault may call it; anything else, including a no-op, reverts.
+    function configure(PoolId id, uint8 field, uint256 value) external {
+        PoolConfig storage c = _configs[id];
+        if (!_states[id].registered) revert NotRegistered();
+        if (msg.sender != c.creatorVault) revert OnlyCreatorVault();
+        // A post-graduation tax is never above its pre-graduation tax (OstraLaunchpad checks it at launch), so that
+        // graduating never raises a rate: lowering a tax lowers its post-graduation tax with it when needed.
+        if (field == FIELD_BUY_TAX) {
+            c.buyTaxBps = uint16(_lower(value, c.buyTaxBps));
+            if (c.postBuyTaxBps > value) c.postBuyTaxBps = uint16(value);
+        } else if (field == FIELD_SELL_TAX) {
+            c.sellTaxBps = uint16(_lower(value, c.sellTaxBps));
+            if (c.postSellTaxBps > value) c.postSellTaxBps = uint16(value);
+        } else if (field == FIELD_POST_BUY_TAX) {
+            c.postBuyTaxBps = uint16(_lower(value, c.postBuyTaxBps));
+        } else if (field == FIELD_POST_SELL_TAX) {
+            c.postSellTaxBps = uint16(_lower(value, c.postSellTaxBps));
+        } else if (field == FIELD_TAX_END_AT) {
+            c.taxEndAt = uint40(_lower(value, c.taxEndAt));
+        } else if (field == FIELD_ANTI_SNIPE) {
+            c.antiSnipeBps = uint16(_lower(value, c.antiSnipeBps));
+        } else if (field == FIELD_MAX_BUY) {
+            uint256 current = c.maxBuy;
+            if (current == 0 || (value != 0 && value <= current) || value > type(uint128).max) {
+                revert NotInTradersFavour();
+            }
+            c.maxBuy = uint128(value);
+        } else if (field == FIELD_RELEASE_LIMITS) {
+            if (value != 0) revert NotInTradersFavour();
+            if (block.timestamp >= c.limitsEndAt || OstraToken(c.token).limitsReleased()) revert NotInTradersFavour();
+            c.limitsEndAt = uint40(block.timestamp);
+            OstraToken(c.token).releaseLimits();
+        } else {
+            revert BadField();
+        }
+        emit PoolConfigured(id, field, value);
+    }
+
+    function _lower(uint256 value, uint256 current) private pure returns (uint256) {
+        if (value >= current) revert NotInTradersFavour();
+        return value;
     }
 
     // ---------------------------------------------------------------------------------------------

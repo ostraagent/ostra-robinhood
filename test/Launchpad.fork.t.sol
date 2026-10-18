@@ -27,6 +27,60 @@ interface IERC6909Balance {
     function balanceOf(address owner, uint256 id) external view returns (uint256);
 }
 
+/// @dev The deployed Uniswap v2 and v3 contracts and Universal Router on Robinhood Chain (Uniswap's
+///      universal-router deploy-addresses/robinhood.json and script/deployParameters/DeployRobinhood.s.sol).
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+interface IUniswapV3Factory {
+    function createPool(address tokenA, address tokenB, uint24 fee) external returns (address pool);
+}
+
+interface IUniswapV3Pool {
+    function initialize(uint160 sqrtPriceX96) external;
+    function liquidity() external view returns (uint128);
+}
+
+interface INonfungiblePositionManager {
+    struct MintParams {
+        address token0;
+        address token1;
+        uint24 fee;
+        int24 tickLower;
+        int24 tickUpper;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        address recipient;
+        uint256 deadline;
+    }
+
+    function mint(MintParams calldata params)
+        external
+        payable
+        returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
+}
+
+interface IPermit2 {
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+}
+
+interface IUniversalRouter {
+    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
+}
+
+/// @dev v4-periphery IV4Router.ExactInputSingleParams as Universal Router 2.1.2 decodes it.
+struct ExactInputSingleParams {
+    PoolKey poolKey;
+    bool zeroForOne;
+    uint128 amountIn;
+    uint128 amountOutMinimum;
+    uint256 minHopPriceX36;
+    bytes hookData;
+}
+
 /// @notice The Ostra launchpad, locker, token and hook on a fork of Robinhood Chain mainnet, against the deployed
 ///         Uniswap v4 PoolManager, USDG and WETH. Swaps go through a plain PoolManager client and through an
 ///         OstraVault's Swap action.
@@ -36,6 +90,11 @@ contract LaunchpadForkTest is Test {
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
     address internal constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
     uint160 internal constant HOOK_FLAGS = 0x28CC;
+    address internal constant V2_FACTORY = 0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f;
+    address internal constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
+    address internal constant V3_POSITION_MANAGER = 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3;
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    address internal constant UNIVERSAL_ROUTER = 0x204FAca1764B154221e35c0d20aBb3c525710498;
 
     IPoolManager internal pm = IPoolManager(POOL_MANAGER);
     OstraVaultFactory internal factory;
@@ -185,9 +244,19 @@ contract LaunchpadForkTest is Test {
 
     function test_launchLocksTheWholeSupplyInTiers() public {
         uint256 pmBefore = IERC20(USDG).balanceOf(POOL_MANAGER);
+        OstraVault creatorVault = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory lp = _params(Currency.wrap(USDG), address(creatorVault), -375_400, bytes32(uint256(1)));
+        address predicted = launchpad.tokenAddress(address(this), lp);
+        uint256 fee = launchpad.LAUNCH_FEE();
         uint256 before = gasleft();
-        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(1)));
+        (address t, PoolId launchedId) = launchpad.launch{value: fee}(lp);
         console.log("gas launch", before - gasleft());
+        // The token's address is known before the launch, and does not depend on the block.
+        assertEq(t, predicted);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(launchedId);
+        assertEq(token.LIMITS_END_AT(), block.timestamp + 1 days);
+        assertEq(token.ANTI_FARMER_END_AT(), block.timestamp + 1 days);
         PoolId id = key.toId();
         OstraHook.PoolConfig memory c = hook.poolConfig(id);
         assertEq(c.token, address(token));
@@ -422,7 +491,8 @@ contract LaunchpadForkTest is Test {
         uint256 owed = token.dividendOf(holder);
         assertGt(owed, 0);
         uint256 held = token.balanceOf(holder);
-        token.claim(holder);
+        vm.prank(holder);
+        token.claimTo(holder);
         assertEq(token.balanceOf(holder), held + owed);
         assertEq(token.dividendOf(holder), 0);
         // The protocol's share goes to the operator's vault.
@@ -511,7 +581,227 @@ contract LaunchpadForkTest is Test {
         hook.dispatch(id);
         uint256 owed = token.dividendOf(holder);
         assertGt(owed, 0);
-        token.claim(holder);
+        vm.prank(holder);
+        token.claimTo(holder);
         assertEq(IERC20(aapl).balanceOf(holder), owed);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Anti-farmer against the deployed Uniswap v2 and v3, and the Universal Router
+    // ---------------------------------------------------------------------------------------------
+
+    function test_antiFarmerKeepsTheTokenOutOfV2AndV3Pools() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(13)));
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 100e6);
+        _buyExactIn(key, token, 50e6, address(this));
+        deal(USDG, address(this), 100e6);
+        bool tokenIs0 = uint160(address(token)) < uint160(USDG);
+        (address token0, address token1) = tokenIs0 ? (address(token), USDG) : (USDG, address(token));
+
+        // Anyone can create the pools; no liquidity can go in while the anti-farmer period lasts.
+        address pair = IUniswapV2Factory(V2_FACTORY).createPair(address(token), USDG);
+        vm.expectRevert(OstraToken.AntiFarmer.selector);
+        token.transfer(pair, 1_000e18);
+
+        address pool = IUniswapV3Factory(V3_FACTORY).createPool(address(token), USDG, 3000);
+        IUniswapV3Pool(pool).initialize(TickMath.getSqrtPriceAtTick(tokenIs0 ? int24(-375_420) : int24(375_420)));
+        vm.expectRevert(OstraToken.AntiFarmer.selector);
+        token.transfer(pool, 1_000e18);
+        token.approve(V3_POSITION_MANAGER, type(uint256).max);
+        IERC20(USDG).approve(V3_POSITION_MANAGER, type(uint256).max);
+        INonfungiblePositionManager.MintParams memory mint = INonfungiblePositionManager.MintParams({
+            token0: token0,
+            token1: token1,
+            fee: 3000,
+            tickLower: -887_220,
+            tickUpper: 887_220,
+            amount0Desired: tokenIs0 ? 100_000e18 : 5e6,
+            amount1Desired: tokenIs0 ? 5e6 : 100_000e18,
+            amount0Min: 0,
+            amount1Min: 0,
+            recipient: address(this),
+            deadline: block.timestamp
+        });
+        // The position manager pays the pool in its mint callback: the token's AntiFarmer surfaces as STF.
+        vm.expectRevert(bytes("STF"));
+        INonfungiblePositionManager(V3_POSITION_MANAGER).mint(mint);
+
+        // Contracts that are not pools of this token still receive it: an OstraVault holding the token.
+        OstraVault bunker = _vault(address(token), BUYER_TOKEN);
+        uint256 g = gasleft();
+        token.transfer(address(bunker), 1_000e18);
+        console.log("gas transfer into a vault during anti-farmer", g - gasleft());
+        assertEq(token.balanceOf(address(bunker)), 1_000e18);
+
+        // After the anti-farmer period both pools take liquidity.
+        vm.warp(block.timestamp + 1 days);
+        token.transfer(pair, 1_000e18);
+        mint.deadline = block.timestamp;
+        INonfungiblePositionManager(V3_POSITION_MANAGER).mint(mint);
+        assertGt(IUniswapV3Pool(pool).liquidity(), 0);
+    }
+
+    /// @dev One V4_SWAP (0x10) command: SWAP_EXACT_IN_SINGLE (0x06), SETTLE_ALL (0x0c), TAKE_ALL (0x0f).
+    function _routerSwap(PoolKey memory key, bool zeroForOne, uint128 amountIn) internal {
+        (Currency input, Currency output) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            ExactInputSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: 1,
+                minHopPriceX36: 0,
+                hookData: ""
+            })
+        );
+        params[1] = abi.encode(input, uint256(amountIn));
+        params[2] = abi.encode(output, uint256(1));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(abi.encodePacked(uint8(0x06), uint8(0x0c), uint8(0x0f)), params);
+        IUniversalRouter(UNIVERSAL_ROUTER).execute(abi.encodePacked(uint8(0x10)), inputs, block.timestamp);
+    }
+
+    function test_theUniversalRouterBuysAndSellsDuringAntiFarmer() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(14)));
+        PoolId id = key.toId();
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        vm.warp(block.timestamp + 601);
+        assertLt(block.timestamp, hook.poolConfig(id).antiFarmerEndAt);
+        address trader = makeAddr("router trader");
+        deal(USDG, trader, 100e6);
+        vm.startPrank(trader);
+        IERC20(USDG).approve(PERMIT2, type(uint256).max);
+        token.approve(PERMIT2, type(uint256).max);
+        IPermit2(PERMIT2).approve(USDG, UNIVERSAL_ROUTER, type(uint160).max, uint48(block.timestamp + 1 hours));
+        IPermit2(PERMIT2).approve(address(token), UNIVERSAL_ROUTER, type(uint160).max, uint48(block.timestamp + 1 hours));
+
+        uint256 claims0 = _claims(Currency.wrap(USDG));
+        uint256 g = gasleft();
+        _routerSwap(key, !tokenIs0, 20e6);
+        console.log("gas Universal Router buy (Ostra pool)", g - gasleft());
+        uint256 bought = token.balanceOf(trader);
+        assertGt(bought, 0);
+        assertEq(IERC20(USDG).balanceOf(trader), 80e6);
+        assertEq(_claims(Currency.wrap(USDG)) - claims0, 0.8e6, "1% hook fee + 3% buy tax");
+
+        // The router settles the token after the swap: the hook's credit lets exactly that amount in.
+        g = gasleft();
+        _routerSwap(key, tokenIs0, uint128(bought / 2));
+        console.log("gas Universal Router sell (Ostra pool)", g - gasleft());
+        assertEq(token.balanceOf(trader), bought - bought / 2);
+        assertGt(IERC20(USDG).balanceOf(trader), 80e6);
+        vm.stopPrank();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Creator settings and vault dividends
+    // ---------------------------------------------------------------------------------------------
+
+    function _configure(OstraVault creatorVault, PoolId id, uint8 field, uint256 value) internal {
+        _spend(creatorVault, CREATOR, 4, abi.encode(address(hook), PoolId.unwrap(id), field, value));
+    }
+
+    function _configureReverts(OstraVault creatorVault, PoolId id, uint8 field, uint256 value, bytes4 err) internal {
+        uint64 n = creatorVault.nonce();
+        bytes memory params = abi.encode(address(hook), PoolId.unwrap(id), field, value);
+        bytes32 next = WotsSigner.keyRoot(_seed(CREATOR, n + 1));
+        bytes memory signature = WotsSigner.sign(_seed(CREATOR, n), creatorVault.spendMessage(4, next, params));
+        vm.expectRevert(err);
+        creatorVault.spend(4, next, params, signature);
+    }
+
+    function test_theCreatorVaultChangesRulesOnlyInTheTradersFavour() public {
+        (OstraToken token, PoolKey memory key, OstraVault creatorVault) = _launchUsdg(bytes32(uint256(15)));
+        PoolId id = key.toId();
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+
+        // Only the creator vault, and never against the traders.
+        vm.expectRevert(OstraHook.OnlyCreatorVault.selector);
+        hook.configure(id, 0, 0);
+        _configureReverts(creatorVault, id, 0, 300, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 1, 501, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 6, 9_000_000e18, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, 8, 0, OstraHook.BadField.selector);
+
+        // Lower taxes; a lowered tax pulls its post-graduation tax down with it, so graduating never raises it.
+        {
+            uint64 n = creatorVault.nonce();
+            bytes memory params = abi.encode(address(hook), PoolId.unwrap(id), uint8(0), uint256(50));
+            bytes32 next = WotsSigner.keyRoot(_seed(CREATOR, n + 1));
+            bytes memory signature = WotsSigner.sign(_seed(CREATOR, n), creatorVault.spendMessage(4, next, params));
+            uint256 g = gasleft();
+            creatorVault.spend(4, next, params, signature);
+            console.log("gas vault ConfigurePool", g - gasleft());
+        }
+        _configure(creatorVault, id, 1, 150);
+        _configure(creatorVault, id, 5, 1_000);
+        OstraHook.PoolConfig memory c = hook.poolConfig(id);
+        assertEq(c.buyTaxBps, 50);
+        assertEq(c.postBuyTaxBps, 50);
+        assertEq(c.sellTaxBps, 150);
+        assertEq(c.postSellTaxBps, 150);
+        (uint256 buyTax, uint256 sellTax, uint256 snipe) = hook.rates(id);
+        assertEq(buyTax, 50);
+        assertEq(sellTax, 150);
+        assertEq(snipe, 1_000);
+
+        // A higher max buy, then the launch limits released now: max buy and max wallet are gone.
+        _configure(creatorVault, id, 6, 15_000_000e18);
+        assertEq(hook.poolConfig(id).maxBuy, 15_000_000e18);
+        _configure(creatorVault, id, 7, 0);
+        assertTrue(token.limitsReleased());
+        _configureReverts(creatorVault, id, 7, 0, OstraHook.NotInTradersFavour.selector);
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 10_000e6);
+        router.swap(key, !tokenIs0, 25_000_000e18, address(router));
+        assertEq(token.balanceOf(address(router)), 25_000_000e18);
+
+        // The tax ends now.
+        _configure(creatorVault, id, 4, block.timestamp);
+        (buyTax, sellTax,) = hook.rates(id);
+        assertEq(buyTax + sellTax, 0);
+        // Liquidity stays closed: only graduation and the end of the anti-farmer period open it.
+        vm.expectRevert();
+        router.addLiquidity(key, -887_200, 887_200, 1e15);
+    }
+
+    function test_aTokenVaultClaimsDividendsToItsOwnersQuoteVault() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(16)));
+        p.dividendToken = USDG;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        vm.warp(block.timestamp + 601);
+        OstraVault buyer = _vault(USDG, BUYER);
+        OstraVault bunker = _vault(address(token), BUYER_TOKEN);
+        deal(USDG, address(buyer), 100e6);
+        _spend(buyer, BUYER, 3, abi.encode(key, Currency.unwrap(key.currency0) != address(token), uint128(20e6), uint128(1), address(bunker)));
+        assertGe(token.balanceOf(address(bunker)), token.MIN_DIVIDEND_BALANCE());
+
+        // Nothing owed yet: the signed claim reverts and keeps its key, to be sent again later.
+        bytes memory params = abi.encode(address(buyer));
+        bytes32 next = WotsSigner.keyRoot(_seed(BUYER_TOKEN, 1));
+        bytes memory signature = WotsSigner.sign(_seed(BUYER_TOKEN, 0), bunker.spendMessage(5, next, params));
+        vm.expectRevert(OstraVault.ZeroAmount.selector);
+        bunker.spend(5, next, params, signature);
+
+        deal(USDG, address(router), 1_000e6);
+        _buyExactIn(key, token, 200e6, address(router));
+        hook.dispatch(id);
+        uint256 owed = token.dividendOf(address(bunker));
+        assertGt(owed, 0);
+        // Only the holder claims its dividends.
+        assertEq(token.claimTo(address(this)), 0);
+        uint256 before = IERC20(USDG).balanceOf(address(buyer));
+        uint256 g = gasleft();
+        bunker.spend(5, next, params, signature);
+        console.log("gas vault ClaimDividend", g - gasleft());
+        assertEq(IERC20(USDG).balanceOf(address(buyer)) - before, owed);
+        assertEq(IERC20(USDG).balanceOf(address(bunker)), 0);
+        assertEq(token.dividendOf(address(bunker)), 0);
+        assertEq(bunker.nonce(), 1);
     }
 }

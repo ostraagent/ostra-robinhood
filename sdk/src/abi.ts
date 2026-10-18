@@ -23,6 +23,32 @@ export const ostraVaultAbi = [
   },
   {
     "type": "function",
+    "name": "ACTION_CLAIM_DIVIDEND",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "ACTION_CONFIGURE_POOL",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "ACTION_OPEN_CHANNEL",
     "inputs": [],
     "outputs": [

@@ -3,25 +3,32 @@
 // real USDG, x402BatchSettlement and Uniswap v4 PoolManager. Every off-chain
 // encoding is compared with the contract's own view function, and every signed
 // call the SDK builds is sent and must land (a vault transfer, a channel open
-// and its close request, a crank change, a swap on a deployed v4 pool, and a
-// relayed deposit through approval, seal and leaf spend).
+// and its close request, a crank change, a swap on a deployed v4 pool, a pool
+// setting and a dividend claim on an Ostra launch, and a relayed deposit
+// through approval, seal and leaf spend).
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
   bytesToHex,
+  concat,
   encodeAbiParameters,
+  encodeDeployData,
   getAddress,
+  getContractAddress,
   hexToBytes,
   keccak256,
+  numberToHex,
   parseEventLogs,
   parseSignature,
   stringToHex,
   verifyTypedData,
   zeroAddress,
+  type Abi,
   type Address,
   type Hex,
   type PrivateKeyAccount,
@@ -29,7 +36,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
-import { ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { usdgAbi } from "../src/external-abi.ts";
@@ -37,8 +44,12 @@ import { depositForLeaves, LEAF_DENOMINATION } from "../src/leaves.ts";
 import {
   approvalMessage,
   channelId,
+  claimDividendParams,
   closeDigest,
+  configurePoolParams,
   closeRequestTypedData,
+  decodeClaimDividendParams,
+  decodeConfigurePoolParams,
   decodeOpenChannelParams,
   decodeSetCrankParams,
   decodeSwapParams,
@@ -53,6 +64,8 @@ import {
   setCrankParams,
   signApproveBatch,
   signSpendLeaf,
+  signVaultClaimDividend,
+  signVaultConfigurePool,
   signVaultOpenChannel,
   signVaultSetCrankKey,
   signVaultSwap,
@@ -73,7 +86,7 @@ import {
 import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readVault } from "../src/reads.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
 import { WotsKeychain } from "../src/wots.ts";
-import { deployOnFork, startFork, type Fork } from "./fork.ts";
+import { deployOnFork, OUT_DIR, startFork, type Fork } from "./fork.ts";
 
 const MASTER = hexToBytes(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/master")));
 const keychainId = (name: string) => hexToBytes(keccak256(stringToHex(`OSTRA/EVM/SDK-TEST/${name}`)));
@@ -100,10 +113,10 @@ async function send(address: Address, abi: readonly unknown[], functionName: str
   return receipt;
 }
 
-async function createVault(chain: WotsKeychain, initialCrank: Address): Promise<Address> {
+async function createVault(chain: WotsKeychain, initialCrank: Address, token: Address = USDG): Promise<Address> {
   const root = bytesToHex(chain.keyRoot(0n));
-  const predicted = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root, initialCrank });
-  const receipt = await send(d.vaultFactory, ostraVaultFactoryAbi, "createVault", [USDG, root, initialCrank]);
+  const predicted = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot: root, initialCrank });
+  const receipt = await send(d.vaultFactory, ostraVaultFactoryAbi, "createVault", [token, root, initialCrank]);
   const [created] = parseEventLogs({ abi: ostraVaultFactoryAbi, logs: receipt.logs, eventName: "VaultCreated" });
   assert.ok(created);
   assert.equal(created.args.vault, predicted);
@@ -176,6 +189,8 @@ test("spend messages are the vault's own, for every action, and decode back", as
     { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(crank.address) },
     { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(zeroAddress) },
     { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address }) },
+    { action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams({ hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.MAX_BUY, value: 5n }) },
+    { action: VAULT_ACTION.CLAIM_DIVIDEND, params: claimDividendParams(fork.accounts[2]!.address) },
   ];
   for (const c of cases) {
     const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
@@ -187,6 +202,8 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.deepEqual(decodeOpenChannelParams(cases[1]!.params), open);
   assert.equal(decodeSetCrankParams(cases[2]!.params), crank.address);
   assert.deepEqual(decodeSwapParams(cases[4]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address });
+  assert.deepEqual(decodeConfigurePoolParams(cases[5]!.params), { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.MAX_BUY, value: 5n });
+  assert.equal(decodeClaimDividendParams(cases[6]!.params), fork.accounts[2]!.address);
   // What the vault would refuse, the SDK never signs.
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
   assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
@@ -205,6 +222,14 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => swapParams({ ...swap, amountIn: 1n << 128n }), /amountIn out of range/);
   assert.throws(() => swapParams({ ...swap, recipient: zeroAddress }), /zero address/);
   assert.doesNotThrow(() => swapParams({ ...swap, key: { ...ETH_USDG, fee: 0x800000 } }));
+  const setting = { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.BUY_TAX, value: 0n } as const;
+  assert.throws(() => configurePoolParams({ ...setting, hook: zeroAddress }), /zero address/);
+  assert.throws(() => configurePoolParams({ ...setting, poolId: "0x1234" }), /poolId must be 32 bytes/);
+  assert.throws(() => configurePoolParams({ ...setting, field: 8 as never }), /unknown pool setting/);
+  assert.throws(() => configurePoolParams({ ...setting, value: 0x10000n }), /value out of range/);
+  assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.TAX_END_AT, value: 1n << 40n }), /value out of range/);
+  assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.RELEASE_LIMITS, value: 1n }), /value out of range/);
+  assert.throws(() => claimDividendParams(zeroAddress), /zero address/);
 });
 
 test("a transfer the SDK signs moves USDG once and rotates the key", async () => {
@@ -305,6 +330,110 @@ test("a swap the SDK signs trades the vault's USDG on the deployed Uniswap v4 po
   assert.equal(after1?.nonce, 1n);
   assert.equal(after1?.keyRoot, bytesToHex(chain.keyRoot(1n)));
   await assert.rejects(() => send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]), "the used signature never works again");
+});
+
+/** A Foundry artifact of the build the fork deploys from (../out). */
+function artifact(file: string, contract: string): { abi: Abi; bytecode: Hex } {
+  const a = JSON.parse(readFileSync(`${OUT_DIR}/${file}/${contract}.json`, "utf8")) as { abi: Abi; bytecode: { object: Hex } };
+  return { abi: a.abi, bytecode: a.bytecode.object };
+}
+
+async function deployArtifact(file: string, contract: string, args: readonly unknown[]): Promise<Address> {
+  const { abi, bytecode } = artifact(file, contract);
+  const hash = await fork.wallet(relayer).deployContract({ abi, bytecode, args, account: relayer, chain: fork.client.chain });
+  const receipt = await fork.client.waitForTransactionReceipt({ hash });
+  assert.equal(receipt.status, "success", `${contract} deployment failed`);
+  return getAddress(receipt.contractAddress!);
+}
+
+/** The deterministic CREATE2 deployer deployed on chain 4663 (github.com/Arachnid/deterministic-deployment-proxy). */
+const CREATE2_DEPLOYER: Address = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
+const WETH: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+/** OstraHook's permission bits (v4-core Hooks): beforeInitialize, beforeAddLiquidity, before/afterSwap, both return deltas. */
+const HOOK_FLAGS = 0x28ccn;
+
+test("a pool setting and a dividend claim the SDK signs land on an Ostra launch", async () => {
+  assert.notEqual(await fork.client.getCode({ address: CREATE2_DEPLOYER }), undefined);
+  const hookArt = artifact("OstraHook.sol", "OstraHook");
+  const launchpadArt = artifact("OstraLaunchpad.sol", "OstraLaunchpad");
+  const tokenArt = artifact("OstraToken.sol", "OstraToken");
+  // The hook's address carries its permission bits: mine a CREATE2 salt for them.
+  const initCode = encodeDeployData({ abi: hookArt.abi, bytecode: hookArt.bytecode, args: [UNISWAP_V4_POOL_MANAGER, WETH, relayer.address] });
+  const bytecodeHash = keccak256(initCode);
+  let salt: Hex = `0x${"00".repeat(32)}`;
+  let hook: Address = zeroAddress;
+  for (let i = 0n; ; ++i) {
+    salt = numberToHex(i, { size: 32 });
+    hook = getContractAddress({ opcode: "CREATE2", from: CREATE2_DEPLOYER, salt, bytecodeHash });
+    if ((BigInt(hook) & 0x3fffn) === HOOK_FLAGS) break;
+  }
+  const deployed = await fork.client.waitForTransactionReceipt({ hash: await fork.wallet(relayer).sendTransaction({ to: CREATE2_DEPLOYER, data: concat([salt, initCode]), account: relayer, chain: fork.client.chain }) });
+  assert.equal(deployed.status, "success");
+  const launchpad = await deployArtifact("OstraLaunchpad.sol", "OstraLaunchpad", [UNISWAP_V4_POOL_MANAGER, hook, WETH, relayer.address]);
+  const locker = await deployArtifact("OstraLocker.sol", "OstraLocker", [UNISWAP_V4_POOL_MANAGER, launchpad, hook]);
+  await send(hook, hookArt.abi, "initialize", [launchpad, locker]);
+  await send(launchpad, launchpadArt.abi, "setLocker", [locker]);
+
+  // A USDG launch with dividends in USDG, by a creator whose USDG vault the SDK controls.
+  const creatorChain = await keychain("launch-creator");
+  const creatorVault = await createVault(creatorChain, zeroAddress);
+  const noKey = { currency0: zeroAddress, currency1: zeroAddress, fee: 0, tickSpacing: 0, hooks: zeroAddress };
+  const params = {
+    name: "Ostra SDK Test", symbol: "OSDK", salt: keccak256(stringToHex("sdk launch")), quote: USDG, creatorVault, startTick: -375_400,
+    tiers: [{ width: 40_000, supplyBps: 4_000 }, { width: 40_000, supplyBps: 3_000 }, { width: 0, supplyBps: 3_000 }],
+    buyTaxBps: 300, sellTaxBps: 500, postBuyTaxBps: 100, postSellTaxBps: 200, taxDuration: 30 * 86_400,
+    creatorBucketBps: 2_500, dividendBucketBps: 2_500, burnBucketBps: 2_500, lpBucketBps: 2_500,
+    dividendToken: USDG, dividendKey: noKey, minDividendBalance: 10n ** 18n,
+    antiSnipeBps: 0, antiSnipeDuration: 0, maxBuy: 0n, maxWallet: 0n, limitsDuration: 0, antiFarmerDuration: 86_400,
+    graduationKind: 2, graduationThreshold: 1_000_000_000_000n,
+  };
+  const predicted = (await fork.client.readContract({ address: launchpad, abi: launchpadArt.abi, functionName: "tokenAddress", args: [relayer.address, params] })) as Address;
+  const launchHash = await fork.wallet(relayer).writeContract({ address: launchpad, abi: launchpadArt.abi, functionName: "launch", args: [params], value: 200_000_000_000_000n, account: relayer, chain: fork.client.chain });
+  const launched = await fork.client.waitForTransactionReceipt({ hash: launchHash });
+  assert.equal(launched.status, "success");
+  const [event] = parseEventLogs({ abi: launchpadArt.abi, logs: launched.logs, eventName: "Launched" }) as unknown as [{ args: { poolId: Hex; token: Address } }];
+  const id = event.args.poolId;
+  const token = getAddress(event.args.token);
+  assert.equal(token, predicted);
+  const key = (await fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolKey", args: [id] })) as PoolKey;
+  assert.equal(poolId(key), id);
+  const config = () => fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolConfig", args: [id] }) as Promise<{ buyTaxBps: number; postBuyTaxBps: number }>;
+
+  // ConfigurePool: the creator vault lowers the buy tax from 3% to 0.5% (the post-graduation 1% follows it down).
+  const creatorState = await readVault(fork.client, d, creatorVault);
+  assert.ok(creatorState);
+  const configure = await signVaultConfigurePool(creatorChain, creatorState, { chainId: ROBINHOOD_CHAIN_ID, configure: { hook, poolId: id, field: POOL_SETTING.BUY_TAX, value: 50n } });
+  assert.equal(configure.action, VAULT_ACTION.CONFIGURE_POOL);
+  await send(creatorVault, ostraVaultAbi, "spend", [configure.action, configure.nextKeyRoot, configure.params, configure.signature]);
+  const c = await config();
+  assert.equal(c.buyTaxBps, 50);
+  assert.equal(c.postBuyTaxBps, 50);
+
+  // A buyer vault swaps USDG into its token vault during the anti-farmer period; the swap pays dividends.
+  const buyerChain = await keychain("launch-buyer");
+  const holderChain = await keychain("launch-holder");
+  const buyer = await createVault(buyerChain, zeroAddress);
+  const holder = await createVault(holderChain, zeroAddress, token);
+  await fork.dealUsdg(buyer, 100_000_000n);
+  const buyerState = await readVault(fork.client, d, buyer);
+  assert.ok(buyerState);
+  const swap = await signVaultSwap(buyerChain, buyerState, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { key, zeroForOne: getAddress(key.currency0) === USDG, amountIn: 20_000_000n, minOut: 1n, recipient: holder } });
+  await send(buyer, ostraVaultAbi, "spend", [swap.action, swap.nextKeyRoot, swap.params, swap.signature]);
+  await send(hook, hookArt.abi, "dispatch", [id]);
+  const owed = (await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "dividendOf", args: [holder] })) as bigint;
+  assert.ok(owed > 0n);
+
+  // ClaimDividend: the token vault claims its USDG dividends to the buyer's USDG vault.
+  const holderState = await readVault(fork.client, d, holder);
+  assert.ok(holderState);
+  assert.equal(holderState.token, token);
+  const claim = await signVaultClaimDividend(holderChain, holderState, { chainId: ROBINHOOD_CHAIN_ID, recipient: buyer });
+  assert.equal(claim.action, VAULT_ACTION.CLAIM_DIVIDEND);
+  const usdgBefore = await balance(buyer);
+  await send(holder, ostraVaultAbi, "spend", [claim.action, claim.nextKeyRoot, claim.params, claim.signature]);
+  assert.equal((await balance(buyer)) - usdgBefore, owed);
+  assert.equal(await fork.client.readContract({ address: token, abi: tokenArt.abi, functionName: "dividendOf", args: [holder] }), 0n);
+  assert.equal((await readVault(fork.client, d, holder))?.nonce, 1n);
 });
 
 test("a crank change the SDK signs lands", async () => {

@@ -1,7 +1,8 @@
 // Messages, ids and addresses the contracts compute, built off-chain byte for
 // byte the same way (test/messages.fork.test.ts compares each with the
 // contract's own view function on a fork of chain 4663):
-//   * OstraVault: spendMessage, the spend params, closeDigest (EIP-712
+//   * OstraVault: spendMessage, the spend params (Transfer, OpenChannel,
+//     SetCrankKey, Swap, ConfigurePool, ClaimDividend), closeDigest (EIP-712
 //     CloseRequest), and the vault address OstraVaultFactory creates;
 //   * Uniswap v4: the pool id of a pool key (PoolIdLibrary.toId);
 //   * OstraPool: depositKey, depositNonce (the EIP-3009 nonce a relayed
@@ -40,6 +41,7 @@ import {
 } from "viem";
 import { BEACON_PROXY_CREATION_CODE, ostraVaultAbi } from "./abi.ts";
 import {
+  POOL_SETTING,
   ROBINHOOD_CHAIN_ID,
   USDG_EIP712_DOMAIN,
   VAULT_ACTION,
@@ -123,6 +125,8 @@ export const SPEND_PARAMS_LEN: Readonly<Record<VaultAction, number>> = {
   [VAULT_ACTION.OPEN_CHANNEL]: 192,
   [VAULT_ACTION.SET_CRANK_KEY]: 32,
   [VAULT_ACTION.SWAP]: 288,
+  [VAULT_ACTION.CONFIGURE_POOL]: 128,
+  [VAULT_ACTION.CLAIM_DIVIDEND]: 32,
 };
 
 function paramsFor(action: number, params: Hex): Hex {
@@ -284,6 +288,59 @@ export function swapOutput(p: Pick<SwapParams, "key" | "zeroForOne">): Address {
   return getAddress(p.zeroForOne ? p.key.currency1 : p.key.currency0);
 }
 
+export type PoolSetting = (typeof POOL_SETTING)[keyof typeof POOL_SETTING];
+
+/** The largest value per OstraHook.configure field: the width of the PoolConfig member it sets. */
+const POOL_SETTING_MAX: Readonly<Record<PoolSetting, bigint>> = {
+  [POOL_SETTING.BUY_TAX]: 0xffffn,
+  [POOL_SETTING.SELL_TAX]: 0xffffn,
+  [POOL_SETTING.POST_BUY_TAX]: 0xffffn,
+  [POOL_SETTING.POST_SELL_TAX]: 0xffffn,
+  [POOL_SETTING.TAX_END_AT]: (1n << 40n) - 1n,
+  [POOL_SETTING.ANTI_SNIPE]: 0xffffn,
+  [POOL_SETTING.MAX_BUY]: U128_MAX,
+  [POOL_SETTING.RELEASE_LIMITS]: 0n,
+};
+
+/**
+ * A ConfigurePool spend: the vault calls hook.configure(poolId, field, value)
+ * as itself, which OstraHook allows only from the pool's creator vault and only
+ * in the traders' favour (POOL_SETTING). Whether the change is in their favour
+ * depends on the pool's current rules: read them (OstraHook.poolConfig) and
+ * simulate before signing.
+ */
+export type ConfigurePoolParams = { hook: Address; poolId: Hex; field: PoolSetting; value: bigint };
+
+const CONFIGURE_POOL_TYPES = [{ type: "address" }, { type: "bytes32" }, { type: "uint8" }, { type: "uint256" }] as const;
+
+/** ConfigurePool params: abi.encode(address hook, bytes32 poolId, uint8 field, uint256 value). */
+export function configurePoolParams(p: ConfigurePoolParams): Hex {
+  const max = POOL_SETTING_MAX[p.field];
+  if (max === undefined) throw new RangeError(`unknown pool setting ${p.field}`);
+  return encodeAbiParameters(CONFIGURE_POOL_TYPES, [nonZeroAddr(p.hook, "hook"), bytes32(p.poolId, "poolId"), p.field, uint(p.value, max, "value")]);
+}
+
+export function decodeConfigurePoolParams(params: Hex): ConfigurePoolParams {
+  const [hook, poolId, field, value] = decodeAbiParameters(CONFIGURE_POOL_TYPES, paramsFor(VAULT_ACTION.CONFIGURE_POOL, params));
+  return { hook, poolId, field: field as PoolSetting, value };
+}
+
+/**
+ * ClaimDividend params: abi.encode(address recipient). The vault's token (an
+ * OstraToken) pays the dividends it owes the vault to `recipient`, which should
+ * be the owner's vault for the dividend token: a vault only spends its own
+ * token. The spend reverts while nothing is owed (OstraToken.dividendOf), and
+ * the same signed bytes can be sent again later.
+ */
+export function claimDividendParams(recipient: Address): Hex {
+  return encodeAbiParameters([{ type: "address" }], [nonZeroAddr(recipient, "recipient")]);
+}
+
+export function decodeClaimDividendParams(params: Hex): Address {
+  const [recipient] = decodeAbiParameters([{ type: "address" }], paramsFor(VAULT_ACTION.CLAIM_DIVIDEND, params));
+  return recipient;
+}
+
 export type VaultSpend = {
   chainId: number;
   vault: Address;
@@ -363,6 +420,14 @@ export async function signVaultSwap(keychain: WotsKeychain, state: VaultKeyState
   const params = swapParams(a.swap);
   if (swapInput(a.swap) !== addr(a.token, "token")) throw new RangeError("the swap's input currency is not the vault's token");
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SWAP, params });
+}
+
+export function signVaultConfigurePool(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; configure: ConfigurePoolParams }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams(a.configure) });
+}
+
+export function signVaultClaimDividend(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; recipient: Address }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CLAIM_DIVIDEND, params: claimDividendParams(a.recipient) });
 }
 
 // ---------------------------------------------------------------------------

@@ -107,9 +107,36 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         locker = OstraLocker(locker_);
     }
 
-    /// @notice The address `launch` gives the token of `creator` with `salt` (CREATE2 from this contract).
+    /// @notice The CREATE2 salt of the token `creator` launches with `salt`.
     function tokenSalt(address creator, bytes32 salt) public pure returns (bytes32) {
         return keccak256(abi.encode(creator, salt));
+    }
+
+    /// @notice The address `launch` gives the token when `creator` launches with `p`: it depends only on the
+    ///         creator and the launch parameters (never on the block), so the token's side in the pool is known
+    ///         before the launch.
+    function tokenAddress(address creator, LaunchParams calldata p) external view returns (address) {
+        bytes32 initCodeHash = keccak256(abi.encodePacked(type(OstraToken).creationCode, abi.encode(_settings(p))));
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), tokenSalt(creator, p.salt), initCodeHash))))
+        );
+    }
+
+    function _settings(LaunchParams calldata p) private view returns (OstraToken.Settings memory) {
+        return OstraToken.Settings({
+            name: p.name,
+            symbol: p.symbol,
+            supply: SUPPLY,
+            poolManager: address(POOL_MANAGER),
+            hook: address(HOOK),
+            locker: address(locker),
+            launchpad: address(this),
+            maxWallet: p.maxWallet,
+            limitsDuration: p.limitsDuration,
+            antiFarmerDuration: p.antiFarmerDuration,
+            dividendToken: p.dividendToken,
+            minDividendBalance: p.minDividendBalance
+        });
     }
 
     function launch(LaunchParams calldata p) external payable nonReentrant returns (address token, PoolId id) {
@@ -117,24 +144,7 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         launchFeesOwed += msg.value;
         _check(p);
         uint40 now_ = uint40(block.timestamp);
-        token = address(
-            new OstraToken{salt: tokenSalt(msg.sender, p.salt)}(
-                OstraToken.Settings({
-                    name: p.name,
-                    symbol: p.symbol,
-                    supply: SUPPLY,
-                    poolManager: address(POOL_MANAGER),
-                    hook: address(HOOK),
-                    locker: address(locker),
-                    launchpad: address(this),
-                    maxWallet: p.maxWallet,
-                    limitsEndAt: now_ + p.limitsDuration,
-                    antiFarmerEndAt: now_ + p.antiFarmerDuration,
-                    dividendToken: p.dividendToken,
-                    minDividendBalance: p.minDividendBalance
-                })
-            )
-        );
+        token = address(new OstraToken{salt: tokenSalt(msg.sender, p.salt)}(_settings(p)));
         bool tokenIs0 = uint160(token) < uint160(Currency.unwrap(p.quote));
         PoolKey memory key = PoolKey({
             currency0: tokenIs0 ? Currency.wrap(token) : p.quote,
