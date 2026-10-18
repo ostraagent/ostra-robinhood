@@ -3,6 +3,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { getAddress, isAddress } from "viem";
 import { applyCors } from "../../merchant/src/cors.ts";
+import type { BackupStore } from "./backups.ts";
 import type { Log, RelayerGate } from "./gate.ts";
 import type { SignatureEscrow } from "./signatures.ts";
 
@@ -29,11 +30,13 @@ const toJson = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigin
 export function createRelayerServer(o: {
   gate: Pick<RelayerGate, "relay" | "vaultState" | "escrow">;
   escrow: Pick<SignatureEscrow, "get">;
+  backups: Pick<BackupStore, "get" | "lastWrite" | "write">;
   facts: Record<string, unknown>;
   clientIp: "socket" | "cf-connecting-ip";
   log: Log;
   scrub: (text: string) => string;
 }): Server {
+  const ipOf = (req: IncomingMessage) => (o.clientIp === "cf-connecting-ip" ? String(req.headers["cf-connecting-ip"] ?? "") : (req.socket.remoteAddress ?? ""));
   return createServer((req, res) => {
     void (async () => {
       try {
@@ -68,6 +71,41 @@ export function createRelayerServer(o: {
           res.end(toJson(record ?? { error: "no_signature", keyRoot }));
           return;
         }
+        if (path.startsWith("/v1/backups/") && (req.method === "GET" || req.method === "POST")) {
+          const name = path.slice("/v1/backups/".length).toLowerCase();
+          if (!/^0x[0-9a-f]{64}$/.test(name)) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "bad_request", message: "a backup name is 32 bytes of 0x hex" }));
+            return;
+          }
+          if (req.method === "GET") {
+            const backup = o.backups.get(name);
+            // A deleted backup still tells when it was deleted: the next write must be later.
+            const deletedAt = backup === undefined ? o.backups.lastWrite(name) : undefined;
+            res.writeHead(backup === undefined ? 404 : 200, { "content-type": "application/json", "cache-control": "no-store" });
+            res.end(toJson(backup ?? { error: "no_backup", name, ...(deletedAt === undefined ? {} : { updatedAt: deletedAt }) }));
+            return;
+          }
+          const ip = ipOf(req);
+          if (ip === "") {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "no_client_ip" }));
+            return;
+          }
+          let body: unknown;
+          try {
+            body = JSON.parse(await readBody(req));
+          } catch {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "bad_request", message: "the body must be JSON" }));
+            return;
+          }
+          const answer = await o.backups.write(name, body, ip, Date.now());
+          if (answer.status === 200) o.log("backup_written", { name, deleted: answer.body.deleted });
+          res.writeHead(answer.status, { "content-type": "application/json", "cache-control": "no-store" });
+          res.end(toJson(answer.body));
+          return;
+        }
         if (path === "/v1/escrow" && req.method === "POST") {
           const answer = await o.gate.escrow({ body: await readBody(req) });
           res.writeHead(answer.status, answer.headers);
@@ -76,7 +114,7 @@ export function createRelayerServer(o: {
         }
         if (path === "/v1/relay" && req.method === "POST") {
           const body = await readBody(req);
-          const ip = o.clientIp === "cf-connecting-ip" ? String(req.headers["cf-connecting-ip"] ?? "") : (req.socket.remoteAddress ?? "");
+          const ip = ipOf(req);
           if (ip === "") {
             res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: "no_client_ip" }));

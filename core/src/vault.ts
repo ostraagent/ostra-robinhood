@@ -96,8 +96,14 @@ export type PendingChannelOpen = { channel: Hex; receiver: Address; receiverAuth
 /** A crank change signed and not landed; `crank` null removes the crank. */
 export type PendingCrankChange = { crank: Address | null };
 
-/** buyer: the vault that pays; seller: the vault payments to the seller land in; private: a vault unshield created. */
-export type VaultKind = "buyer" | "seller" | "private";
+/**
+ * buyer: the vault that pays; seller: the vault payments to the seller land
+ * in; private: a vault unshield created; creator: the vault a launch pays its
+ * creator's share to (OstraLaunchpad creatorVault), with its own records and
+ * relayer client (Keys.forCreatorVault), so paying the relayer for it does
+ * not tie it to the buyer vault.
+ */
+export type VaultKind = "buyer" | "seller" | "private" | "creator";
 
 export type BalanceResult = {
   chainId: number;
@@ -211,19 +217,22 @@ export class VaultService {
         ? keys.vaultKeychain(config.chainId, token)
         : kind === "seller"
           ? keys.sellerKeychain(config.chainId, token)
-          : keys.privateVaultKeychain(config.chainId, token, privateIndex as bigint);
+          : kind === "creator"
+            ? keys.creatorKeychain(config.chainId, token)
+            : keys.privateVaultKeychain(config.chainId, token, privateIndex as bigint);
     this.#initCrank = kind === "seller" ? null : zeroAddress;
   }
 
   /** Seller vault: the crank it is (or will be) created with, which is part of its address. */
   setInitCrank(crank: Address): void {
-    if (this.kind !== "seller") throw new Error("the buyer vault is created without a crank");
+    if (this.kind !== "seller") throw new Error(`the ${this.kind} vault is created without a crank`);
     if (!isAddress(crank, { strict: false })) throw new RangeError("a crank is an address");
     this.#initCrank = getAddress(crank);
   }
 
   #missing(): string {
     if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; unshield creates it`;
+    if (this.kind === "creator") return "this agent has no creator vault yet; open it before a launch names it";
     return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
   }
 
@@ -374,7 +383,7 @@ export class VaultService {
       // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault is paid up front by the buyer vault.
       const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" }));
       const result: OpenVaultResult = { vault, token, nonce: "0", created: true, txHash, softLimit };
-      if (this.#sender.relayed && this.kind === "buyer") {
+      if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator")) {
         result.note =
           "the Ostra relayer paid the vault's creation; the vault owes that price, paid with the first voucher of its channel to the relayer, " +
           "which this server opens from the vault once it holds tokens (nothing else is relayed for the vault until then)";

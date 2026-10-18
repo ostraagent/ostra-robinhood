@@ -1,12 +1,16 @@
 // shield and unshield on a fork of Robinhood Chain mainnet, against the real
 // aggregator (aggregator/src, its HTTP endpoint served on a local port), with
 // the agent's own fee payer sending (LocalSender, as without the relayer):
-//   * eight shield deposits of one leaf from one vault: each sweep registers
-//     and polls them; the aggregator builds one batch of the eight, every
-//     deposit approves it after checking it on-chain, the aggregator seals it
-//     and every deposit is closed; the pool fee reaches the treasury;
-//   * unshield of the eight leaves at once (window 0): each leaf goes into
-//     its own new private vault, created and funded in one transaction;
+//   * eight shield deposits: seven of one leaf from the buyer vault, and one
+//     of two leaves the creator vault's auto-shield makes from its balance
+//     above what it keeps (its own records folder and sender, the agent's
+//     shield records); each service moves on only its own vault's deposits.
+//     The aggregator builds one batch of the eight, every deposit approves it
+//     after checking it on-chain, the aggregator seals it and every deposit
+//     is closed; the pool fee reaches the treasury;
+//   * unshield of the nine leaves at once (window 0), the creator's among
+//     them: each leaf goes into its own new private vault, created and funded
+//     in one transaction;
 //   * a ninth deposit no batch takes (fewer than eight): once
 //     DEPOSIT_TIMEOUT_SECONDS have passed on the chain, the sweep cancels it
 //     and the pool refunds it in full to the vault.
@@ -30,10 +34,14 @@ import { loadConfig as loadAggregatorConfig } from "../../aggregator/src/config.
 import { createAggregatorServer } from "../../aggregator/src/http.ts";
 import { ensurePrivateDir } from "../../aggregator/src/keys.ts";
 import { StateStore } from "../../aggregator/src/store.ts";
-import { Keys, LocalSender, ShieldService, UnshieldService, VaultService, X402_NETWORK, type Config, type PrivateVaultContext } from "../src/index.ts";
+import { Keys, LocalSender, RELAYER_CHANNEL_DEPOSIT, ShieldService, UnshieldService, VaultService, X402_NETWORK, type Config, type PrivateVaultContext } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
 
 const DEPOSITS = 8;
+/** Deposits of one leaf from the buyer vault; the eighth is the creator vault's auto-shield of two leaves. */
+const BUYER_DEPOSITS = DEPOSITS - 1;
+const CREATOR_LEAVES = 2;
+const LEAVES = BUYER_DEPOSITS + CREATOR_LEAVES;
 
 let fork: Fork;
 let d: Deployment;
@@ -63,7 +71,7 @@ after(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true });
 });
 
-test("eight shield deposits are sealed in one batch, unshielded into eight private vaults, and a lone deposit is refunded after the timeout", async () => {
+test("eight shield deposits, one of them the creator vault's auto-shield, are sealed in one batch, unshielded into nine private vaults, and a lone deposit is refunded after the timeout", async () => {
   const client = fork.client as PublicClient;
   const transport = retryingHttp(fork.url);
   const balanceOf = (x: Address) => client.readContract({ address: USDG, abi: usdgAbi, functionName: "balanceOf", args: [x] });
@@ -110,42 +118,70 @@ test("eight shield deposits are sealed in one batch, unshielded into eight priva
   assert.equal(opened.created, true);
   const p = await readPool(client, d.pool);
   const amount = depositForLeaves(1, p.feeBps);
-  await fork.dealUsdg(opened.vault, amount * BigInt(DEPOSITS + 1));
+  const creatorAmount = depositForLeaves(CREATOR_LEAVES, p.feeBps);
+  await fork.dealUsdg(opened.vault, amount * BigInt(BUYER_DEPOSITS + 1));
   const treasuryBefore = await balanceOf(p.treasury);
 
-  // Eight deposits of one leaf: each is registered and polled when it is made.
-  for (let i = 0; i < DEPOSITS; i++) {
+  // The creator vault: its own records and sender; its shield service keeps the agent's shield records.
+  const creatorKeys = await keys.forCreatorVault(config.chainId, d.token);
+  const creatorSender = new LocalSender(client, transport, feePayer);
+  const creatorVault = new VaultService(client, transport, config, creatorKeys, creatorSender, "creator");
+  const creatorShield = new ShieldService(client, config, keys, creatorVault, creatorSender);
+  const creator = await creatorVault.open();
+  assert.equal(creator.created, true);
+  assert.notEqual(creator.vault, opened.vault);
+  // What a launch's dispatch paid it (the fork stands in for the payouts): two leaves and what it keeps, plus a little.
+  await fork.dealUsdg(creator.vault, creatorAmount + RELAYER_CHANNEL_DEPOSIT + 5_000n);
+  assert.deepEqual(await creatorShield.autoShield(), { vault: creator.vault, enabled: false, keep: "1" });
+  assert.deepEqual(await creatorShield.sweep(), []);
+  assert.equal(await balanceOf(creator.vault), creatorAmount + RELAYER_CHANNEL_DEPOSIT + 5_000n, "off: nothing shielded");
+  assert.deepEqual(await creatorShield.setAutoShield(true), { vault: creator.vault, enabled: true, keep: "1" });
+
+  // Seven deposits of one leaf from the buyer vault: each is registered and polled when it is made.
+  for (let i = 0; i < BUYER_DEPOSITS; i++) {
     const r = await shield.shield(1);
     assert.equal(r.status, "pending");
     assert.equal(r.aggregator.status, "queued", JSON.stringify(r.aggregator));
   }
   assert.equal(await balanceOf(opened.vault), amount);
 
+  // The creator vault's sweep shields its balance above what it keeps: one deposit of two leaves, once.
+  assert.deepEqual(await creatorShield.sweep(), []);
+  assert.equal(await balanceOf(creator.vault), RELAYER_CHANNEL_DEPOSIT + 5_000n);
+  const creatorDeposit = (await shield.list()).filter((s) => s.vault === creator.vault);
+  assert.equal(creatorDeposit.length, 1);
+  assert.equal(creatorDeposit[0]?.leaves, CREATOR_LEAVES);
+  assert.equal(creatorDeposit[0]?.status, "pending");
+  assert.ok((await shield.list()).filter((s) => s.vault !== creator.vault).every((s) => s.vault === opened.vault));
+  assert.deepEqual(await creatorShield.sweep(), []);
+  assert.equal((await shield.list()).length, DEPOSITS, "nothing more is due");
+
   // Sweeps and aggregator passes until every deposit is closed: build, approve, seal, close.
   for (let round = 0; round < 8; round++) {
     await aggregator.pass();
     assert.deepEqual(await shield.sweep(), []);
+    assert.deepEqual(await creatorShield.sweep(), []);
     if ((await shield.list()).every((s) => s.status === "closed")) break;
   }
   const views = await shield.list();
   assert.equal(views.length, DEPOSITS);
-  assert.ok(views.every((v) => v.status === "closed" && v.batch !== null && v.leavesInPool.length === 1 && !v.leavesInPool[0]!.spent), JSON.stringify(views));
+  assert.ok(views.every((v) => v.status === "closed" && v.batch !== null && v.leavesInPool.length === v.leaves && v.leavesInPool.every((l) => !l.spent)), JSON.stringify(views));
   const batchId = BigInt(views[0]!.batch!);
   assert.ok(views.every((v) => v.batch === views[0]!.batch));
   const sealed = await readBatch(client, d.pool, batchId);
   assert.equal(sealed.status, "sealed");
-  assert.equal(sealed.leafCount, DEPOSITS);
-  assert.equal(sealed.unspent, DEPOSITS);
-  assert.equal((await balanceOf(p.treasury)) - treasuryBefore, (amount - LEAF_DENOMINATION) * BigInt(DEPOSITS));
+  assert.equal(sealed.leafCount, LEAVES);
+  assert.equal(sealed.unspent, LEAVES);
+  assert.equal((await balanceOf(p.treasury)) - treasuryBefore, (amount - LEAF_DENOMINATION) * BigInt(BUYER_DEPOSITS) + (creatorAmount - LEAF_DENOMINATION * BigInt(CREATOR_LEAVES)));
   assert.equal((await aggregator.health()).queued, 0);
 
-  // Unshield every leaf now: eight private vaults, ten tokens each.
-  const u = await unshield.unshield(DEPOSITS, 0);
-  assert.equal(u.leaves.length, DEPOSITS);
+  // Unshield every leaf now, the creator's too: nine private vaults, ten tokens each.
+  const u = await unshield.unshield(LEAVES, 0);
+  assert.equal(u.leaves.length, LEAVES);
   assert.ok(u.leaves.every((l) => l.status === "spent"), JSON.stringify(u.leaves));
   const privateVaults = await unshield.vaults();
-  assert.equal(privateVaults.length, DEPOSITS);
-  assert.equal(new Set(privateVaults.map((v) => v.vault)).size, DEPOSITS);
+  assert.equal(privateVaults.length, LEAVES);
+  assert.equal(new Set(privateVaults.map((v) => v.vault)).size, LEAVES);
   for (const v of privateVaults) assert.equal(await balanceOf(v.vault), LEAF_DENOMINATION);
   assert.equal((await readBatch(client, d.pool, batchId)).unspent, 0);
   assert.ok((await shield.list()).every((s) => s.leavesInPool.every((l) => l.spent)));

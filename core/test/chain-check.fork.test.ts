@@ -23,7 +23,7 @@ const FUNDER_KEY = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab
 /** The keeper fee payer of this run (a test key, written where the keeper reads it). */
 const FEE_PAYER_KEY = keccak256(stringToHex("OSTRA/EVM/CORE-CHECK/fee-payer"));
 /** PASS lines the check prints when everything passes. */
-const EXPECTED_PASSES = 25;
+const EXPECTED_PASSES = 28;
 
 let fork: Fork;
 let d: Deployment;

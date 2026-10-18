@@ -27,10 +27,13 @@ import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type Privat
 import { privateKeyToAccount } from "viem/accounts";
 import { WotsKeychain, sha256, utf8, type WotsStore } from "@ostraagent/sdk";
 import type { SignatureEscrowClient } from "./escrow.ts";
+import { backupSignerOf, sealSeed } from "./passkey.ts";
 import type { Folder } from "./storage.ts";
 
 /** The folder of the private vaults' records: one folder per private vault in it (keys.forPrivateVault). */
 export const PRIVATE_DIR = "private";
+/** The folder of the creator vaults' records: one folder per (chain, token) in it (keys.forCreatorVault). */
+export const CREATOR_DIR = "creator";
 
 const VAULT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/VAULT/EVM/v1");
 const VOUCHER_KEY_DOMAIN = utf8("OSTRA/MCP/VOUCHER/EVM/v1");
@@ -42,6 +45,7 @@ const SHIELD_DEPOSIT_ID_DOMAIN = utf8("OSTRA/MCP/SHIELD-DEPOSIT-ID/EVM/v1");
 const SHIELD_APPROVE_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/SHIELD-APPROVE/EVM/v1");
 const SHIELD_LEAF_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/SHIELD-LEAF/EVM/v1");
 const PRIVATE_VAULT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/PRIVATE-VAULT/EVM/v1");
+const CREATOR_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/CREATOR-VAULT/EVM/v1");
 
 /** secp256k1 group order: a private key must be in 1..n-1. */
 const SECP256K1_N = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141n;
@@ -119,6 +123,14 @@ export function privateVaultKeychainId(chainId: number, token: Address, index: b
   return sha256([PRIVATE_VAULT_KEYCHAIN_DOMAIN, chainBytes(chainId), tokenBytes(token), u64Be(index)]);
 }
 
+/**
+ * Keychain id of the creator vault for (chain, token): the vault a launch pays
+ * its creator's share to (OstraLaunchpad creatorVault), one per quote token.
+ */
+export function creatorKeychainId(chainId: number, token: Address): Uint8Array {
+  return sha256([CREATOR_KEYCHAIN_DOMAIN, chainBytes(chainId), tokenBytes(token)]);
+}
+
 /** What a Keys holds: the master seed and fee payer key, the WOTS store, and where records are kept. */
 export type KeysParts<S extends WotsStore = WotsStore> = {
   master: Uint8Array;
@@ -173,9 +185,31 @@ export class Keys<S extends WotsStore = WotsStore> {
     return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
   }
 
+  /**
+   * The same keys with records kept in the folder of the creator vault for
+   * (chain, token) (<agent folder>/creator/<chain>-<token>, created now): its
+   * relayer client and channels are its own. Shield records stay in the
+   * agent's folder (ShieldService takes the agent's keys).
+   */
+  async forCreatorVault(chainId: number, token: Address): Promise<Keys<S>> {
+    const folder = this.#root.folder(CREATOR_DIR).folder(`${chainId}-${getAddress(token)}`);
+    await folder.ensure();
+    return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
+  }
+
   /** True once an encrypted backup of the master seed has been exported. */
   backupExported(): Promise<boolean> {
     return this.#backupExported();
+  }
+
+  /** The seed's backup key (passkey.ts): it signs this seed's writes to the relayer's passkey backups. */
+  backupSigner(): PrivateKeyAccount {
+    return backupSignerOf(this.#master);
+  }
+
+  /** The master seed encrypted under a passkey's PRF output, for the backup of passkey `credentialId` (passkey.ts sealSeed). */
+  passkeyBackup(prf: Uint8Array, credentialId: Uint8Array): Promise<string> {
+    return sealSeed(this.#master, prf, credentialId);
   }
 
   /** A keychain of this seed that asks the signature escrow (when there is one) before it signs. */
@@ -189,6 +223,11 @@ export class Keys<S extends WotsStore = WotsStore> {
 
   sellerKeychain(chainId: number, token: Address): WotsKeychain {
     return this.#keychain(sellerKeychainId(chainId, token));
+  }
+
+  /** Keychain of the creator vault for (chain, token) (key index = the vault's on-chain nonce). */
+  creatorKeychain(chainId: number, token: Address): WotsKeychain {
+    return this.#keychain(creatorKeychainId(chainId, token));
   }
 
   /** Keychain of private vault `index` (key index = the vault's on-chain nonce). */

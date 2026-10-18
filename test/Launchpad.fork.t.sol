@@ -71,6 +71,24 @@ interface IUniversalRouter {
     function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
 }
 
+/// @dev A Robinhood stock token (AAPL at 0xaF3D...93f9): a beacon proxy whose beacon is also its access registry.
+///      Selectors read from the deployed implementation (0xb354...5aE2) and registry bytecode.
+interface IRobinhoodStockToken {
+    function pause() external;
+    function unpause() external;
+    function tokenPaused() external view returns (bool);
+    function ACCESS_CONTROLLED_REGISTRY() external pure returns (address);
+}
+
+interface IRobinhoodStockRegistry {
+    function pause() external;
+    function unpause() external;
+    function paused() external view returns (bool);
+    function blockAccounts(address[] calldata accounts) external;
+    function unblockAccounts(address[] calldata accounts) external;
+    function isBlocked(address account) external view returns (bool);
+}
+
 /// @dev v4-periphery IV4Router.ExactInputSingleParams as Universal Router 2.1.2 decodes it.
 struct ExactInputSingleParams {
     PoolKey poolKey;
@@ -803,5 +821,107 @@ contract LaunchpadForkTest is Test {
         assertEq(IERC20(USDG).balanceOf(address(bunker)), 0);
         assertEq(token.dividendOf(address(bunker)), 0);
         assertEq(bunker.nonce(), 1);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // A stock token as the quote (AAPL)
+    // ---------------------------------------------------------------------------------------------
+
+    address internal constant AAPL = 0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9;
+    address internal constant AAPL_REGISTRY = 0xe10b6f6B275de231345c20D14Ab812db62151b00;
+    /// @dev Holders of the issuer's roles (RoleGranted logs of the registry; each call checked on mainnet with
+    ///      eth_call from the holder): pausing the token, pausing the registry, blocking accounts.
+    address internal constant AAPL_TOKEN_PAUSER = 0xFCcF56B674113d9C4eb0F9B3370930ceD9E6Ab23;
+    address internal constant AAPL_REGISTRY_PAUSER = 0xe7BCB188254Bc6eBBfF63014DfED4cD4A024F22A;
+    address internal constant AAPL_BLOCKER = 0x913cA87347391218e5De2C17c5A0AEba8B0b28fD;
+    bytes32 internal constant CREATOR_AAPL = keccak256("OSTRA/EVM/TEST/creator-aapl-vault");
+
+    function _one(address a) internal pure returns (address[] memory list) {
+        list = new address[](1);
+        list[0] = a;
+    }
+
+    function test_aStockTokenPoolTradesAndPaysTheCreatorInTheStock() public {
+        assertEq(IRobinhoodStockToken(AAPL).ACCESS_CONTROLLED_REGISTRY(), AAPL_REGISTRY);
+        OstraVault creatorVault = _vault(AAPL, CREATOR_AAPL);
+        // TEST/AAPL starting at 2e-7 AAPL a token (both 18 decimals: tick -154,200), a 200 AAPL market cap,
+        // graduation at 5 AAPL raised.
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(AAPL), address(creatorVault), -154_200, bytes32(uint256(14)));
+        p.name = "Test";
+        p.symbol = "TEST";
+        p.graduationThreshold = 5e18;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        assertEq(token.symbol(), "TEST");
+        PoolKey memory key = hook.poolKey(id);
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        assertEq(Currency.unwrap(tokenIs0 ? key.currency1 : key.currency0), AAPL);
+        Currency aapl = Currency.wrap(AAPL);
+        vm.warp(block.timestamp + 601);
+        deal(AAPL, address(router), 20e18);
+
+        // A buy of 1 AAPL pays 1% hook fee + 3% buy tax in AAPL.
+        address holder = makeAddr("TEST holder");
+        uint256 claims0 = _claims(aapl);
+        BalanceDelta d = _buyExactIn(key, token, 1e18, holder);
+        assertEq(tokenIs0 ? d.amount1() : d.amount0(), -1e18);
+        assertEq(_claims(aapl) - claims0, 0.04e18);
+        assertGt(token.balanceOf(holder), 0);
+        _buyExactIn(key, token, 1e18, address(router));
+        uint256 aaplBefore = IERC20(AAPL).balanceOf(address(router));
+        router.swap(key, tokenIs0, -int256(token.balanceOf(address(router)) / 2), address(router));
+        assertGt(IERC20(AAPL).balanceOf(address(router)), aaplBefore, "a sell pays out AAPL");
+
+        // Dispatch pays the creator vault in AAPL; the vault spends it with its WOTS key.
+        vm.recordLogs();
+        hook.dispatch(id);
+        uint256 paid = _creatorPaid();
+        assertGt(paid, 0);
+        assertEq(IERC20(AAPL).balanceOf(address(creatorVault)), paid);
+        _spend(creatorVault, CREATOR_AAPL, 0, abi.encode(makeAddr("creator out"), paid));
+        assertEq(IERC20(AAPL).balanceOf(makeAddr("creator out")), paid);
+        assertGt(token.dividendOf(holder), 0);
+
+        // The issuer's controls reach the pool. A paused token stops every swap until it is unpaused.
+        vm.prank(AAPL_TOKEN_PAUSER);
+        IRobinhoodStockToken(AAPL).pause();
+        assertTrue(IRobinhoodStockToken(AAPL).tokenPaused());
+        vm.expectRevert();
+        router.swap(key, !tokenIs0, -0.1e18, holder);
+        vm.prank(AAPL_TOKEN_PAUSER);
+        IRobinhoodStockToken(AAPL).unpause();
+        _buyExactIn(key, token, 0.1e18, holder);
+
+        // So does a paused registry.
+        vm.prank(AAPL_REGISTRY_PAUSER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).pause();
+        assertTrue(IRobinhoodStockRegistry(AAPL_REGISTRY).paused());
+        vm.expectRevert();
+        router.swap(key, !tokenIs0, -0.1e18, holder);
+        vm.prank(AAPL_REGISTRY_PAUSER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).unpause();
+        _buyExactIn(key, token, 0.1e18, holder);
+
+        // A blocked trader can neither pay nor be paid AAPL; others still trade.
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).blockAccounts(_one(address(router)));
+        assertTrue(IRobinhoodStockRegistry(AAPL_REGISTRY).isBlocked(address(router)));
+        vm.expectRevert();
+        router.swap(key, !tokenIs0, -0.1e18, holder);
+        TestSwapRouter other = new TestSwapRouter(POOL_MANAGER);
+        deal(AAPL, address(other), 1e18);
+        other.swap(key, !tokenIs0, -0.1e18, holder);
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).unblockAccounts(_one(address(router)));
+        _buyExactIn(key, token, 0.1e18, holder);
+
+        // A blocked PoolManager freezes the pool for everyone until it is unblocked.
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).blockAccounts(_one(POOL_MANAGER));
+        vm.expectRevert();
+        other.swap(key, !tokenIs0, -0.1e18, holder);
+        vm.prank(AAPL_BLOCKER);
+        IRobinhoodStockRegistry(AAPL_REGISTRY).unblockAccounts(_one(POOL_MANAGER));
+        other.swap(key, !tokenIs0, -0.1e18, holder);
     }
 }

@@ -21,6 +21,13 @@
 //                      them without relaying (gate.ts), for an agent that
 //                      sends with its own fee payer: 200, 409 key_reused,
 //                      503 escrow_unavailable, 400 no_signatures
+//   GET  /v1/backups/<name>  the passkey backup kept under that name (32 bytes
+//                      in 0x hex; backups.ts): 200 {name, owner, blob,
+//                      updatedAt}, 404 no_backup (with updatedAt when deleted)
+//   POST /v1/backups/<name>  body {"op": "put" | "delete", "owner", "blob"
+//                      (put), "at", "signature"}: writes it, signed by the
+//                      seed's backup key: 200, 400, 403 bad_signature, 404,
+//                      409 owner_mismatch or replayed, 429 backup_limit
 // The web app's origin gets CORS on every route, and its preflights (OPTIONS)
 // are answered with 204 (merchant/src/cors.ts).
 //
@@ -38,6 +45,7 @@ import { createOstraMerchant } from "../../merchant/src/merchant.ts";
 import { FileChannelStorage } from "../../merchant/src/store.ts";
 import { loadRelayerConfig } from "./config.ts";
 import { RelayerGate } from "./gate.ts";
+import { BackupStore } from "./backups.ts";
 import { createRelayerServer } from "./http.ts";
 import { openRelayerAccount } from "./keys.ts";
 import { Ledger } from "./ledger.ts";
@@ -63,6 +71,7 @@ async function main(): Promise<void> {
   const storage = await FileChannelStorage.open(config.dataDir);
   const ledger = await Ledger.open(config.dataDir);
   const escrow = await SignatureEscrow.open(config.dataDir);
+  const backups = await BackupStore.open(config.dataDir, d.chainId);
   const merchant = await createOstraMerchant({
     rpcUrl: config.rpcUrl,
     deployment: d,
@@ -89,7 +98,7 @@ async function main(): Promise<void> {
   });
   const facts = { ...gate.facts(), merchant: keys.merchant, crank: merchant.crank, facilitator: keys.facilitator.address };
 
-  const server = createRelayerServer({ gate, escrow, facts, clientIp: config.clientIp, log, scrub });
+  const server = createRelayerServer({ gate, escrow, backups, facts, clientIp: config.clientIp, log, scrub });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(config.listen.port, config.listen.host, () => resolve());

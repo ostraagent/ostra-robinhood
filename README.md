@@ -36,9 +36,10 @@ Contents:
   the locker adds liquidity and the max buy and the token's max wallet apply. During the
   anti-farmer period the token enters no other v4 pool and no Uniswap v2 or v3 style pool. The
   creator vault can change the rules only in the traders' favour (lower taxes, earlier tax end,
-  higher max buy, limits released). `test/Launchpad.fork.t.sol` runs it against the real
-  PoolManager, USDG, WETH and AAPL pools, Uniswap v2 and v3 factories, the v3 position manager and
-  Universal Router 2.1.2.
+  higher max buy, limits released). A pool's quote is ETH or any ERC-20, a stock token among them.
+  `test/Launchpad.fork.t.sol` runs it against the real PoolManager, USDG, WETH and AAPL pools, a
+  TEST/AAPL pool quoted in the AAPL stock token, Uniswap v2 and v3 factories, the v3 position
+  manager and Universal Router 2.1.2.
 - `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
@@ -68,6 +69,9 @@ Contents:
   The signature escrow keeps every WOTS signature until the chain shows its key used: a restored
   device reads it (GET /v1/signatures/<key root>) before signing, and an agent sending with its own
   fee payer escrows first (POST /v1/escrow); a recovering vault's new key is escrowed too.
+  Passkey backups (GET and POST /v1/backups/<name>) keep a seed encrypted under a passkey's PRF
+  output, which the relayer cannot open, named by the hash of the credential id; the seed's backup
+  key binds the name with its first write and alone replaces or deletes it.
   `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
   ETH; its fork test runs it on a mainnet fork.
 - `core/`: Ostra Agent's logic shared by the MCP package and the web app (`@ostraagent/core`),
@@ -77,12 +81,16 @@ Contents:
   the vault to Ostra sellers (closed on the payer path: requestClose, then finalizeWithdraw after
   the grace period), session keys, shield and unshield, guardian recovery (set guardians and the
   policy, support another vault's recovery, adopt a vault on a new device and cancel a recovery),
-  and the relayer's signature escrow (a key with no record on this device asks it before signing,
-  so a device restored from the seed sends a signature still in flight instead of signing again).
+  the relayer's signature escrow (a key with no record on this device asks it before signing,
+  so a device restored from the seed sends a signature still in flight instead of signing again),
+  the passkey backup of the seed (AES-256-GCM under HKDF of the WebAuthn PRF output, kept by the
+  relayer), and the creator vault a launch pays its creator's share to, with its own records and
+  relayer client and an optional auto-shield of its balance into the shielded pool.
   `scripts/chain-check.ts` runs it end to end against the keeper, the relayer and a seller server;
   its fork test runs it on a mainnet fork. `test/recovery.fork.test.ts` runs a guardian recovery
   on a fork.
-  `test/shield.fork.test.ts` runs shield and unshield against the aggregator on a fork.
+  `test/shield.fork.test.ts` runs shield, the creator vault's auto-shield and unshield against the
+  aggregator on a fork.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
   batches: a depositor posts the leaves of its pending deposit (checked against the on-chain
   commitment and amount) with its depositor key and deposit id (checked to derive the deposit key,

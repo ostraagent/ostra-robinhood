@@ -41,6 +41,11 @@
 //      instead of signing a second message with the same key; its next
 //      withdrawal is escrowed before its fee payer sends it. A restored
 //      device that cannot reach the escrow signs nothing.
+//  10. The passkey backup of the seed (POST and GET /v1/backups/<name>): the
+//      seed, encrypted under a passkey's PRF output (32 random bytes stand in
+//      for an authenticator's), is kept by the relayer and opened by a new
+//      device with the same passkey; another seed cannot replace it, another
+//      passkey cannot open it, and the seed's backup key deletes it.
 // Whether the checks pass or a step fails, the run then cleans up: every
 // relayer channel still holding unclaimed escrow is closed through the keeper
 // (signed with the relayer's merchant key), and the vaults, the relayer
@@ -98,7 +103,7 @@ import { MerchantKeys, ensurePrivateDir, isPrivateKey } from "../../merchant/src
 import { CHANNELS_DIR } from "../../merchant/src/store.ts";
 import { parseListen } from "../../relayer/src/config.ts";
 import { openRelayerAccount } from "../../relayer/src/keys.ts";
-import { ChannelService, Keys, LocalSender, RelayerClient, SignatureEscrowClient, VaultService, X402_NETWORK, type Config } from "../src/index.ts";
+import { ChannelService, Keys, LocalSender, PasskeyBackupClient, RelayerClient, RelayerError, SignatureEscrowClient, VaultService, X402_NETWORK, backupName, type Config } from "../src/index.ts";
 import { MemoryFolder } from "../test/memory-folder.ts";
 
 /** Gas the relayer account is funded for, at the current fee: about forty relayed transactions. */
@@ -557,6 +562,22 @@ async function main(): Promise<void> {
     const blind = new VaultService(client, transport, config, blindKeys, new LocalSender(client, transport, feePayer), "buyer");
     const blindError = await blind.withdraw(funder.address, "0.01").then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
     check(/cannot be reached/.test(blindError) && (await nonceOf()) === lostAt + 2n && (await blindStore.load(buyerKeys.keychainId, lostAt + 2n)) === undefined, "a restored device that cannot reach the escrow signs nothing", blindError);
+
+    // --- 10. the passkey backup of the seed ---------------------------------------------------------------------------
+    const backups = new PasskeyBackupClient(relayerUrl, d.chainId);
+    const credential = new Uint8Array(randomBytes(32));
+    const prf = new Uint8Array(randomBytes(32));
+    const saved = await backups.save(keys, credential, prf);
+    const reopened = await backups.restore(credential, prf);
+    check(saved.name === backupName(credential) && reopened !== null && bytesToHex(reopened) === bytesToHex(master), "the relayer keeps the seed's passkey backup and a new device with the same passkey decrypts it", saved);
+    const intruder = new Keys({ master: new Uint8Array(randomBytes(32)), feePayer, store: new FileWotsStore(join(runDir, "wots-intruder")), folder: new MemoryFolder(), backupExported: async () => true });
+    const taken = await backups.save(intruder, credential, prf).then(() => "", (err: unknown) => (err instanceof RelayerError ? `${err.status} ${err.code}` : String(err)));
+    const wrongPasskey = await backups.restore(credential, new Uint8Array(randomBytes(32))).then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
+    check(taken === "409 owner_mismatch" && /does not open this backup/.test(wrongPasskey) && bytesToHex((await backups.restore(credential, prf)) ?? new Uint8Array()) === bytesToHex(master), "another seed cannot replace the backup and another passkey cannot open it", { taken, wrongPasskey });
+    await backups.remove(keys, credential);
+    const resaved = await backups.save(keys, credential, prf);
+    await backups.remove(keys, credential);
+    check((await backups.get(credential)) === null && resaved.updatedAt > saved.updatedAt, "the seed's backup key deletes the backup (and writes it again later)", resaved);
   } catch (err) {
     runError = err;
   } finally {

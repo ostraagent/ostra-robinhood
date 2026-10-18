@@ -9,6 +9,7 @@ export * from "./config.ts";
 export * from "./encoding.ts";
 export * from "./escrow.ts";
 export * from "./keys.ts";
+export * from "./passkey.ts";
 export * from "./pending.ts";
 export * from "./random.ts";
 export * from "./relay.ts";

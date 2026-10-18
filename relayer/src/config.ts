@@ -14,7 +14,8 @@
 //   OSTRA_RELAYER_SECRETS    directory (0700) of that merchant key, the
 //                            facilitator key and the relayer key (keys.ts)
 //   OSTRA_RELAYER_DATA       directory (0700) of the channel records, the
-//                            relayer ledger and the signature escrow
+//                            relayer ledger, the signature escrow and the
+//                            passkey backups
 //   OSTRA_RELAYER_LISTEN     host:port of this server, e.g. 127.0.0.1:4300
 //   OSTRA_RELAYER_CLIENT_IP  "socket" (default: the connection's address) or
 //                            "cf-connecting-ip" (behind Cloudflare and a local proxy only)

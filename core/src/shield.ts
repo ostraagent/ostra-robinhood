@@ -30,7 +30,21 @@
 // depositor key, which holds no ETH, could not move it on its own.
 //
 // Entries, in the agent's `shield` folder (on disk OSTRA_HOME/shield, 0700):
-// <chain>-<token>-<index>.json, records without secrets.
+// <chain>-<token>-<index>.json, records without secrets. Every vault of the
+// agent in that token (the buyer vault, the creator vault) shields through its
+// own ShieldService into the same records: a record names the vault it
+// refunds to, deposit numbers are shared (a new record is created
+// exclusively), each service moves on only its own vault's deposits, and list
+// shows them all, so unshield takes the leaves of any of them.
+//
+// Auto-shield (design v0.4: the creator's share of a launch, optionally into
+// the shielded pool when the quote is USDG): when it is on for this service's
+// vault, every sweep shields as many leaves as the vault's balance above
+// `keep` pays for (within the pool's limits), once no earlier deposit of the
+// vault is still being funded. It is meant for the creator vault, which holds
+// nothing but the creator's payouts. `keep` (default RELAYER_CHANNEL_DEPOSIT)
+// stays in the vault to pay the relayer for the shield's own transactions.
+// Setting: auto-shield-<chain>-<token>-<vault>.json in the same folder.
 
 import { bytesToHex, encodeFunctionData, getAddress, hexToBytes, parseSignature, type Address, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import {
@@ -58,9 +72,9 @@ import {
   type Leaf,
   type WotsKeychain,
 } from "@ostraagent/sdk";
-import { formatTokenAmount } from "./amount.ts";
+import { formatTokenAmount, parseTokenAmount } from "./amount.ts";
 import { chainTime, tokenBalance } from "./chain.ts";
-import type { Config } from "./config.ts";
+import { RELAYER_CHANNEL_DEPOSIT, type Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import type { Sender } from "./relay.ts";
 import type { Folder } from "./storage.ts";
@@ -93,6 +107,8 @@ export type ShieldRecord = {
   chainId: number;
   token: string;
   index: number;
+  /** The vault the deposit is funded from and refunds to; absent on records made before 18 Oct 2026 (the buyer vault's). */
+  vault?: string;
   depositor: string;
   /** The deposit key (OstraPool.depositKey of the depositor and the deposit id). */
   deposit: string;
@@ -124,6 +140,8 @@ export type ShieldResult = {
 
 export type ShieldView = {
   index: number;
+  /** The vault it was shielded from (null: the buyer vault, on records made before 18 Oct 2026). */
+  vault: string | null;
   deposit: string;
   leaves: number;
   amount: string;
@@ -132,6 +150,9 @@ export type ShieldView = {
   /** The deposit's leaves in the pool, once sealed: spent ones are gone from the pool. */
   leavesInPool: { batch: string; leafIndex: number; amount: string; spent: boolean }[];
 };
+
+/** Auto-shield of a vault (see the header). */
+export type AutoShieldSetting = { vault: Address; enabled: boolean; keep: string };
 
 function recordName(chainId: number, token: string, index: number): string {
   return `${chainId}-${getAddress(token)}-${index}.json`;
@@ -205,6 +226,82 @@ export class ShieldService {
     await this.#folder.write(recordName(record.chainId, record.token, record.index), `${JSON.stringify(record, null, 2)}\n`);
   }
 
+  /** True when `record` belongs to this service's vault. */
+  async #mine(record: ShieldRecord): Promise<boolean> {
+    if (record.vault === undefined) return this.#vault.kind === "buyer";
+    return getAddress(record.vault) === (await this.#vault.vaultAddress());
+  }
+
+  /** A new record under the first free deposit number (created exclusively: another vault's service may be creating one too). */
+  async #createRecord(make: (index: number) => ShieldRecord): Promise<ShieldRecord> {
+    await this.#folder.ensure();
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const index = (await this.#records()).reduce((n, r) => Math.max(n, r.index + 1), 0);
+      const record = make(index);
+      try {
+        await this.#folder.create(recordName(record.chainId, record.token, record.index), `${JSON.stringify(record, null, 2)}\n`);
+        return record;
+      } catch (err) {
+        if ((await this.#folder.read(recordName(record.chainId, record.token, record.index))) === undefined) throw err;
+      }
+    }
+    throw new Error("could not take a free shield deposit number");
+  }
+
+  async #autoShieldName(): Promise<string> {
+    return `auto-shield-${this.#config.chainId}-${this.#token()}-${await this.#vault.vaultAddress()}.json`;
+  }
+
+  /** This vault's auto-shield setting (off unless set). */
+  autoShield(): Promise<AutoShieldSetting> {
+    return this.#serial(() => this.#autoShieldSetting());
+  }
+
+  async #autoShieldSetting(): Promise<AutoShieldSetting> {
+    const vault = await this.#vault.vaultAddress();
+    const text = await this.#folder.read(await this.#autoShieldName());
+    if (text === undefined) return { vault, enabled: false, keep: formatTokenAmount(RELAYER_CHANNEL_DEPOSIT) };
+    const r = JSON.parse(text) as { enabled?: unknown; keep?: unknown };
+    if (typeof r.enabled !== "boolean" || typeof r.keep !== "string") throw new Error(`${await this.#autoShieldName()} is not an auto-shield setting`);
+    return { vault, enabled: r.enabled, keep: formatTokenAmount(parseTokenAmount(r.keep)) };
+  }
+
+  /** Turns auto-shield of this vault on or off; `keep` (tokens, default RELAYER_CHANNEL_DEPOSIT) stays in the vault. */
+  setAutoShield(enabled: boolean, keep?: string): Promise<AutoShieldSetting> {
+    return this.#serial(async () => {
+      if (enabled) this.#aggregatorUrl();
+      const kept = keep === undefined ? RELAYER_CHANNEL_DEPOSIT : parseTokenAmount(keep);
+      if (kept < 0n) throw new RangeError("keep must not be negative");
+      await this.#folder.ensure();
+      await this.#folder.write(await this.#autoShieldName(), `${JSON.stringify({ enabled, keep: formatTokenAmount(kept) })}\n`);
+      return this.#autoShieldSetting();
+    });
+  }
+
+  /**
+   * One auto-shield step (in the sweep): the leaves the vault's balance above
+   * `keep` pays for, within the pool's largest deposit and total. Null when
+   * it is off, nothing is due, or an earlier deposit of the vault is still
+   * being funded.
+   */
+  async #autoShieldStep(): Promise<ShieldResult | null> {
+    const setting = await this.#autoShieldSetting();
+    if (!setting.enabled) return null;
+    for (const r of await this.#records()) if (r.status === "funding" && (await this.#mine(r))) return null;
+    const status = await this.#vault.status();
+    if (!status.vaultExists) return null;
+    const p = await readPool(this.#client, this.#pool());
+    if (p.maxDeposit === 0n) return null;
+    const vault = await this.#vault.vaultAddress();
+    const available = (await tokenBalance(this.#client, this.#token(), vault)) - parseTokenAmount(setting.keep);
+    const room = p.maxTotal - (await tokenBalance(this.#client, this.#token(), this.#pool()));
+    const most = maxLeavesPerDeposit(p.maxDeposit, p.feeBps);
+    let leaves = 0;
+    while (leaves < most && depositForLeaves(leaves + 1, p.feeBps) <= available && depositForLeaves(leaves + 1, p.feeBps) <= room) leaves += 1;
+    if (leaves === 0) return null;
+    return this.#shieldLocked(leaves);
+  }
+
   #signer(record: ShieldRecord): PrivateKeyAccount {
     return this.#keys.shieldSigner(this.#config.chainId, this.#token(), BigInt(record.index));
   }
@@ -275,33 +372,38 @@ export class ShieldService {
 
   /** Puts `leaves` standard leaves of the vault's tokens into the shielded pool. */
   shield(leaves: number): Promise<ShieldResult> {
-    return this.#serial(async () => {
-      this.#aggregatorUrl();
-      if (!Number.isInteger(leaves) || leaves < 1) throw new RangeError("leaves must be a positive whole number");
-      const pool = this.#pool();
-      const p = await readPool(this.#client, pool);
-      if (p.token !== this.#token()) throw new Error(`the pool ${pool} holds ${p.token}, not ${this.#token()}`);
-      if (p.maxDeposit === 0n) throw new Error("the pool does not accept deposits (no deposit limit)");
-      const most = maxLeavesPerDeposit(p.maxDeposit, p.feeBps);
-      if (leaves > most) throw new RangeError(`one deposit holds at most ${most} leaves (the pool's largest deposit is ${formatTokenAmount(p.maxDeposit)})`);
-      const terms = await this.#aggregator("GET", "/v1/terms");
-      if (terms.chainId !== this.#config.chainId || typeof terms.pool !== "string" || getAddress(terms.pool) !== pool || typeof terms.token !== "string" || getAddress(terms.token) !== this.#token()) {
-        throw new Error(`the aggregator serves pool ${String(terms.pool)} on chain ${String(terms.chainId)}, not ${pool} on ${this.#config.chainId}`);
-      }
-      const amount = depositForLeaves(leaves, p.feeBps);
-      const status = await this.#vault.status();
-      if (!status.vaultExists) throw new Error("open the vault and fund it first (open_vault)");
+    return this.#serial(() => this.#shieldLocked(leaves));
+  }
 
-      const index = (await this.#records()).reduce((n, r) => Math.max(n, r.index + 1), 0);
+  async #shieldLocked(leaves: number): Promise<ShieldResult> {
+    this.#aggregatorUrl();
+    if (!Number.isInteger(leaves) || leaves < 1) throw new RangeError("leaves must be a positive whole number");
+    const pool = this.#pool();
+    const p = await readPool(this.#client, pool);
+    if (p.token !== this.#token()) throw new Error(`the pool ${pool} holds ${p.token}, not ${this.#token()}`);
+    if (p.maxDeposit === 0n) throw new Error("the pool does not accept deposits (no deposit limit)");
+    const most = maxLeavesPerDeposit(p.maxDeposit, p.feeBps);
+    if (leaves > most) throw new RangeError(`one deposit holds at most ${most} leaves (the pool's largest deposit is ${formatTokenAmount(p.maxDeposit)})`);
+    const terms = await this.#aggregator("GET", "/v1/terms");
+    if (terms.chainId !== this.#config.chainId || typeof terms.pool !== "string" || getAddress(terms.pool) !== pool || typeof terms.token !== "string" || getAddress(terms.token) !== this.#token()) {
+      throw new Error(`the aggregator serves pool ${String(terms.pool)} on chain ${String(terms.chainId)}, not ${pool} on ${this.#config.chainId}`);
+    }
+    const amount = depositForLeaves(leaves, p.feeBps);
+    const status = await this.#vault.status();
+    if (!status.vaultExists) throw new Error("open the vault and fund it first (open_vault)");
+
+    const vault = await this.#vault.vaultAddress();
+    // The record comes first: whatever happens next, the sweep finds the depositor key again.
+    const record = await this.#createRecord((index) => {
       const signer = this.#keys.shieldSigner(this.#config.chainId, this.#token(), BigInt(index));
-      const key = depositKey(signer.address, this.#keys.shieldDepositId(this.#config.chainId, this.#token(), BigInt(index)));
-      const record: ShieldRecord = {
+      return {
         version: 1,
         chainId: this.#config.chainId,
         token: this.#token(),
         index,
+        vault,
         depositor: signer.address,
-        deposit: key,
+        deposit: depositKey(signer.address, this.#keys.shieldDepositId(this.#config.chainId, this.#token(), BigInt(index))),
         leaves,
         amount: amount.toString(),
         status: "funding",
@@ -312,29 +414,28 @@ export class ShieldService {
         createdAt: Math.floor(Date.now() / 1000),
         closedAt: null,
       };
-      // The record comes first: whatever happens next, the sweep finds the depositor key again.
-      await this.#save(record);
-      await this.#fundAndDeposit(record);
-      let view: ShieldResult["aggregator"];
-      try {
-        await this.#register(record);
-        view = await this.#poll(record);
-      } catch (err) {
-        view = { status: "unreachable", error: (err as Error).message };
-      }
-      return {
-        index,
-        deposit: key,
-        depositor: signer.address,
-        leaves,
-        amount: formatTokenAmount(amount),
-        status: record.status,
-        aggregator: view,
-        note:
-          "the deposit waits for a batch of at least 8 deposits; this server approves the batch when it is ready (every 5 minutes it checks), " +
-          "and a deposit no batch took within 48 hours is refunded in full to the vault",
-      };
     });
+    const { index, depositor, deposit: key } = record;
+    await this.#fundAndDeposit(record);
+    let view: ShieldResult["aggregator"];
+    try {
+      await this.#register(record);
+      view = await this.#poll(record);
+    } catch (err) {
+      view = { status: "unreachable", error: (err as Error).message };
+    }
+    return {
+      index,
+      deposit: key,
+      depositor,
+      leaves,
+      amount: formatTokenAmount(amount),
+      status: record.status,
+      aggregator: view,
+      note:
+        "the deposit waits for a batch of at least 8 deposits; this server approves the batch when it is ready (every 5 minutes it checks), " +
+        "and a deposit no batch took within 48 hours is refunded in full to the vault",
+    };
   }
 
   /** Steps 1 and 2: the depositor key gets the tokens from the vault, then the deposit is submitted with its EIP-3009 authorization. */
@@ -381,18 +482,27 @@ export class ShieldService {
   // The sweep
   // ---------------------------------------------------------------------------
 
-  /** Moves every shield deposit on: registers, polls, approves, closes, cancels. Returns one message per deposit that failed. */
+  /**
+   * Moves every shield deposit of this vault on: registers, polls, approves,
+   * closes, cancels; then the auto-shield step. Returns one message per
+   * deposit (or auto-shield) that failed.
+   */
   sweep(): Promise<string[]> {
     return this.#serial(async () => {
       const failures: string[] = [];
       if (this.#config.aggregatorUrl === null) return failures;
       for (const record of await this.#records()) {
-        if (record.status === "closed") continue;
+        if (record.status === "closed" || !(await this.#mine(record))) continue;
         try {
           await this.#advance(record);
         } catch (err) {
           failures.push(`shield deposit ${record.index}: ${(err as Error).message}`);
         }
+      }
+      try {
+        await this.#autoShieldStep();
+      } catch (err) {
+        failures.push(`auto-shield: ${(err as Error).message}`);
       }
       return failures;
     });
@@ -513,7 +623,7 @@ export class ShieldService {
   // balance
   // ---------------------------------------------------------------------------
 
-  /** Every shield deposit of this vault's token, with its leaves in the pool once sealed. */
+  /** Every shield deposit in this token (of every vault of the agent), with its leaves in the pool once sealed. */
   list(): Promise<ShieldView[]> {
     return this.#serial(async () => {
       const out: ShieldView[] = [];
@@ -526,7 +636,7 @@ export class ShieldService {
             leavesInPool.push({ batch: r.batch, leafIndex: i, amount: formatTokenAmount(LEAF_DENOMINATION), spent: b.status === "none" || leaf === undefined || leaf.spent });
           }
         }
-        out.push({ index: r.index, deposit: r.deposit, leaves: r.leaves, amount: formatTokenAmount(BigInt(r.amount)), status: r.status, batch: r.batch, leavesInPool });
+        out.push({ index: r.index, vault: r.vault === undefined ? null : getAddress(r.vault), deposit: r.deposit, leaves: r.leaves, amount: formatTokenAmount(BigInt(r.amount)), status: r.status, batch: r.batch, leavesInPool });
       }
       return out;
     });
