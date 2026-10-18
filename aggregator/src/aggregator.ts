@@ -3,8 +3,11 @@
 //   * a depositor sends the leaves of its pending deposit (POST
 //     /v1/deposits); they are accepted only if their LtHash is the deposit's
 //     on-chain commitment and they add up to its amount after the pool fee;
-//   * the depositor polls its deposit with an EIP-191 signature of its
-//     one-time depositor key (named in the deposit's DepositCreated event);
+//   * the deposit names its one-time depositor key and deposit id; their
+//     deposit key (keccak(abi.encode(depositor, depositId)), as the pool
+//     derives it) must be the deposit's, so no event log is read and any RPC
+//     serves the aggregator, even one that limits eth_getLogs to 10 blocks;
+//   * the depositor polls its deposit with an EIP-191 signature of that key;
 //     only deposits polled within FRESH_SECONDS go into a batch;
 //   * with at least MIN_ANONYMITY_DEPOSITS fresh deposits, it creates a batch
 //     sized to their leaves, appends the leaves shuffled, and gives every
@@ -19,7 +22,7 @@
 //
 // The aggregator key can never move pool funds; it can only delay a batch.
 
-import { bytesToHex, decodeEventLog, getAbiItem, getAddress, keccak256, type Address, type Hex, type PrivateKeyAccount, type PublicClient, type TransactionReceipt } from "viem";
+import { bytesToHex, decodeEventLog, getAddress, isAddress, keccak256, type Address, type Hex, type PrivateKeyAccount, type PublicClient, type TransactionReceipt } from "viem";
 import {
   LEAF_DENOMINATION,
   MAX_LEAVES_PER_BATCH,
@@ -114,8 +117,26 @@ function parseDepositKey(value: unknown): Hex {
   return value.toLowerCase() as Hex;
 }
 
+const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * The depositor of `deposit`, from the depositor and deposit id the request
+ * names: the pool keeps no depositor, only the key derived from both, so the
+ * pair is accepted only if it derives exactly that key.
+ */
+function parseDepositor(deposit: Hex, depositorValue: unknown, depositIdValue: unknown): Address {
+  if (typeof depositorValue !== "string" || !isAddress(depositorValue, { strict: false })) {
+    throw new AggregatorError(400, "invalid_request", "depositor must be an address in 0x hex");
+  }
+  if (typeof depositIdValue !== "string" || !BYTES32.test(depositIdValue)) throw new AggregatorError(400, "invalid_request", "depositId must be 32 bytes in 0x hex");
+  const depositor = getAddress(depositorValue);
+  if (depositKey(depositor, depositIdValue as Hex).toLowerCase() !== deposit) {
+    throw new AggregatorError(400, "invalid_depositor", "the depositor and deposit id do not derive this deposit key");
+  }
+  return depositor;
+}
+
 const wireRoot = (keyRoot: string) => `0x${keyRoot}` as Hex;
-const depositCreatedEvent = getAbiItem({ abi: ostraPoolAbi, name: "DepositCreated" });
 
 export class Aggregator {
   readonly #client: PublicClient;
@@ -209,8 +230,9 @@ export class Aggregator {
   /** POST /v1/deposits { deposit, leaves }: the leaves of a pending deposit. */
   async register(body: unknown): Promise<AggregatorDepositView> {
     if (typeof body !== "object" || body === null) throw new AggregatorError(400, "invalid_request", "the body must be an object");
-    const { deposit: depositValue, leaves: leavesValue } = body as Record<string, unknown>;
+    const { deposit: depositValue, depositor: depositorValue, depositId: depositIdValue, leaves: leavesValue } = body as Record<string, unknown>;
     const deposit = parseDepositKey(depositValue);
+    const depositor = parseDepositor(deposit, depositorValue, depositIdValue);
     if (!Array.isArray(leavesValue) || leavesValue.length === 0 || leavesValue.length > MAX_LEAVES_PER_BATCH) {
       throw new AggregatorError(400, "invalid_leaves", `leaves must be a list of 1 to ${MAX_LEAVES_PER_BATCH} leaves`);
     }
@@ -235,7 +257,6 @@ export class Aggregator {
     const total = leaves.reduce((s, l) => s + l.amount, 0n);
     const net = poolNetAmount(d.amount, this.#pool.feeBps);
     if (net !== total) throw new AggregatorError(409, "amount_mismatch", `the deposit nets ${net} after the pool fee; the leaves add up to ${total}`);
-    const depositor = await this.#depositorOf(deposit);
     // The chain was read without holding anything: another request may have registered it meanwhile.
     if (this.#state.deposits[deposit] === undefined && this.#state.open?.deposits.includes(deposit) !== true) {
       this.#state.deposits[deposit] = { deposit, depositor, leaves: leaves.map(leafToWire), queuedAt: this.#now(), polledAt: null, pollNotBefore: 0 };
@@ -243,26 +264,6 @@ export class Aggregator {
       this.log("deposit_registered", { deposit, leaves: leaves.length });
     }
     return this.#view(deposit);
-  }
-
-  /**
-   * The depositor of `deposit`, from its DepositCreated event (the pool keeps
-   * no depositor, only the key derived from it); the key is checked to be
-   * depositKey(depositor, depositId) of that event.
-   */
-  async #depositorOf(deposit: Hex): Promise<string> {
-    const logs = await this.#client.getLogs({
-      address: this.#pool.pool,
-      event: depositCreatedEvent,
-      args: { depositKey: deposit },
-      fromBlock: BigInt(this.#deployment.fromBlock),
-      toBlock: "latest",
-    });
-    for (const log of logs) {
-      const { args } = decodeEventLog({ abi: ostraPoolAbi, eventName: "DepositCreated", data: log.data, topics: log.topics });
-      if (depositKey(args.depositor, args.depositId) === deposit) return getAddress(args.depositor);
-    }
-    throw new Error(`the DepositCreated event of ${deposit} was not found`);
   }
 
   /** GET /v1/deposits/<deposit>?at=<unix seconds>&signature=<0x hex>: a signed poll by the deposit's depositor key. */

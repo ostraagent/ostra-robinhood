@@ -55,13 +55,21 @@ Contents:
   `test/shield.fork.test.ts` runs shield and unshield against the aggregator on a fork.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
   batches: a depositor posts the leaves of its pending deposit (checked against the on-chain
-  commitment and amount) and polls it with an EIP-191 signature of its depositor key; with at least
+  commitment and amount) with its depositor key and deposit id (checked to derive the deposit key,
+  so no event log is read and an RPC that limits eth_getLogs serves it) and polls it with an
+  EIP-191 signature of its depositor key; with at least
   8 deposits polled in the last 10 minutes it creates a batch, appends the leaves shuffled, seals it
   once every deposit approved within 15 minutes or abandons it, and forgets which leaf came from
   which deposit after the seal. A batch takes at most 43 deposits, so its sealBatch transaction
   stays under the sequencer's 95,000-byte limit. `scripts/aggregator-check.ts` runs the aggregator
-  process end to end with eight depositors; its fork test runs it on a mainnet fork (it waits out
-  the 900-second approval window once, about 20 minutes).
+  process end to end with sixteen depositors in two groups of eight; its fork test runs it on a
+  mainnet fork (it waits out the 900-second approval window once, about 20 minutes).
+
+The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
+block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
+never printed: anvil's errors are passed on with it replaced. `core/test/recover-logs.test.ts` runs
+against mainnet itself with `OSTRA_LIMITED_RPC`, an RPC that limits eth_getLogs (Alchemy Free: 10
+blocks a request), and checks that channel recovery still reads every log window.
 
 ```
 node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)

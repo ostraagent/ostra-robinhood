@@ -19,6 +19,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { robinhoodChain } from "../src/chain.ts";
 import { ROBINHOOD_PUBLIC_RPC, USDG } from "../src/constants.ts";
+import { redact } from "../src/chain.ts";
 import { deployOstra } from "../src/deploy.ts";
 import type { Deployment } from "../src/deployment.ts";
 
@@ -56,8 +57,21 @@ async function rpc(url: string, method: string, params: unknown[]): Promise<unkn
 export async function startFork(): Promise<Fork> {
   const port = 20_000 + Math.floor(Math.random() * 30_000);
   const url = `http://127.0.0.1:${port}`;
-  const child: ChildProcess = spawn("anvil", ["--fork-url", process.env.OSTRA_FORK_RPC ?? ROBINHOOD_PUBLIC_RPC, "--port", String(port), "--silent"], {
-    stdio: ["ignore", "ignore", "inherit"],
+  // OSTRA_FORK_RPC may carry an API key (an archive RPC such as Alchemy keeps the fork block's state, which the
+  // public RPC drops after some minutes): anvil's errors are passed on line by line with the URL replaced.
+  const forkUrl = process.env.OSTRA_FORK_RPC !== undefined && process.env.OSTRA_FORK_RPC !== "" ? process.env.OSTRA_FORK_RPC : ROBINHOOD_PUBLIC_RPC;
+  const child: ChildProcess = spawn("anvil", ["--fork-url", forkUrl, "--port", String(port), "--silent"], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let pendingErr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    pendingErr += chunk.toString("utf8");
+    const lines = pendingErr.split("\n");
+    pendingErr = lines.pop() ?? "";
+    for (const line of lines) process.stderr.write(`${redact(line, forkUrl)}\n`);
+  });
+  child.stderr?.on("end", () => {
+    if (pendingErr !== "") process.stderr.write(`${redact(pendingErr, forkUrl)}\n`);
   });
   let exited = false;
   child.on("exit", () => {

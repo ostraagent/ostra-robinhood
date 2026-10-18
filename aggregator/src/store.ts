@@ -20,7 +20,7 @@ export const STATE_FILE = "state.json";
 export type DepositRecord = {
   /** The OstraPool deposit key (0x, lowercase hex). */
   deposit: string;
-  /** The depositor (from the deposit's DepositCreated event): the one-time key whose EIP-191 signature polls it. */
+  /** The depositor (named at registration and checked to derive the deposit key): the one-time key whose EIP-191 signature polls it. */
   depositor: string;
   leaves: WireLeaf[];
   /** Unix seconds; the queue order (a deposit that let a batch expire goes to the back). */

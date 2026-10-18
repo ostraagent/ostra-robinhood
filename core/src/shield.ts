@@ -254,7 +254,9 @@ export class ShieldService {
   }
 
   async #register(record: ShieldRecord): Promise<void> {
-    await this.#aggregator("POST", "/v1/deposits", { deposit: record.deposit, leaves: this.#leaves(record).map(leafToWire) });
+    // The depositor and deposit id let the aggregator check the deposit key without reading event logs.
+    const depositId = this.#keys.shieldDepositId(this.#config.chainId, this.#token(), BigInt(record.index));
+    await this.#aggregator("POST", "/v1/deposits", { deposit: record.deposit, depositor: this.#signer(record).address, depositId, leaves: this.#leaves(record).map(leafToWire) });
     if (!record.registered) {
       record.registered = true;
       await this.#save(record);

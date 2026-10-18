@@ -33,7 +33,7 @@ import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 /** anvil's development account 2 (a public test key, used only on the fork; it only sends transactions). */
 const FUNDER_KEY = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 /** PASS lines the check prints when everything passes. */
-const EXPECTED_PASSES = 33;
+const EXPECTED_PASSES = 34;
 /** EIP-2935 history storage contract and Arbitrum's history window (blocks). */
 const HISTORY_STORAGE: Address = "0x0000F90827F1C53a10cb7A02335B175320002935";
 const HISTORY_WINDOW = 393_168n;

@@ -1,10 +1,12 @@
 // HTTP endpoint of the aggregator (JSON over HTTP; served to depositors
 // through an HTTPS proxy):
 //
-//   POST /v1/deposits             { deposit, leaves: [{ keyRoot, amount }] }
+//   POST /v1/deposits             { deposit, depositor, depositId, leaves: [{ keyRoot, amount }] }
 //                                 the leaves of a pending deposit (deposit =
-//                                 its OstraPool deposit key, 0x hex); accepted
-//                                 only if they match its on-chain commitment
+//                                 its OstraPool deposit key, 0x hex, which
+//                                 depositor and depositId must derive);
+//                                 accepted only if they match its on-chain
+//                                 commitment
 //   GET  /v1/deposits/<deposit>?at=<unix seconds>&signature=<0x hex>
 //                                 a poll signed (EIP-191) by the deposit's
 //                                 depositor key: queued, or the batch number

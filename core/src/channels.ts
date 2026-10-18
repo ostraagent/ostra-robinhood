@@ -38,6 +38,7 @@ import { bytesToHex, decodeFunctionData, encodeFunctionData, getAddress, isAddre
 import type { BatchSettlementClientContext } from "@x402/evm/batch-settlement/client";
 import {
   MULTICALL3,
+  ROBINHOOD_PUBLIC_RPC,
   VAULT_ACTION,
   X402_MAX_WITHDRAW_DELAY,
   X402_MIN_WITHDRAW_DELAY,
@@ -49,6 +50,7 @@ import {
   ostraVaultAbi,
   readChannel,
   readVault,
+  robinhoodClient,
   vaultChannelConfig,
   type ChannelConfig,
   type ChannelState,
@@ -74,6 +76,23 @@ const MAX_STEPS_PER_CALL = 4;
 const CLOSE_REQUEST_TTL_SECONDS = 3_600n;
 
 const channelOpenedEvent = parseAbiItem("event ChannelOpened(bytes32 indexed channelId, uint128 amount)");
+
+/**
+ * Blocks one eth_getLogs request spans when a channel is recovered: the most
+ * the public Robinhood Chain RPC allows (measured 18 Oct 2026; more is refused
+ * with "only 10000000 are allowed"), about 11.8 days at 0.1 s a block.
+ */
+export const LOG_WINDOW_BLOCKS = 10_000_000n;
+
+/** The ChannelOpened logs of `channel` from `vault` between `fromBlock` and `toBlock`, read in windows of LOG_WINDOW_BLOCKS. */
+async function channelOpenedLogs(client: PublicClient, vault: Address, channel: Hex, fromBlock: bigint, toBlock: bigint) {
+  const out = [];
+  for (let from = fromBlock; from <= toBlock; from += LOG_WINDOW_BLOCKS) {
+    const to = from + LOG_WINDOW_BLOCKS - 1n < toBlock ? from + LOG_WINDOW_BLOCKS - 1n : toBlock;
+    out.push(...(await client.getLogs({ address: vault, event: channelOpenedEvent, args: { channelId: channel }, fromBlock: from, toBlock: to })));
+  }
+  return out;
+}
 
 export type ChannelRecipient = { recipient: Address; bps: number };
 
@@ -205,10 +224,20 @@ export function payCapacity(record: ChannelRecord): bigint {
  * chain (after a restore from the seed, when no record of it is here): the
  * vault's ChannelOpened event gives the transaction, and the OpenChannel
  * spend in it (sent alone or through Multicall3) gives the config.
+ * The logs are read from the agent's RPC; one that refuses the window (Alchemy
+ * Free allows 10 blocks a request) is replaced, for the logs only, by the
+ * public RPC. A config is returned only if it hashes to `channel`, so the log
+ * source needs no trust.
  */
 export async function recoverChannelConfig(client: PublicClient, config: Config, vault: Address, channel: Hex): Promise<ChannelConfig | null> {
   const d = config.deployment;
-  const logs = await client.getLogs({ address: vault, event: channelOpenedEvent, args: { channelId: channel }, fromBlock: BigInt(d.fromBlock), toBlock: "latest" });
+  const latest = await client.getBlockNumber();
+  let logs;
+  try {
+    logs = await channelOpenedLogs(client, vault, channel, BigInt(d.fromBlock), latest);
+  } catch {
+    logs = await channelOpenedLogs(robinhoodClient(ROBINHOOD_PUBLIC_RPC), vault, channel, BigInt(d.fromBlock), latest);
+  }
   for (const log of logs) {
     if (log.transactionHash === null) continue;
     const tx = await client.getTransaction({ hash: log.transactionHash });

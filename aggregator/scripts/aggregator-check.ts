@@ -2,9 +2,10 @@
 // the configured chain, with two groups of eight depositors that each deposit
 // one standard leaf. Nothing is simulated: every step is a real transaction.
 //
-//   1. Registrations that must be refused: an unknown deposit, leaves that do
-//      not match the commitment, a non-standard leaf, a leaf listed twice, and
-//      a poll not signed by the deposit's depositor key.
+//   1. Registrations that must be refused: an unknown deposit, a depositor
+//      and deposit id that do not derive the deposit key, leaves that do not
+//      match the commitment, a non-standard leaf, a leaf listed twice, and a
+//      poll not signed by the deposit's depositor key.
 //   2. Seven deposits of the first group registered and polled: no batch
 //      (minimum anonymity 8).
 //   3. The eighth: a batch of the eight is built, its leaves shuffled; every
@@ -258,8 +259,14 @@ async function main(): Promise<void> {
     const res = await fetch(`${base}${path}`, init);
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
-  const register = (deposit: Hex, leaves: Leaf[]) =>
-    http("/v1/deposits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deposit, leaves: leaves.map(leafToWire) }) });
+  /** POST /v1/deposits: the deposit key, the depositor and deposit id it derives from, and the leaves. */
+  const register = (who: { deposit: Hex; depositor: Address; depositId: Hex }, leaves: Leaf[]) =>
+    http("/v1/deposits", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deposit: who.deposit, depositor: who.depositor, depositId: who.depositId, leaves: leaves.map(leafToWire) }),
+    });
+  const named = (dep: Depositor) => ({ deposit: dep.deposit, depositor: dep.key.address, depositId: dep.depositId });
   const poll = async (dep: Depositor, signer: PrivateKeyAccount = dep.key) => {
     const at = BigInt(nowSeconds());
     const signature = await signAggregatorPoll(signer, { chainId: d.chainId, pool, deposit: dep.deposit }, at);
@@ -364,20 +371,23 @@ async function main(): Promise<void> {
       const groupB = depositors.slice(GROUP);
       const d0 = groupA[0] as Depositor;
       const stranger = privateKeyToAccount(generatePrivateKey());
-      let r = await register(depositKey(stranger.address, bytesToHex(randomBytes(32))), d0.leaves);
+      const strangerId = bytesToHex(randomBytes(32));
+      let r = await register({ deposit: depositKey(stranger.address, strangerId), depositor: stranger.address, depositId: strangerId }, d0.leaves);
       check(r.status === 404 && r.body.error === "unknown_deposit", "a key that is not a deposit is refused", r);
-      r = await register(d0.deposit, [{ keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION }]);
+      r = await register({ deposit: d0.deposit, depositor: stranger.address, depositId: d0.depositId }, d0.leaves);
+      check(r.status === 400 && r.body.error === "invalid_depositor", "a depositor that does not derive the deposit key is refused (no event log is read)", r);
+      r = await register(named(d0), [{ keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION }]);
       check(r.status === 409 && r.body.error === "commitment_mismatch", "leaves that do not match the deposit's commitment are refused", r);
-      r = await register(d0.deposit, [{ keyRoot: d0.leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION / 2n }, { keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION / 2n }]);
+      r = await register(named(d0), [{ keyRoot: d0.leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION / 2n }, { keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION / 2n }]);
       check(r.status === 400 && r.body.error === "non_standard_leaf", "a leaf of another amount is refused", r);
-      r = await register(d0.deposit, [d0.leaves[0] as Leaf, d0.leaves[0] as Leaf]);
+      r = await register(named(d0), [d0.leaves[0] as Leaf, d0.leaves[0] as Leaf]);
       check(r.status === 400 && r.body.error === "duplicate_leaf", "a leaf listed twice is refused", r);
       r = await poll(d0);
       check(r.status === 200 && r.body.status === "unknown", "a deposit not registered polls as unknown", r);
 
       // --- 2. seven deposits of the first group: no batch -----------------------------------------
       for (const dep of groupA.slice(0, GROUP - 1)) {
-        r = await register(dep.deposit, dep.leaves);
+        r = await register(named(dep), dep.leaves);
         if (r.status !== 200 || r.body.status !== "queued") throw new Error(`registration of deposit ${dep.index} failed: ${toJson(r)}`);
         await poll(dep);
       }
@@ -388,7 +398,7 @@ async function main(): Promise<void> {
       check(health.open === null && health.fresh === GROUP - 1, "seven fresh deposits: no batch is built below the minimum anonymity", { open: health.open, fresh: health.fresh });
 
       // --- 3. the eighth: a batch of eight, approved by all and sealed -----------------------------
-      r = await register((groupA[GROUP - 1] as Depositor).deposit, (groupA[GROUP - 1] as Depositor).leaves);
+      r = await register(named(groupA[GROUP - 1] as Depositor), (groupA[GROUP - 1] as Depositor).leaves);
       check(r.status === 200 && r.body.status === "queued", "the eighth deposit is registered", r.body);
       const batched = async (group: Depositor[], what: string): Promise<{ batchId: bigint; state: Hex } | null> => {
         const views = await waitBatched(group, 4 * PASS_SECONDS + 60);
@@ -424,7 +434,7 @@ async function main(): Promise<void> {
       // --- 4. the second group: seven approve, the eighth does not: abandoned ----------------------
       // (Sealed first, then abandoned: every token state a seal touches is read before the 15-minute wait.)
       for (const dep of groupB) {
-        r = await register(dep.deposit, dep.leaves);
+        r = await register(named(dep), dep.leaves);
         if (r.status !== 200 || r.body.status !== "queued") throw new Error(`registration of deposit ${dep.index} failed: ${toJson(r)}`);
       }
       const b1 = await batched(groupB, "the second group's eight deposits report one new batch and state hash");
