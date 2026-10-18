@@ -19,7 +19,7 @@ Contents:
   `OstraToken`'s dividends owed to the vault, to the signed recipient (the owner's vault for the
   dividend token). A vault whose seed is lost is recovered by its guardians (other vaults): once the
   threshold supports the same new key root, the recovery waits its delay (36 hours to 14 days) and
-  anyone finishes it; any spend by the current key cancels it.
+  anyone finishes it, or the new key's first spend does; any spend by the current key cancels it.
   `lib/v4-core` is `src/` and `licenses/` of Uniswap v4-core v4.0.0 (commit e50237c), the release
   whose PoolManager runs on chain 4663.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)
@@ -65,6 +65,9 @@ Contents:
   it as an Ostra seller through `merchant/` and sends it from its own account, so agents need no
   ETH. createVault, a leaf spent into a vault, unshield and an open to the relayer are relayed
   before payment as the vault's debt; WOTS signatures are escrowed before anything is simulated.
+  The signature escrow keeps every WOTS signature until the chain shows its key used: a restored
+  device reads it (GET /v1/signatures/<key root>) before signing, and an agent sending with its own
+  fee payer escrows first (POST /v1/escrow); a recovering vault's new key is escrowed too.
   `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
   ETH; its fork test runs it on a mainnet fork.
 - `core/`: Ostra Agent's logic shared by the MCP package and the web app (`@ostraagent/core`),
@@ -72,8 +75,13 @@ Contents:
   the buyer, seller and private vaults (open, withdraw, open a channel, change the crank), the
   relayer client that pays the relayer with vouchers of the vault's channel to it, channels from
   the vault to Ostra sellers (closed on the payer path: requestClose, then finalizeWithdraw after
-  the grace period), session keys, shield and unshield. `scripts/chain-check.ts` runs it end to end
-  against the keeper, the relayer and a seller server; its fork test runs it on a mainnet fork.
+  the grace period), session keys, shield and unshield, guardian recovery (set guardians and the
+  policy, support another vault's recovery, adopt a vault on a new device and cancel a recovery),
+  and the relayer's signature escrow (a key with no record on this device asks it before signing,
+  so a device restored from the seed sends a signature still in flight instead of signing again).
+  `scripts/chain-check.ts` runs it end to end against the keeper, the relayer and a seller server;
+  its fork test runs it on a mainnet fork. `test/recovery.fork.test.ts` runs a guardian recovery
+  on a fork.
   `test/shield.fork.test.ts` runs shield and unshield against the aggregator on a fork.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
   batches: a depositor posts the leaves of its pending deposit (checked against the on-chain

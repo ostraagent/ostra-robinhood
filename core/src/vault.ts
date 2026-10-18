@@ -25,22 +25,37 @@
 // itself (no token account, no rent); a channel is an x402 batch-settlement
 // channel whose id is fixed by its config, so an open is sent once (on Solana
 // each send of an open had its own slot and channel address).
+//
+// Recovery (design v0.4, when the device and the seed are lost): the owner
+// sets the vault's guardians and policy (setGuardian, setRecoveryPolicy); a
+// guardian vault supports moving another vault to a new seed's key
+// (supportRecovery); the new device adopts the vault (requestRecovery) and
+// gives its guardians the key root to support. Once the delay is over, the
+// new seed's first spend finishes the recovery on-chain, and the vault is
+// this seed's from then on. Any spend by the current key cancels a recovery.
 
-import { bytesToHex, encodeFunctionData, getAddress, isAddress, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
+import { bytesToHex, encodeAbiParameters, encodeFunctionData, getAddress, isAddress, keccak256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
 import {
   VAULT_ACTION,
   channelId as computeChannelId,
+  decodeVaultSpendMessage,
   fromHex,
   openChannelParams,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
+  readRecovery,
   readVault,
+  setRecoveryPolicyParams,
   signVaultOpenChannel,
   signVaultSetCrankKey,
+  signVaultSetGuardian,
+  signVaultSetRecoveryPolicy,
+  signVaultSupportRecovery,
   signVaultTransfer,
   setCrankParams,
   transferParams,
   usdgAbi,
+  WotsKeyMismatchError,
   vaultAddress as computeVaultAddress,
   vaultChannelConfig,
   type ChannelConfig,
@@ -51,7 +66,7 @@ import {
   type WotsKeychain,
 } from "@ostraagent/sdk";
 import { formatEth, formatTokenAmount, parseTokenAmount, TOKEN_DECIMALS } from "./amount.ts";
-import { ethBalance, tokenBalance, tokenDecimals } from "./chain.ts";
+import { chainTime, ethBalance, tokenBalance, tokenDecimals } from "./chain.ts";
 import { VAULT_SOFT_LIMIT, type Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { decodeVaultOpenChannelMessage, decodeVaultSetCrankKeyMessage, decodeVaultSpendHeader, decodeVaultTransferMessage } from "./pending.ts";
@@ -95,6 +110,8 @@ export type BalanceResult = {
   overSoftLimit: boolean;
   pendingWithdrawal: PendingWithdrawal | null;
   pendingChannelOpen: PendingChannelOpen | null;
+  /** Another vault operation (swap, pool settings, dividends, recovery) signed and not landed: its spend action. */
+  pendingOperation?: { action: number };
   /** Seller vault only: the crank now on the vault (null: none) and a crank change not landed yet. */
   crank?: Address | null;
   pendingCrankChange?: PendingCrankChange | null;
@@ -108,7 +125,9 @@ export type BalanceResult = {
 export type ResentSpend =
   | { operation: "withdraw"; txHash: Hash; destination: Address; amount: string }
   | { operation: "open_channel"; txHash: Hash; channel: Hex; receiverAuthorizer: Address; deposit: string }
-  | { operation: "set_crank"; txHash: Hash; crank: Address | null };
+  | { operation: "set_crank"; txHash: Hash; crank: Address | null }
+  /** Any other spend action (swap, pool settings, dividends, recovery), sent again as it was signed. */
+  | { operation: "vault_spend"; txHash: Hash; action: number };
 
 export type WithdrawResult =
   | { status: "sent"; txHash: Hash; destination: Address; amount: string; vaultNonce: string }
@@ -122,6 +141,35 @@ export type CrankChangeResult =
   | { status: "sent"; txHash: Hash; crank: Address | null; vaultNonce: string }
   | { status: "unchanged"; crank: Address | null; vaultNonce: string }
   | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+/** The result of a recovery spend (guardian, policy, support). */
+export type RecoverySpendResult =
+  | { status: "sent"; txHash: Hash; vaultNonce: string }
+  | { status: "unchanged"; vaultNonce: string }
+  | { status: "resent_pending"; resent: ResentSpend; vaultNonce: string; note: string };
+
+/** A vault's guardian recovery as read from the chain. */
+export type RecoveryInfo = {
+  vault: Address;
+  guardianCount: number;
+  /** 0: recovery off. */
+  threshold: number;
+  delaySeconds: number;
+  /** The recovery waiting in the vault's current round; `mine`: it moves the vault to this seed's key. */
+  pending: { newKeyRoot: Hex; executableAt: string; ready: boolean; mine: boolean } | null;
+};
+
+/** What a new device that lost the old seed does to recover a vault (requestRecovery). */
+export type RecoveryRequest = {
+  vault: Address;
+  /** recovered: the vault's key is this seed's; the others say what is still needed. */
+  status: "waiting_for_guardians" | "other_recovery_pending" | "waiting_for_delay" | "ready" | "recovered";
+  /** The key root the guardians support: this seed's key at the vault's current nonce. */
+  newKeyRoot: Hex;
+  nonce: string;
+  recovery: RecoveryInfo;
+  note: string;
+};
 
 /** A signed channel open about to be sent (new or resent): its params, its config and its channel id. */
 export type ChannelOpening = { open: OpenChannelParams; config: ChannelConfig; channel: Hex };
@@ -143,6 +191,8 @@ export class VaultService {
   readonly #sender: Sender;
   /** The crank the vault was created with (part of its address); unknown for a seller vault until setInitCrank. */
   #initCrank: Address | null;
+  /** A vault this seed recovered (requestRecovery) instead of the one it creates; undefined until read. */
+  #adopted: Address | null | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   #onChannelOpening: ((opening: ChannelOpening) => Promise<void>) | null = null;
 
@@ -179,12 +229,45 @@ export class VaultService {
 
   /** Runs vault operations one at a time (each reads the nonce it signs with). */
   #serial<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.#queue.then(fn, fn);
+    const guarded = () => fn().catch(async (err: unknown) => {
+      throw await this.#explain(err);
+    });
+    const run = this.#queue.then(guarded, guarded);
     this.#queue = run.catch(() => undefined);
     return run;
   }
 
+  /** A key mismatch on a vault this seed is recovering: the recovery is not past its delay yet. */
+  async #explain(err: unknown): Promise<unknown> {
+    if (!(err instanceof WotsKeyMismatchError)) return err;
+    const adopted = await this.#adoptedVault().catch(() => null);
+    if (adopted === null) return err;
+    return new Error(`this seed is recovering ${adopted}: the vault's key becomes this seed's once the guardians' recovery is past its delay (requestRecovery says what it still needs); nothing was signed`, { cause: err });
+  }
+
+  /** The record of the vault this seed recovered, kept with this vault's records. */
+  #adoptedName(): string {
+    return `adopted-${this.kind}-vault.json`;
+  }
+
+  async #adoptedVault(): Promise<Address | null> {
+    if (this.#adopted !== undefined) return this.#adopted;
+    const text = await this.#keys.folder.read(this.#adoptedName());
+    if (text === undefined) {
+      this.#adopted = null;
+      return null;
+    }
+    const r = JSON.parse(text) as { chainId?: unknown; token?: unknown; vault?: unknown };
+    if (r.chainId !== this.#config.chainId || typeof r.token !== "string" || getAddress(r.token) !== this.#config.deployment.token || typeof r.vault !== "string" || !isAddress(r.vault, { strict: false })) {
+      throw new Error(`${this.#adoptedName()} is not a recovered vault of chain ${this.#config.chainId} in ${this.#config.deployment.token}`);
+    }
+    this.#adopted = getAddress(r.vault);
+    return this.#adopted;
+  }
+
   async vaultAddress(): Promise<Address> {
+    const adopted = await this.#adoptedVault();
+    if (adopted !== null) return adopted;
     if (this.#initCrank === null) throw new Error(this.#missing());
     const d = this.#config.deployment;
     return computeVaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot: this.#keyRoot(0n), initialCrank: this.#initCrank });
@@ -194,8 +277,21 @@ export class VaultService {
     return bytesToHex(this.#keychain.keyRoot(index));
   }
 
+  /**
+   * The vault's state, with the key this seed signs with: the vault's key
+   * root, or, for a vault this seed is recovering, the recovery's new key root
+   * once its delay is over (the next spend finishes the recovery).
+   */
   async #read(vault: Address): Promise<VaultState | null> {
-    return readVault(this.#client, this.#config.deployment, vault);
+    const v = await readVault(this.#client, this.#config.deployment, vault);
+    if (v === null) return null;
+    const mine = this.#keyRoot(v.nonce).toLowerCase();
+    if (v.keyRoot.toLowerCase() === mine) return v;
+    const r = await readRecovery(this.#client, vault);
+    if (r.pending !== null && r.pending.newKeyRoot.toLowerCase() === mine && r.pending.executableAt <= (await chainTime(this.#client))) {
+      return { ...v, keyRoot: mine as Hex };
+    }
+    return v;
   }
 
   async #checkToken(): Promise<void> {
@@ -288,8 +384,9 @@ export class VaultService {
     });
   }
 
+  /** The spend signed under `nonce` and not landed: this device's record, or the relayer escrow's (keys.ts). */
   async #pending(nonce: bigint): Promise<{ message: string; signature: string } | null> {
-    const record = await this.#keys.store.load(this.#keychain.keychainId, nonce);
+    const record = await this.#keychain.signed(nonce);
     return record === undefined ? null : record;
   }
 
@@ -302,6 +399,7 @@ export class VaultService {
       let pendingWithdrawal: PendingWithdrawal | null = null;
       let pendingChannelOpen: PendingChannelOpen | null = null;
       let pendingCrankChange: PendingCrankChange | null = null;
+      let pendingOperation: { action: number } | undefined;
       if (v !== null) {
         const p = await this.#pending(v.nonce);
         if (p !== null) {
@@ -322,6 +420,8 @@ export class VaultService {
             };
           } else if (header.action === VAULT_ACTION.SET_CRANK_KEY) {
             pendingCrankChange = { crank: decodeVaultSetCrankKeyMessage(message).crank };
+          } else {
+            pendingOperation = { action: header.action };
           }
         }
       }
@@ -337,6 +437,7 @@ export class VaultService {
         overSoftLimit: balance > VAULT_SOFT_LIMIT,
         pendingWithdrawal,
         pendingChannelOpen,
+        ...(pendingOperation === undefined ? {} : { pendingOperation }),
         ...(this.kind === "seller" ? { crank: v === null ? null : v.crank, pendingCrankChange } : {}),
         feePayer: this.#keys.feePayer.address,
         feePayerEth: formatEth(await ethBalance(this.#client, this.#keys.feePayer.address)),
@@ -383,7 +484,10 @@ export class VaultService {
       const txHash = await sender.send([spendCall(vault, { action: VAULT_ACTION.SET_CRANK_KEY, nextKeyRoot, params, signature })], { reservation });
       return { operation: "set_crank", txHash, crank };
     }
-    throw new Error(`a vault operation this package does not send (spend action ${header.action}) was signed under nonce ${v.nonce} and must be completed first`);
+    // Any other action: the same signed bytes again.
+    const s = decodeVaultSpendMessage(message);
+    const txHash = await sender.send([spendCall(vault, { action: s.action, nextKeyRoot: s.nextKeyRoot, params: s.params, signature })], { reservation });
+    return { operation: "vault_spend", txHash, action: s.action };
   }
 
   /**
@@ -401,7 +505,7 @@ export class VaultService {
       reservation = await sender.reserve(VAULT_SPEND_GAS, sender === this.#sender ? this.#opener() : undefined, this.kind !== "seller" ? moves : 0n);
     } catch (err) {
       if (!(err instanceof PendingSpendUnpaidError)) throw err;
-      const local = new LocalSender(this.#client, this.#transport, this.#keys.feePayer);
+      const local = new LocalSender(this.#client, this.#transport, this.#keys.feePayer, this.#keys.escrow);
       const need = VAULT_SPEND_GAS * (await this.#client.getGasPrice()) * ETH_HEADROOM;
       if ((await ethBalance(this.#client, this.#keys.feePayer.address)) < need) {
         throw new Error(`${err.message}; send at least ${formatEth(need)} ETH to the fee payer ${this.#keys.feePayer.address} and call again: it sends that operation itself`);
@@ -594,6 +698,174 @@ export class VaultService {
         }
         return { status: "sent", txHash, crank: target, vaultNonce: (v.nonce + 1n).toString() };
       });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recovery
+  // ---------------------------------------------------------------------------
+
+  async #recoveryOf(vault: Address): Promise<RecoveryInfo> {
+    const r = await readRecovery(this.#client, vault);
+    let pending: RecoveryInfo["pending"] = null;
+    if (r.pending !== null) {
+      const v = await readVault(this.#client, this.#config.deployment, vault);
+      const mine = v !== null && r.pending.newKeyRoot.toLowerCase() === this.#keyRoot(v.nonce).toLowerCase();
+      pending = { newKeyRoot: r.pending.newKeyRoot, executableAt: r.pending.executableAt.toString(), ready: r.pending.executableAt <= (await chainTime(this.#client)), mine };
+    }
+    return { vault, guardianCount: r.guardianCount, threshold: r.threshold, delaySeconds: r.delay, pending };
+  }
+
+  /** This vault's guardian recovery: its guardians, policy and the recovery waiting, if any. */
+  recovery(): Promise<RecoveryInfo> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress();
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      return this.#recoveryOf(vault);
+    });
+  }
+
+  /**
+   * A recovery spend from this vault: a spend signed earlier is sent first
+   * (and this one is not); `unchanged` answers without signing when there is
+   * nothing to change.
+   */
+  #recoverySpend(sign: (v: VaultState) => Promise<SignedSpend>, unchanged: (v: VaultState, vault: Address) => Promise<boolean>, via?: Sender): Promise<RecoverySpendResult> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress();
+      if ((await this.#read(vault)) === null) throw new Error(this.#missing());
+      const chosen = via ?? this.#sender;
+      await this.requireEth(VAULT_SPEND_GAS, "send the vault operation", chosen);
+      return this.#paidSpend(chosen, async (sender, reservation) => {
+        const v = await this.#read(vault);
+        if (v === null) throw new Error(this.#missing());
+        const resent = await this.#sendPending(vault, v, sender, reservation);
+        if (resent !== null) {
+          return { status: "resent_pending", resent, vaultNonce: (v.nonce + 1n).toString(), note: "an earlier signed vault operation had not landed and was sent now; this one was not, call again for it" };
+        }
+        if (await unchanged(v, vault)) return { status: "unchanged", vaultNonce: v.nonce.toString() };
+        const signed = await sign(v);
+        let txHash: Hash;
+        try {
+          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+        } catch (err) {
+          throw new Error(`${(err as Error).message}\nthe signed operation is kept; the next call on this vault sends it again before anything else`);
+        }
+        return { status: "sent", txHash, vaultNonce: (v.nonce + 1n).toString() };
+      });
+    });
+  }
+
+  /** Adds (enabled) or removes a guardian of this vault: another Ostra vault keeps the recovery post-quantum. */
+  async setGuardian(guardianText: string, enabled: boolean, via?: Sender): Promise<RecoverySpendResult> {
+    if (!isAddress(guardianText, { strict: false })) throw new RangeError(`${guardianText} is not an address`);
+    const guardian = getAddress(guardianText);
+    if (guardian === zeroAddress) throw new RangeError("a guardian is not the zero address");
+    return this.#recoverySpend(
+      (v) => signVaultSetGuardian(this.#keychain, v, { chainId: this.#config.chainId, guardian, enabled }),
+      async (_v, vault) => {
+        if (guardian === vault) throw new Error("a vault cannot be its own guardian");
+        const now = (await this.#client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "isGuardian", args: [guardian] })) as boolean;
+        if (now === enabled) return true;
+        const r = await readRecovery(this.#client, vault);
+        if (enabled && r.guardianCount === 255) throw new Error("the vault has the most guardians it can hold (255)");
+        if (!enabled && r.guardianCount - 1 < r.threshold) throw new Error(`removing it would leave ${r.guardianCount - 1} guardians, fewer than the threshold of ${r.threshold}; lower the threshold first`);
+        return false;
+      },
+      via,
+    );
+  }
+
+  /** Sets how many guardians must support a recovery and how long it then waits (threshold 0 and delay 0: off). */
+  async setRecoveryPolicy(threshold: number, delaySeconds: number, via?: Sender): Promise<RecoverySpendResult> {
+    setRecoveryPolicyParams({ threshold, delay: delaySeconds });
+    return this.#recoverySpend(
+      (v) => signVaultSetRecoveryPolicy(this.#keychain, v, { chainId: this.#config.chainId, threshold, delay: delaySeconds }),
+      async (_v, vault) => {
+        const r = await readRecovery(this.#client, vault);
+        if (threshold > r.guardianCount) throw new Error(`the vault has ${r.guardianCount} guardians, fewer than a threshold of ${threshold}`);
+        return r.threshold === threshold && r.delay === delaySeconds;
+      },
+      via,
+    );
+  }
+
+  /**
+   * Cancels a recovery of this vault that waits (the owner still holds the
+   * key): any spend does; this one sets the same policy again.
+   */
+  async cancelRecovery(via?: Sender): Promise<RecoverySpendResult | { status: "nothing_to_cancel" }> {
+    const vault = await this.vaultAddress();
+    const r = await readRecovery(this.#client, vault);
+    if (r.pending === null) return { status: "nothing_to_cancel" };
+    return this.#recoverySpend(
+      (v) => signVaultSetRecoveryPolicy(this.#keychain, v, { chainId: this.#config.chainId, threshold: r.threshold, delay: r.delay }),
+      async () => false,
+      via,
+    );
+  }
+
+  /** As a guardian (this vault), supports moving `vaultText` to `newKeyRootText` (the key root its owner's new device gave). */
+  async supportRecovery(vaultText: string, newKeyRootText: string, via?: Sender): Promise<RecoverySpendResult> {
+    if (!isAddress(vaultText, { strict: false })) throw new RangeError(`${vaultText} is not an address`);
+    const target = getAddress(vaultText);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(newKeyRootText) || /^0x0{64}$/.test(newKeyRootText)) throw new RangeError("the new key root is 32 bytes of 0x hex, not zero");
+    const newKeyRoot = newKeyRootText.toLowerCase() as Hex;
+    return this.#recoverySpend(
+      (v) => signVaultSupportRecovery(this.#keychain, v, { chainId: this.#config.chainId, vault: target, newKeyRoot }),
+      async (_v, vault) => {
+        if (target === vault) throw new Error("a vault cannot support its own recovery");
+        const t = await readVault(this.#client, this.#config.deployment, target);
+        if (t === null) throw new Error(`${target} is not an Ostra vault`);
+        const read = (functionName: string, args: readonly unknown[] = []) => this.#client.readContract({ address: target, abi: ostraVaultAbi, functionName: functionName as never, args: args as never });
+        if (!((await read("isGuardian", [vault])) as boolean)) throw new Error(`this vault ${vault} is not a guardian of ${target}`);
+        const r = await readRecovery(this.#client, target);
+        if (r.threshold === 0) throw new Error(`${target} has recovery turned off`);
+        const proposal = keccak256(encodeAbiParameters([{ type: "uint32" }, { type: "bytes32" }], [r.round, newKeyRoot]));
+        return (await read("supportedBy", [proposal, vault])) as boolean;
+      },
+      via,
+    );
+  }
+
+  /**
+   * On a new device that lost the old seed: adopts `vaultText` as this seed's
+   * vault of this kind and says what the recovery still needs. The guardians
+   * support `newKeyRoot`; once the delay is over, the next operation on the
+   * vault finishes the recovery.
+   */
+  requestRecovery(vaultText: string): Promise<RecoveryRequest> {
+    return this.#serial(async () => {
+      if (this.kind === "private") throw new Error("a private vault is recovered with the seed that unshielded it");
+      if (!isAddress(vaultText, { strict: false })) throw new RangeError(`${vaultText} is not an address`);
+      const vault = getAddress(vaultText);
+      const v = await readVault(this.#client, this.#config.deployment, vault);
+      if (v === null || v.token !== this.#config.deployment.token) throw new Error(`${vault} is not an Ostra vault in ${this.#config.deployment.token}`);
+      const adopted = await this.#adoptedVault();
+      if (adopted !== null && adopted !== vault) throw new Error(`this seed already recovers ${adopted} as its ${this.kind} vault`);
+      const newKeyRoot = this.#keyRoot(v.nonce).toLowerCase() as Hex;
+      const recovery = await this.#recoveryOf(vault);
+      if (v.keyRoot.toLowerCase() !== newKeyRoot && recovery.threshold === 0) throw new Error(`${vault} has no guardian recovery set; it cannot be recovered without its seed`);
+      if (adopted === null) {
+        await this.#keys.folder.write(this.#adoptedName(), `${JSON.stringify({ chainId: this.#config.chainId, token: this.#config.deployment.token, vault })}\n`);
+        this.#adopted = vault;
+      }
+      let status: RecoveryRequest["status"];
+      let note: string;
+      if (v.keyRoot.toLowerCase() === newKeyRoot) {
+        status = "recovered";
+        note = "the vault's key is this seed's";
+      } else if (recovery.pending?.mine === true) {
+        status = recovery.pending.ready ? "ready" : "waiting_for_delay";
+        note = recovery.pending.ready ? "the next operation on this vault finishes the recovery" : `the recovery waits until ${recovery.pending.executableAt} (unix seconds); any spend by the old key cancels it`;
+      } else if (recovery.pending !== null) {
+        status = "other_recovery_pending";
+        note = `the guardians started a recovery to another key root (${recovery.pending.newKeyRoot}); only a spend by the vault's current key cancels it, so ask the guardians which device it is for`;
+      } else {
+        status = "waiting_for_guardians";
+        note = `give this key root to the vault's guardians: ${recovery.threshold} of ${recovery.guardianCount} must support it; it changes if the vault's nonce moves`;
+      }
+      return { vault, status, newKeyRoot, nonce: v.nonce.toString(), recovery, note };
     });
   }
 

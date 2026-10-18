@@ -9,7 +9,13 @@
 //      the key behind any on-chain key_root can always be recomputed;
 //   2. writes the signature to a durable store BEFORE returning it, so a
 //      transaction that fails to land is retried with the identical bytes;
-//   3. refuses to sign a different message with an index that already signed.
+//   3. refuses to sign a different message with an index that already signed;
+//   4. with a signature escrow (WotsSignatureLookup: the Ostra relayer keeps
+//      every WOTS signature it receives until the chain shows its key used),
+//      asks it before signing with a key the local store has no record of, so
+//      a device restored from the seed resends a signature still in flight
+//      instead of signing a second message with the same key, and refuses to
+//      sign while the escrow cannot be read.
 //
 // This module does not depend on Node: the durable store is the WotsStore
 // interface. FileWotsStore (wots-file.ts, Node only) keeps records on disk.
@@ -203,6 +209,15 @@ export interface WotsStore {
   saveIfAbsent(record: WotsSignatureRecord): Promise<boolean>;
 }
 
+/**
+ * Where WOTS signatures that left this device are kept (the Ostra relayer's
+ * escrow, GET /v1/signatures/<key root>): the message and signature held for
+ * `keyRoot` (0x hex; the answer's bytes are hex too, with or without 0x),
+ * null when none is held. Must throw when it cannot tell, so nothing is
+ * signed then.
+ */
+export type WotsSignatureLookup = (keyRoot: string) => Promise<{ message: string; signature: string } | null>;
+
 /** Thrown when an index that already signed is asked to sign a different message. */
 export class WotsKeyReuseError extends Error {
   readonly index: bigint;
@@ -233,11 +248,13 @@ export class WotsKeychain {
   readonly keychainId: Uint8Array;
   readonly #master: Uint8Array;
   readonly #store: WotsStore;
+  readonly #lookup: WotsSignatureLookup | undefined;
 
-  constructor(master: Uint8Array, keychainId: Uint8Array, store: WotsStore) {
+  constructor(master: Uint8Array, keychainId: Uint8Array, store: WotsStore, lookup?: WotsSignatureLookup) {
     this.#master = bytes32(master, "master").slice();
     this.keychainId = bytes32(keychainId, "keychainId").slice();
     this.#store = store;
+    this.#lookup = lookup;
   }
 
   #key(index: bigint): WotsKey {
@@ -246,6 +263,35 @@ export class WotsKeychain {
 
   keyRoot(index: bigint): Uint8Array {
     return this.#key(index).keyRoot();
+  }
+
+  /**
+   * The signature key `index` released, if any: the local record, or else the
+   * one the signature escrow holds for its key root, which is checked (it must
+   * verify against the key) and stored locally before it is returned.
+   */
+  async signed(index: bigint): Promise<WotsSignatureRecord | undefined> {
+    const local = await this.#store.load(this.keychainId, index);
+    if (local !== undefined || this.#lookup === undefined) return local;
+    const keyRoot = this.#key(index).keyRoot();
+    const held = await this.#lookup(`0x${toHex(keyRoot)}`);
+    if (held === null) return undefined;
+    const bare = (h: string) => (h.startsWith("0x") || h.startsWith("0X") ? h.slice(2) : h).toLowerCase();
+    const message = fromHex(bare(held.message));
+    const signature = fromHex(bare(held.signature));
+    if (!wotsVerify(signature, message, keyRoot)) throw new Error(`the escrowed signature for WOTS key ${index} does not verify against that key`);
+    const record: WotsSignatureRecord = {
+      version: 1,
+      keychain: toHex(this.keychainId),
+      index: index.toString(),
+      keyRoot: toHex(keyRoot),
+      messageSha256: toHex(sha256([message])),
+      message: toHex(message),
+      signature: toHex(signature),
+      createdAt: new Date().toISOString(),
+    };
+    await this.#store.saveIfAbsent(record);
+    return this.#store.load(this.keychainId, index);
   }
 
   /**
@@ -264,7 +310,7 @@ export class WotsKeychain {
       throw new WotsKeyMismatchError(index);
     }
     for (;;) {
-      const existing = await this.#store.load(this.keychainId, index);
+      const existing = await this.signed(index);
       if (existing !== undefined) return this.#reuse(existing, index, message, keyRoot);
 
       const signature = signWithKey(key, message);

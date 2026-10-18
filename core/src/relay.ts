@@ -130,24 +130,35 @@ export interface Sender {
   release(reservation: Reservation | null): void;
 }
 
-/** The agent's own fee payer sends and pays the gas (Fase 1). */
+/** Escrows the WOTS signatures of calls before they are sent (escrow.ts SignatureEscrowClient). */
+export type CallEscrow = { escrow(calls: readonly RelayCall[]): Promise<void> };
+
+/**
+ * The agent's own fee payer sends and pays the gas (Fase 1). With the
+ * relayer's signature escrow, the WOTS signatures in the calls are escrowed
+ * first, as the relayer escrows the calls it relays; nothing is sent when that
+ * fails.
+ */
 export class LocalSender implements Sender {
   readonly relayed = false;
   readonly #client: PublicClient;
   readonly #transport: Transport;
   readonly #feePayer: PrivateKeyAccount;
+  readonly #escrow: CallEscrow | null;
 
-  constructor(client: PublicClient, transport: Transport, feePayer: PrivateKeyAccount) {
+  constructor(client: PublicClient, transport: Transport, feePayer: PrivateKeyAccount, escrow: CallEscrow | null = null) {
     this.#client = client;
     this.#transport = transport;
     this.#feePayer = feePayer;
+    this.#escrow = escrow;
   }
 
   async payer(): Promise<Address> {
     return this.#feePayer.address;
   }
 
-  send(calls: RelayCall[]): Promise<Hash> {
+  async send(calls: RelayCall[]): Promise<Hash> {
+    if (this.#escrow !== null) await this.#escrow.escrow(calls);
     return sendCalls(this.#client, this.#transport, this.#feePayer, calls);
   }
 

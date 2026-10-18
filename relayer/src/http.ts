@@ -27,7 +27,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 const toJson = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 
 export function createRelayerServer(o: {
-  gate: Pick<RelayerGate, "relay" | "vaultState">;
+  gate: Pick<RelayerGate, "relay" | "vaultState" | "escrow">;
   escrow: Pick<SignatureEscrow, "get">;
   facts: Record<string, unknown>;
   clientIp: "socket" | "cf-connecting-ip";
@@ -66,6 +66,12 @@ export function createRelayerServer(o: {
           const record = o.escrow.get(keyRoot);
           res.writeHead(record === undefined ? 404 : 200, { "content-type": "application/json", "cache-control": "no-store" });
           res.end(toJson(record ?? { error: "no_signature", keyRoot }));
+          return;
+        }
+        if (path === "/v1/escrow" && req.method === "POST") {
+          const answer = await o.gate.escrow({ body: await readBody(req) });
+          res.writeHead(answer.status, answer.headers);
+          res.end(answer.body === undefined ? undefined : typeof answer.body === "string" ? answer.body : toJson(answer.body));
           return;
         }
         if (path === "/v1/relay" && req.method === "POST") {

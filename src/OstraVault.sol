@@ -72,8 +72,8 @@ interface IOstraRecovery {
 ///                 resubmitted with the same bytes, never signed again.
 ///
 /// Recovery (when the owner has lost the seed): once `recoveryThreshold` guardians support the same new key root,
-/// the recovery waits `recoveryDelay`; then anyone may finish it and the vault's key becomes that root (the nonce runs
-/// on). Every spend, signed by the current key, cancels a recovery under way and every support gathered so far: an
+/// the recovery waits `recoveryDelay`; then anyone may finish it (finishRecovery), or the new seed's first spend, signed
+/// by that root, finishes it itself; the vault's key becomes that root (the nonce runs on). Every spend, signed by the current key, cancels a recovery under way and every support gathered so far: an
 /// owner who still holds the key always wins, and a stale support never counts again.
 ///
 /// Channels the vault pays (payer = vault):
@@ -213,7 +213,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     {
         _checkParamsShape(action, params);
         bytes memory message = spendMessage(action, nextKeyRoot, params);
-        if (Wots.recoverKeyRoot(signature, message) != keyRoot) revert WotsSignatureInvalid();
+        bytes32 signer = Wots.recoverKeyRoot(signature, message);
+        if (signer != keyRoot) _finishRecoveryBy(signer);
 
         // Rotate before any external call: the signature can never be used again.
         uint64 spent = nonce;
@@ -431,6 +432,17 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             pendingRecovery = PendingRecovery({round: round, executableAt: executableAt, newKeyRoot: newKeyRoot});
             emit RecoveryStarted(round, newKeyRoot, executableAt);
         }
+    }
+
+    /// @dev A spend not signed by the current key: valid only as the first spend of a recovery whose delay is over,
+    ///      signed by its new key root, which finishes the recovery (the spend then rotates the key as usual).
+    function _finishRecoveryBy(bytes32 signer) private {
+        PendingRecovery memory p = pendingRecovery;
+        if (p.executableAt == 0 || p.round != recoveryRound || block.timestamp < p.executableAt || signer != p.newKeyRoot) {
+            revert WotsSignatureInvalid();
+        }
+        delete pendingRecovery;
+        emit Recovered(p.round, p.newKeyRoot);
     }
 
     /// @notice Finishes a recovery whose delay is over; anyone may call it. The vault's key becomes the new root.

@@ -16,7 +16,9 @@
 //
 // keyed by the key root the relayer recovers itself (wotsRecoverKeyRoot), and
 // only when that is the key root the chain holds now (read at the latest
-// block): any other signature can never pass the contract, so it is not
+// block), or, for a vault, the new key root of the guardian recovery waiting
+// in its current round (its first spend finishes that recovery, OstraVault):
+// any other signature can never pass the contract, so it is not
 // stored and the request goes on to be refused by its simulation. A key root
 // holds one message; a request signing another one with it is refused with
 // the stored record, which the client sends again instead. GET
@@ -68,7 +70,8 @@ export type WotsClaim = (
 
 /** The on-chain key a claim must be signed with now. */
 export type KeyState =
-  | { kind: "vault"; keyRoot: Hex; nonce: bigint }
+  /** recoveryKeyRoot: the new key root of a recovery waiting in the vault's current round, which may sign too. */
+  | { kind: "vault"; keyRoot: Hex; nonce: bigint; recoveryKeyRoot?: Hex }
   | { kind: "approval"; keyRoot: Hex; pending: boolean }
   | { kind: "leaf"; keyRoot: Hex; leafAmount: bigint; spent: boolean };
 
@@ -155,7 +158,7 @@ export function escrowRecord(claim: WotsClaim, state: KeyState | null, block: bi
     return null;
   }
   const recovered = bytesToHex(wotsRecoverKeyRoot(hexToBytes(claim.signature), message));
-  if (lower(recovered) !== lower(state.keyRoot)) return null;
+  if (!liveRoot(state, recovered)) return null;
   return {
     keyRoot: lower(recovered),
     kind: claim.kind,
@@ -171,10 +174,16 @@ export function escrowRecord(claim: WotsClaim, state: KeyState | null, block: bi
   };
 }
 
+/** True when `keyRoot` may sign for `state` now: its key root, or a vault's waiting recovery root. */
+function liveRoot(state: KeyState, keyRoot: string): boolean {
+  if (lower(state.keyRoot) === lower(keyRoot)) return true;
+  return state.kind === "vault" && state.recoveryKeyRoot !== undefined && lower(state.recoveryKeyRoot) === lower(keyRoot);
+}
+
 /** True when the chain's `state` shows the record's key used (or the account gone). */
 export function keyUsed(record: SignatureRecord, state: KeyState | null): boolean {
   if (state === null || state.kind !== record.kind) return true;
-  if (lower(state.keyRoot) !== lower(record.keyRoot)) return true;
+  if (!liveRoot(state, record.keyRoot)) return true;
   if (state.kind === "vault") return state.nonce.toString() !== record.nonce;
   if (state.kind === "approval") return !state.pending;
   return state.spent;
@@ -214,7 +223,7 @@ export async function readKeyStates(client: PublicClient, d: Deployment, targets
     for (const t of chunk) {
       const before = contracts.length;
       if (t.kind === "vault") {
-        for (const fn of ["token", "initialKeyRoot", "initialCrank", "keyRoot", "nonce"]) contracts.push({ address: t.account, abi: ostraVaultAbi, functionName: fn });
+        for (const fn of ["token", "initialKeyRoot", "initialCrank", "keyRoot", "nonce", "recoveryRound", "pendingRecovery"]) contracts.push({ address: t.account, abi: ostraVaultAbi, functionName: fn });
       } else if (t.kind === "approval") {
         contracts.push({ address: t.account, abi: ostraPoolAbi, functionName: "getDeposit", args: [t.depositKey] });
       } else {
@@ -234,9 +243,11 @@ export async function readKeyStates(client: PublicClient, d: Deployment, targets
         return;
       }
       if (t.kind === "vault") {
-        const [token, initialKeyRoot, initialCrank, keyRoot, nonce] = r.map((x) => x.result) as [Address, Hex, Address, Hex, bigint];
+        const [token, initialKeyRoot, initialCrank, keyRoot, nonce, round, pending] = r.map((x) => x.result) as [Address, Hex, Address, Hex, bigint, number, readonly [number, bigint, Hex]];
         const expected = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot, initialCrank });
-        out.push(expected === getAddress(t.account) && getAddress(token) !== zeroAddress ? { kind: "vault", keyRoot, nonce } : null);
+        const [pendingRound, executableAt, newKeyRoot] = pending;
+        const recovery = executableAt !== 0n && pendingRound === round ? { recoveryKeyRoot: newKeyRoot } : {};
+        out.push(expected === getAddress(t.account) && getAddress(token) !== zeroAddress ? { kind: "vault", keyRoot, nonce, ...recovery } : null);
       } else if (t.kind === "approval") {
         const dep = r[0]?.result as { status: number; approvalKeyRoot: Hex };
         const status = DEPOSIT_STATUS[dep.status];

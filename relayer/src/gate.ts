@@ -52,6 +52,12 @@
 // before (its simulation refuses it). A request sent again after it was
 // relayed (paid, or an open to the relayer sent again to pay for it) was
 // escrowed the first time, so the chain is not read for it again.
+//
+// POST /v1/escrow (escrow) takes the same {"calls"} body and only escrows its
+// WOTS signatures, for an agent that sends the transaction with its own fee
+// payer: 200 once they are held (or can never pass the contract), 409
+// key_reused with the stored record, 503 escrow_unavailable, 400 for a body
+// without a WOTS signature.
 
 import type { IncomingMessage } from "node:http";
 import { getAddress, isAddress, type Address, type PublicClient } from "viem";
@@ -230,6 +236,23 @@ export class RelayerGate {
       if (v === null || v.token !== this.#o.merchant.token) return json(400, { error: "bad_payer", message: `payer ${request.payer} is not an Ostra vault in ${this.#o.merchant.token}` });
     }
     return this.#serialized(tx.hash, () => this.#relay(tx, request, input));
+  }
+
+  /** POST /v1/escrow: escrows the WOTS signatures of `calls` without relaying them. */
+  async escrow(input: { body: string }): Promise<Answer> {
+    let tx: RelayTx;
+    try {
+      const body = JSON.parse(input.body) as { calls?: unknown };
+      if (body === null || typeof body !== "object") throw new Error("the request must be a JSON object");
+      tx = decodeRelayRequest(body);
+      if (wotsClaims(tx.parsed, tx.calls, this.#o.deployment).length === 0) {
+        return json(400, { error: "no_signatures", message: "the calls carry no WOTS signature to escrow" });
+      }
+    } catch (err) {
+      return json(400, { error: "bad_transaction", message: (err as Error).message });
+    }
+    const refused = await this.#escrow(tx);
+    return refused ?? json(200, { escrowed: true, request: tx.hash });
   }
 
   /**

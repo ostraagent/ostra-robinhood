@@ -9,7 +9,9 @@
 // so the seed alone recovers every vault, channel, deposit and leaf. The fee
 // payer key pays transaction gas when no relayer pays; it holds only ETH,
 // never tokens. Every WOTS signature goes to the WotsStore before it is used
-// (one key, one message; see WotsKeychain).
+// (one key, one message; see WotsKeychain), and with the relayer's signature
+// escrow (escrow.ts) every key with no local record asks the escrow before it
+// signs, so a device restored from the seed never signs twice with one key.
 //
 // On Robinhood Chain (design v0.4) the Ed25519 keys of the Solana version are
 // secp256k1 keys from the same derivation, and every derivation names the
@@ -24,6 +26,7 @@
 import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type PrivateKeyAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { WotsKeychain, sha256, utf8, type WotsStore } from "@ostraagent/sdk";
+import type { SignatureEscrowClient } from "./escrow.ts";
 import type { Folder } from "./storage.ts";
 
 /** The folder of the private vaults' records: one folder per private vault in it (keys.forPrivateVault). */
@@ -129,6 +132,8 @@ export type KeysParts<S extends WotsStore = WotsStore> = {
   masterCreated?: boolean;
   /** True once an encrypted backup of the master seed was exported. */
   backupExported: () => Promise<boolean>;
+  /** The relayer's signature escrow (with OSTRA_RELAYER_URL; the web app always has one). */
+  escrow?: SignatureEscrowClient | null;
 };
 
 export class Keys<S extends WotsStore = WotsStore> {
@@ -138,6 +143,8 @@ export class Keys<S extends WotsStore = WotsStore> {
   readonly store: S;
   /** True when this call created the master seed (a backup should follow). */
   readonly masterCreated: boolean;
+  /** The relayer's signature escrow every keychain asks before it signs; null: records on this device only. */
+  readonly escrow: SignatureEscrowClient | null;
   readonly #master: Uint8Array;
   readonly #root: Folder;
   readonly #backupExported: () => Promise<boolean>;
@@ -148,6 +155,7 @@ export class Keys<S extends WotsStore = WotsStore> {
     this.feePayer = parts.feePayer;
     this.store = parts.store;
     this.masterCreated = parts.masterCreated ?? false;
+    this.escrow = parts.escrow ?? null;
     this.#master = parts.master.slice();
     this.#root = parts.root ?? parts.folder;
     this.#backupExported = parts.backupExported;
@@ -162,7 +170,7 @@ export class Keys<S extends WotsStore = WotsStore> {
   async forPrivateVault(chainId: number, token: Address, index: bigint): Promise<Keys<S>> {
     const folder = this.#root.folder(PRIVATE_DIR).folder(`${chainId}-${getAddress(token)}-${index}`);
     await folder.ensure();
-    return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported });
+    return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
   }
 
   /** True once an encrypted backup of the master seed has been exported. */
@@ -170,17 +178,22 @@ export class Keys<S extends WotsStore = WotsStore> {
     return this.#backupExported();
   }
 
+  /** A keychain of this seed that asks the signature escrow (when there is one) before it signs. */
+  #keychain(id: Uint8Array): WotsKeychain {
+    return new WotsKeychain(this.#master, id, this.store, this.escrow?.lookup);
+  }
+
   vaultKeychain(chainId: number, token: Address): WotsKeychain {
-    return new WotsKeychain(this.#master, vaultKeychainId(chainId, token), this.store);
+    return this.#keychain(vaultKeychainId(chainId, token));
   }
 
   sellerKeychain(chainId: number, token: Address): WotsKeychain {
-    return new WotsKeychain(this.#master, sellerKeychainId(chainId, token), this.store);
+    return this.#keychain(sellerKeychainId(chainId, token));
   }
 
   /** Keychain of private vault `index` (key index = the vault's on-chain nonce). */
   privateVaultKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return new WotsKeychain(this.#master, privateVaultKeychainId(chainId, token, index), this.store);
+    return this.#keychain(privateVaultKeychainId(chainId, token, index));
   }
 
   /**
@@ -224,11 +237,11 @@ export class Keys<S extends WotsStore = WotsStore> {
 
   /** Approval keys of shield deposit `index` (one per approveBatch; the key rotates every time). */
   shieldApprovalKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return new WotsKeychain(this.#master, shieldApprovalKeychainId(chainId, token, index), this.store);
+    return this.#keychain(shieldApprovalKeychainId(chainId, token, index));
   }
 
   /** Leaf keys of shield deposit `index`: leaf j of the deposit is key j, which spends it once. */
   shieldLeafKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return new WotsKeychain(this.#master, shieldLeafKeychainId(chainId, token, index), this.store);
+    return this.#keychain(shieldLeafKeychainId(chainId, token, index));
   }
 }

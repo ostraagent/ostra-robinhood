@@ -7,6 +7,7 @@ export * from "./chain.ts";
 export * from "./channels.ts";
 export * from "./config.ts";
 export * from "./encoding.ts";
+export * from "./escrow.ts";
 export * from "./keys.ts";
 export * from "./pending.ts";
 export * from "./random.ts";

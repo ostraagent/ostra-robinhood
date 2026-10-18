@@ -133,6 +133,41 @@ test("an index never signs two different messages, even after a restart", async 
   assert.deepEqual(files, ["00000000000000000005.json"]);
 });
 
+test("a restored device asks the signature escrow before signing and never signs a second message", async () => {
+  // The first device signed key 3 and the signature left it; that device is lost. The escrow (the relayer's
+  // GET /v1/signatures, exercised end to end in core's chain-check) is read through a WotsSignatureLookup.
+  const enc = new TextEncoder();
+  const sent = enc.encode("withdraw 5 to alice");
+  const lost = new WotsKeychain(master, keychainId, await freshStore());
+  const sentSig = await lost.sign(3n, sent);
+  const escrow = new Map<string, { message: string; signature: string }>([[`0x${toHex(lost.keyRoot(3n))}`, { message: `0x${toHex(sent)}`, signature: `0x${toHex(sentSig)}` }]]);
+  const asked: string[] = [];
+  const lookup = async (keyRoot: string) => {
+    asked.push(keyRoot);
+    return escrow.get(keyRoot) ?? null;
+  };
+  const store = await freshStore();
+  const restored = new WotsKeychain(master, keychainId, store, lookup);
+  // Another message with that key is refused; the escrowed one is now a local record, resent as it was.
+  await assert.rejects(() => restored.sign(3n, enc.encode("withdraw 5 to mallory")), WotsKeyReuseError);
+  assert.equal((await store.load(keychainId, 3n))?.message, toHex(sent));
+  assert.equal(toHex(await restored.sign(3n, sent)), toHex(sentSig));
+  assert.equal((await restored.signed(3n))?.signature, toHex(sentSig));
+  // A key the escrow holds nothing for signs normally, after asking.
+  await restored.sign(4n, enc.encode("next"));
+  assert.ok(asked.includes(`0x${toHex(lost.keyRoot(4n))}`));
+  // An escrow that cannot be read blocks signing, and nothing is stored.
+  const down = new WotsKeychain(master, keychainId, await freshStore(), async () => {
+    throw new Error("the relayer cannot be reached");
+  });
+  await assert.rejects(() => down.sign(7n, enc.encode("x")), /cannot be reached/);
+  // A record that is not a signature by the key is refused, not stored.
+  const badStore = await freshStore();
+  const lying = new WotsKeychain(master, keychainId, badStore, async () => ({ message: `0x${toHex(sent)}`, signature: `0x${toHex(sentSig)}` }));
+  await assert.rejects(() => lying.sign(8n, sent), /does not verify/);
+  assert.equal(await badStore.load(keychainId, 8n), undefined);
+});
+
 test("concurrent signers cannot both claim one index", async () => {
   const store = await freshStore();
   const enc = new TextEncoder();

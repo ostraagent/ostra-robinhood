@@ -17,6 +17,10 @@
 //                      root (32 bytes in hex, with or without 0x;
 //                      signatures.ts): 200 with the record, 404 no_signature,
 //                      400 bad_key_root
+//   POST /v1/escrow    body {"calls": [...]}: escrows the WOTS signatures in
+//                      them without relaying (gate.ts), for an agent that
+//                      sends with its own fee payer: 200, 409 key_reused,
+//                      503 escrow_unavailable, 400 no_signatures
 // The web app's origin gets CORS on every route, and its preflights (OPTIONS)
 // are answered with 204 (merchant/src/cors.ts).
 //

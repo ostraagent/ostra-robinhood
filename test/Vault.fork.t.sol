@@ -707,6 +707,37 @@ contract VaultForkTest is Test {
         assertEq(usdg.balanceOf(address(owner)), 60e6);
     }
 
+    function test_theNewSeedsFirstSpendFinishesTheRecovery() public {
+        (OstraVault owner, OstraVault[3] memory g) = _guarded();
+        _fund(address(owner), 50e6);
+        uint64 n = owner.nonce();
+        bytes32 newRoot = _root(NEW_SEED, n);
+        _support(g[0], G1, owner, newRoot);
+        _support(g[2], G3, owner, newRoot);
+        address to = makeAddr("first spend");
+        bytes memory params = abi.encode(to, uint256(20e6));
+        // Before the delay is over the new seed cannot spend.
+        (bytes32 next, bytes memory signature) = _sign(owner, NEW_SEED, 0, params);
+        vm.expectRevert(OstraVault.WotsSignatureInvalid.selector);
+        owner.spend(0, next, params, signature);
+        vm.warp(block.timestamp + 3 days);
+        // After it, the new seed's first spend finishes the recovery itself: no separate transaction.
+        vm.expectEmit(address(owner));
+        emit OstraVault.Recovered(owner.recoveryRound(), newRoot);
+        uint256 gas = gasleft();
+        owner.spend(0, next, params, signature);
+        console.log("gas first spend of a recovered vault (finishes the recovery)", gas - gasleft());
+        assertEq(usdg.balanceOf(to), 20e6);
+        assertEq(owner.keyRoot(), next);
+        assertEq(owner.nonce(), n + 1);
+        vm.expectRevert(OstraVault.NoRecovery.selector);
+        owner.finishRecovery();
+        // A key that is neither the current one nor a ready recovery's never spends.
+        (next, signature) = _sign(owner, OWNER, 0, params);
+        vm.expectRevert(OstraVault.WotsSignatureInvalid.selector);
+        owner.spend(0, next, params, signature);
+    }
+
     function test_anOwnerSpendCancelsARecoveryAndEverySupport() public {
         (OstraVault owner, OstraVault[3] memory g) = _guarded();
         bytes32 newRoot = _root(NEW_SEED, owner.nonce());

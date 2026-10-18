@@ -34,6 +34,13 @@
 //   8. Accounting: every token the buyer vault was funded with is in the
 //      vault, in a channel, or withdrawn; the seller claimed exactly its two
 //      prices; the relayer claimed no more than the vouchers signed.
+//   9. The relayer's signature escrow, as a lost device needs it: a
+//      withdrawal is signed, escrowed with the relayer (POST /v1/escrow) and
+//      never sent (the device is lost). A device restored from the seed with
+//      no WOTS records finds that signature in the escrow and sends it
+//      instead of signing a second message with the same key; its next
+//      withdrawal is escrowed before its fee payer sends it. A restored
+//      device that cannot reach the escrow signs nothing.
 // Whether the checks pass or a step fails, the run then cleans up: every
 // relayer channel still holding unclaimed escrow is closed through the keeper
 // (signed with the relayer's merchant key), and the vaults, the relayer
@@ -91,13 +98,13 @@ import { MerchantKeys, ensurePrivateDir, isPrivateKey } from "../../merchant/src
 import { CHANNELS_DIR } from "../../merchant/src/store.ts";
 import { parseListen } from "../../relayer/src/config.ts";
 import { openRelayerAccount } from "../../relayer/src/keys.ts";
-import { ChannelService, Keys, LocalSender, RelayerClient, VaultService, X402_NETWORK, type Config } from "../src/index.ts";
+import { ChannelService, Keys, LocalSender, RelayerClient, SignatureEscrowClient, VaultService, X402_NETWORK, type Config } from "../src/index.ts";
 import { MemoryFolder } from "../test/memory-folder.ts";
 
 /** Gas the relayer account is funded for, at the current fee: about forty relayed transactions. */
 const RELAYER_GAS_BUDGET = 40n * 1_500_000n;
-/** Gas the agent's fee payer is funded for: one vault spend sent by itself, with headroom. */
-const FEE_PAYER_GAS_BUDGET = 2n * 400_000n * 2n;
+/** Gas the agent's fee payer is funded for: three vault spends sent by itself, with headroom. */
+const FEE_PAYER_GAS_BUDGET = 4n * 400_000n * 2n;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
 
@@ -240,6 +247,8 @@ async function main(): Promise<void> {
   else if (!(await stat(runDir)).isDirectory()) throw new Error(`${runDir} is not a directory`);
   const secret = (name: string, valid?: (bytes: Uint8Array) => boolean) => (recoverRun === undefined ? newSecret(join(runDir, name), valid) : readSecret(join(runDir, name)));
   const wotsStore = new FileWotsStore(join(runDir, "wots"));
+  // Step 9's restored device: the same seed with its own WOTS records (the cleanup lands what it signed too).
+  const restoredStore = new FileWotsStore(join(runDir, "wots-restored"));
   console.log(`funder ${funder.address}, run state ${runDir}${recoverRun === undefined ? "" : " (recovery only)"}`);
 
   const baseEnv: Record<string, string> = {};
@@ -318,7 +327,7 @@ async function main(): Promise<void> {
       try {
         // A spend the current key already signed (never landed) is landed first, so the next key is free.
         const current = await readVault(client, d, v.vault);
-        const pending = current === null ? undefined : await wotsStore.load(v.keys.keychainId, current.nonce);
+        const pending = current === null ? undefined : ((await wotsStore.load(v.keys.keychainId, current.nonce)) ?? (await restoredStore.load(v.keys.keychainId, current.nonce)));
         if (current !== null && pending !== undefined) {
           const signed = decodeVaultSpendMessage(hexToBytes(`0x${pending.message}`));
           await send(funder, v.vault, encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, `0x${pending.signature}`] }));
@@ -516,6 +525,38 @@ async function main(): Promise<void> {
     check(sellerChannel.totalClaimed === 2n * price && claimedByRelayer <= signedToRelayer, "the seller claimed exactly its two prices; the relayer no more than the vouchers signed", { seller: sellerChannel.totalClaimed, claimedByRelayer, signedToRelayer });
     const swept = await relayerClient.sweep();
     check(swept.length === 0 && (await relayerClient.channels()).length >= 1, "the relayer client's sweep keeps channels younger than a day and retires none", swept);
+
+    // --- 9. the signature escrow: a device lost after signing, a device restored from the seed ---------------------
+    const escrow = new SignatureEscrowClient(relayerUrl);
+    const nonceOf = async () => (await readVault(client, d, buyerVault))?.nonce;
+    const lostAt = await nonceOf();
+    if (lostAt === undefined) throw new Error("buyer vault missing");
+    // The lost device escrows the signed withdrawal as its fee payer would before sending, then is gone.
+    const lostDevice = new VaultService(client, transport, config, keys, new LocalSender(client, transport, feePayer, {
+      escrow: async (calls) => {
+        await escrow.escrow(calls);
+        throw new Error("the device was lost after the escrow");
+      },
+    }), "buyer");
+    const lostError = await lostDevice.withdraw(funder.address, "0.01").then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
+    const held = await escrow.lookup(bytesToHex(buyerKeys.keyRoot(lostAt)));
+    check(/lost after the escrow/.test(lostError) && held !== null && (await nonceOf()) === lostAt, "a withdrawal signed on a device lost before sending it is held by the relayer's signature escrow, not on-chain", { lostError, held: held !== null });
+    const restoredKeys = new Keys({ master, feePayer, store: restoredStore, folder: new MemoryFolder(), backupExported: async () => true, escrow });
+    const restored = new VaultService(client, transport, config, restoredKeys, new LocalSender(client, transport, feePayer, escrow), "buyer");
+    const funderBeforeRestore = await balance(funder.address);
+    const resent = await restored.withdraw(funder.address, "0.02");
+    check(
+      resent.status === "resent_pending" && resent.resent.operation === "withdraw" && resent.resent.amount === "0.01" && (await balance(funder.address)) - funderBeforeRestore === tokens("0.01") && (await nonceOf()) === lostAt + 1n,
+      "a device restored from the seed with no WOTS records finds that signature in the escrow and sends it instead of signing another message with the key",
+      resent,
+    );
+    const next = await restored.withdraw(funder.address, "0.02");
+    check(next.status === "sent" && (await balance(funder.address)) - funderBeforeRestore === tokens("0.03") && (await nonceOf()) === lostAt + 2n, "the restored device's next withdrawal is escrowed, then sent by its fee payer", next);
+    const blindStore = new FileWotsStore(join(runDir, "wots-blind"));
+    const blindKeys = new Keys({ master, feePayer, store: blindStore, folder: new MemoryFolder(), backupExported: async () => true, escrow: new SignatureEscrowClient("http://127.0.0.1:9") });
+    const blind = new VaultService(client, transport, config, blindKeys, new LocalSender(client, transport, feePayer), "buyer");
+    const blindError = await blind.withdraw(funder.address, "0.01").then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
+    check(/cannot be reached/.test(blindError) && (await nonceOf()) === lostAt + 2n && (await blindStore.load(buyerKeys.keychainId, lostAt + 2n)) === undefined, "a restored device that cannot reach the escrow signs nothing", blindError);
   } catch (err) {
     runError = err;
   } finally {

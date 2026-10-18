@@ -460,7 +460,7 @@ export class ShieldService {
         }
       }
       if (index < 0n) throw new Error("the deposit's approval key is not one of this machine's");
-      const stored = await this.#keys.store.load(keys.keychainId, index);
+      const stored = await keys.signed(index);
       if (stored !== undefined) {
         const earlier = decodeApproveMessage(hexToBytes(`0x${stored.message}`));
         if (earlier.batchId !== batchId || earlier.state.toLowerCase() !== state) {
