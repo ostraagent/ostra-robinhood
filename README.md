@@ -21,6 +21,14 @@ Contents:
 - `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009), batches
   of one-leaf-each leaves checked with LtHash, WOTS approvals, sealing, WOTS leaf spends, refunds after
   48 hours. `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG.
+- `src/launchpad/`: the Ostra launchpad on the deployed Uniswap v4 PoolManager. `OstraLaunchpad`
+  launches a fixed-supply `OstraToken` whose whole supply goes into single-sided tiers of one pool
+  (the top tier open to the highest price), held forever by `OstraLocker`; `OstraHook`, the pools'
+  one hook, charges every swap 1% hook fee (70% creator, 30% protocol, half of that for the OSTRA
+  buyback) plus the pool's buy or sell tax and anti-snipe tax in the quote, and pays them out
+  (creator vault, burn, added liquidity, holder dividends) in `dispatch`. Before graduation only
+  the locker adds liquidity and the max buy and the token's max wallet apply.
+  `test/Launchpad.fork.t.sol` runs it against the real PoolManager, USDG, WETH and AAPL pools.
 - `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
