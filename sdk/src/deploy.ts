@@ -1,7 +1,8 @@
 // Deploys Ostra's contracts from the Foundry build (Node only; exported by
 // the SDK's Node entry). One path for the fork tests and for mainnet:
-//   1. OstraVault implementation (bound to x402BatchSettlement), its
-//      UpgradeableBeacon, and OstraVaultFactory on that beacon;
+//   1. OstraVault implementation (bound to x402BatchSettlement and the
+//      Uniswap v4 PoolManager), its UpgradeableBeacon, and OstraVaultFactory
+//      on that beacon;
 //   2. OstraPool implementation, its UpgradeableBeacon, and the pool as a
 //      BeaconProxy initialized for USDG with the decided fee and limits;
 //   3. OstraSplitFactory.
@@ -12,7 +13,7 @@
 import { readFileSync } from "node:fs";
 import { encodeFunctionData, getAddress, type Abi, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 import { beaconProxyAbi, ostraPoolAbi, ostraSplitFactoryAbi, ostraVaultAbi, ostraVaultFactoryAbi, upgradeableBeaconAbi } from "./abi.ts";
-import { POOL_FEE_BPS, POOL_MAX_DEPOSIT, POOL_MAX_TOTAL, ROBINHOOD_CHAIN_ID, USDG, X402_BATCH_SETTLEMENT } from "./constants.ts";
+import { POOL_FEE_BPS, POOL_MAX_DEPOSIT, POOL_MAX_TOTAL, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, X402_BATCH_SETTLEMENT } from "./constants.ts";
 import type { Deployment } from "./deployment.ts";
 import { LEAF_DENOMINATION } from "./leaves.ts";
 
@@ -63,8 +64,12 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     if (norm(got) !== norm(want)) throw new Error(`${what}: ${String(got)}, expected ${String(want)}`);
   };
 
-  const vaultImplementation = await deploy("OstraVault", ostraVaultAbi, creationCode(o.outDir, "OstraVault.sol", "OstraVault"), [X402_BATCH_SETTLEMENT]);
+  const vaultImplementation = await deploy("OstraVault", ostraVaultAbi, creationCode(o.outDir, "OstraVault.sol", "OstraVault"), [
+    X402_BATCH_SETTLEMENT,
+    UNISWAP_V4_POOL_MANAGER,
+  ]);
   expect("vault implementation BATCH_SETTLEMENT", await read(vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), X402_BATCH_SETTLEMENT);
+  expect("vault implementation POOL_MANAGER", await read(vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
   const vaultBeacon = await deploy("OstraVault beacon", upgradeableBeaconAbi, creationCode(o.outDir, "UpgradeableBeacon.sol", "UpgradeableBeacon"), [
     vaultImplementation,
     o.beaconOwner,
@@ -115,6 +120,7 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
   same("vault beacon owner", await read(d.vaultBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
   same("vault factory beacon", await read(d.vaultFactory, ostraVaultFactoryAbi, "BEACON"), d.vaultBeacon);
   same("vault implementation settlement", await read(d.vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), d.batchSettlement);
+  same("vault implementation pool manager", await read(d.vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
   same("pool beacon implementation", await read(d.poolBeacon, upgradeableBeaconAbi, "implementation"), d.poolImplementation);
   same("pool beacon owner", await read(d.poolBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
   same("pool token", await read(d.pool, ostraPoolAbi, "token"), d.token);

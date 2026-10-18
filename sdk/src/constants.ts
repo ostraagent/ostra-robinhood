@@ -31,6 +31,15 @@ export const X402_BATCH_SETTLEMENT_DOMAIN = { name: "x402 Batch Settlement", ver
 export const X402_MIN_WITHDRAW_DELAY = 900;
 export const X402_MAX_WITHDRAW_DELAY = 2_592_000;
 
+/**
+ * Uniswap v4 PoolManager (Uniswap's v4 deployments page): the vault's Swap
+ * action trades on it. Its runtime code is v4-core v4.0.0's PoolManager
+ * built with that release's settings; UNISWAP_V4_POOL_MANAGER_CODE_HASH is
+ * the hash of that code on chain 4663.
+ */
+export const UNISWAP_V4_POOL_MANAGER: Address = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+export const UNISWAP_V4_POOL_MANAGER_CODE_HASH = "0xbd3881180b547f5fe817545743cfb4343e96b1bc6640dcd70c106b0066e95626";
+
 /** Chainlink ETH/USD (8 decimals, heartbeat 86,400 s, deviation 0.5%). */
 export const CHAINLINK_ETH_USD: Address = "0x78F3556b67E17Df817D51Ef5a990cDaF09E8d3A9";
 export const CHAINLINK_ETH_USD_DECIMALS = 8;
@@ -57,7 +66,7 @@ export const POOL_MAX_DEPOSIT = 250_000_000n;
 export const POOL_MAX_TOTAL = 2_500_000_000n;
 
 /** OstraVault spend actions. */
-export const VAULT_ACTION = { TRANSFER: 0, OPEN_CHANNEL: 1, SET_CRANK_KEY: 2 } as const;
+export const VAULT_ACTION = { TRANSFER: 0, OPEN_CHANNEL: 1, SET_CRANK_KEY: 2, SWAP: 3 } as const;
 
 /** OstraPool deposit statuses, by their on-chain number. */
 export const DEPOSIT_STATUS = ["none", "pending", "consumed", "cancelled", "closed"] as const;

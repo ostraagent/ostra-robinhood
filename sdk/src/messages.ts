@@ -3,6 +3,7 @@
 // contract's own view function on a fork of chain 4663):
 //   * OstraVault: spendMessage, the spend params, closeDigest (EIP-712
 //     CloseRequest), and the vault address OstraVaultFactory creates;
+//   * Uniswap v4: the pool id of a pool key (PoolIdLibrary.toId);
 //   * OstraPool: depositKey, depositNonce (the EIP-3009 nonce a relayed
 //     deposit is authorized with), approvalMessage, leafMessage;
 //   * x402BatchSettlement: the channel id (EIP-712 ChannelConfig) and the
@@ -121,6 +122,7 @@ export const SPEND_PARAMS_LEN: Readonly<Record<VaultAction, number>> = {
   [VAULT_ACTION.TRANSFER]: 64,
   [VAULT_ACTION.OPEN_CHANNEL]: 192,
   [VAULT_ACTION.SET_CRANK_KEY]: 32,
+  [VAULT_ACTION.SWAP]: 288,
 };
 
 function paramsFor(action: number, params: Hex): Hex {
@@ -192,6 +194,94 @@ export function setCrankParams(crank: Address): Hex {
 export function decodeSetCrankParams(params: Hex): Address {
   const [crank] = decodeAbiParameters([{ type: "address" }], paramsFor(VAULT_ACTION.SET_CRANK_KEY, params));
   return crank;
+}
+
+/** A Uniswap v4 pool key (v4-core PoolKey); the zero address as a currency is native ETH. */
+export type PoolKey = {
+  currency0: Address;
+  currency1: Address;
+  /** LP fee in hundredths of a bip (at most 1,000,000), or 0x800000 for a dynamic-fee pool. */
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+};
+
+/** v4-core LPFeeLibrary.MAX_LP_FEE and DYNAMIC_FEE_FLAG; TickMath.MIN_TICK_SPACING and MAX_TICK_SPACING. */
+const MAX_LP_FEE = 1_000_000;
+const DYNAMIC_FEE_FLAG = 0x800000;
+const MIN_TICK_SPACING = 1;
+const MAX_TICK_SPACING = 32_767;
+
+const POOL_KEY_TYPE = {
+  type: "tuple",
+  components: [
+    { name: "currency0", type: "address" },
+    { name: "currency1", type: "address" },
+    { name: "fee", type: "uint24" },
+    { name: "tickSpacing", type: "int24" },
+    { name: "hooks", type: "address" },
+  ],
+} as const;
+
+const SWAP_PARAMS_TYPES = [POOL_KEY_TYPE, { type: "bool" }, { type: "uint128" }, { type: "uint128" }, { type: "address" }] as const;
+
+/** A key the PoolManager accepts: sorted distinct currencies, a valid fee and a valid tick spacing. */
+function poolKey(k: PoolKey): PoolKey {
+  const currency0 = addr(k.currency0, "currency0");
+  const currency1 = addr(k.currency1, "currency1");
+  if (BigInt(currency0) >= BigInt(currency1)) throw new RangeError("currency0 must sort below currency1");
+  if (!Number.isInteger(k.fee) || (k.fee !== DYNAMIC_FEE_FLAG && (k.fee < 0 || k.fee > MAX_LP_FEE))) {
+    throw new RangeError(`fee must be 0..${MAX_LP_FEE} or the dynamic fee flag`);
+  }
+  if (!Number.isInteger(k.tickSpacing) || k.tickSpacing < MIN_TICK_SPACING || k.tickSpacing > MAX_TICK_SPACING) {
+    throw new RangeError(`tickSpacing must be ${MIN_TICK_SPACING}..${MAX_TICK_SPACING}`);
+  }
+  return { currency0, currency1, fee: k.fee, tickSpacing: k.tickSpacing, hooks: addr(k.hooks, "hooks") };
+}
+
+/** PoolIdLibrary.toId: keccak256(abi.encode(key)), the id the PoolManager and its events use. */
+export function poolId(key: PoolKey): Hex {
+  return keccak256(encodeAbiParameters([POOL_KEY_TYPE], [poolKey(key)]));
+}
+
+/** An exact-input swap of the vault's token on a Uniswap v4 pool. */
+export type SwapParams = {
+  key: PoolKey;
+  /** true: currency0 in, currency1 out. The input side must be the vault's token. */
+  zeroForOne: boolean;
+  /** At most this much of the vault's token goes in. */
+  amountIn: bigint;
+  /** At least this much of the other currency comes out, or the spend reverts. */
+  minOut: bigint;
+  /** Receives the output (another vault, for example); native ETH only to a recipient that accepts it. */
+  recipient: Address;
+};
+
+/** Swap params: abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn, uint128 minOut, address recipient). */
+export function swapParams(p: SwapParams): Hex {
+  if (typeof p.zeroForOne !== "boolean") throw new RangeError("zeroForOne must be a boolean");
+  return encodeAbiParameters(SWAP_PARAMS_TYPES, [
+    poolKey(p.key),
+    p.zeroForOne,
+    positive(p.amountIn, U128_MAX, "amountIn"),
+    uint(p.minOut, U128_MAX, "minOut"),
+    nonZeroAddr(p.recipient, "recipient"),
+  ]);
+}
+
+export function decodeSwapParams(params: Hex): SwapParams {
+  const [key, zeroForOne, amountIn, minOut, recipient] = decodeAbiParameters(SWAP_PARAMS_TYPES, paramsFor(VAULT_ACTION.SWAP, params));
+  return { key: { ...key }, zeroForOne, amountIn, minOut, recipient };
+}
+
+/** The currency a swap spends: currency0 when zeroForOne, else currency1. */
+export function swapInput(p: Pick<SwapParams, "key" | "zeroForOne">): Address {
+  return getAddress(p.zeroForOne ? p.key.currency0 : p.key.currency1);
+}
+
+/** The currency a swap pays out. */
+export function swapOutput(p: Pick<SwapParams, "key" | "zeroForOne">): Address {
+  return getAddress(p.zeroForOne ? p.key.currency1 : p.key.currency0);
 }
 
 export type VaultSpend = {
@@ -266,6 +356,13 @@ export function signVaultOpenChannel(keychain: WotsKeychain, state: VaultKeyStat
 
 export function signVaultSetCrankKey(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; crank: Address }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(a.crank) });
+}
+
+/** Signs a Swap; `token` is the vault's token, which must be the swap's input (the vault refuses anything else). */
+export async function signVaultSwap(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; token: Address; swap: SwapParams }): Promise<SignedSpend> {
+  const params = swapParams(a.swap);
+  if (swapInput(a.swap) !== addr(a.token, "token")) throw new RangeError("the swap's input currency is not the vault's token");
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SWAP, params });
 }
 
 // ---------------------------------------------------------------------------

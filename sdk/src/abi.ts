@@ -12,6 +12,11 @@ export const ostraVaultAbi = [
         "name": "batchSettlement",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "poolManager",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "stateMutability": "nonpayable"
@@ -32,6 +37,19 @@ export const ostraVaultAbi = [
   {
     "type": "function",
     "name": "ACTION_SET_CRANK_KEY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "ACTION_SWAP",
     "inputs": [],
     "outputs": [
       {
@@ -77,6 +95,19 @@ export const ostraVaultAbi = [
         "name": "",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "POOL_MANAGER",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IPoolManager"
       }
     ],
     "stateMutability": "view"
@@ -613,6 +644,25 @@ export const ostraVaultAbi = [
     "stateMutability": "view"
   },
   {
+    "type": "function",
+    "name": "unlockCallback",
+    "inputs": [
+      {
+        "name": "data",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
     "type": "event",
     "name": "ChannelOpened",
     "inputs": [
@@ -714,6 +764,43 @@ export const ostraVaultAbi = [
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "Swapped",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "zeroForOne",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "amountOut",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "BadAction",
     "inputs": []
@@ -726,6 +813,11 @@ export const ostraVaultAbi = [
   {
     "type": "error",
     "name": "BadSignatureLength",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "BadSwapDelta",
     "inputs": []
   },
   {
@@ -763,6 +855,11 @@ export const ostraVaultAbi = [
   {
     "type": "error",
     "name": "Expired",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InsufficientOutput",
     "inputs": []
   },
   {
@@ -815,6 +912,11 @@ export const ostraVaultAbi = [
   {
     "type": "error",
     "name": "Unauthorized",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "UnexpectedCallback",
     "inputs": []
   },
   {

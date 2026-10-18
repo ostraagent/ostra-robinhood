@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { domainSeparator, type Address } from "viem";
+import { domainSeparator, keccak256, type Address } from "viem";
 import { x402BatchSettlementAbi } from "../src/abi.ts";
 import { assertRobinhoodChain } from "../src/chain.ts";
 import {
@@ -13,6 +13,8 @@ import {
   ERC8004_REPUTATION_REGISTRY,
   MULTICALL3,
   ROBINHOOD_CHAIN_ID,
+  UNISWAP_V4_POOL_MANAGER,
+  UNISWAP_V4_POOL_MANAGER_CODE_HASH,
   USDG,
   USDG_DECIMALS,
   USDG_EIP712_DOMAIN,
@@ -45,6 +47,7 @@ test("the fork is Robinhood Chain and every contract the SDK names has code", as
     ERC8004_IDENTITY_REGISTRY,
     ERC8004_REPUTATION_REGISTRY,
     MULTICALL3,
+    UNISWAP_V4_POOL_MANAGER,
   };
   for (const [name, address] of Object.entries(named)) {
     const code = await fork.client.getCode({ address });
@@ -74,6 +77,12 @@ test("Chainlink ETH/USD: 8 decimals and a positive answer", async () => {
   const [, answer, , updatedAt] = await fork.client.readContract({ address: CHAINLINK_ETH_USD, abi: chainlinkAggregatorAbi, functionName: "latestRoundData" });
   assert.ok(answer > 0n);
   assert.ok(updatedAt > 0n);
+});
+
+test("Uniswap v4 PoolManager: the code is v4-core v4.0.0's, by its hash", async () => {
+  const code = await fork.client.getCode({ address: UNISWAP_V4_POOL_MANAGER });
+  assert.ok(code !== undefined);
+  assert.equal(keccak256(code), UNISWAP_V4_POOL_MANAGER_CODE_HASH);
 });
 
 test("Multicall3 aggregate3 runs calls in one transaction", async () => {

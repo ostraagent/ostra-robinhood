@@ -1,9 +1,10 @@
 // The SDK's messages, ids and addresses against the contracts themselves, on
 // a fork of Robinhood Chain mainnet: Ostra deployed with deploy.ts next to the
-// real USDG and x402BatchSettlement. Every off-chain encoding is compared with
-// the contract's own view function, and every signed call the SDK builds is
-// sent and must land (a vault transfer, a channel open and its close request,
-// a crank change, and a relayed deposit through approval, seal and leaf spend).
+// real USDG, x402BatchSettlement and Uniswap v4 PoolManager. Every off-chain
+// encoding is compared with the contract's own view function, and every signed
+// call the SDK builds is sent and must land (a vault transfer, a channel open
+// and its close request, a crank change, a swap on a deployed v4 pool, and a
+// relayed deposit through approval, seal and leaf spend).
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -12,6 +13,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
   bytesToHex,
+  encodeAbiParameters,
   getAddress,
   hexToBytes,
   keccak256,
@@ -27,7 +29,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
 import { depositCommitment, type Leaf } from "../src/aggregator.ts";
-import { ROBINHOOD_CHAIN_ID, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
+import { ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { usdgAbi } from "../src/external-abi.ts";
@@ -39,6 +41,7 @@ import {
   closeRequestTypedData,
   decodeOpenChannelParams,
   decodeSetCrankParams,
+  decodeSwapParams,
   decodeTransferParams,
   decodeVaultSpendMessage,
   depositAuthorizationTypedData,
@@ -46,12 +49,17 @@ import {
   depositNonce,
   leafMessage,
   openChannelParams,
+  poolId,
   setCrankParams,
   signApproveBatch,
   signSpendLeaf,
   signVaultOpenChannel,
   signVaultSetCrankKey,
+  signVaultSwap,
   signVaultTransfer,
+  swapInput,
+  swapOutput,
+  swapParams,
   transferParams,
   vaultAddress,
   vaultChannelConfig,
@@ -59,6 +67,8 @@ import {
   voucherDigest,
   voucherTypedData,
   type OpenChannelParams,
+  type PoolKey,
+  type SwapParams,
 } from "../src/messages.ts";
 import { batchStateOf, readBatch, readChannel, readDeposit, readPool, readVault } from "../src/reads.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
@@ -101,6 +111,9 @@ async function createVault(chain: WotsKeychain, initialCrank: Address): Promise<
 }
 
 const balance = (who: Address) => fork.client.readContract({ address: USDG, abi: usdgAbi, functionName: "balanceOf", args: [who] });
+
+/** The hookless native ETH/USDG pool at 0.05% on the deployed PoolManager (currency0 = ETH, currency1 = USDG). */
+const ETH_USDG: PoolKey = { currency0: zeroAddress, currency1: USDG, fee: 500, tickSpacing: 10, hooks: zeroAddress };
 
 before(async () => {
   fork = await startFork();
@@ -162,6 +175,7 @@ test("spend messages are the vault's own, for every action, and decode back", as
     { action: VAULT_ACTION.OPEN_CHANNEL, params: openChannelParams(open) },
     { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(crank.address) },
     { action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(zeroAddress) },
+    { action: VAULT_ACTION.SWAP, params: swapParams({ key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address }) },
   ];
   for (const c of cases) {
     const onChain = await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "spendMessage", args: [c.action, next, c.params] });
@@ -172,6 +186,7 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.deepEqual(decodeTransferParams(cases[0]!.params), { to: fork.accounts[2]!.address, amount: 5n });
   assert.deepEqual(decodeOpenChannelParams(cases[1]!.params), open);
   assert.equal(decodeSetCrankParams(cases[2]!.params), crank.address);
+  assert.deepEqual(decodeSwapParams(cases[4]!.params), { key: ETH_USDG, zeroForOne: false, amountIn: 1_000_000n, minOut: 7n, recipient: fork.accounts[2]!.address });
   // What the vault would refuse, the SDK never signs.
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: `0x${"00".repeat(32)}`, action: 0, params: cases[0]!.params }), /nextKeyRoot must not be zero/);
   assert.throws(() => transferParams({ to: zeroAddress, amount: 1n }), /zero address/);
@@ -180,6 +195,16 @@ test("spend messages are the vault's own, for every action, and decode back", as
   assert.throws(() => openChannelParams({ ...open, withdrawDelay: 899 }), /withdrawDelay/);
   assert.throws(() => openChannelParams({ ...open, withdrawDelay: 2_592_001 }), /withdrawDelay/);
   assert.throws(() => vaultSpendMessage({ chainId: ROBINHOOD_CHAIN_ID, vault, nonce: 0n, nextKeyRoot: next, action: 0, params: cases[2]!.params }), /64 bytes/);
+  const swap: SwapParams = { key: ETH_USDG, zeroForOne: false, amountIn: 1n, minOut: 0n, recipient: fork.accounts[2]!.address };
+  assert.throws(() => swapParams({ ...swap, key: { ...ETH_USDG, currency0: USDG, currency1: zeroAddress } }), /currency0 must sort below currency1/);
+  assert.throws(() => swapParams({ ...swap, key: { ...ETH_USDG, currency0: USDG } }), /currency0 must sort below currency1/);
+  assert.throws(() => swapParams({ ...swap, key: { ...ETH_USDG, fee: 1_000_001 } }), /fee/);
+  assert.throws(() => swapParams({ ...swap, key: { ...ETH_USDG, tickSpacing: 0 } }), /tickSpacing/);
+  assert.throws(() => swapParams({ ...swap, key: { ...ETH_USDG, tickSpacing: 32_768 } }), /tickSpacing/);
+  assert.throws(() => swapParams({ ...swap, amountIn: 0n }), /greater than zero/);
+  assert.throws(() => swapParams({ ...swap, amountIn: 1n << 128n }), /amountIn out of range/);
+  assert.throws(() => swapParams({ ...swap, recipient: zeroAddress }), /zero address/);
+  assert.doesNotThrow(() => swapParams({ ...swap, key: { ...ETH_USDG, fee: 0x800000 } }));
 });
 
 test("a transfer the SDK signs moves USDG once and rotates the key", async () => {
@@ -247,6 +272,39 @@ test("an open the SDK signs creates the channel the SDK names; vouchers and clos
   const pending = await readChannel(fork.client, X402_BATCH_SETTLEMENT, id);
   assert.equal(pending.pendingWithdrawal?.amount, 20_000_000n);
   await assert.rejects(() => send(buyer, ostraVaultAbi, "requestClose", [config, 20_000_000n, deadline, closeSig]), "a close signature works once");
+});
+
+test("a swap the SDK signs trades the vault's USDG on the deployed Uniswap v4 pool, once", async () => {
+  const chain = await keychain("swap");
+  const vault = await createVault(chain, zeroAddress);
+  await fork.dealUsdg(vault, 50_000_000n);
+  const to = fork.accounts[3]!.address;
+  assert.equal(poolId(ETH_USDG), keccak256(encodeAbiParameters([{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }], [zeroAddress, USDG, 500, 10, zeroAddress])));
+  const swap: SwapParams = { key: ETH_USDG, zeroForOne: false, amountIn: 10_000_000n, minOut: 1n, recipient: to };
+  assert.equal(swapInput(swap), USDG);
+  assert.equal(swapOutput(swap), zeroAddress);
+  const state = await readVault(fork.client, d, vault);
+  assert.ok(state);
+  // The SDK refuses a swap whose input is not the vault's token; the vault would revert it.
+  await assert.rejects(() => signVaultSwap(chain, state, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap: { ...swap, zeroForOne: true } }), /not the vault's token/);
+  const spend = await signVaultSwap(chain, state, { chainId: ROBINHOOD_CHAIN_ID, token: USDG, swap });
+  assert.equal(spend.action, VAULT_ACTION.SWAP);
+  const ethBefore = await fork.client.getBalance({ address: to });
+  const receipt = await send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]);
+  const [swapped] = parseEventLogs({ abi: ostraVaultAbi, logs: receipt.logs, eventName: "Swapped" });
+  assert.ok(swapped);
+  assert.equal(swapped.args.poolId, poolId(ETH_USDG));
+  assert.equal(swapped.args.zeroForOne, false);
+  assert.equal(swapped.args.amountIn, 10_000_000n);
+  assert.equal(swapped.args.recipient, to);
+  assert.ok(swapped.args.amountOut > 0n);
+  assert.equal((await fork.client.getBalance({ address: to })) - ethBefore, swapped.args.amountOut);
+  assert.equal(await balance(vault), 40_000_000n);
+  assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "POOL_MANAGER" }), UNISWAP_V4_POOL_MANAGER);
+  const after1 = await readVault(fork.client, d, vault);
+  assert.equal(after1?.nonce, 1n);
+  assert.equal(after1?.keyRoot, bytesToHex(chain.keyRoot(1n)));
+  await assert.rejects(() => send(vault, ostraVaultAbi, "spend", [spend.action, spend.nextKeyRoot, spend.params, spend.signature]), "the used signature never works again");
 });
 
 test("a crank change the SDK signs lands", async () => {

@@ -8,10 +8,14 @@ Contents:
 - `src/Wots.sol`, `src/LtHash.sol`: the WOTS verifier and the LtHash accumulator, byte-compatible
   with the Solana program and the Ostra TypeScript SDK, tested against vectors made by that SDK.
 - `src/OstraVault.sol`, `src/OstraVaultFactory.sol`: vaults spent only with rotating WOTS keys
-  (Transfer, OpenChannel, SetCrankKey), as beacon proxies at addresses fixed by token, initial key
-  root and initial crank. Channels are x402 batch-settlement channels on the deployed
+  (Transfer, OpenChannel, SetCrankKey, Swap), as beacon proxies at addresses fixed by token, initial
+  key root and initial crank. Channels are x402 batch-settlement channels on the deployed
   x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
-  vouchers and refunds unclaimed escrow.
+  vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
+  Uniswap v4 pool of the deployed PoolManager, with the vault itself as the swapper (what the pool's
+  hook sees); the output goes to the signed recipient, such as another vault.
+  `lib/v4-core` is `src/` and `licenses/` of Uniswap v4-core v4.0.0 (commit e50237c), the release
+  whose PoolManager runs on chain 4663.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)
   and the rest to the seller vault.
 - `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009), batches

@@ -8,6 +8,14 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+
 import {Wots} from "./Wots.sol";
 import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 
@@ -24,6 +32,12 @@ import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 ///                  itself is the deposit collector, and only for that one deposit. payerAuthorizer (the
 ///                  channel's voucher key) must not be zero.
 /// * 2 SetCrankKey: params abi.encode(address crank). address(0) removes the crank.
+/// * 3 Swap:        params abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn, uint128 minOut,
+///                  address recipient). An exact-input swap of up to `amountIn` of this vault's token on the
+///                  Uniswap v4 pool `key`, which must have this vault's token on its input side. The vault
+///                  unlocks the PoolManager itself, so the swap's sender (what the pool's hook sees) is this
+///                  vault. At least `minOut` of the other currency goes to `recipient` (another vault, for
+///                  example); native ETH only to a recipient that accepts it.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
@@ -37,12 +51,13 @@ import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 /// Channels the vault is paid through (receiverAuthorizer = vault):
 /// * claim and refund: only the crank. Claims apply payer-signed vouchers; a refund returns unclaimed escrow
 ///   to the payer. The crank can never send funds anywhere else.
-contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
+contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     uint8 public constant ACTION_TRANSFER = 0;
     uint8 public constant ACTION_OPEN_CHANNEL = 1;
     uint8 public constant ACTION_SET_CRANK_KEY = 2;
+    uint8 public constant ACTION_SWAP = 3;
 
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
@@ -50,6 +65,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
 
     /// @notice The x402BatchSettlement deployment this vault opens and closes channels on.
     IX402BatchSettlement public immutable BATCH_SETTLEMENT;
+    /// @notice The Uniswap v4 PoolManager this vault swaps on.
+    IPoolManager public immutable POOL_MANAGER;
 
     IERC20 public token;
     bytes32 public initialKeyRoot;
@@ -66,11 +83,13 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
 
     bytes32 private transient _expectedChannel;
     uint256 private transient _expectedAmount;
+    bool private transient _swapPending;
 
     event Spent(uint64 indexed nonce, uint8 indexed action, bytes32 nextKeyRoot);
     event CrankChanged(address indexed crank);
     event ChannelOpened(bytes32 indexed channelId, uint128 amount);
     event CloseRequested(bytes32 indexed channelId, uint128 amount, address authorizer);
+    event Swapped(bytes32 indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut, address recipient);
 
     error BadAction();
     error BadParams();
@@ -82,9 +101,13 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
     error UnexpectedCollect();
     error DepositNotCollected();
     error Expired();
+    error UnexpectedCallback();
+    error BadSwapDelta();
+    error InsufficientOutput();
 
-    constructor(address batchSettlement) EIP712("Ostra Vault", "1") {
+    constructor(address batchSettlement, address poolManager) EIP712("Ostra Vault", "1") {
         BATCH_SETTLEMENT = IX402BatchSettlement(batchSettlement);
+        POOL_MANAGER = IPoolManager(poolManager);
         _disableInitializers();
     }
 
@@ -130,10 +153,12 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
             token.safeTransfer(to, amount);
         } else if (action == ACTION_OPEN_CHANNEL) {
             _openChannel(params);
-        } else {
+        } else if (action == ACTION_SET_CRANK_KEY) {
             address newCrank = abi.decode(params, (address));
             crank = newCrank;
             emit CrankChanged(newCrank);
+        } else {
+            _swap(params);
         }
     }
 
@@ -144,6 +169,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
             if (params.length != 192) revert BadParams();
         } else if (action == ACTION_SET_CRANK_KEY) {
             if (params.length != 32) revert BadParams();
+        } else if (action == ACTION_SWAP) {
+            if (params.length != 288) revert BadParams();
         } else {
             revert BadAction();
         }
@@ -193,6 +220,59 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712 {
         _expectedChannel = bytes32(0);
         _expectedAmount = 0;
         token.safeTransfer(address(BATCH_SETTLEMENT), amount);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Swaps on Uniswap v4
+    // ---------------------------------------------------------------------------------------------
+
+    function _swap(bytes calldata params) private {
+        (PoolKey memory key, bool zeroForOne, uint128 amountIn,, address recipient) =
+            abi.decode(params, (PoolKey, bool, uint128, uint128, address));
+        if (amountIn == 0) revert ZeroAmount();
+        if (recipient == address(0)) revert BadParams();
+        Currency input = zeroForOne ? key.currency0 : key.currency1;
+        if (Currency.unwrap(input) != address(token)) revert WrongToken();
+        _swapPending = true;
+        bytes memory result = POOL_MANAGER.unlock(params);
+        if (_swapPending) revert UnexpectedCallback();
+        (uint256 paid, uint256 received) = abi.decode(result, (uint256, uint256));
+        emit Swapped(PoolId.unwrap(key.toId()), zeroForOne, paid, received, recipient);
+    }
+
+    /// @notice PoolManager callback. Works only inside this vault's own Swap spend, with the params that spend
+    ///         signed (the PoolManager passes them back unchanged).
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(POOL_MANAGER) || !_swapPending) revert UnexpectedCallback();
+        _swapPending = false;
+        (PoolKey memory key, bool zeroForOne, uint128 amountIn, uint128 minOut, address recipient) =
+            abi.decode(data, (PoolKey, bool, uint128, uint128, address));
+        BalanceDelta delta = POOL_MANAGER.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(uint256(amountIn)),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            ""
+        );
+        (int128 inDelta, int128 outDelta) =
+            zeroForOne ? (delta.amount0(), delta.amount1()) : (delta.amount1(), delta.amount0());
+        // Exact input: the vault owes the input side and is owed the output side. A hook that returns deltas
+        // may change both, never beyond what the signature allows.
+        if (inDelta > 0 || outDelta < 0) revert BadSwapDelta();
+        uint256 paid = uint256(-int256(inDelta));
+        uint256 received = uint256(int256(outDelta));
+        if (paid > amountIn) revert BadSwapDelta();
+        if (received < minOut) revert InsufficientOutput();
+        if (paid > 0) {
+            POOL_MANAGER.sync(zeroForOne ? key.currency0 : key.currency1);
+            token.safeTransfer(address(POOL_MANAGER), paid);
+            // A token that delivers less than it was asked to move cannot settle the swap.
+            if (POOL_MANAGER.settle() != paid) revert BadSwapDelta();
+        }
+        if (received > 0) POOL_MANAGER.take(zeroForOne ? key.currency1 : key.currency0, recipient, received);
+        return abi.encode(paid, received);
     }
 
     // ---------------------------------------------------------------------------------------------

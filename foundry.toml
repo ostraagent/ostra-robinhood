@@ -11,7 +11,10 @@ optimizer_runs = 200
 # CREATE2 addresses (and the SDK's copy of the BeaconProxy code) must not depend on where it was built.
 bytecode_hash = "none"
 fs_permissions = [{ access = "read", path = "./vectors" }]
-remappings = ["@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"]
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@uniswap/v4-core/=lib/v4-core/",
+]
 
 [rpc_endpoints]
 robinhood = "https://rpc.mainnet.chain.robinhood.com"
