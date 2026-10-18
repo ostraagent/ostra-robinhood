@@ -241,10 +241,11 @@ test("spend messages are the vault's own, for every action, and decode back", as
   const setting = { hook: fork.accounts[3]!.address, poolId: poolId(ETH_USDG), field: POOL_SETTING.BUY_TAX, value: 0n } as const;
   assert.throws(() => configurePoolParams({ ...setting, hook: zeroAddress }), /zero address/);
   assert.throws(() => configurePoolParams({ ...setting, poolId: "0x1234" }), /poolId must be 32 bytes/);
-  assert.throws(() => configurePoolParams({ ...setting, field: 8 as never }), /unknown pool setting/);
+  assert.throws(() => configurePoolParams({ ...setting, field: 9 as never }), /unknown pool setting/);
   assert.throws(() => configurePoolParams({ ...setting, value: 0x10000n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.TAX_END_AT, value: 1n << 40n }), /value out of range/);
   assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.RELEASE_LIMITS, value: 1n }), /value out of range/);
+  assert.throws(() => configurePoolParams({ ...setting, field: POOL_SETTING.VOLATILITY_FEE, value: 1n }), /value out of range/);
   assert.throws(() => claimDividendParams(zeroAddress), /zero address/);
   assert.throws(() => setGuardianParams({ guardian: zeroAddress, enabled: true }), /zero address/);
   assert.throws(() => setRecoveryPolicyParams({ threshold: 1, delay: MIN_RECOVERY_DELAY - 1 }), /delay/);
@@ -381,7 +382,8 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const launchpadArt = artifact("OstraLaunchpad.sol", "OstraLaunchpad");
   const tokenArt = artifact("OstraToken.sol", "OstraToken");
   // The hook's address carries its permission bits: mine a CREATE2 salt for them.
-  const initCode = encodeDeployData({ abi: hookArt.abi, bytecode: hookArt.bytecode, args: [UNISWAP_V4_POOL_MANAGER, WETH, relayer.address] });
+  const fees = await deployArtifact("OstraFees.sol", "OstraFees", []);
+  const initCode = encodeDeployData({ abi: hookArt.abi, bytecode: hookArt.bytecode, args: [UNISWAP_V4_POOL_MANAGER, WETH, fees, relayer.address] });
   const bytecodeHash = keccak256(initCode);
   let salt: Hex = `0x${"00".repeat(32)}`;
   let hook: Address = zeroAddress;
@@ -408,7 +410,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
     creatorBucketBps: 2_500, dividendBucketBps: 2_500, burnBucketBps: 2_500, lpBucketBps: 2_500,
     dividendToken: USDG, dividendKey: noKey, minDividendBalance: 10n ** 18n,
     antiSnipeBps: 0, antiSnipeDuration: 0, maxBuy: 0n, maxWallet: 0n, limitsDuration: 0, antiFarmerDuration: 86_400,
-    graduationKind: 2, graduationThreshold: 1_000_000_000_000n,
+    graduationKind: 2, graduationThreshold: 1_000_000_000_000n, volatilityFee: true,
   };
   const predicted = (await fork.client.readContract({ address: launchpad, abi: launchpadArt.abi, functionName: "tokenAddress", args: [relayer.address, params] })) as Address;
   const launchHash = await fork.wallet(relayer).writeContract({ address: launchpad, abi: launchpadArt.abi, functionName: "launch", args: [params], value: 200_000_000_000_000n, account: relayer, chain: fork.client.chain });
@@ -420,7 +422,7 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   assert.equal(token, predicted);
   const key = (await fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolKey", args: [id] })) as PoolKey;
   assert.equal(poolId(key), id);
-  const config = () => fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolConfig", args: [id] }) as Promise<{ buyTaxBps: number; postBuyTaxBps: number }>;
+  const config = () => fork.client.readContract({ address: hook, abi: hookArt.abi, functionName: "poolConfig", args: [id] }) as Promise<{ buyTaxBps: number; postBuyTaxBps: number; volatilityFee: boolean }>;
 
   // ConfigurePool: the creator vault lowers the buy tax from 3% to 0.5% (the post-graduation 1% follows it down).
   const creatorState = await readVault(fork.client, d, creatorVault);
@@ -431,6 +433,14 @@ test("a pool setting and a dividend claim the SDK signs land on an Ostra launch"
   const c = await config();
   assert.equal(c.buyTaxBps, 50);
   assert.equal(c.postBuyTaxBps, 50);
+  assert.equal(c.volatilityFee, true);
+
+  // ConfigurePool: the creator vault turns the volatility LP fee off.
+  const creatorNext = await readVault(fork.client, d, creatorVault);
+  assert.ok(creatorNext);
+  const off = await signVaultConfigurePool(creatorChain, creatorNext, { chainId: ROBINHOOD_CHAIN_ID, configure: { hook, poolId: id, field: POOL_SETTING.VOLATILITY_FEE, value: 0n } });
+  await send(creatorVault, ostraVaultAbi, "spend", [off.action, off.nextKeyRoot, off.params, off.signature]);
+  assert.equal((await config()).volatilityFee, false);
 
   // A buyer vault swaps USDG into its token vault during the anti-farmer period; the swap pays dividends.
   const buyerChain = await keychain("launch-buyer");

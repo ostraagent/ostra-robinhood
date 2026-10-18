@@ -91,7 +91,9 @@ export const DEFAULT_RECOVERY_THRESHOLD = 2;
  * changes. Every change is in the traders' favour or the hook reverts: taxes
  * and anti-snipe (bps) only lower, the tax end only earlier (unix seconds), the
  * max buy only higher or 0 (none), RELEASE_LIMITS (value 0) ends the max buy and
- * the max wallet now.
+ * the max wallet now, VOLATILITY_FEE (value 0) turns the volatility LP fee off
+ * for good (the pool pays the base LP fee, or the closed-market fee in a stock
+ * pool).
  */
 export const POOL_SETTING = {
   BUY_TAX: 0,
@@ -102,6 +104,7 @@ export const POOL_SETTING = {
   ANTI_SNIPE: 5,
   MAX_BUY: 6,
   RELEASE_LIMITS: 7,
+  VOLATILITY_FEE: 8,
 } as const;
 
 /** OstraPool deposit statuses, by their on-chain number. */

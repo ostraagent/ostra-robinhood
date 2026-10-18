@@ -33,7 +33,9 @@ interface IWETH9Deposit {
 ///         the highest price), held by OstraLocker forever; no bonding-curve contract and no migration. The pool's
 ///         rules (taxes, buckets, anti-snipe, limits, anti-farmer, graduation) are the creator's, fixed at launch,
 ///         inside the bounds below. The launch fee is LAUNCH_FEE in ETH (paying it in OSTRA, at 30% off and burned,
-///         comes once OSTRA exists).
+///         comes once OSTRA exists). A pool quoted in a Robinhood stock token (one whose access registry is
+///         ROBINHOOD_STOCK_REGISTRY, as every stock token's is) pays OstraFees' session fee; the volatility fee is the
+///         creator's choice.
 contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -44,6 +46,10 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
     uint32 public constant MAX_ANTI_SNIPE_DURATION = 1 hours;
     uint32 public constant MAX_ANTI_FARMER_DURATION = 365 days;
     uint256 public constant MAX_TIERS = 8;
+    /// @notice The access registry (and beacon) every Robinhood stock token reports (ACCESS_CONTROLLED_REGISTRY;
+    ///         read on chain 18 Oct 2026 for AAPL, TSLA, NVDA and SPY).
+    address public constant ROBINHOOD_STOCK_REGISTRY = 0xe10b6f6B275de231345c20D14Ab812db62151b00;
+    uint256 private constant STOCK_PROBE_GAS = 20_000;
 
     struct Tier {
         /// @notice Width in ticks, a multiple of the tick spacing; 0 only for the last tier (open to the top).
@@ -81,6 +87,8 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         uint32 antiFarmerDuration;
         uint8 graduationKind;
         uint128 graduationThreshold;
+        /// @notice The LP fee follows the price's distance from its 60-second EMA, up to 1% (OstraFees).
+        bool volatilityFee;
     }
 
     IPoolManager public immutable POOL_MANAGER;
@@ -271,6 +279,20 @@ contract OstraLaunchpad is Ownable2Step, ReentrancyGuardTransient {
         c.graduationThreshold = p.graduationThreshold;
         c.launchedAt = now_;
         c.dividendToken = p.dividendToken == address(this) ? token : p.dividendToken;
+        c.stockQuote = isStockToken(Currency.unwrap(p.quote));
+        c.volatilityFee = p.volatilityFee;
+    }
+
+    /// @notice True when `token` is a Robinhood stock token: its ACCESS_CONTROLLED_REGISTRY() is
+    ///         ROBINHOOD_STOCK_REGISTRY (a static call with bounded gas; ETH and other tokens are not).
+    function isStockToken(address token) public view returns (bool isStock) {
+        if (token.code.length == 0) return false;
+        address registry = ROBINHOOD_STOCK_REGISTRY;
+        assembly ("memory-safe") {
+            mstore(0x00, 0x50c09be300000000000000000000000000000000000000000000000000000000) // ACCESS_CONTROLLED_REGISTRY()
+            let ok := staticcall(STOCK_PROBE_GAS, token, 0x00, 0x04, 0x00, 0x20)
+            isStock := and(ok, and(gt(returndatasize(), 0x1f), eq(mload(0x00), registry)))
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

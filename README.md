@@ -36,10 +36,16 @@ Contents:
   the locker adds liquidity and the max buy and the token's max wallet apply. During the
   anti-farmer period the token enters no other v4 pool and no Uniswap v2 or v3 style pool. The
   creator vault can change the rules only in the traders' favour (lower taxes, earlier tax end,
-  higher max buy, limits released). A pool's quote is ETH or any ERC-20, a stock token among them.
-  `test/Launchpad.fork.t.sol` runs it against the real PoolManager, USDG, WETH and AAPL pools, a
-  TEST/AAPL pool quoted in the AAPL stock token, Uniswap v2 and v3 factories, the v3 position
-  manager and Universal Router 2.1.2.
+  higher max buy, limits released, volatility fee off). A pool's quote is ETH or any ERC-20, a
+  stock token among them. The LP fee is set per swap by `OstraFees`: 0.25%; 0.50% in a pool quoted
+  in a Robinhood stock token while the NYSE is closed (weekends and the NYSE holidays of 2026 to
+  2028, US daylight time computed on chain); if the creator chose it at launch, up to 1% as the
+  price moves away from its 60-second EMA (the larger of the two, never above 1%); and a surcharge
+  only for an actor reversing its own swap within the same second (100 pips per tick moved since
+  its first swap of that second, at most 5%). `test/Fees.t.sol` checks the calendar against NYSE's
+  published holidays and independently computed times. `test/Launchpad.fork.t.sol` runs it against
+  the real PoolManager, USDG, WETH and AAPL pools, a TEST/AAPL pool quoted in the AAPL stock token,
+  Uniswap v2 and v3 factories, the v3 position manager and Universal Router 2.1.2.
 - `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the

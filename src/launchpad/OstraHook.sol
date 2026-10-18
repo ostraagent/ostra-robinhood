@@ -19,6 +19,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
+import {OSTRA_BASE_LP_FEE, OstraFees} from "./OstraFees.sol";
 import {OstraLocker} from "./OstraLocker.sol";
 import {OstraToken} from "./OstraToken.sol";
 
@@ -35,6 +36,11 @@ interface IWETH9 {
 /// * the pool's buy or sell tax (at most 10% each; the post-graduation rate after graduation, nothing after the
 ///   tax end), shared among the pool's buckets: creator, holder dividends, burn, added liquidity;
 /// * on buys, the anti-snipe tax, falling linearly to zero over its duration, shared like the tax.
+/// The LP fee, the pools' dynamic Uniswap v4 fee, is set on every swap from OstraFees: 0.25%; 0.50% for a pool
+/// quoted in a stock token while its market is closed (weekends, NYSE holidays); with the volatility fee the
+/// creator may choose at launch, up to 1% as the price moves away from its 60-second EMA; plus the MEV surcharge
+/// for an actor reversing its own swap within the same second. Every LP fee above the base is in the LpFeeCharged
+/// event and readable (OstraFees.lpFeeOf and mevSurchargeOf).
 /// The quote side that is the swap's specified currency is charged in beforeSwap, the unspecified side in
 /// afterSwap. What is charged is held as PoolManager claims (ERC-6909) and paid out by dispatch, which anyone may
 /// call: it collects the locked positions' LP fees (shared 70/30 like the hook fee), turns token-side fees into
@@ -43,8 +49,9 @@ interface IWETH9 {
 /// Before graduation only the locker adds liquidity, buys are capped at the pool's max buy, and the token's
 /// max wallet applies; graduation happens once, when the pool's threshold is reached, and lifts all three.
 /// The creator's vault (an OstraVault, through its ConfigurePool spend) may change a pool's rules only in the
-/// traders' favour: lower taxes or anti-snipe, an earlier tax end, a higher or no max buy, or the launch limits
-/// released now (configure). Nothing can raise a rate or tighten a limit after launch.
+/// traders' favour: lower taxes or anti-snipe, an earlier tax end, a higher or no max buy, the launch limits
+/// released now, or the volatility fee turned off (configure). Nothing can raise a rate or tighten a limit after
+/// launch.
 contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -55,8 +62,6 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     uint256 public constant CREATOR_FEE_SHARE_BPS = 7_000;
     /// @notice Part of the protocol's share kept for the OSTRA buyback-and-burn.
     uint256 public constant BUYBACK_SHARE_BPS = 5_000;
-    /// @notice LP fee of every Ostra pool (dynamic-fee pools; set on every swap).
-    uint24 public constant LP_FEE = 2_500;
     int24 public constant TICK_SPACING = 200;
     /// @notice A dispatch conversion moves the pool's sqrt price by at most this (about 1% of the price).
     uint256 public constant MAX_DISPATCH_SQRT_MOVE_BPS = 50;
@@ -65,7 +70,8 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     uint8 public constant GRADUATION_QUOTE_RAISED = 2;
 
     /// @notice configure fields. Taxes and anti-snipe (bps) only go down, the tax end only earlier, the max buy
-    ///         only up or to 0 (no max buy); RELEASE_LIMITS (value 0) ends the max buy and the max wallet now.
+    ///         only up or to 0 (no max buy); RELEASE_LIMITS (value 0) ends the max buy and the max wallet now;
+    ///         VOLATILITY_FEE (value 0) turns the volatility fee off.
     uint8 public constant FIELD_BUY_TAX = 0;
     uint8 public constant FIELD_SELL_TAX = 1;
     uint8 public constant FIELD_POST_BUY_TAX = 2;
@@ -74,6 +80,8 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     uint8 public constant FIELD_ANTI_SNIPE = 5;
     uint8 public constant FIELD_MAX_BUY = 6;
     uint8 public constant FIELD_RELEASE_LIMITS = 7;
+    /// @notice Value 0: turns the pool's volatility fee off (the LP fee is then OstraFees' session fee only).
+    uint8 public constant FIELD_VOLATILITY_FEE = 8;
 
     struct PoolConfig {
         address token;
@@ -99,6 +107,10 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
         uint40 launchedAt;
         /// @notice address(0) none; the token; the quote (WETH for ETH); or another ERC-20 bought via dividendKey.
         address dividendToken;
+        /// @notice The quote is a Robinhood stock token (OstraLaunchpad checks it at launch): the session fee applies.
+        bool stockQuote;
+        /// @notice The creator chose the volatility fee (it can only be turned off).
+        bool volatilityFee;
     }
 
     struct PoolState {
@@ -121,6 +133,7 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
 
     IPoolManager public immutable POOL_MANAGER;
     address public immutable WETH;
+    OstraFees public immutable FEES;
 
     address public launchpad;
     OstraLocker public locker;
@@ -130,6 +143,8 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     mapping(PoolId => PoolState) private _states;
     mapping(PoolId => Pending) private _pending;
     mapping(PoolId => PoolKey) private _dividendKeys;
+    /// @notice Each pool's OstraFees.FeeState, packed (OstraFees.unpack).
+    mapping(PoolId => uint256) public feeState;
     /// @notice Protocol share owed per currency (claims), and the part kept for the OSTRA buyback.
     mapping(Currency => uint256) public protocolOwed;
     mapping(Currency => uint256) public buybackOwed;
@@ -148,6 +163,8 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     );
     event ProtocolClaimed(Currency indexed currency, address to, uint256 amount);
     event PoolConfigured(PoolId indexed poolId, uint8 field, uint256 value);
+    /// @notice A swap's LP fee was above OstraFees.BASE_LP_FEE or carried an MEV surcharge (pips, 1e6 = 100%).
+    event LpFeeCharged(PoolId indexed poolId, uint24 lpFee, uint24 mevSurcharge);
 
     error AlreadyInitialized();
     error OnlyPoolManager();
@@ -163,9 +180,10 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
     error NotInTradersFavour();
     error BadField();
 
-    constructor(address poolManager, address weth, address admin) Ownable(admin) {
+    constructor(address poolManager, address weth, address fees, address admin) Ownable(admin) {
         POOL_MANAGER = IPoolManager(poolManager);
         WETH = weth;
+        FEES = OstraFees(fees);
         Hooks.validateHookPermissions(
             IHooks(address(this)),
             Hooks.Permissions({
@@ -243,6 +261,7 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
         antiSnipe = _antiSnipe(c, graduated);
     }
 
+
     function _tax(PoolConfig memory c, bool graduated, bool buy) private view returns (uint256) {
         if (block.timestamp >= c.taxEndAt) return 0;
         if (graduated) return buy ? c.postBuyTaxBps : c.postSellTaxBps;
@@ -293,6 +312,9 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
             if (block.timestamp >= c.limitsEndAt || OstraToken(c.token).limitsReleased()) revert NotInTradersFavour();
             c.limitsEndAt = uint40(block.timestamp);
             OstraToken(c.token).releaseLimits();
+        } else if (field == FIELD_VOLATILITY_FEE) {
+            if (value != 0 || !c.volatilityFee) revert NotInTradersFavour();
+            c.volatilityFee = false;
         } else {
             revert BadField();
         }
@@ -354,13 +376,33 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
         return c.tokenIs0 ? key.currency1 : key.currency0;
     }
 
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         int128 fee = _beforeSwapFee(key, params);
-        return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee, 0), LP_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+        uint24 lp = _lpFee(key.toId(), params.zeroForOne, sender);
+        return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee, 0), lp | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+    }
+
+    /// @dev The swap's LP fee from OstraFees (the MEV surcharge included), keeping the pool's fee state. The actor
+    ///      is the swap's tx.origin and its swapper together (OstraFees.actorOf).
+    function _lpFee(PoolId id, bool zeroForOne, address sender) private returns (uint24) {
+        PoolConfig storage c = _configs[id];
+        uint256 state = feeState[id];
+        (uint24 fee, uint24 surcharge, uint256 next) = FEES.quote(
+            state,
+            _tick(id),
+            zeroForOne,
+            uint64(uint256(keccak256(abi.encode(tx.origin, sender)))),
+            c.stockQuote,
+            c.volatilityFee,
+            block.timestamp
+        );
+        if (next != state) feeState[id] = next;
+        if (fee != OSTRA_BASE_LP_FEE || surcharge != 0) emit LpFeeCharged(id, fee, surcharge);
+        return fee + surcharge;
     }
 
     function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta, bytes calldata)
@@ -725,9 +767,19 @@ contract OstraHook is IHooks, IUnlockCallback, Ownable2Step, ReentrancyGuardTran
 
     /// @dev slot0's sqrt price (v4-core StateLibrary.getSlot0, read the same way: pools mapping at slot 6).
     function _sqrtPrice(PoolId id) private view returns (uint160 sqrtPriceX96) {
-        bytes32 slot = keccak256(abi.encodePacked(PoolId.unwrap(id), bytes32(uint256(6))));
-        bytes32 data = POOL_MANAGER.extsload(slot);
-        sqrtPriceX96 = uint160(uint256(data));
+        sqrtPriceX96 = uint160(uint256(_slot0(id)));
+    }
+
+    /// @dev slot0's tick (StateLibrary.getSlot0: the 24 bits above the sqrt price, sign-extended).
+    function _tick(PoolId id) private view returns (int24 tick) {
+        bytes32 data = _slot0(id);
+        assembly ("memory-safe") {
+            tick := signextend(2, shr(160, data))
+        }
+    }
+
+    function _slot0(PoolId id) private view returns (bytes32) {
+        return POOL_MANAGER.extsload(keccak256(abi.encodePacked(PoolId.unwrap(id), bytes32(uint256(6)))));
     }
 
     /// @dev The largest liquidity amount0 and amount1 can pay for in [sqrtA, sqrtB] at sqrtP.

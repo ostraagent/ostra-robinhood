@@ -306,6 +306,7 @@ const POOL_SETTING_MAX: Readonly<Record<PoolSetting, bigint>> = {
   [POOL_SETTING.ANTI_SNIPE]: 0xffffn,
   [POOL_SETTING.MAX_BUY]: U128_MAX,
   [POOL_SETTING.RELEASE_LIMITS]: 0n,
+  [POOL_SETTING.VOLATILITY_FEE]: 0n,
 };
 
 /**

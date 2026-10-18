@@ -16,6 +16,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 import {OstraVault} from "../src/OstraVault.sol";
 import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
+import {OstraFees} from "../src/launchpad/OstraFees.sol";
 import {OstraHook} from "../src/launchpad/OstraHook.sol";
 import {OstraLaunchpad} from "../src/launchpad/OstraLaunchpad.sol";
 import {OstraLocker} from "../src/launchpad/OstraLocker.sol";
@@ -117,6 +118,7 @@ contract LaunchpadForkTest is Test {
     IPoolManager internal pm = IPoolManager(POOL_MANAGER);
     OstraVaultFactory internal factory;
     OstraHook internal hook;
+    OstraFees internal fees;
     OstraLocker internal locker;
     OstraLaunchpad internal launchpad;
     TestSwapRouter internal router;
@@ -136,7 +138,8 @@ contract LaunchpadForkTest is Test {
         factory = new OstraVaultFactory(address(beacon));
 
         // The hook's address carries its permission bits (v4-core Hooks): mine a CREATE2 salt for them.
-        bytes32 initHash = keccak256(abi.encodePacked(type(OstraHook).creationCode, abi.encode(POOL_MANAGER, WETH, address(this))));
+        fees = new OstraFees();
+        bytes32 initHash = keccak256(abi.encodePacked(type(OstraHook).creationCode, abi.encode(POOL_MANAGER, WETH, address(fees), address(this))));
         bytes32 salt;
         for (uint256 i = 0; i < 500_000; ++i) {
             address a = vm.computeCreate2Address(bytes32(i), initHash, address(this));
@@ -145,7 +148,7 @@ contract LaunchpadForkTest is Test {
                 break;
             }
         }
-        hook = new OstraHook{salt: salt}(POOL_MANAGER, WETH, address(this));
+        hook = new OstraHook{salt: salt}(POOL_MANAGER, WETH, address(fees), address(this));
         assertEq(uint160(address(hook)) & 0x3FFF, HOOK_FLAGS);
         launchpad = new OstraLaunchpad(POOL_MANAGER, address(hook), WETH, address(this));
         locker = new OstraLocker(POOL_MANAGER, address(launchpad), address(hook));
@@ -741,7 +744,7 @@ contract LaunchpadForkTest is Test {
         _configureReverts(creatorVault, id, 0, 300, OstraHook.NotInTradersFavour.selector);
         _configureReverts(creatorVault, id, 1, 501, OstraHook.NotInTradersFavour.selector);
         _configureReverts(creatorVault, id, 6, 9_000_000e18, OstraHook.NotInTradersFavour.selector);
-        _configureReverts(creatorVault, id, 8, 0, OstraHook.BadField.selector);
+        _configureReverts(creatorVault, id, 9, 0, OstraHook.BadField.selector);
 
         // Lower taxes; a lowered tax pulls its post-graduation tax down with it, so graduating never raises it.
         {
@@ -923,5 +926,167 @@ contract LaunchpadForkTest is Test {
         vm.prank(AAPL_BLOCKER);
         IRobinhoodStockRegistry(AAPL_REGISTRY).unblockAccounts(_one(POOL_MANAGER));
         other.swap(key, !tokenIs0, -0.1e18, holder);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The LP fee (OstraFees): the session fee, the volatility fee, the MEV surcharge
+    // ---------------------------------------------------------------------------------------------
+
+    bytes32 internal constant SWAP_EVENT = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
+
+    /// @dev The LP fee (pips) of the last PoolManager Swap event in the recorded logs: what the swap paid.
+    function _swapFee() internal returns (uint24 fee) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter == POOL_MANAGER && logs[i].topics[0] == SWAP_EVENT) {
+                (,,,,, fee) = abi.decode(logs[i].data, (int128, int128, uint160, uint128, int24, uint24));
+                found = true;
+            }
+        }
+        assertTrue(found, "no Swap event");
+    }
+
+    /// @dev The first time from now, at `hourUtc` on a later day, at which the stock market is closed (or open).
+    function _nextTime(bool closed, uint256 hourUtc) internal view returns (uint256 t) {
+        t = (block.timestamp / 1 days + 1) * 1 days + hourUtc * 1 hours;
+        while (fees.nyseClosed(t) != closed) t += 1 days;
+    }
+
+    function _routerBuy(PoolKey memory key, OstraToken token, uint256 quoteIn, address origin) internal returns (uint24) {
+        vm.recordLogs();
+        vm.prank(origin, origin);
+        _buyExactIn(key, token, quoteIn, address(router));
+        return _swapFee();
+    }
+
+    function _routerSell(PoolKey memory key, OstraToken token, uint256 tokensIn, address origin) internal returns (uint24) {
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        vm.recordLogs();
+        vm.prank(origin, origin);
+        router.swap(key, tokenIs0, -int256(tokensIn), address(router));
+        return _swapFee();
+    }
+
+    function test_aStockPoolPaysTheClosedSessionFeeOnlyWhileTheMarketIsClosed() public {
+        OstraVault creatorVault = _vault(AAPL, CREATOR_AAPL);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(AAPL), address(creatorVault), -154_200, bytes32(uint256(20)));
+        p.name = "Test";
+        p.symbol = "TEST";
+        p.graduationThreshold = 5e18;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        assertTrue(hook.poolConfig(id).stockQuote, "AAPL is detected as a stock token");
+        (OstraToken usdgToken, PoolKey memory usdgKey,) = _launchUsdg(bytes32(uint256(21)));
+        assertFalse(hook.poolConfig(usdgKey.toId()).stockQuote);
+        assertFalse(launchpad.isStockToken(USDG));
+        assertFalse(launchpad.isStockToken(address(0)));
+        assertTrue(launchpad.isStockToken(0x322F0929c4625eD5bAd873c95208D54E1c003b2d)); // TSLA
+        deal(AAPL, address(router), 10e18);
+        deal(USDG, address(router), 1_000e6);
+        address trader = makeAddr("session trader");
+
+        // A weekday, the market open (16:00 UTC is 11:00 or 12:00 ET): the base fee.
+        vm.warp(_nextTime(false, 16));
+        assertEq(fees.lpFeeOf(hook, id), 2_500);
+        assertEq(_routerBuy(key, token, 0.1e18, trader), 2_500);
+
+        // The market closed (a weekend day or a holiday): 0.50% in the stock pool, the base fee elsewhere.
+        vm.warp(_nextTime(true, 16));
+        assertEq(fees.lpFeeOf(hook, id), 5_000);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit OstraHook.LpFeeCharged(id, 5_000, 0);
+        _routerBuy(key, token, 0.1e18, trader);
+        assertEq(_routerBuy(key, token, 0.1e18, trader), 5_000);
+        assertEq(fees.lpFeeOf(hook, usdgKey.toId()), 2_500);
+        assertEq(_routerBuy(usdgKey, usdgToken, 10e6, trader), 2_500);
+
+        // Open again.
+        vm.warp(_nextTime(false, 16));
+        assertEq(_routerBuy(key, token, 0.1e18, trader), 2_500);
+    }
+
+    function test_theVolatilityFeeFollowsThePriceAndTheCreatorCanOnlyTurnItOff() public {
+        OstraVault creatorVault = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(creatorVault), -375_400, bytes32(uint256(22)));
+        p.volatilityFee = true;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        assertTrue(hook.poolConfig(id).volatilityFee);
+        vm.warp(block.timestamp + 601);
+        deal(USDG, address(router), 5_000e6);
+        address trader = makeAddr("volatility trader");
+
+        // The first swap starts the EMA at the pool's price: the base fee.
+        assertEq(_routerBuy(key, token, 1e6, trader), 2_500);
+        // A large buy in the same second moves the price; the next swap, priced against the unmoved EMA, pays up to 1%.
+        _routerBuy(key, token, 400e6, trader);
+        OstraFees.FeeState memory st = fees.unpack(hook.feeState(id));
+        uint24 expected = fees.lpFeeOf(hook, id);
+        assertGt(expected, 2_500);
+        assertEq(_routerBuy(key, token, 1e6, trader), expected);
+        assertEq(st.emaAt, block.timestamp);
+        // The price holds: after an hour the EMA has caught up, the fee is the base again.
+        vm.warp(block.timestamp + 64 * 60);
+        assertEq(fees.lpFeeOf(hook, id), 2_500);
+        assertEq(_routerBuy(key, token, 1e6, trader), 2_500);
+
+        // The creator turns it off; it cannot be turned on, or off twice.
+        _configure(creatorVault, id, hook.FIELD_VOLATILITY_FEE(), 0);
+        assertFalse(hook.poolConfig(id).volatilityFee);
+        _configureReverts(creatorVault, id, hook.FIELD_VOLATILITY_FEE(), 0, OstraHook.NotInTradersFavour.selector);
+        _configureReverts(creatorVault, id, hook.FIELD_VOLATILITY_FEE(), 1, OstraHook.NotInTradersFavour.selector);
+        vm.warp(block.timestamp + 1);
+        _routerBuy(key, token, 400e6, trader);
+        assertEq(_routerBuy(key, token, 1e6, trader), 2_500);
+    }
+
+    function test_onlyAnActorReversingItsOwnSwapWithinTheSecondPaysTheMevSurcharge() public {
+        (OstraToken token, PoolKey memory key,) = _launchUsdg(bytes32(uint256(23)));
+        PoolId id = key.toId();
+        bool tokenIs0 = Currency.unwrap(key.currency0) == address(token);
+        vm.warp(_nextTime(false, 16));
+        deal(USDG, address(router), 5_000e6);
+        address bot = makeAddr("sandwich bot");
+        address user = makeAddr("user");
+        // Tokens for the sells, bought in an earlier second.
+        _routerBuy(key, token, 500e6, user);
+        vm.warp(block.timestamp + 1);
+
+        // The bot's front-run opens the second; a user's buy moves the price on.
+        assertEq(_routerBuy(key, token, 200e6, bot), 2_500);
+        assertEq(_routerBuy(key, token, 200e6, user), 2_500);
+        // The user selling back pays the base fee: it is not the second's first actor.
+        assertEq(_routerSell(key, token, 1_000_000e18, user), 2_500);
+        // The bot's back-run pays the surcharge for the move since its own first swap.
+        uint24 surcharge = fees.mevSurchargeOf(hook, id, bot, address(router), tokenIs0);
+        assertGt(surcharge, 0);
+        assertLe(surcharge, fees.MAX_MEV_SURCHARGE());
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit OstraHook.LpFeeCharged(id, 2_500, surcharge);
+        assertEq(_routerSell(key, token, 1_000_000e18, bot), 2_500 + surcharge);
+        // The next second, nothing.
+        vm.warp(block.timestamp + 1);
+        assertEq(fees.mevSurchargeOf(hook, id, bot, address(router), tokenIs0), 0);
+
+        // Two Ostra vaults relayed by the same sender are two actors: a buy and a sell in one second pay the base fee.
+        address relayer = makeAddr("relayer account");
+        OstraVault buyer = _vault(USDG, BUYER);
+        OstraVault bunker = _vault(address(token), BUYER_TOKEN);
+        deal(USDG, address(buyer), 100e6);
+        vm.prank(relayer, relayer);
+        _spend(buyer, BUYER, 3, abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(bunker)));
+        vm.warp(block.timestamp + 1);
+        vm.recordLogs();
+        vm.prank(relayer, relayer);
+        _spend(buyer, BUYER, 3, abi.encode(key, !tokenIs0, uint128(20e6), uint128(1), address(bunker)));
+        assertEq(_swapFee(), 2_500);
+        uint128 sell = uint128(token.balanceOf(address(bunker)) / 4);
+        vm.recordLogs();
+        vm.prank(relayer, relayer);
+        _spend(bunker, BUYER_TOKEN, 3, abi.encode(key, tokenIs0, sell, uint128(1), address(buyer)));
+        assertEq(_swapFee(), 2_500);
     }
 }
