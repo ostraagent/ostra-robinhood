@@ -45,6 +45,9 @@
 //   OSTRA_CHECK_RECOVER    optional: the name of a run directory (run-...) in
 //                          OSTRA_CHECK_STATE whose cleanup did not finish; the
 //                          check then runs only that cleanup, from that run's keys
+//   OSTRA_MERCHANT_IDLE_SECONDS  optional: the seller server's idle timeout,
+//                          passed on to it (default 300 s, as on mainnet); the
+//                          check waits this long for channel B's idle close
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -94,6 +97,7 @@ import { BatchSettlementEvmScheme as BatchSettlementClient } from "@x402/evm/bat
 import { parseListen } from "../src/config.ts";
 import { wireChannelConfig } from "../src/forwarder.ts";
 import { MerchantKeys, ensurePrivateDir, isPrivateKey } from "../src/keys.ts";
+import { parseIdleSeconds } from "../src/config.ts";
 import { IDLE_TIMEOUT_SECONDS } from "../src/lifecycle.ts";
 import { CHANNELS_DIR } from "../src/store.ts";
 
@@ -262,6 +266,8 @@ async function main(): Promise<void> {
     const value = process.env[name];
     if (value !== undefined && value !== "") baseEnv[name] = value;
   }
+  const idleText = process.env.OSTRA_MERCHANT_IDLE_SECONDS;
+  const idleSeconds = parseIdleSeconds(idleText) ?? IDLE_TIMEOUT_SECONDS;
   const keeperEnv: Record<string, string> = { ...baseEnv };
   for (const name of ["OSTRA_KEEPER_SECRETS", "OSTRA_KEEPER_DATA", "OSTRA_KEEPER_LISTEN", "OSTRA_KEEPER_FEE_RECIPIENT"]) {
     const value = process.env[name];
@@ -280,6 +286,7 @@ async function main(): Promise<void> {
     OSTRA_MERCHANT_LISTEN: `${merchantListen.host}:${merchantListen.port}`,
     OSTRA_MERCHANT_PRICE: price.toString(),
     OSTRA_MERCHANT_DEPOSIT: tokens("2").toString(),
+    ...(idleText === undefined || idleText === "" ? {} : { OSTRA_MERCHANT_IDLE_SECONDS: idleText }),
   });
   const serverScript = fileURLToPath(new URL("../src/server.ts", import.meta.url));
   const keeper = new Proc("keeper", fileURLToPath(new URL("../../keeper/src/main.ts", import.meta.url)), keeperEnv);
@@ -530,8 +537,8 @@ async function main(): Promise<void> {
     // --- 4. channel B: the buyer goes silent ---------------------------------------
     const buyerB = newClient(keccak256(new Uint8Array(randomBytes(32))), tokens("0.5"));
     const channelB = await paid(buyerB, "0.3 on channel B (deposit 0.5)", price);
-    console.log(`channel B ${channelB}; the server must close it after ${IDLE_TIMEOUT_SECONDS} s without activity`);
-    const idleClose = await server.waitEvent((e) => e.event === "channel_closed_by_keeper" && e.channel === channelB && e.why === "idle", IDLE_TIMEOUT_SECONDS + 240);
+    console.log(`channel B ${channelB}; the server must close it after ${idleSeconds} s without activity`);
+    const idleClose = await server.waitEvent((e) => e.event === "channel_closed_by_keeper" && e.channel === channelB && e.why === "idle", idleSeconds + 240);
     check(idleClose !== undefined, "the idle channel B was closed by the server through the keeper", idleClose ?? "no close");
     ch = await waitChannel(channelB, (c) => c.balance === c.totalClaimed, 60);
     check(ch.totalClaimed === price && ch.balance === ch.totalClaimed, "channel B claimed at 0.3 with nothing left unclaimed", ch);

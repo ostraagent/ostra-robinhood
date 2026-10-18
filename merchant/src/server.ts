@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     ...(config.suggestedDeposit === undefined ? {} : { suggestedDeposit: config.suggestedDeposit }),
     extraSplits: config.extraSplits,
     ...(config.gracePeriodSeconds === undefined ? {} : { gracePeriodSeconds: config.gracePeriodSeconds }),
+    ...(config.idleTimeoutSeconds === undefined ? {} : { idleTimeoutSeconds: config.idleTimeoutSeconds }),
     log,
   });
   const facts = {

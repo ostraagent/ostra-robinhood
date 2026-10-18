@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { getAddress } from "viem";
-import { loadMerchantConfig, parseListen, parseSplitsEnv } from "../src/config.ts";
+import { loadMerchantConfig, parseIdleSeconds, parseListen, parseSplitsEnv } from "../src/config.ts";
 
 const deployment = {
   version: 1,
@@ -78,6 +78,13 @@ test("the seller's own splits and withdraw delay come from accept_payments' sett
   const set = loadMerchantConfig({ ...base, OSTRA_MERCHANT_SPLITS: JSON.stringify([{ recipient: MARKET.toLowerCase(), bps: 100 }]), OSTRA_MERCHANT_GRACE_SECONDS: "1800" });
   assert.deepEqual(set.extraSplits, [{ recipient: MARKET, bps: 100 }]);
   assert.equal(set.gracePeriodSeconds, 1800);
+  // The idle timeout: the 300 s default unless set; any whole number of seconds a Node timer can wait.
+  assert.equal(c.idleTimeoutSeconds, undefined);
+  assert.equal(loadMerchantConfig({ ...base, OSTRA_MERCHANT_IDLE_SECONDS: "20" }).idleTimeoutSeconds, 20);
+  assert.equal(parseIdleSeconds("2147483"), 2_147_483);
+  assert.throws(() => parseIdleSeconds("2147484"), /OSTRA_MERCHANT_IDLE_SECONDS/);
+  assert.throws(() => parseIdleSeconds("0"), /OSTRA_MERCHANT_IDLE_SECONDS/);
+  assert.throws(() => parseIdleSeconds("1.5"), /OSTRA_MERCHANT_IDLE_SECONDS/);
   assert.deepEqual(parseSplitsEnv("[]"), []);
   assert.throws(() => parseSplitsEnv("{"), /not JSON/);
   assert.throws(() => parseSplitsEnv('{"recipient":"x"}'), /JSON array/);

@@ -2,8 +2,9 @@
 // mainnet with Ostra deployed on it: the keeper and the seller server run as
 // their own processes from their environment, as on the VPS. The fork only
 // stands in for funding: the funder gets 2.5 USDG (anvil_dealERC20) and the
-// keeper fee payer ETH (anvil_setBalance). It waits out the server's 300 s
-// idle close of channel B, as the check does on mainnet.
+// keeper fee payer ETH (anvil_setBalance). The server's idle timeout is set to
+// 60 s (OSTRA_MERCHANT_IDLE_SECONDS) so the check does not wait out mainnet's
+// 300 s for channel B's idle close; the close itself is the same path.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -79,6 +80,7 @@ test("scripts/chain-check.ts passes against the keeper and seller server process
     OSTRA_MERCHANT_LISTEN: `127.0.0.1:${await freePort()}`,
     OSTRA_CHECK_FUNDER: join(root, "funder.key"),
     OSTRA_CHECK_STATE: join(root, "check"),
+    OSTRA_MERCHANT_IDLE_SECONDS: "60",
   };
   const script = fileURLToPath(new URL("../scripts/chain-check.ts", import.meta.url));
   const child = spawn(process.execPath, [script], { env, stdio: ["ignore", "pipe", "pipe"] });

@@ -20,6 +20,9 @@
 //                            [{"recipient": "<address>", "bps": <1..10000>}] (optional)
 //   OSTRA_MERCHANT_GRACE_SECONDS  withdraw delay of new channels; at least the
 //                            keeper's minimum, which is the default (optional)
+//   OSTRA_MERCHANT_IDLE_SECONDS  seconds without a paid request after which a
+//                            channel is closed through the keeper (optional;
+//                            the default is IDLE_TIMEOUT_SECONDS, 300)
 // The MCP tool accept_payments returns these settings for this server.
 
 import { readFileSync } from "node:fs";
@@ -38,6 +41,7 @@ export type MerchantConfig = {
   suggestedDeposit: bigint | undefined;
   extraSplits: { recipient: Address; bps: number }[];
   gracePeriodSeconds: number | undefined;
+  idleTimeoutSeconds: number | undefined;
 };
 
 const U128_MAX = (1n << 128n) - 1n;
@@ -64,6 +68,18 @@ export function parseSplitsEnv(text: string | undefined): { recipient: Address; 
     }
     return { recipient: evmAddress(e.recipient, `OSTRA_MERCHANT_SPLITS[${i}].recipient`), bps: e.bps };
   });
+}
+
+/** Node's largest timer delay (2^31 - 1 ms), in whole seconds: a longer setTimeout fires at once. */
+const MAX_IDLE_SECONDS = 2_147_483;
+
+/** OSTRA_MERCHANT_IDLE_SECONDS: a whole number of seconds the idle watchdog's timer can wait. */
+export function parseIdleSeconds(text: string | undefined): number | undefined {
+  if (text === undefined || text === "") return undefined;
+  if (!/^[1-9][0-9]{0,6}$/.test(text) || Number(text) > MAX_IDLE_SECONDS) {
+    throw new Error(`OSTRA_MERCHANT_IDLE_SECONDS must be a whole number of seconds from 1 to ${MAX_IDLE_SECONDS}`);
+  }
+  return Number(text);
 }
 
 /** A withdraw delay x402BatchSettlement accepts (at most 30 days); merchant.ts checks the keeper's minimum. */
@@ -133,5 +149,6 @@ export function loadMerchantConfig(env: NodeJS.ProcessEnv = process.env): Mercha
     suggestedDeposit: deposit === undefined || deposit === "" ? undefined : baseUnits(deposit, "OSTRA_MERCHANT_DEPOSIT"),
     extraSplits: parseSplitsEnv(env.OSTRA_MERCHANT_SPLITS),
     gracePeriodSeconds: graceSeconds(env.OSTRA_MERCHANT_GRACE_SECONDS),
+    idleTimeoutSeconds: parseIdleSeconds(env.OSTRA_MERCHANT_IDLE_SECONDS),
   };
 }
