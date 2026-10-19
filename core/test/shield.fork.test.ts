@@ -5,7 +5,11 @@
 //     of two leaves the creator vault's auto-shield makes from its balance
 //     above what it keeps (its own records folder and sender, the agent's
 //     shield records); each service moves on only its own vault's deposits.
-//     The aggregator builds one batch of the eight, every deposit approves it
+//     The first batch of the eight is abandoned: the creator vault's service
+//     does not sweep within the approval time. Its leaves are public, so
+//     every deposit sends a new leaf set (attempt 1) when the aggregator asks.
+//     The aggregator builds the next batch of the eight, sharing no leaf with
+//     the abandoned one; every deposit approves it
 //     after checking it on-chain, the aggregator seals it and every deposit
 //     is closed; the pool fee reaches the treasury;
 //   * unshield of the nine leaves at once (window 0), the creator's among
@@ -15,7 +19,9 @@
 //     DEPOSIT_TIMEOUT_SECONDS have passed on the chain, the sweep cancels it
 //     and the pool refunds it in full to the vault.
 // The aggregator's pass runs when the test calls it instead of every 30
-// seconds, so the test does not wait for its timer.
+// seconds, so the test does not wait for its timer, and the wall clock the
+// aggregator and the agent read (Date.now) is moved forward past the approval
+// time instead of waiting it out.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -30,11 +36,11 @@ import { DEPOSIT_TIMEOUT_SECONDS, FileWotsStore, LEAF_DENOMINATION, USDG, deposi
 import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { Aggregator } from "../../aggregator/src/aggregator.ts";
 import { Sender as AggregatorSender } from "../../aggregator/src/chain.ts";
-import { loadConfig as loadAggregatorConfig } from "../../aggregator/src/config.ts";
+import { APPROVAL_SECONDS, loadConfig as loadAggregatorConfig } from "../../aggregator/src/config.ts";
 import { createAggregatorServer } from "../../aggregator/src/http.ts";
 import { ensurePrivateDir } from "../../aggregator/src/keys.ts";
 import { StateStore } from "../../aggregator/src/store.ts";
-import { Keys, LocalSender, RELAYER_CHANNEL_DEPOSIT, ShieldService, UnshieldService, VaultService, X402_NETWORK, type Config, type PrivateVaultContext } from "../src/index.ts";
+import { Keys, LEAF_KEYS_PER_ATTEMPT, LocalSender, RELAYER_CHANNEL_DEPOSIT, ShieldService, UnshieldService, VaultService, X402_NETWORK, type Config, type PrivateVaultContext } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
 
 const DEPOSITS = 8;
@@ -156,8 +162,32 @@ test("eight shield deposits, one of them the creator vault's auto-shield, are se
   assert.deepEqual(await creatorShield.sweep(), []);
   assert.equal((await shield.list()).length, DEPOSITS, "nothing more is due");
 
-  // Sweeps and aggregator passes until every deposit is closed: build, approve, seal, close.
-  for (let round = 0; round < 8; round++) {
+  // The first batch: built and complete on-chain, approved by the buyer vault's seven deposits only.
+  await aggregator.pass();
+  await aggregator.pass();
+  const first = (await aggregator.health()).open;
+  assert.ok(first !== null && first.batch !== null && first.approveBy !== null && first.deposits === DEPOSITS && first.leaves === LEAVES, JSON.stringify(first));
+  const abandonedId = BigInt(first.batch);
+  assert.deepEqual(await shield.sweep(), []);
+  await aggregator.pass();
+  assert.notEqual((await aggregator.health()).open, null, "still waiting for the creator vault's approval");
+  // The approval time passes (the wall clock moves; the chain's own time is not involved).
+  const realNow = Date.now;
+  let offset = 0;
+  const shift = (seconds: number) => {
+    offset += seconds * 1000;
+    Date.now = () => realNow() + offset;
+  };
+  shift(APPROVAL_SECONDS + 1);
+  await aggregator.pass();
+  assert.equal((await aggregator.health()).open, null);
+  const abandoned = await readBatch(client, d.pool, abandonedId);
+  assert.equal(abandoned.status, "closed");
+  assert.equal(abandoned.leafCount, LEAVES);
+  shift(5);
+
+  // Sweeps and aggregator passes until every deposit is closed: new leaf sets, build, approve, seal, close.
+  for (let round = 0; round < 12; round++) {
     await aggregator.pass();
     assert.deepEqual(await shield.sweep(), []);
     assert.deepEqual(await creatorShield.sweep(), []);
@@ -172,6 +202,11 @@ test("eight shield deposits, one of them the creator vault's auto-shield, are se
   assert.equal(sealed.status, "sealed");
   assert.equal(sealed.leafCount, LEAVES);
   assert.equal(sealed.unspent, LEAVES);
+  assert.notEqual(batchId, abandonedId);
+  // The sealed batch holds the second leaf sets only: no leaf of the abandoned batch is in it.
+  const abandonedRoots = new Set(abandoned.leaves.map((l) => l.keyRoot.toLowerCase()));
+  assert.ok(sealed.leaves.every((l) => !abandonedRoots.has(l.keyRoot.toLowerCase())));
+  assert.ok(views.every((v) => v.leavesInPool.every((l) => l.key >= LEAF_KEYS_PER_ATTEMPT && l.key < 2 * LEAF_KEYS_PER_ATTEMPT)), JSON.stringify(views));
   assert.equal((await balanceOf(p.treasury)) - treasuryBefore, (amount - LEAF_DENOMINATION) * BigInt(BUYER_DEPOSITS) + (creatorAmount - LEAF_DENOMINATION * BigInt(CREATOR_LEAVES)));
   assert.equal((await aggregator.health()).queued, 0);
 
@@ -199,4 +234,5 @@ test("eight shield deposits, one of them the creator vault's auto-shield, are se
   const refunded = (await shield.list()).find((s) => s.index === lone.index);
   assert.equal(refunded?.status, "closed");
   assert.equal(await balanceOf(opened.vault), amount);
+  Date.now = realNow;
 });

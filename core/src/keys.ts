@@ -113,7 +113,7 @@ export function shieldApprovalKeychainId(chainId: number, token: Address, index:
   return sha256([SHIELD_APPROVE_KEYCHAIN_DOMAIN, ...shieldParts(chainId, token, index)]);
 }
 
-/** Keychain id of the leaf keys of shield deposit `index`: leaf j is key j (public; the secret is the master seed). */
+/** Keychain id of the leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex; public, the secret is the master seed). */
 export function shieldLeafKeychainId(chainId: number, token: Address, index: bigint): Uint8Array {
   return sha256([SHIELD_LEAF_KEYCHAIN_DOMAIN, ...shieldParts(chainId, token, index)]);
 }
@@ -279,7 +279,7 @@ export class Keys<S extends WotsStore = WotsStore> {
     return this.#keychain(shieldApprovalKeychainId(chainId, token, index));
   }
 
-  /** Leaf keys of shield deposit `index`: leaf j of the deposit is key j, which spends it once. */
+  /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */
   shieldLeafKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
     return this.#keychain(shieldLeafKeychainId(chainId, token, index));
   }

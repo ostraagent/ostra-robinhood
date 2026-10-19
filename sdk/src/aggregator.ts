@@ -1,6 +1,6 @@
 // What the aggregator server (aggregator/) and the depositors (the MCP
-// package) share: the wire format of leaves, the depositor's signed poll, and
-// the checks a depositor runs on a batch before it approves it.
+// package) share: the wire format of leaves, the depositor's signed leaves and
+// poll, and the checks a depositor runs on a batch before it approves it.
 //
 // Design v0.3, decided 15 Oct 2026: a depositor sends its leaves to the
 // aggregator over HTTPS (POST /v1/deposits), then polls its deposit (GET
@@ -15,14 +15,38 @@
 // key, and the poll is an EIP-191 signature of the depositor key over
 // "OSTRA/AGGREGATOR/POLL/EVM/v1" || chainid || pool || deposit key || at (u64,
 // unix seconds), so a poll for one pool or chain is never valid for another.
+//
+// OstraPool version 2 (19 Oct 2026): a deposit records nothing about its
+// leaves on-chain (version 1 recorded their LtHash commitment, which let
+// anyone match each deposit to its leaves). The depositor key signs its leaves
+// instead (EIP-191 over "OSTRA/AGGREGATOR/LEAVES/EVM/v1" || chainid || pool ||
+// deposit key || attempt (u32) || keccak256 of the leaves), so only the
+// depositor can register them. Every batch that does not seal published its
+// leaves on-chain, so a deposit of that batch is never batched with those
+// leaves again: the aggregator asks for a new set ("rekey"), the next attempt,
+// and the depositor derives fresh leaf keys for it. The depositor also checks
+// on-chain itself that no finished batch it is not in holds its current set
+// (core shield.ts), so an aggregator that lost its state cannot offer a
+// published set again. Leaf sets of different batches then never share a
+// leaf, and comparing them tells nothing.
+//
+// Trust: the aggregator sees which leaves are whose until the seal, and the
+// depositor's own RPC must be honest: the contract no longer checks a
+// deposit's leaves itself, so the depositor's on-chain reading of the batch
+// (batchContainsLeaves) is what keeps its funds; the aggregator and the
+// depositor's RPC must not be the same untrusted party.
 
-import { bytesToHex, encodePacked, getAddress, hexToBytes, isAddress, isHex, stringToHex, verifyMessage, type Address, type Hex, type LocalAccount } from "viem";
+import { bytesToHex, encodePacked, getAddress, hexToBytes, isAddress, isHex, keccak256, stringToHex, verifyMessage, type Address, type Hex, type LocalAccount } from "viem";
 import { fromHex, toHex } from "./hash.ts";
 import { isStandardLeaf } from "./leaves.ts";
 import { batchStateHash, encodeLeaf, lthashOfLeaves } from "./lthash.ts";
 
 const POLL_DOMAIN = stringToHex("OSTRA/AGGREGATOR/POLL/EVM/v1"); // bytes28
+const LEAVES_DOMAIN = stringToHex("OSTRA/AGGREGATOR/LEAVES/EVM/v1"); // bytes30
 const U64_MAX = (1n << 64n) - 1n;
+
+/** Leaf sets a deposit may register (attempts 0..MAX_LEAF_ATTEMPTS - 1); a deposit that runs out is never batched again and is refunded after the timeout. */
+export const MAX_LEAF_ATTEMPTS = 64;
 
 /** A leaf: its WOTS key root and its amount in base units (one standard leaf on Robinhood Chain). */
 export type Leaf = { keyRoot: Uint8Array; amount: bigint };
@@ -47,15 +71,10 @@ export function leafFromWire(value: unknown): Leaf {
   return { keyRoot: fromHex(keyRoot), amount: parsed };
 }
 
-/** The LtHash commitment a deposit records for these leaves (order does not matter). */
-export function depositCommitment(leaves: readonly Leaf[]): Uint8Array {
-  return lthashOfLeaves(leaves.map((l) => encodeLeaf(l.keyRoot, l.amount)));
-}
-
-/** The state hash of a batch holding exactly these leaves, as approveBatch and sealBatch compute it. */
+/** The state hash of a batch holding exactly these leaves (in any order), as OstraPool.batchState computes it. */
 export function leavesStateHash(leaves: readonly Leaf[]): Uint8Array {
   const total = leaves.reduce((sum, l) => sum + l.amount, 0n);
-  return batchStateHash(depositCommitment(leaves), leaves.length, total);
+  return batchStateHash(lthashOfLeaves(leaves.map((l) => encodeLeaf(l.keyRoot, l.amount))), leaves.length, total);
 }
 
 /** The leaves of a batch as a depositor checks them (reads.ts readBatch gives them). */
@@ -99,6 +118,55 @@ export function aggregatorPollMessage(t: PollTarget, at: bigint): Uint8Array {
   return hexToBytes(encodePacked(["bytes28", "uint256", "address", "bytes32", "uint64"], [POLL_DOMAIN, BigInt(t.chainId), getAddress(t.pool), t.deposit, at]));
 }
 
+export type LeavesTarget = PollTarget & { attempt: number };
+
+function attemptOf(attempt: number): number {
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt >= MAX_LEAF_ATTEMPTS) throw new RangeError(`attempt must be an integer in 0..${MAX_LEAF_ATTEMPTS - 1}`);
+  return attempt;
+}
+
+/** keccak256 of the leaves in order, each its key root (32 bytes) and amount (u64, big-endian). */
+function leavesDigest(leaves: readonly Leaf[]): Hex {
+  if (leaves.length === 0) throw new RangeError("a leaf set must not be empty");
+  const packed = new Uint8Array(leaves.length * 40);
+  const view = new DataView(packed.buffer);
+  leaves.forEach((l, i) => {
+    if (l.keyRoot.length !== 32) throw new RangeError("keyRoot must be 32 bytes");
+    if (l.amount <= 0n || l.amount > U64_MAX) throw new RangeError("leaf amount out of range");
+    packed.set(l.keyRoot, i * 40);
+    view.setBigUint64(i * 40 + 32, l.amount, false);
+  });
+  return keccak256(packed);
+}
+
+/** The message a depositor signs to register `leaves` as attempt `t.attempt` of its deposit. */
+export function aggregatorLeavesMessage(t: LeavesTarget, leaves: readonly Leaf[]): Uint8Array {
+  if (!Number.isSafeInteger(t.chainId) || t.chainId <= 0) throw new RangeError("chainId must be a positive integer");
+  if (!isAddress(t.pool, { strict: false })) throw new RangeError("pool is not an address");
+  if (!isHex(t.deposit) || t.deposit.length !== 66) throw new RangeError("deposit must be a 32-byte deposit key");
+  return hexToBytes(
+    encodePacked(
+      ["bytes30", "uint256", "address", "bytes32", "uint32", "bytes32"],
+      [LEAVES_DOMAIN, BigInt(t.chainId), getAddress(t.pool), t.deposit, attemptOf(t.attempt), leavesDigest(leaves)],
+    ),
+  );
+}
+
+/** The depositor key's signature of its leaves (65 bytes, EIP-191). */
+export async function signAggregatorLeaves(signer: LocalAccount, t: LeavesTarget, leaves: readonly Leaf[]): Promise<Hex> {
+  return signer.signMessage({ message: { raw: aggregatorLeavesMessage(t, leaves) } });
+}
+
+/** True when `signature` is `owner`'s signature of `leaves` as attempt `t.attempt` of the deposit. */
+export async function verifyAggregatorLeaves(owner: Address, t: LeavesTarget, leaves: readonly Leaf[], signature: Hex): Promise<boolean> {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return false;
+  try {
+    return await verifyMessage({ address: owner, message: { raw: bytesToHex(aggregatorLeavesMessage(t, leaves)) }, signature });
+  } catch {
+    return false;
+  }
+}
+
 /** The depositor key's poll signature (65 bytes, EIP-191). */
 export async function signAggregatorPoll(signer: LocalAccount, t: PollTarget, at: bigint): Promise<Hex> {
   return signer.signMessage({ message: { raw: aggregatorPollMessage(t, at) } });
@@ -114,8 +182,13 @@ export async function verifyAggregatorPoll(owner: Address, t: PollTarget, at: bi
   }
 }
 
-/** GET /v1/deposits/<deposit>: what the aggregator holds for a deposit. */
+/**
+ * GET /v1/deposits/<deposit> (and POST /v1/deposits): what the aggregator
+ * holds for a deposit. "rekey": a batch with the deposit's leaves did not
+ * seal, so the deposit must register a new leaf set as `attempt`.
+ */
 export type AggregatorDepositView =
   | { status: "unknown" }
-  | { status: "queued"; leaves: number }
+  | { status: "queued"; leaves: number; attempt: number }
+  | { status: "rekey"; attempt: number }
   | { status: "batched"; batch: string; stateHash: string; approveBy: number };

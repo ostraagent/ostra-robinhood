@@ -30,20 +30,22 @@ interface IERC3009Receive {
 ///         (program/src/instructions/init_pool.rs, deposit.rs, batch.rs, spend_leaf.rs). Every pool is a
 ///         beacon proxy; its initializer is the Solana InitPool.
 ///
-/// Flow, as on Solana:
-/// * deposit: a depositor puts `amount` in, committing (LtHash) to the leaves it wants and naming the WOTS
-///   key that approves a batch for it. The commitment itself is in the DepositCreated event; the pool keeps
-///   its keccak256, and SealBatch is given the commitment again. A deposit over the per-deposit limit, one
-///   that takes the pool balance over the total limit, or one whose amount after the fee is not a whole
-///   number of leaves is refused.
+/// Flow:
+/// * deposit: a depositor puts `amount` in and names the WOTS key that approves a batch for it. A deposit
+///   over the per-deposit limit, one that takes the pool balance over the total limit, or one whose amount
+///   after the fee is not a whole number of leaves is refused. The deposit names no leaves: its leaves go
+///   to the aggregator off-chain, so nothing on-chain ties a deposit to its leaves (version 2; version 1
+///   recorded an LtHash commitment of the leaves, which let anyone match every deposit to its leaves).
 /// * createBatch / appendLeaves: any aggregator builds a batch of leaves (key root, one leaf of the token).
 ///   Here appendLeaves already refuses a leaf of any other amount (on Solana SealBatch did, since
 ///   AppendLeaves did not read the pool); a batch with such a leaf can never seal either way.
 /// * approveBatch: each depositor approves the batch's exact state with its WOTS approval key, which
 ///   rotates. The approval never reads the batch, so it always lands.
-/// * sealBatch: succeeds only if the batch's leaves are exactly the union of the consumed deposits' committed
-///   leaves (LtHash commitments sum to the accumulator, amounts after fees sum to the leaf total) and every
-///   consumed deposit approved the batch's current state. The fees go to the treasury.
+/// * sealBatch: succeeds only if every consumed deposit approved the batch's current state and their amounts
+///   after fees sum to the batch's leaf total. A depositor approves only a state whose leaves include every
+///   leaf of its own, so the leaves no depositor claims are exactly the other consumed deposits' worth: a
+///   party that adds leaves of its own can only fill the room its own deposits paid for. The fees go to
+///   the treasury.
 /// * spendLeaf: a sealed leaf moves, whole, to the destination its WOTS key signed.
 /// * cancelDeposit: after DEPOSIT_TIMEOUT (48 hours, the Solana 432,000 slots of 400 ms) a deposit no batch
 ///   consumed goes back to its refund owner in full, without fee.
@@ -56,6 +58,8 @@ interface IERC3009Receive {
 contract OstraPool is Initializable, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
+    /// @notice The implementation version: 2 takes deposits without a leaf commitment.
+    uint8 public constant VERSION = 2;
     uint16 public constant MAX_FEE_BPS = 500;
     uint16 public constant MAX_LEAVES_PER_BATCH = 192;
     uint64 public constant LEAF_TOKENS = 10;
@@ -74,7 +78,7 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
 
     bytes20 private constant APPROVE_DOMAIN = "OSTRA/APPROVE/EVM/v1";
     bytes17 private constant LEAF_DOMAIN = "OSTRA/LEAF/EVM/v1";
-    bytes21 private constant DEPOSIT_NONCE_DOMAIN = "OSTRA/DEPOSIT/EVM/v1:";
+    bytes21 private constant DEPOSIT_NONCE_DOMAIN = "OSTRA/DEPOSIT/EVM/v2:";
 
     struct DepositRecord {
         uint8 status;
@@ -84,7 +88,9 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         uint64 approvedBatch; // batch id + 1; 0 = none
         bytes32 approvalKeyRoot;
         bytes32 approvedState;
-        bytes32 commitmentHash;
+        // Version 1 only: keccak256 of the deposit's leaf commitment. Kept so the storage layout does not
+        // move under the beacon upgrade; a version 2 deposit leaves it zero, and only getDeposit returns it.
+        bytes32 legacyCommitmentHash;
     }
 
     struct Batch {
@@ -119,8 +125,7 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         bytes32 depositId,
         uint64 amount,
         address refundOwner,
-        bytes32 approvalKeyRoot,
-        bytes commitment
+        bytes32 approvalKeyRoot
     );
     event BatchCreated(uint64 indexed batchId, address indexed aggregator, uint16 capacity);
     event LeavesAppended(uint64 indexed batchId, uint16 firstIndex, bytes32[] keyRoots);
@@ -144,7 +149,6 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
     error NonStandardDeposit();
     error NonStandardLeaf();
     error DepositExists();
-    error BadCommitment();
     error DepositNotPending();
     error DepositNotConsumed();
     error DepositNotApproved();
@@ -156,7 +160,6 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
     error BatchFull();
     error BatchNotEmpty();
     error BatchAmountMismatch();
-    error BatchCommitmentMismatch();
     error LeafIndexOutOfRange();
     error LeafAlreadySpent();
     error WotsSignatureInvalid();
@@ -225,8 +228,7 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         bytes32 depositId,
         uint64 amount,
         address refundOwner,
-        bytes32 approvalKeyRoot,
-        bytes calldata commitment
+        bytes32 approvalKeyRoot
     ) public view returns (bytes32) {
         return keccak256(
             abi.encodePacked(
@@ -237,21 +239,17 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
                 depositId,
                 amount,
                 refundOwner,
-                approvalKeyRoot,
-                keccak256(commitment)
+                approvalKeyRoot
             )
         );
     }
 
     /// @notice Deposit from the caller, which approved the pool for `amount`.
-    function deposit(
-        bytes32 depositId,
-        uint64 amount,
-        address refundOwner,
-        bytes32 approvalKeyRoot,
-        bytes calldata commitment
-    ) external nonReentrant {
-        _recordDeposit(msg.sender, depositId, amount, refundOwner, approvalKeyRoot, commitment);
+    function deposit(bytes32 depositId, uint64 amount, address refundOwner, bytes32 approvalKeyRoot)
+        external
+        nonReentrant
+    {
+        _recordDeposit(msg.sender, depositId, amount, refundOwner, approvalKeyRoot);
         token.safeTransferFrom(msg.sender, address(this), amount);
     }
 
@@ -263,15 +261,14 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         uint64 amount,
         address refundOwner,
         bytes32 approvalKeyRoot,
-        bytes calldata commitment,
         uint256 validAfter,
         uint256 validBefore,
         uint8 v,
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
-        _recordDeposit(depositor, depositId, amount, refundOwner, approvalKeyRoot, commitment);
-        bytes32 nonce = depositNonce(depositor, depositId, amount, refundOwner, approvalKeyRoot, commitment);
+        _recordDeposit(depositor, depositId, amount, refundOwner, approvalKeyRoot);
+        bytes32 nonce = depositNonce(depositor, depositId, amount, refundOwner, approvalKeyRoot);
         uint256 before = token.balanceOf(address(this));
         IERC3009Receive(address(token)).receiveWithAuthorization(
             depositor, address(this), amount, validAfter, validBefore, nonce, v, r, s
@@ -284,12 +281,10 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         bytes32 depositId,
         uint64 amount,
         address refundOwner,
-        bytes32 approvalKeyRoot,
-        bytes calldata commitment
+        bytes32 approvalKeyRoot
     ) private {
         if (amount == 0) revert ZeroAmount();
         if (refundOwner == address(0) || refundOwner == address(this)) revert InvalidRefundOwner();
-        if (commitment.length != LtHash.BYTES) revert BadCommitment();
         if (amount > maxDeposit) revert DepositOverLimit();
         // The balance counts every token the pool holds, including tokens sent to it directly.
         if (token.balanceOf(address(this)) + amount > maxTotal) revert PoolOverLimit();
@@ -303,8 +298,7 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         d.amount = amount;
         d.refundOwner = refundOwner;
         d.approvalKeyRoot = approvalKeyRoot;
-        d.commitmentHash = keccak256(commitment);
-        emit DepositCreated(key, depositor, depositId, amount, refundOwner, approvalKeyRoot, commitment);
+        emit DepositCreated(key, depositor, depositId, amount, refundOwner, approvalKeyRoot);
     }
 
     /// @notice CancelDeposit: anyone, after DEPOSIT_TIMEOUT; the whole amount goes back to the refund owner.
@@ -404,17 +398,14 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
         emit BatchApproved(key, batchId, state, nextKeyRoot);
     }
 
-    /// @notice SealBatch: only the batch's aggregator. `commitments[i]` is the commitment of `keys[i]`.
-    function sealBatch(uint64 batchId, bytes32[] calldata keys, bytes[] calldata commitments)
-        external
-        nonReentrant
-    {
+    /// @notice SealBatch: only the batch's aggregator, with every deposit the batch consumes. Each must have
+    ///         approved the batch's current state, and their amounts after fees must add up to its leaves.
+    function sealBatch(uint64 batchId, bytes32[] calldata keys) external nonReentrant {
         Batch storage b = _batches[batchId];
         if (b.status != BATCH_OPEN) revert BatchNotOpen();
         if (msg.sender != b.aggregator) revert Unauthorized();
-        if (keys.length == 0 || keys.length != commitments.length) revert EmptyBatch();
-        uint256[64] memory acc = b.acc;
-        bytes32 current = LtHash.stateHash(acc, b.leafCount, b.totalAmount);
+        if (keys.length == 0) revert EmptyBatch();
+        bytes32 current = LtHash.stateHash(b.acc, b.leafCount, b.totalAmount);
         uint256 fee = feeBps;
         uint256 sum;
         uint256 fees;
@@ -422,15 +413,12 @@ contract OstraPool is Initializable, ReentrancyGuardTransient {
             DepositRecord storage d = _deposits[keys[i]];
             if (d.status != DEPOSIT_PENDING) revert DepositNotPending();
             if (d.approvedBatch != batchId + 1 || d.approvedState != current) revert DepositNotApproved();
-            if (keccak256(commitments[i]) != d.commitmentHash) revert BadCommitment();
             uint256 depositFee = (uint256(d.amount) * fee) / 10_000;
             sum += d.amount - depositFee;
             fees += depositFee;
-            LtHash.sub(acc, LtHash.fromBytes(commitments[i]));
             d.status = DEPOSIT_CONSUMED;
         }
         if (sum != b.totalAmount) revert BatchAmountMismatch();
-        if (!LtHash.isZero(acc)) revert BatchCommitmentMismatch();
         b.status = BATCH_SEALED;
         emit BatchSealed(batchId, keys, uint64(fees));
         if (fees > 0) {

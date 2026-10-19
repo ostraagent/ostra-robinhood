@@ -1,8 +1,10 @@
 // The aggregator (design v0.3, core service 5, decided 15 Oct 2026; on
 // Robinhood Chain, design v0.4). It builds the shielded pool's batches:
 //   * a depositor sends the leaves of its pending deposit (POST
-//     /v1/deposits); they are accepted only if their LtHash is the deposit's
-//     on-chain commitment and they add up to its amount after the pool fee;
+//     /v1/deposits), signed by its depositor key; they are accepted only if
+//     they add up to its amount after the pool fee. OstraPool version 2
+//     records nothing about a deposit's leaves on-chain, so the signature is
+//     what ties a leaf set to its deposit, and only this server sees it;
 //   * the deposit names its one-time depositor key and deposit id; their
 //     deposit key (keccak(abi.encode(depositor, depositId)), as the pool
 //     derives it) must be the deposit's, so no event log is read and any RPC
@@ -12,22 +14,26 @@
 //   * with at least MIN_ANONYMITY_DEPOSITS fresh deposits, it creates a batch
 //     sized to their leaves, appends the leaves shuffled, and gives every
 //     depositor the batch's state hash to approve;
-//   * when every deposit approved, it seals the batch (the pool checks the
-//     leaves against the commitments and charges the pool fee) and forgets
-//     which leaves came from which deposit; a batch not approved by all within
-//     APPROVAL_SECONDS is abandoned and built again without the deposits that
-//     did not approve.
+//   * when every deposit approved, it seals the batch (the pool checks every
+//     approval and that the deposits add up to the leaves, and charges the
+//     pool fee) and forgets which leaves came from which deposit; a batch not
+//     approved by all within APPROVAL_SECONDS is abandoned and built again
+//     without the deposits that did not approve;
+//   * an abandoned batch's leaves are public, so every deposit of it must send
+//     a new leaf set (a higher attempt; the poll answers "rekey") before it is
+//     batched again: no two batches ever share a leaf, so comparing them
+//     tells nothing about which leaves are whose.
 // On Solana a sealed batch whose leaves were all spent was then closed for its
 // rent; an EVM batch has no rent, so it is left as it is.
 //
 // The aggregator key can never move pool funds; it can only delay a batch.
 
-import { bytesToHex, decodeEventLog, getAddress, isAddress, keccak256, type Address, type Hex, type PrivateKeyAccount, type PublicClient, type TransactionReceipt } from "viem";
+import { bytesToHex, decodeEventLog, getAddress, isAddress, type Address, type Hex, type PrivateKeyAccount, type PublicClient, type TransactionReceipt } from "viem";
 import {
   LEAF_DENOMINATION,
+  MAX_LEAF_ATTEMPTS,
   MAX_LEAVES_PER_BATCH,
   batchStateOf,
-  depositCommitment,
   depositKey,
   isStandardLeaf,
   leafFromWire,
@@ -38,6 +44,7 @@ import {
   readBatch,
   readPool,
   toHex,
+  verifyAggregatorLeaves,
   verifyAggregatorPoll,
   type AggregatorDepositView,
   type BatchState,
@@ -227,12 +234,16 @@ export class Aggregator {
   // Requests
   // ---------------------------------------------------------------------------
 
-  /** POST /v1/deposits { deposit, leaves }: the leaves of a pending deposit. */
+  /** POST /v1/deposits { deposit, depositor, depositId, attempt, leaves, signature }: a leaf set of a pending deposit. */
   async register(body: unknown): Promise<AggregatorDepositView> {
     if (typeof body !== "object" || body === null) throw new AggregatorError(400, "invalid_request", "the body must be an object");
-    const { deposit: depositValue, depositor: depositorValue, depositId: depositIdValue, leaves: leavesValue } = body as Record<string, unknown>;
+    const { deposit: depositValue, depositor: depositorValue, depositId: depositIdValue, attempt: attemptValue, leaves: leavesValue, signature: signatureValue } = body as Record<string, unknown>;
     const deposit = parseDepositKey(depositValue);
     const depositor = parseDepositor(deposit, depositorValue, depositIdValue);
+    if (typeof attemptValue !== "number" || !Number.isInteger(attemptValue) || attemptValue < 0 || attemptValue >= MAX_LEAF_ATTEMPTS) {
+      throw new AggregatorError(400, "invalid_request", `attempt must be an integer in 0..${MAX_LEAF_ATTEMPTS - 1}`);
+    }
+    const attempt = attemptValue;
     if (!Array.isArray(leavesValue) || leavesValue.length === 0 || leavesValue.length > MAX_LEAVES_PER_BATCH) {
       throw new AggregatorError(400, "invalid_leaves", `leaves must be a list of 1 to ${MAX_LEAVES_PER_BATCH} leaves`);
     }
@@ -246,24 +257,47 @@ export class Aggregator {
       throw new AggregatorError(400, "non_standard_leaf", `every leaf must be ${LEAF_DENOMINATION} base units, the pool's only leaf amount`);
     }
     if (new Set(leaves.map((l) => toHex(l.keyRoot))).size !== leaves.length) throw new AggregatorError(400, "duplicate_leaf", "every leaf of a deposit needs its own key root");
-    if (this.#state.deposits[deposit] !== undefined || this.#state.open?.deposits.includes(deposit) === true) return this.#view(deposit);
+    if (typeof signatureValue !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signatureValue)) {
+      throw new AggregatorError(400, "invalid_request", "signature must be 65 bytes of 0x hex");
+    }
+    const target = { chainId: this.#deployment.chainId, pool: this.#pool.pool, deposit, attempt };
+    if (!(await verifyAggregatorLeaves(depositor, target, leaves, signatureValue as Hex))) {
+      throw new AggregatorError(401, "bad_signature", "the leaves are not signed by the deposit's depositor key");
+    }
+    if (!this.#takes(deposit, attempt)) return this.#view(deposit);
 
     const [d] = (await readDeposits(this.#client, this.#pool.pool, [deposit])) as [DepositState];
     if (d.status === "none") throw new AggregatorError(404, "unknown_deposit", `${deposit} is not a deposit of the pool ${this.#pool.pool}`);
     if (d.status !== "pending") throw new AggregatorError(409, "deposit_not_pending", `${deposit} is already ${d.status}`);
-    if (keccak256(bytesToHex(depositCommitment(leaves))) !== d.commitmentHash.toLowerCase()) {
-      throw new AggregatorError(409, "commitment_mismatch", "the leaves do not match the deposit's commitment");
-    }
     const total = leaves.reduce((s, l) => s + l.amount, 0n);
     const net = poolNetAmount(d.amount, this.#pool.feeBps);
     if (net !== total) throw new AggregatorError(409, "amount_mismatch", `the deposit nets ${net} after the pool fee; the leaves add up to ${total}`);
     // The chain was read without holding anything: another request may have registered it meanwhile.
-    if (this.#state.deposits[deposit] === undefined && this.#state.open?.deposits.includes(deposit) !== true) {
-      this.#state.deposits[deposit] = { deposit, depositor, leaves: leaves.map(leafToWire), queuedAt: this.#now(), polledAt: null, pollNotBefore: 0 };
+    if (this.#takes(deposit, attempt)) {
+      const record = this.#state.deposits[deposit];
+      if (record === undefined) {
+        this.#state.deposits[deposit] = { deposit, depositor, leaves: leaves.map(leafToWire), attempt, minAttempt: 0, queuedAt: this.#now(), polledAt: null, pollNotBefore: 0 };
+      } else {
+        record.leaves = leaves.map(leafToWire);
+        record.attempt = attempt;
+      }
       await this.#save();
-      this.log("deposit_registered", { deposit, leaves: leaves.length });
+      this.log("deposit_registered", { deposit, leaves: leaves.length, attempt });
     }
     return this.#view(deposit);
+  }
+
+  /**
+   * True when leaf set `attempt` would replace what the aggregator holds for
+   * `deposit`: never while the deposit is in the open batch, never below its
+   * minAttempt, and only above the set it holds (a set already held is kept).
+   */
+  #takes(deposit: string, attempt: number): boolean {
+    if (this.#state.open?.deposits.includes(deposit) === true) return false;
+    const record = this.#state.deposits[deposit];
+    if (record === undefined) return true;
+    if (attempt < record.minAttempt) return false;
+    return record.leaves.length === 0 || attempt > record.attempt;
   }
 
   /** GET /v1/deposits/<deposit>?at=<unix seconds>&signature=<0x hex>: a signed poll by the deposit's depositor key. */
@@ -297,7 +331,8 @@ export class Aggregator {
     }
     const record = this.#state.deposits[deposit];
     if (record === undefined) return { status: "unknown" };
-    return { status: "queued", leaves: record.leaves.length };
+    if (record.leaves.length === 0) return { status: "rekey", attempt: record.minAttempt };
+    return { status: "queued", leaves: record.leaves.length, attempt: record.attempt };
   }
 
   terms(): Terms {
@@ -503,17 +538,12 @@ export class Aggregator {
     this.log("batch_appended", { batch: open.batch, leaves: count });
   }
 
-  /** sealBatch with every deposit of the batch and its commitment; the pool fee goes to the treasury. */
+  /** sealBatch with every deposit of the batch; the pool fee goes to the treasury. */
   async #seal(open: OpenBatch, id: bigint): Promise<void> {
     const keys = open.deposits as Hex[];
-    const commitments = keys.map((k) => {
-      const record = this.#state.deposits[k];
-      if (record === undefined) throw new Error(`deposit ${k} of the open batch has no record`);
-      return bytesToHex(depositCommitment(record.leaves.map(leafFromWire)));
-    });
     let tx: string | null = null;
     try {
-      tx = (await this.#send("sealBatch", [id, keys, commitments])).transactionHash;
+      tx = (await this.#send("sealBatch", [id, keys])).transactionHash;
     } catch (err) {
       const now = await readBatch(this.#client, this.#pool.pool, id);
       if (now.status !== "sealed") throw err;
@@ -549,15 +579,36 @@ export class Aggregator {
       record.polledAt = null;
       record.pollNotBefore = now;
     }
+    this.#retireLeaves(open);
     this.#state.open = null;
     await this.#save();
     this.log("batch_abandoned", { batch: open.batch, reason, notApproved: notApproved.length, gone: gone.length });
   }
 
-  /** Forgets an open batch that is not (or no longer) this aggregator's open batch on-chain; its deposits stay queued. */
+  /** Forgets an open batch that is not (or no longer) this aggregator's open batch on-chain; its deposits stay queued, each waiting for a new leaf set. */
   async #dropOpen(open: OpenBatch, reason: string): Promise<void> {
+    this.#retireLeaves(open);
     this.#state.open = null;
     await this.#save();
     this.log("batch_dropped", { batch: open.batch, reason });
+  }
+
+  /**
+   * The leaf sets of a batch that will not seal may be public on-chain, so
+   * none is used again: each of its deposits must send the next attempt. A
+   * deposit out of attempts keeps its record with minAttempt at
+   * MAX_LEAF_ATTEMPTS, so no leaf set of it is ever taken again (deleting it
+   * would let the published set back in as new); cancelDeposit refunds it
+   * after the timeout, and the record goes once the deposit is no longer
+   * pending.
+   */
+  #retireLeaves(open: OpenBatch): void {
+    for (const d of open.deposits) {
+      const record = this.#state.deposits[d];
+      if (record === undefined) continue;
+      record.minAttempt = Math.min(MAX_LEAF_ATTEMPTS, Math.max(record.minAttempt, record.attempt + 1));
+      record.leaves = [];
+      if (record.minAttempt === MAX_LEAF_ATTEMPTS) this.log("deposit_retired", { deposit: d, reason: "leaf_attempts_used" });
+    }
   }
 }

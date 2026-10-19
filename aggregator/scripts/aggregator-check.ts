@@ -3,9 +3,10 @@
 // one standard leaf. Nothing is simulated: every step is a real transaction.
 //
 //   1. Registrations that must be refused: an unknown deposit, a depositor
-//      and deposit id that do not derive the deposit key, leaves that do not
-//      match the commitment, a non-standard leaf, a leaf listed twice, and a
-//      poll not signed by the deposit's depositor key.
+//      and deposit id that do not derive the deposit key, leaves not signed
+//      by the deposit's depositor key, leaves that do not add up to the
+//      deposit after the pool fee, a non-standard leaf, a leaf listed twice,
+//      and a poll not signed by the deposit's depositor key.
 //   2. Seven deposits of the first group registered and polled: no batch
 //      (minimum anonymity 8).
 //   3. The eighth: a batch of the eight is built, its leaves shuffled; every
@@ -15,11 +16,13 @@
 //      the aggregator then closed the spent batch for its rent; an EVM batch
 //      has no rent, so it stays sealed.)
 //   4. The second group: a batch of its eight; seven approve, the eighth does
-//      not: after APPROVAL_SECONDS the batch is abandoned (closed for good),
-//      and with only seven fresh deposits no new batch is built until the
-//      eighth polls again.
-//   5. The eighth polls: a new batch of the eight, all approve, it is sealed
-//      as in step 3 and its leaves are spent.
+//      not: after APPROVAL_SECONDS the batch is abandoned (closed for good).
+//      Its leaves are public, so every one of its deposits is asked for a new
+//      leaf set (attempt 1) and the old set is not taken again; with only
+//      seven fresh deposits no new batch is built until the eighth polls again.
+//   5. The eighth polls: a new batch of the eight, sharing no leaf with the
+//      abandoned one; all approve, it is sealed as in step 3 and its leaves
+//      are spent.
 // On Solana one group of eight went through the abandoned batch first and was
 // sealed after it. Here a group is sealed before the 15-minute wait, so every
 // token state a seal touches is read early: a mainnet fork (the fork test)
@@ -78,7 +81,6 @@ import {
   batchStateOf,
   checkDeployment,
   depositAuthorizationTypedData,
-  depositCommitment,
   depositForLeaves,
   depositKey,
   fromHex,
@@ -90,6 +92,7 @@ import {
   retryingHttp,
   robinhoodChain,
   sha256,
+  signAggregatorLeaves,
   signAggregatorPoll,
   signApproveBatch,
   signSpendLeaf,
@@ -185,6 +188,8 @@ type Depositor = {
   key: PrivateKeyAccount;
   approval: WotsKeychain;
   leafKeys: WotsKeychain;
+  /** The leaf set it offers: attempt a is one leaf with leaf key a. */
+  attempt: number;
   leaves: Leaf[];
   deposit: Hex;
   depositId: Hex;
@@ -201,7 +206,7 @@ function depositorsOf(master: Uint8Array, store: FileWotsStore): Depositor[] {
     const approval = new WotsKeychain(master, sha256([utf8("OSTRA/CHECK/APPROVE/EVM/v1"), i]), store);
     const leafKeys = new WotsKeychain(master, sha256([utf8("OSTRA/CHECK/LEAF/EVM/v1"), i]), store);
     const depositId = bytesToHex(sha256([utf8("OSTRA/CHECK/DEPOSIT-ID/EVM/v1"), master, i]));
-    out.push({ index, key, approval, leafKeys, leaves: [{ keyRoot: leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION }], deposit: depositKey(key.address, depositId), depositId });
+    out.push({ index, key, approval, leafKeys, attempt: 0, leaves: [{ keyRoot: leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION }], deposit: depositKey(key.address, depositId), depositId });
   }
   return out;
 }
@@ -259,13 +264,17 @@ async function main(): Promise<void> {
     const res = await fetch(`${base}${path}`, init);
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
-  /** POST /v1/deposits: the deposit key, the depositor and deposit id it derives from, and the leaves. */
-  const register = (who: { deposit: Hex; depositor: Address; depositId: Hex }, leaves: Leaf[]) =>
-    http("/v1/deposits", {
+  /** POST /v1/deposits: the deposit key, the depositor and deposit id it derives from, and leaf set `attempt` signed by `signer`. */
+  const register = async (who: { deposit: Hex; depositor: Address; depositId: Hex }, leaves: Leaf[], signer: PrivateKeyAccount, attempt: number) => {
+    const signature = await signAggregatorLeaves(signer, { chainId: d.chainId, pool, deposit: who.deposit, attempt }, leaves);
+    return http("/v1/deposits", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ deposit: who.deposit, depositor: who.depositor, depositId: who.depositId, leaves: leaves.map(leafToWire) }),
+      body: JSON.stringify({ deposit: who.deposit, depositor: who.depositor, depositId: who.depositId, attempt, leaves: leaves.map(leafToWire), signature }),
     });
+  };
+  /** Registers the depositor's current leaf set. */
+  const registerOwn = (dep: Depositor) => register(named(dep), dep.leaves, dep.key, dep.attempt);
   const named = (dep: Depositor) => ({ deposit: dep.deposit, depositor: dep.key.address, depositId: dep.depositId });
   const poll = async (dep: Depositor, signer: PrivateKeyAccount = dep.key) => {
     const at = BigInt(nowSeconds());
@@ -288,7 +297,7 @@ async function main(): Promise<void> {
     const leaf = dep.leaves[0] as Leaf;
     const leafIndex = b.leaves.findIndex((l) => l.keyRoot.toLowerCase() === bytesToHex(leaf.keyRoot));
     if (leafIndex < 0) throw new Error(`depositor ${dep.index}: its leaf is not in batch ${b.batchId}`);
-    const s = await signSpendLeaf(dep.leafKeys, { index: 0n, leafKeyRoot: bytesToHex(leaf.keyRoot) }, { chainId: d.chainId, pool, batchId: b.batchId, leafIndex, destination, leafAmount: LEAF_DENOMINATION });
+    const s = await signSpendLeaf(dep.leafKeys, { index: BigInt(dep.attempt), leafKeyRoot: bytesToHex(leaf.keyRoot) }, { chainId: d.chainId, pool, batchId: b.batchId, leafIndex, destination, leafAmount: LEAF_DENOMINATION });
     return send(pool, ostraPoolAbi, "spendLeaf", [s.batchId, s.leafIndex, s.destination, s.signature]);
   };
   /** Polls the depositors in `who` until each reports a batch (or `seconds` pass); returns their views. */
@@ -341,7 +350,6 @@ async function main(): Promise<void> {
           amount,
           refundOwner: funder.address,
           approvalKeyRoot: bytesToHex(dep.approval.keyRoot(0n)),
-          commitment: depositCommitment(dep.leaves),
         };
         const validBefore = (await chainTime()) + AUTHORIZATION_TTL_SECONDS;
         const signature = await dep.key.signTypedData(depositAuthorizationTypedData({ ...args, chainId: d.chainId, pool, validAfter: 0n, validBefore }));
@@ -352,7 +360,6 @@ async function main(): Promise<void> {
           args.amount,
           args.refundOwner,
           args.approvalKeyRoot,
-          bytesToHex(args.commitment),
           0n,
           validBefore,
           v === undefined ? yParity + 27 : Number(v),
@@ -372,22 +379,24 @@ async function main(): Promise<void> {
       const d0 = groupA[0] as Depositor;
       const stranger = privateKeyToAccount(generatePrivateKey());
       const strangerId = bytesToHex(randomBytes(32));
-      let r = await register({ deposit: depositKey(stranger.address, strangerId), depositor: stranger.address, depositId: strangerId }, d0.leaves);
+      let r = await register({ deposit: depositKey(stranger.address, strangerId), depositor: stranger.address, depositId: strangerId }, d0.leaves, stranger, 0);
       check(r.status === 404 && r.body.error === "unknown_deposit", "a key that is not a deposit is refused", r);
-      r = await register({ deposit: d0.deposit, depositor: stranger.address, depositId: d0.depositId }, d0.leaves);
+      r = await register({ deposit: d0.deposit, depositor: stranger.address, depositId: d0.depositId }, d0.leaves, stranger, 0);
       check(r.status === 400 && r.body.error === "invalid_depositor", "a depositor that does not derive the deposit key is refused (no event log is read)", r);
-      r = await register(named(d0), [{ keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION }]);
-      check(r.status === 409 && r.body.error === "commitment_mismatch", "leaves that do not match the deposit's commitment are refused", r);
-      r = await register(named(d0), [{ keyRoot: d0.leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION / 2n }, { keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION / 2n }]);
+      r = await register(named(d0), d0.leaves, stranger, 0);
+      check(r.status === 401 && r.body.error === "bad_signature", "leaves not signed by the deposit's depositor key are refused (the chain holds nothing to check them against)", r);
+      r = await register(named(d0), [d0.leaves[0] as Leaf, { keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION }], d0.key, 0);
+      check(r.status === 409 && r.body.error === "amount_mismatch", "leaves that do not add up to the deposit after the pool fee are refused", r);
+      r = await register(named(d0), [{ keyRoot: d0.leafKeys.keyRoot(0n), amount: LEAF_DENOMINATION / 2n }, { keyRoot: d0.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION / 2n }], d0.key, 0);
       check(r.status === 400 && r.body.error === "non_standard_leaf", "a leaf of another amount is refused", r);
-      r = await register(named(d0), [d0.leaves[0] as Leaf, d0.leaves[0] as Leaf]);
+      r = await register(named(d0), [d0.leaves[0] as Leaf, d0.leaves[0] as Leaf], d0.key, 0);
       check(r.status === 400 && r.body.error === "duplicate_leaf", "a leaf listed twice is refused", r);
       r = await poll(d0);
       check(r.status === 200 && r.body.status === "unknown", "a deposit not registered polls as unknown", r);
 
       // --- 2. seven deposits of the first group: no batch -----------------------------------------
       for (const dep of groupA.slice(0, GROUP - 1)) {
-        r = await register(named(dep), dep.leaves);
+        r = await registerOwn(dep);
         if (r.status !== 200 || r.body.status !== "queued") throw new Error(`registration of deposit ${dep.index} failed: ${toJson(r)}`);
         await poll(dep);
       }
@@ -398,7 +407,7 @@ async function main(): Promise<void> {
       check(health.open === null && health.fresh === GROUP - 1, "seven fresh deposits: no batch is built below the minimum anonymity", { open: health.open, fresh: health.fresh });
 
       // --- 3. the eighth: a batch of eight, approved by all and sealed -----------------------------
-      r = await register(named(groupA[GROUP - 1] as Depositor), (groupA[GROUP - 1] as Depositor).leaves);
+      r = await registerOwn(groupA[GROUP - 1] as Depositor);
       check(r.status === 200 && r.body.status === "queued", "the eighth deposit is registered", r.body);
       const batched = async (group: Depositor[], what: string): Promise<{ batchId: bigint; state: Hex } | null> => {
         const views = await waitBatched(group, 4 * PASS_SECONDS + 60);
@@ -434,7 +443,7 @@ async function main(): Promise<void> {
       // --- 4. the second group: seven approve, the eighth does not: abandoned ----------------------
       // (Sealed first, then abandoned: every token state a seal touches is read before the 15-minute wait.)
       for (const dep of groupB) {
-        r = await register(named(dep), dep.leaves);
+        r = await registerOwn(dep);
         if (r.status !== 200 || r.body.status !== "queued") throw new Error(`registration of deposit ${dep.index} failed: ${toJson(r)}`);
       }
       const b1 = await batched(groupB, "the second group's eight deposits report one new batch and state hash");
@@ -452,7 +461,19 @@ async function main(): Promise<void> {
         abandoned = await proc.waitEvent((e) => e.event === "batch_abandoned" && e.batch === b1.batchId.toString(), 60);
       }
       check(abandoned?.reason === "approval_expired" && abandoned.notApproved === 1, "the batch is abandoned when one deposit does not approve in time", abandoned);
-      check((await readBatch(client, pool, b1.batchId)).status === "closed", "the abandoned batch is closed on-chain (it can never be sealed)");
+      const closed = await readBatch(client, pool, b1.batchId);
+      check(closed.status === "closed", "the abandoned batch is closed on-chain (it can never be sealed)");
+      const rekey: AggregatorDepositView[] = [];
+      for (const dep of groupB) rekey.push(await viewOf(dep));
+      check(rekey.every((v) => v.status === "rekey" && v.attempt === 1), "every deposit of the abandoned batch is asked for a new leaf set (its leaves are public in the closed batch)", rekey);
+      r = await registerOwn(groupB[0] as Depositor);
+      check(r.status === 200 && r.body.status === "rekey", "the leaf set of the abandoned batch is not taken again", r.body);
+      for (const dep of groupB) {
+        dep.attempt = 1;
+        dep.leaves = [{ keyRoot: dep.leafKeys.keyRoot(1n), amount: LEAF_DENOMINATION }];
+        r = await registerOwn(dep);
+        if (r.status !== 200 || r.body.status !== "queued" || r.body.attempt !== 1) throw new Error(`the new leaf set of deposit ${dep.index} was not taken: ${toJson(r)}`);
+      }
       for (const dep of early) await poll(dep);
       await sleep((2 * PASS_SECONDS + 5) * 1000);
       health = (await http("/v1/health")).body;
@@ -463,7 +484,9 @@ async function main(): Promise<void> {
       const b2 = await batched(groupB, "once the eighth polls again a new batch of the eight is built");
       if (b2 === null || b2.batchId === b1.batchId) throw new Error("no second batch was built for the second group");
       const bB = await readBatch(client, pool, b2.batchId);
-      check(groupB.every((dep) => batchContainsLeaves(bB, dep.leaves)) && batchStateOf(bB).toLowerCase() === b2.state, "every depositor finds its leaf in the new batch, at the state hash given");
+      check(groupB.every((dep) => batchContainsLeaves(bB, dep.leaves)) && batchStateOf(bB).toLowerCase() === b2.state, "every depositor finds its new leaf in the new batch, at the state hash given");
+      const abandonedRoots = new Set(closed.leaves.map((l) => l.keyRoot.toLowerCase()));
+      check(closed.leaves.length === GROUP && bB.leaves.every((l) => !abandonedRoots.has(l.keyRoot.toLowerCase())), "the new batch shares no leaf with the abandoned one, so comparing the two links no leaf to a deposit");
       await sealAndSpend(groupB, b2.batchId, b2.state, await tokenBalance(poolInfo.treasury));
     } catch (err) {
       runError = err;

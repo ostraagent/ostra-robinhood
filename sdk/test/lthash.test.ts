@@ -72,7 +72,7 @@ test("homomorphism: union adds, the seal check reaches zero", () => {
   const d1 = fromHex(acc("deposit_1_ab"));
   const d2 = fromHex(acc("deposit_2_cmax"));
   assert.equal(toHex(lthashAdd(d1.slice(), d2)), toHex(batch));
-  // SealBatch: acc -= each consumed commitment, must end at zero.
+  // Subtracting the LtHash of each part from the union's ends at zero.
   const rest = lthashSub(lthashSub(batch.slice(), d1), d2);
   assert.ok(lthashIsZero(rest));
   // Missing or substituted leaf: the check fails.

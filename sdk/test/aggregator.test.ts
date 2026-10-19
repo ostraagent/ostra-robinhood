@@ -1,5 +1,5 @@
-// Wire format, commitments and poll signatures shared by the aggregator and
-// the depositors. That a batch built from these leaves seals on-chain is
+// Wire format, state hashes and the leaf and poll signatures shared by the
+// aggregator and the depositors. That a batch built from these leaves seals on-chain is
 // checked by test/messages.fork.test.ts and the aggregator's own checks.
 
 import assert from "node:assert/strict";
@@ -7,14 +7,17 @@ import { test } from "node:test";
 import { bytesToHex, keccak256, stringToHex, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
+  MAX_LEAF_ATTEMPTS,
+  aggregatorLeavesMessage,
   aggregatorPollMessage,
   batchContainsLeaves,
   batchLeavesStandard,
-  depositCommitment,
   leafFromWire,
   leafToWire,
   leavesStateHash,
+  signAggregatorLeaves,
   signAggregatorPoll,
+  verifyAggregatorLeaves,
   verifyAggregatorPoll,
   type BatchLeaves,
 } from "../src/aggregator.ts";
@@ -63,18 +66,12 @@ test("malformed wire leaves are refused", () => {
   assert.throws(() => leafToWire({ keyRoot: root(1), amount: 0n }));
 });
 
-test("the deposit commitment is the LtHash of the encoded leaves, in any order", () => {
-  const leaves = [leaf(1), leaf(2), leaf(3)];
-  const expected = lthashOfLeaves(leaves.map((l) => encodeLeaf(l.keyRoot, l.amount)));
-  assert.deepEqual(depositCommitment(leaves), expected);
-  assert.deepEqual(depositCommitment([leaves[2]!, leaves[0]!, leaves[1]!]), expected);
-  assert.notDeepEqual(depositCommitment([leaf(1), leaf(2)]), expected);
-});
-
-test("the state hash of a set of leaves is the one of a batch holding exactly them", () => {
+test("the state hash of a set of leaves is the one of a batch holding exactly them, in any order", () => {
   const leaves = [leaf(4), leaf(5), leaf(6, 20_000_000n)];
-  assert.deepEqual(leavesStateHash(leaves), batchStateHash(depositCommitment(leaves), 3, 40_000_000n));
+  const acc = lthashOfLeaves(leaves.map((l) => encodeLeaf(l.keyRoot, l.amount)));
+  assert.deepEqual(leavesStateHash(leaves), batchStateHash(acc, 3, 40_000_000n));
   assert.deepEqual(leavesStateHash([leaves[1]!, leaves[2]!, leaves[0]!]), leavesStateHash(leaves));
+  assert.notDeepEqual(leavesStateHash([leaf(4), leaf(5)]), leavesStateHash(leaves));
 });
 
 test("a depositor finds its leaves in a batch, counted as a multiset", () => {
@@ -111,4 +108,34 @@ test("a poll is signed by the depositor key and bound to the chain, the pool, th
   assert.equal(await verifyAggregatorPoll(signer.address, target, 1_792_000_001n, sig), false, "another time");
   assert.equal(await verifyAggregatorPoll(signer.address, target, 1_792_000_000n, sig.slice(0, -2) as Hex), false, "short signature");
   assert.equal(await verifyAggregatorPoll(signer.address, target, 1_792_000_000n, "0xzz" as Hex), false, "not hex");
+});
+
+test("a leaf set is signed by the depositor key and bound to the chain, the pool, the deposit, the attempt and every leaf", async () => {
+  const signer = privateKeyToAccount(`0x${"07".repeat(32)}`);
+  const other = privateKeyToAccount(`0x${"08".repeat(32)}`);
+  const target = { chainId: 4663, pool: POOL, deposit: DEPOSIT, attempt: 3 } as const;
+  const leaves = [leaf(1), leaf(2)];
+  const message = aggregatorLeavesMessage(target, leaves);
+  assert.equal(message.length, 30 + 32 + 20 + 32 + 4 + 32);
+  assert.deepEqual(message.subarray(0, 30), utf8("OSTRA/AGGREGATOR/LEAVES/EVM/v1"));
+  assert.equal(bytesToHex(message.subarray(114, 118)), "0x00000003");
+  // keccak256 of every leaf as key root (32 bytes) || amount (u64 big-endian).
+  const packed = `0x${"01".repeat(32)}0000000000989680${"02".repeat(32)}0000000000989680` as Hex;
+  assert.equal(bytesToHex(message.subarray(118)), keccak256(packed));
+  const sig = await signAggregatorLeaves(signer, target, leaves);
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, leaves, sig), true);
+  assert.equal(await verifyAggregatorLeaves(other.address, target, leaves, sig), false, "another owner");
+  assert.equal(await verifyAggregatorLeaves(signer.address, { ...target, attempt: 4 }, leaves, sig), false, "another attempt");
+  assert.equal(await verifyAggregatorLeaves(signer.address, { ...target, deposit: OTHER }, leaves, sig), false, "another deposit");
+  assert.equal(await verifyAggregatorLeaves(signer.address, { ...target, pool: OTHER_POOL }, leaves, sig), false, "another pool");
+  assert.equal(await verifyAggregatorLeaves(signer.address, { ...target, chainId: 1 }, leaves, sig), false, "another chain");
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, [leaf(1), leaf(3)], sig), false, "another leaf");
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, [leaf(2), leaf(1)], sig), false, "another order");
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, [leaf(1)], sig), false, "a leaf left out");
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, [leaf(1), leaf(2, 20_000_000n)], sig), false, "another amount");
+  assert.equal(await verifyAggregatorLeaves(signer.address, target, leaves, "0xzz" as Hex), false, "not hex");
+  assert.throws(() => aggregatorLeavesMessage({ ...target, attempt: MAX_LEAF_ATTEMPTS }, leaves), RangeError);
+  assert.throws(() => aggregatorLeavesMessage({ ...target, attempt: -1 }, leaves), RangeError);
+  assert.throws(() => aggregatorLeavesMessage({ ...target, attempt: 1.5 }, leaves), RangeError);
+  assert.throws(() => aggregatorLeavesMessage(target, []), RangeError);
 });

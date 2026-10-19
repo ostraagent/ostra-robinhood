@@ -60,7 +60,6 @@ export async function readDeposits(client: PublicClient, pool: Address, keys: re
       approvedBatch: d.approvedBatch === 0n ? null : d.approvedBatch - 1n,
       approvalKeyRoot: d.approvalKeyRoot,
       approvedState: /^0x0{64}$/.test(d.approvedState) ? null : d.approvedState,
-      commitmentHash: d.commitmentHash,
     };
   });
 }

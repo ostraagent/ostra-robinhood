@@ -36,7 +36,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraPoolAbi, ostraVaultAbi, ostraVaultFactoryAbi, x402BatchSettlementAbi } from "../src/abi.ts";
-import { depositCommitment, type Leaf } from "../src/aggregator.ts";
+import type { Leaf } from "../src/aggregator.ts";
 import { airdropLeaf, airdropTree } from "../src/airdrop.ts";
 import { CIRCUIT_BREAKER, DEFAULT_RECOVERY_DELAY, MIN_RECOVERY_DELAY, POOL_SETTING, ROBINHOOD_CHAIN_ID, UNISWAP_V4_POOL_MANAGER, USDG, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE, X402_BATCH_SETTLEMENT } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
@@ -655,7 +655,6 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
   assert.equal(pool.feeBps, 30);
   assert.equal(pool.leafAmount, LEAF_DENOMINATION);
   const leaves: Leaf[] = [{ keyRoot: leafChain.keyRoot(0n), amount: LEAF_DENOMINATION }];
-  const commitment = depositCommitment(leaves);
   const depositId = keccak256(stringToHex("deposit 1"));
   const amount = depositForLeaves(1, pool.feeBps);
   const args = {
@@ -664,7 +663,6 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
     amount,
     refundOwner: depositor.address,
     approvalKeyRoot: bytesToHex(approvalChain.keyRoot(0n)),
-    commitment,
   };
   const key = depositKey(depositor.address, depositId);
   assert.equal(key, await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "depositKey", args: [depositor.address, depositId] }));
@@ -674,7 +672,7 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
       address: d.pool,
       abi: ostraPoolAbi,
       functionName: "depositNonce",
-      args: [depositor.address, depositId, amount, depositor.address, args.approvalKeyRoot, bytesToHex(commitment)],
+      args: [depositor.address, depositId, amount, depositor.address, args.approvalKeyRoot],
     }),
   );
 
@@ -689,7 +687,6 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
     amount,
     depositor.address,
     args.approvalKeyRoot,
-    bytesToHex(commitment),
     0n,
     typed.message.validBefore,
     Number(v),
@@ -699,7 +696,7 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
   const dep = await readDeposit(fork.client, d.pool, key);
   assert.equal(dep.status, "pending");
   assert.equal(dep.amount, amount);
-  assert.equal(dep.commitmentHash, keccak256(bytesToHex(commitment)));
+  assert.equal(await fork.client.readContract({ address: d.pool, abi: ostraPoolAbi, functionName: "VERSION" }), 2);
   assert.equal(await balance(depositor.address), 0n);
 
   // A batch of the one leaf; the depositor approves its exact state.
@@ -723,7 +720,7 @@ test("pool messages are the pool's own; a relayed deposit is approved, sealed an
   assert.equal(approved.approvedState, state);
   assert.equal(approved.approvalKeyRoot, nextRoot);
 
-  await send(d.pool, ostraPoolAbi, "sealBatch", [batchId, [key], [bytesToHex(commitment)]]);
+  await send(d.pool, ostraPoolAbi, "sealBatch", [batchId, [key]]);
   assert.equal((await readBatch(fork.client, d.pool, batchId)).status, "sealed");
   assert.equal((await readDeposit(fork.client, d.pool, key)).status, "consumed");
 

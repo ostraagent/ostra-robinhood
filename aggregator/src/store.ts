@@ -3,6 +3,11 @@
 // until their batch is sealed; a sealed batch's deposits are deleted from it
 // at once (design v0.3: the aggregator forgets that mapping after the seal).
 //
+// State version 2 (OstraPool version 2, 19 Oct 2026) adds each deposit's leaf
+// set attempt: a batch that does not seal published its leaves, so its
+// deposits must send a new set (minAttempt) before they are batched again.
+// A version 1 file loads with every deposit at attempt 0.
+//
 // The file is written to a temporary file and renamed, so a crash leaves
 // either the old or the new state. Saves run one at a time and always write
 // the latest state.
@@ -22,7 +27,12 @@ export type DepositRecord = {
   deposit: string;
   /** The depositor (named at registration and checked to derive the deposit key): the one-time key whose EIP-191 signature polls it. */
   depositor: string;
+  /** The deposit's current leaf set; empty while a new one is awaited (attempt < minAttempt). */
   leaves: WireLeaf[];
+  /** The attempt number of `leaves` (signed by the depositor key with them). */
+  attempt: number;
+  /** The lowest attempt accepted next: one above every attempt whose leaves went into a batch that did not seal (MAX_LEAF_ATTEMPTS: none is). */
+  minAttempt: number;
   /** Unix seconds; the queue order (a deposit that let a batch expire goes to the back). */
   queuedAt: number;
   /** Unix seconds of the latest signed poll, or null until the depositor polls (again). */
@@ -53,14 +63,14 @@ export type OpenBatch = {
 };
 
 export type AggregatorState = {
-  version: 1;
+  version: 2;
   /** Every registered pending deposit, including those of the open batch until it is sealed. */
   deposits: Record<string, DepositRecord>;
   open: OpenBatch | null;
 };
 
 export function emptyState(): AggregatorState {
-  return { version: 1, deposits: {}, open: null };
+  return { version: 2, deposits: {}, open: null };
 }
 
 export class StateStore {
@@ -79,9 +89,16 @@ export class StateStore {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
       throw err;
     }
-    const state = JSON.parse(text) as AggregatorState;
-    if (state.version !== 1) throw new Error(`${this.path}: unknown state version ${String(state.version)}`);
-    return state;
+    const state = JSON.parse(text) as Omit<AggregatorState, "version"> & { version: number };
+    if (state.version === 1) {
+      for (const r of Object.values(state.deposits) as (DepositRecord & { attempt?: number; minAttempt?: number })[]) {
+        r.attempt ??= 0;
+        r.minAttempt ??= 0;
+      }
+      state.version = 2;
+    }
+    if (state.version !== 2) throw new Error(`${this.path}: unknown state version ${String(state.version)}`);
+    return state as AggregatorState;
   }
 
   /** Writes `state` as it is when this write runs (later changes to the object are picked up). */

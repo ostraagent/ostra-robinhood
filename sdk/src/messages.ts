@@ -58,13 +58,12 @@ import {
   X402_MAX_WITHDRAW_DELAY,
   X402_MIN_WITHDRAW_DELAY,
 } from "./constants.ts";
-import { LTHASH_BYTES } from "./lthash.ts";
 import { WOTS_SIGNATURE_LEN, type WotsKeychain } from "./wots.ts";
 
 const SPEND_DOMAIN = stringToHex("OSTRA/VAULT/EVM/v1"); // bytes18
 const APPROVE_DOMAIN = stringToHex("OSTRA/APPROVE/EVM/v1"); // bytes20
 const LEAF_DOMAIN = stringToHex("OSTRA/LEAF/EVM/v1"); // bytes17
-const DEPOSIT_NONCE_DOMAIN = stringToHex("OSTRA/DEPOSIT/EVM/v1:"); // bytes21
+const DEPOSIT_NONCE_DOMAIN = stringToHex("OSTRA/DEPOSIT/EVM/v2:"); // bytes21 (OstraPool version 2)
 
 const ZERO32: Hex = `0x${"00".repeat(32)}`;
 const U64_MAX = (1n << 64n) - 1n;
@@ -755,20 +754,13 @@ export type DepositArgs = {
   amount: bigint;
   refundOwner: Address;
   approvalKeyRoot: Hex;
-  /** The LtHash commitment of the deposit's leaves (2,048 bytes). */
-  commitment: Uint8Array;
 };
-
-function commitmentHex(commitment: Uint8Array): Hex {
-  if (commitment.length !== LTHASH_BYTES) throw new RangeError(`commitment must be ${LTHASH_BYTES} bytes`);
-  return bytesToHex(commitment);
-}
 
 /** OstraPool.depositNonce: the EIP-3009 nonce that binds every field of a relayed deposit. */
 export function depositNonce(a: DepositArgs & { chainId: number; pool: Address }): Hex {
   return keccak256(
     encodePacked(
-      ["bytes21", "uint256", "address", "address", "bytes32", "uint64", "address", "bytes32", "bytes32"],
+      ["bytes21", "uint256", "address", "address", "bytes32", "uint64", "address", "bytes32"],
       [
         DEPOSIT_NONCE_DOMAIN,
         chain(a.chainId),
@@ -778,7 +770,6 @@ export function depositNonce(a: DepositArgs & { chainId: number; pool: Address }
         positive(a.amount, U64_MAX, "amount"),
         nonZeroAddr(a.refundOwner, "refundOwner"),
         nonZero32(a.approvalKeyRoot, "approvalKeyRoot"),
-        keccak256(commitmentHex(a.commitment)),
       ],
     ),
   );

@@ -29,9 +29,14 @@ Contents:
   whose PoolManager runs on chain 4663.
 - `src/OstraSplit.sol`: the receiver of a seller's channels, paying fixed bps shares (the keeper fee)
   and the rest to the seller vault.
-- `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009), batches
-  of one-leaf-each leaves checked with LtHash, WOTS approvals, sealing, WOTS leaf spends, refunds after
-  48 hours. `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG.
+- `src/OstraPool.sol`: the shielded pool for one token. Deposits (also relayed with EIP-3009) that
+  record nothing about their leaves, batches of standard leaves whose state (an LtHash of the leaves)
+  every consumed deposit approves with its WOTS key, sealing when the deposits add up to the
+  leaves, WOTS leaf spends, refunds after 48 hours. Version 2 (19 Oct 2026): version 1 recorded each
+  deposit's LtHash commitment, from which anyone could match every deposit to its leaves; the live
+  pool is upgraded through its beacon (`sdk/scripts/upgrade-pool.ts`, same storage layout).
+  `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG, including that upgrade of
+  the live pool.
 - `src/launchpad/`: the Ostra launchpad on the deployed Uniswap v4 PoolManager. `OstraLaunchpad`
   launches a fixed-supply `OstraToken` whose whole supply goes into single-sided tiers of one pool
   (the top tier open to the highest price), held forever by `OstraLocker`; `OstraHook`, the pools'
@@ -152,8 +157,8 @@ Contents:
   `scripts/chain-check.ts` runs it end to end against the keeper, the relayer and a seller server;
   its fork test runs it on a mainnet fork. `test/recovery.fork.test.ts` runs a guardian recovery
   on a fork.
-  `test/shield.fork.test.ts` runs shield, the creator vault's auto-shield and unshield against the
-  aggregator on a fork. `test/launchpad.fork.test.ts` runs the launchpad service on a fork.
+  `test/shield.fork.test.ts` runs shield, the creator vault's auto-shield, an abandoned batch with
+  the new leaf sets after it, and unshield against the aggregator on a fork. `test/launchpad.fork.test.ts` runs the launchpad service on a fork.
 - `mcp/`: Ostra Agent's MCP server (`@ostraagent/mcp`, stdio, `@modelcontextprotocol/sdk` 1.32.1).
   Its keys and records stay in OSTRA_HOME (0700; files 0600; the seed backed up with
   `node src/backup-cli.ts export <file>`, encrypted under a passphrase typed in a terminal). Tools:
@@ -164,14 +169,15 @@ Contents:
   tool says whether it was refused before anything was signed. With OSTRA_RELAYER_URL the agent needs
   no ETH. `test/mcp.fork.test.ts` drives the server over stdio on a fork.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
-  batches: a depositor posts the leaves of its pending deposit (checked against the on-chain
-  commitment and amount) with its depositor key and deposit id (checked to derive the deposit key,
-  so no event log is read and an RPC that limits eth_getLogs serves it) and polls it with an
-  EIP-191 signature of its depositor key; with at least
+  batches: a depositor posts a leaf set of its pending deposit, signed (EIP-191) by its depositor
+  key and checked against the deposit's amount after the pool fee, with that key and its deposit
+  id (checked to derive the deposit key, so no event log is read and an RPC that limits
+  eth_getLogs serves it), and polls it with an EIP-191 signature of the same key. A batch that
+  does not seal has published its leaves, so each of its deposits must send a new leaf set (the
+  next attempt) before it is batched again, and no two batches share a leaf; with at least
   8 deposits polled in the last 10 minutes it creates a batch, appends the leaves shuffled, seals it
   once every deposit approved within 15 minutes or abandons it, and forgets which leaf came from
-  which deposit after the seal. A batch takes at most 43 deposits, so its sealBatch transaction
-  stays under the sequencer's 95,000-byte limit. `scripts/aggregator-check.ts` runs the aggregator
+  which deposit after the seal. A batch takes at most 43 deposits. `scripts/aggregator-check.ts` runs the aggregator
   process end to end with sixteen depositors in two groups of eight; its fork test runs it on a
   mainnet fork (it waits out the 900-second approval window once, about 20 minutes).
 - `rpc-proxy/`: the RPC proxy for the web app (`@ostraagent/rpc-proxy`). It forwards one JSON-RPC
@@ -192,6 +198,10 @@ and the dispatcher.
 
 - `sdk/scripts/deploy.ts` deploys from the Foundry build with the deployer key in a 0600 file and
   writes the record; run again, it resumes or only checks. Its fork test runs it as on mainnet.
+- `sdk/scripts/upgrade-pool.ts` upgrades the pool to OstraPool version 2 with the beacon owner's key
+  (only an empty pool), compares every pool setting before and after, and rewrites
+  `poolImplementation` in the record; run again, it only checks. Its fork test upgrades the live
+  pool on a mainnet fork.
 - `relayer/scripts/setup-mainnet.ts` then creates the services' keys under `/etc/ostra/robinhood`
   (0700), the operator vault (the keeper fee recipient) and the relayer's seller vault with the
   keeper crank, tops up the keeper, relayer and aggregator accounts with ETH from the deployer, and

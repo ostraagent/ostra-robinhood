@@ -2,9 +2,9 @@
 // src/LtHash.sol (and the Solana program's lthash.rs): 1024 little-endian u16 lanes, wrapping addition,
 // each element expanded by SHA-256 in counter mode.
 //
-// A depositor commits to the multiset of its leaves; SealBatch subtracts every
-// consumed deposit's commitment from the batch accumulator and requires zero,
-// so the published leaves must be exactly the union of the committed ones.
+// The batch accumulator is the LtHash of the batch's leaves; the state a
+// depositor approves hashes it with the leaf count and total, so an approval
+// covers exactly the leaves the batch holds (OstraPool.batchState).
 
 import { keccak256, sha256, u64Le, utf8 } from "./hash.ts";
 
@@ -89,7 +89,7 @@ export function lthashIsZero(acc: Uint8Array): boolean {
   return x === 0;
 }
 
-/** Commitment to a multiset of encoded leaves (order does not matter). */
+/** LtHash of a multiset of encoded leaves (order does not matter). */
 export function lthashOfLeaves(leaves: readonly Uint8Array[]): Uint8Array {
   const acc = lthashZero();
   for (const leaf of leaves) lthashAddLeaf(acc, leaf);

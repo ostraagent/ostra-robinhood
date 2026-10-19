@@ -12,6 +12,8 @@ function rec(n: number, o: { leaves?: number; queuedAt?: number; polledAt?: numb
     deposit: `deposit-${String(n).padStart(3, "0")}`,
     depositor: "0x00000000000000000000000000000000000000aa",
     leaves: Array.from({ length: o.leaves ?? 1 }, () => leaf),
+    attempt: 0,
+    minAttempt: 0,
     queuedAt: o.queuedAt ?? NOW - 1000 + n,
     polledAt: o.polledAt === undefined ? NOW - 10 : o.polledAt,
     pollNotBefore: 0,
@@ -37,6 +39,14 @@ test("no batch below the minimum anonymity, counting only fresh deposits", () =>
   assert.equal(selectDeposits([...seven, rec(7, { polledAt: NOW - FRESH_SECONDS - 1 })], NOW), null);
   const picked = selectDeposits([...seven, rec(7)], NOW);
   assert.equal(picked?.length, 8);
+});
+
+test("a deposit waiting for a new leaf set is never batched, fresh or not", () => {
+  const seven = Array.from({ length: 7 }, (_, i) => rec(i));
+  const rekey = { ...rec(7), leaves: [], minAttempt: 1 };
+  assert.equal(isFresh(rekey, NOW), true);
+  assert.equal(selectDeposits([...seven, rekey], NOW), null);
+  assert.equal(selectDeposits([...seven, rekey, rec(8)], NOW)?.some((r) => r.deposit === rekey.deposit), false);
 });
 
 test("deposits are taken oldest first, up to MAX_DEPOSITS_PER_BATCH", () => {

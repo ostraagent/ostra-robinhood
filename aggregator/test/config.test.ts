@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { encodeFunctionData, size, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { LTHASH_BYTES, ostraPoolAbi } from "@ostraagent/sdk";
+import { MAX_LEAVES_PER_BATCH, ostraPoolAbi } from "@ostraagent/sdk";
 import { MAX_DEPOSITS_PER_BATCH, loadConfig, parseListen } from "../src/config.ts";
 
 const deployment = {
@@ -69,8 +69,7 @@ test("missing or invalid settings are refused", async () => {
 /** The signed sealBatch transaction of `deposits` deposits, in bytes (largest field values, so no encoding is shorter). */
 async function sealBatchSize(deposits: number): Promise<number> {
   const keys = Array.from({ length: deposits }, () => `0x${"ff".repeat(32)}` as Hex);
-  const commitments = Array.from({ length: deposits }, () => `0x${"ff".repeat(LTHASH_BYTES)}` as Hex);
-  const data = encodeFunctionData({ abi: ostraPoolAbi, functionName: "sealBatch", args: [(1n << 64n) - 1n, keys, commitments] });
+  const data = encodeFunctionData({ abi: ostraPoolAbi, functionName: "sealBatch", args: [(1n << 64n) - 1n, keys] });
   // A public test key (anvil's account 1); the transaction is only measured, never sent.
   const account = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
   const tx = await account.signTransaction({
@@ -86,10 +85,10 @@ async function sealBatchSize(deposits: number): Promise<number> {
   return size(tx);
 }
 
-test("a sealBatch of MAX_DEPOSITS_PER_BATCH deposits fits the sequencer's 95,000-byte transaction limit", async () => {
+test("a sealBatch of every deposit a batch can hold is far below the sequencer's 95,000-byte transaction limit", async () => {
   assert.equal(MAX_DEPOSITS_PER_BATCH, 43);
-  const most = await sealBatchSize(MAX_DEPOSITS_PER_BATCH);
-  const one = await sealBatchSize(MAX_DEPOSITS_PER_BATCH + 1);
-  assert.ok(most <= 92_500, `${most} bytes`);
-  assert.ok(one > 94_500, `${one} bytes`);
+  assert.ok(MAX_DEPOSITS_PER_BATCH <= MAX_LEAVES_PER_BATCH);
+  // A deposit carries at least one leaf, so no batch has more deposits than leaves.
+  const most = await sealBatchSize(MAX_LEAVES_PER_BATCH);
+  assert.ok(most <= 10_000, `${most} bytes`);
 });

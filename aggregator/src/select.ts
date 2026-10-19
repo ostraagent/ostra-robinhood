@@ -12,7 +12,7 @@ export function isFresh(record: DepositRecord, now: number): boolean {
 }
 
 /**
- * The deposits of the next batch: fresh deposits in queue order (oldest
+ * The deposits of the next batch: fresh deposits with a leaf set, in queue order (oldest
  * first), as many as fit in MAX_DEPOSITS_PER_BATCH deposits and
  * MAX_LEAVES_PER_BATCH leaves; a deposit that does not fit is skipped for a
  * later one that does. Null when fewer than MIN_ANONYMITY_DEPOSITS would go
@@ -20,7 +20,8 @@ export function isFresh(record: DepositRecord, now: number): boolean {
  */
 export function selectDeposits(records: readonly DepositRecord[], now: number): DepositRecord[] | null {
   const queue = records
-    .filter((r) => isFresh(r, now))
+    // A deposit waiting for a new leaf set (rekey) has none to offer.
+    .filter((r) => isFresh(r, now) && r.leaves.length > 0)
     .sort((a, b) => a.queuedAt - b.queuedAt || (a.deposit < b.deposit ? -1 : a.deposit > b.deposit ? 1 : 0));
   const picked: DepositRecord[] = [];
   let leaves = 0;

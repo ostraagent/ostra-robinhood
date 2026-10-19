@@ -10,19 +10,31 @@
 //      nonce binds every field of the deposit (OstraPool.depositNonce), and
 //      the sender (the relayer, or the local fee payer) submits
 //      depositWithAuthorization, so the depositor key needs no ETH. The
-//      deposit commits to its leaves (standard 10-token leaves, one WOTS key
-//      each) and names the vault as its refund owner;
-//   3. the leaves go to the aggregator, and every sweep polls it with an
-//      EIP-191 signature of the depositor key. Once the deposit is in a
-//      complete batch whose leaves on-chain are all standard leaves and
-//      include all of its own, at the state hash given, the deposit approves
-//      that batch with its next approval key;
+//      deposit names the vault as its refund owner and nothing about its
+//      leaves (OstraPool version 2), so nothing on-chain ties it to them;
+//   3. the leaves (standard 10-token leaves, one WOTS key each) go to the
+//      aggregator signed by the depositor key, and every sweep polls it with
+//      an EIP-191 signature of that key. Once the deposit is in a complete
+//      batch whose leaves on-chain are all standard leaves and include all of
+//      its own, at the state hash given, the deposit approves that batch with
+//      its next approval key. A batch that does not seal has published its
+//      leaves, so the aggregator then asks for new ones ("rekey"): leaf set
+//      `attempt` uses leaf keys attempt * LEAF_KEYS_PER_ATTEMPT + j. Before
+//      sending a set, the sweep also reads the aggregator's batches created
+//      since the set was first sent: one other than the aggregator's current
+//      open batch that holds a leaf of the set means the set is public, and
+//      the deposit moves to the next set itself. So no leaf is offered to two
+//      batches, whatever the aggregator remembers. Only the aggregator's own
+//      batches count (only its key appends to them): anyone may copy public
+//      leaves into a batch of their own, which must not make a deposit drop
+//      out of the batch it is in. Batches are read through the agent's own
+//      RPC, which must be honest: the pool does not check a deposit's leaves;
 //   4. once the batch is sealed, the deposit is closed (closeDeposit marks it,
 //      so an old approval can never be replayed into it). The leaves stay in
 //      the pool until they are spent (unshield).
 // A deposit no batch took within DEPOSIT_TIMEOUT_SECONDS (48 hours) is
 // cancelled: the pool refunds it in full to the vault. Every key comes from
-// the master seed, so the seed alone recovers every deposit and leaf.
+// the master seed: the seed and a record's attempt recover its leaves.
 //
 // On Solana the depositor key was the refund owner and gave back the deposit
 // rent and its token account at the end; an EVM chain has no rent, and with
@@ -55,15 +67,16 @@ import {
   batchLeavesStandard,
   batchStateOf,
   depositAuthorizationTypedData,
-  depositCommitment,
   depositForLeaves,
   depositKey,
   leafToWire,
+  MAX_LEAF_ATTEMPTS,
   maxLeavesPerDeposit,
   ostraPoolAbi,
   readBatch,
   readDeposit,
   readPool,
+  signAggregatorLeaves,
   signAggregatorPoll,
   signApproveBatch,
   toHex,
@@ -85,10 +98,14 @@ export const SHIELD_DIR = "shield";
 const AGGREGATOR_TIMEOUT_MS = 30_000;
 /** How long a deposit authorization the depositor key signs stays valid (it is signed again when it ran out unsent). */
 const AUTHORIZATION_TTL_SECONDS = 3_600n;
-/** Gas of a relayed deposit, for the local fee payer's ETH check: depositWithAuthorization measured at 273,995 on the fork, rounded up. */
+/** Gas of a relayed deposit, for the local fee payer's ETH check: depositWithAuthorization measured at 198,687 on the fork (OstraPool version 2), rounded up with room. */
 const DEPOSIT_GAS = 350_000n;
 /** approvalMessage: "OSTRA/APPROVE/EVM/v1" (20) || chain ID (32) || pool (20) || key (32) || batch (u64) || state (32) || next key root (32). */
 const APPROVE_MESSAGE_LEN = 20 + 32 + 20 + 32 + 8 + 32 + 32;
+/** Leaf keys per leaf set: leaf j of attempt a is leaf key a * LEAF_KEYS_PER_ATTEMPT + j (a deposit holds at most MAX_LEAVES_PER_BATCH leaves). */
+export const LEAF_KEYS_PER_ATTEMPT = 256;
+/** Batches the sweep reads per deposit to check that its leaf set is not public (see the header); the rest wait for the next sweep. */
+const LEAF_SCAN_BATCHES = 32n;
 
 export type ShieldStatus =
   /** The record exists; the depositor key may already hold the tokens. */
@@ -116,6 +133,12 @@ export type ShieldRecord = {
   /** Deposit amount in base units: the leaves plus the pool fee. */
   amount: string;
   status: ShieldStatus;
+  /** The leaf set the deposit offers (see the header); absent on records made before 19 Oct 2026, which are attempt 0. */
+  attempt?: number;
+  /** The first batch (decimal) that may hold the current leaf set and is not yet known to be over without it; absent until the set is first sent. */
+  leafScanFrom?: string;
+  /** Every aggregator account this deposit's leaves were sent to: their batches all count in the check that a leaf set is not public. */
+  aggregators?: string[];
   /** True once the aggregator accepted the leaves. */
   registered: boolean;
   /** The sealed batch and where this deposit's leaves are in it (in leaf order). */
@@ -147,12 +170,19 @@ export type ShieldView = {
   amount: string;
   status: ShieldStatus;
   batch: string | null;
-  /** The deposit's leaves in the pool, once sealed: spent ones are gone from the pool. */
-  leavesInPool: { batch: string; leafIndex: number; amount: string; spent: boolean }[];
+  /** The deposit's leaves in the pool, once sealed (`key`: the leaf key index): spent ones are gone from the pool. */
+  leavesInPool: { batch: string; leafIndex: number; key: number; amount: string; spent: boolean }[];
 };
 
 /** Auto-shield of a vault (see the header). */
 export type AutoShieldSetting = { vault: Address; enabled: boolean; keep: string };
+
+/** The leaf key of leaf j of leaf set `attempt`. */
+export function leafKeyIndex(attempt: number, j: number): number {
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt >= MAX_LEAF_ATTEMPTS) throw new RangeError(`leaf set ${String(attempt)} is out of range`);
+  if (!Number.isInteger(j) || j < 0 || j >= LEAF_KEYS_PER_ATTEMPT) throw new RangeError(`leaf ${String(j)} is out of range`);
+  return attempt * LEAF_KEYS_PER_ATTEMPT + j;
+}
 
 function recordName(chainId: number, token: string, index: number): string {
   return `${chainId}-${getAddress(token)}-${index}.json`;
@@ -314,10 +344,10 @@ export class ShieldService {
     return this.#keys.shieldApprovalKeychain(this.#config.chainId, this.#token(), BigInt(record.index));
   }
 
-  /** The deposit's leaves: standard leaves, leaf j with leaf key j. */
-  #leaves(record: ShieldRecord): Leaf[] {
+  /** The deposit's leaves in leaf set `attempt` (default: the record's): standard leaves, leaf j with leaf key attempt * LEAF_KEYS_PER_ATTEMPT + j. */
+  #leaves(record: ShieldRecord, attempt = record.attempt ?? 0): Leaf[] {
     const keys = this.#leafKeys(record);
-    return Array.from({ length: record.leaves }, (_, j) => ({ keyRoot: keys.keyRoot(BigInt(j)), amount: LEAF_DENOMINATION }));
+    return Array.from({ length: record.leaves }, (_, j) => ({ keyRoot: keys.keyRoot(BigInt(leafKeyIndex(attempt, j))), amount: LEAF_DENOMINATION }));
   }
 
   #readDeposit(record: ShieldRecord): Promise<DepositState> {
@@ -350,12 +380,97 @@ export class ShieldService {
     return parsed;
   }
 
-  async #register(record: ShieldRecord): Promise<void> {
+  /** Sends the deposit's current leaf set, signed by the depositor key; a "rekey" answer moves to the leaf set asked for and sends that. */
+  async #register(record: ShieldRecord): Promise<AggregatorDepositView> {
     // The depositor and deposit id let the aggregator check the deposit key without reading event logs.
     const depositId = this.#keys.shieldDepositId(this.#config.chainId, this.#token(), BigInt(record.index));
-    await this.#aggregator("POST", "/v1/deposits", { deposit: record.deposit, depositor: this.#signer(record).address, depositId, leaves: this.#leaves(record).map(leafToWire) });
-    if (!record.registered) {
-      record.registered = true;
+    const signer = this.#signer(record);
+    for (let round = 0; round < 2; round++) {
+      const attempt = record.attempt ?? 0;
+      const leaves = this.#leaves(record);
+      if (record.leafScanFrom === undefined) {
+        // No batch created before the set is first sent can hold it: the aggregator learns it from this request.
+        // A record sent before leafScanFrom existed (registered, without it) is checked from the first batch.
+        record.leafScanFrom = record.registered ? "0" : (await readPool(this.#client, this.#pool())).batchCount.toString();
+        await this.#save(record);
+      }
+      const signature = await signAggregatorLeaves(signer, { chainId: this.#config.chainId, pool: this.#pool(), deposit: record.deposit as Hex, attempt }, leaves);
+      const view = (await this.#aggregator("POST", "/v1/deposits", { deposit: record.deposit, depositor: signer.address, depositId, attempt, leaves: leaves.map(leafToWire), signature })) as AggregatorDepositView;
+      if (view.status === "rekey") {
+        await this.#rekey(record, view.attempt);
+        continue;
+      }
+      if (!record.registered) {
+        record.registered = true;
+        await this.#save(record);
+      }
+      return view;
+    }
+    throw new Error("the aggregator asked for a new leaf set twice in a row");
+  }
+
+  /** Moves the deposit to leaf set `attempt`: only forward, so a leaf set once offered is never offered again. */
+  async #rekey(record: ShieldRecord, attempt: number): Promise<void> {
+    const current = record.attempt ?? 0;
+    if (!Number.isInteger(attempt) || attempt <= current || attempt >= MAX_LEAF_ATTEMPTS) {
+      throw new Error(`the aggregator asked for leaf set ${String(attempt)}; this deposit is at ${current} (at most ${MAX_LEAF_ATTEMPTS - 1})`);
+    }
+    record.attempt = attempt;
+    record.registered = false;
+    delete record.leafScanFrom;
+    await this.#save(record);
+  }
+
+  /**
+   * Moves to the next leaf set when a batch of the aggregator other than its
+   * current open batch holds a leaf of the current set (closed, sealed while
+   * this deposit is still pending, or left open): that set is public. The
+   * current open batch is read again next time; every other batch is passed
+   * for good, as the aggregator appends only to its current open batch (a
+   * batch of another account never counts: anyone may copy public leaves
+   * into one).
+   */
+  async #retireIfPublished(record: ShieldRecord): Promise<void> {
+    if (record.leafScanFrom === undefined) {
+      // A record sent before leafScanFrom existed is checked from the first batch; one never sent has nothing to check.
+      if (!record.registered) return;
+      record.leafScanFrom = "0";
+    }
+    // The batch count first: a batch created after it is not read now, and one created before it is the
+    // aggregator's current batch in the health read after it, unless it is over already.
+    const { batchCount } = await readPool(this.#client, this.#pool());
+    const health = await this.#aggregator("GET", "/v1/health");
+    if (typeof health.aggregator !== "string") throw new Error("the aggregator's health names no aggregator account");
+    const aggregator = getAddress(health.aggregator);
+    // An aggregator that changed its account (and with it, its state) must not hide the old account's batches.
+    const accounts = new Set([...(record.aggregators ?? []).map((a) => getAddress(a)), aggregator]);
+    if (accounts.size !== (record.aggregators ?? []).length) {
+      record.aggregators = [...accounts];
+      await this.#save(record);
+    }
+    const open = health.open as { batch?: unknown } | null;
+    const current = open !== null && typeof open === "object" && typeof open.batch === "string" ? BigInt(open.batch) : null;
+    const mine = new Set(this.#leaves(record).map((l) => `0x${toHex(l.keyRoot)}`));
+    const from = BigInt(record.leafScanFrom);
+    let next = from;
+    for (let id = from; id < batchCount && id < from + LEAF_SCAN_BATCHES; id++) {
+      const b = await readBatch(this.#client, this.#pool(), id);
+      if (!accounts.has(b.aggregator)) {
+        if (next === id) next = id + 1n;
+        continue;
+      }
+      const holds = b.leaves.some((l) => mine.has(l.keyRoot.toLowerCase()));
+      const isCurrent = b.aggregator === aggregator && b.status === "open" && id === current;
+      // The aggregator appends only to the batch it has saved as its open batch.
+      if (holds && !isCurrent) {
+        await this.#rekey(record, (record.attempt ?? 0) + 1);
+        return;
+      }
+      // The aggregator's current open batch may still get this set's leaves: it is read again next time.
+      if (!isCurrent && next === id) next = id + 1n;
+    }
+    if (next !== from) {
+      record.leafScanFrom = next.toString();
       await this.#save(record);
     }
   }
@@ -378,6 +493,7 @@ export class ShieldService {
   async #shieldLocked(leaves: number): Promise<ShieldResult> {
     this.#aggregatorUrl();
     if (!Number.isInteger(leaves) || leaves < 1) throw new RangeError("leaves must be a positive whole number");
+    if (leaves > LEAF_KEYS_PER_ATTEMPT) throw new RangeError(`one deposit holds at most ${LEAF_KEYS_PER_ATTEMPT} leaves`);
     const pool = this.#pool();
     const p = await readPool(this.#client, pool);
     if (p.token !== this.#token()) throw new Error(`the pool ${pool} holds ${p.token}, not ${this.#token()}`);
@@ -388,6 +504,8 @@ export class ShieldService {
     if (terms.chainId !== this.#config.chainId || typeof terms.pool !== "string" || getAddress(terms.pool) !== pool || typeof terms.token !== "string" || getAddress(terms.token) !== this.#token()) {
       throw new Error(`the aggregator serves pool ${String(terms.pool)} on chain ${String(terms.chainId)}, not ${pool} on ${this.#config.chainId}`);
     }
+    if (typeof terms.aggregator !== "string") throw new Error("the aggregator's terms name no aggregator account");
+    const aggregatorAccount = getAddress(terms.aggregator);
     const amount = depositForLeaves(leaves, p.feeBps);
     const status = await this.#vault.status();
     if (!status.vaultExists) throw new Error("open the vault and fund it first (open_vault)");
@@ -411,6 +529,7 @@ export class ShieldService {
         batch: null,
         leafIndexes: null,
         refunded: false,
+        aggregators: [aggregatorAccount],
         createdAt: Math.floor(Date.now() / 1000),
         closedAt: null,
       };
@@ -460,7 +579,6 @@ export class ShieldService {
         amount,
         refundOwner: await this.#vault.vaultAddress(),
         approvalKeyRoot: bytesToHex(this.#approvalKeys(record).keyRoot(0n)),
-        commitment: depositCommitment(this.#leaves(record)),
       };
       if (depositKey(deposit.depositor, deposit.depositId) !== record.deposit) throw new Error("the deposit key does not match the record");
       const validAfter = 0n;
@@ -470,7 +588,7 @@ export class ShieldService {
       const data = encodeFunctionData({
         abi: ostraPoolAbi,
         functionName: "depositWithAuthorization",
-        args: [deposit.depositor, deposit.depositId, deposit.amount, deposit.refundOwner, deposit.approvalKeyRoot, bytesToHex(deposit.commitment), validAfter, validBefore, v === undefined ? yParity + 27 : Number(v), r, s],
+        args: [deposit.depositor, deposit.depositId, deposit.amount, deposit.refundOwner, deposit.approvalKeyRoot, validAfter, validBefore, v === undefined ? yParity + 27 : Number(v), r, s],
       });
       await this.#sender.send([{ to: this.#pool(), data }]);
     }
@@ -532,8 +650,15 @@ export class ShieldService {
       await this.#save(record);
       return;
     }
+    await this.#retireIfPublished(record);
     await this.#register(record);
-    const view = await this.#poll(record);
+    let view = await this.#poll(record);
+    if (view.status === "rekey") {
+      // A batch with this leaf set did not seal since the leaves were sent: the next set goes now.
+      await this.#rekey(record, view.attempt);
+      await this.#register(record);
+      view = await this.#poll(record);
+    }
     if (view.status !== "batched") return;
     await this.#approve(record, d, BigInt(view.batch), view.stateHash.toLowerCase() as Hex);
   }
@@ -588,18 +713,28 @@ export class ShieldService {
     }
   }
 
-  /** The batch is sealed: where the leaves are, then the deposit closes. */
+  /**
+   * The batch is sealed: where the leaves are, then the deposit closes. The
+   * batch holds the leaf set the deposit approved it with, the record's own
+   * unless the record moved on after approving: earlier sets are looked for too.
+   */
   async #sealed(record: ShieldRecord, d: DepositState): Promise<void> {
     const batchId = d.approvedBatch;
     if (batchId === null) throw new Error("a consumed deposit without its batch");
     const b = await readBatch(this.#client, this.#pool(), batchId);
-    const leaves = this.#leaves(record);
-    const indexes = leaves.map((l) => b.leaves.findIndex((x) => x.keyRoot.toLowerCase() === `0x${toHex(l.keyRoot)}` && x.amount === l.amount));
-    if (b.status === "none" || indexes.some((i) => i < 0)) throw new Error(`the sealed batch ${batchId} does not show every leaf of this deposit`);
-    record.batch = batchId.toString();
-    record.leafIndexes = indexes;
-    record.status = "sealed";
-    await this.#save(record);
+    if (b.status === "none") throw new Error(`the sealed batch ${batchId} is not on-chain`);
+    for (let attempt = record.attempt ?? 0; attempt >= 0; attempt--) {
+      const leaves = this.#leaves(record, attempt);
+      const indexes = leaves.map((l) => b.leaves.findIndex((x) => x.keyRoot.toLowerCase() === `0x${toHex(l.keyRoot)}` && x.amount === l.amount));
+      if (indexes.some((i) => i < 0)) continue;
+      record.attempt = attempt;
+      record.batch = batchId.toString();
+      record.leafIndexes = indexes;
+      record.status = "sealed";
+      await this.#save(record);
+      return;
+    }
+    throw new Error(`the sealed batch ${batchId} does not show every leaf of this deposit`);
   }
 
   /**
@@ -631,10 +766,10 @@ export class ShieldService {
         const leavesInPool: ShieldView["leavesInPool"] = [];
         if (r.batch !== null && r.leafIndexes !== null) {
           const b = await readBatch(this.#client, this.#pool(), BigInt(r.batch));
-          for (const i of r.leafIndexes) {
+          r.leafIndexes.forEach((i, j) => {
             const leaf = b.leaves[i];
-            leavesInPool.push({ batch: r.batch, leafIndex: i, amount: formatTokenAmount(LEAF_DENOMINATION), spent: b.status === "none" || leaf === undefined || leaf.spent });
-          }
+            leavesInPool.push({ batch: r.batch as string, leafIndex: i, key: leafKeyIndex(r.attempt ?? 0, j), amount: formatTokenAmount(LEAF_DENOMINATION), spent: b.status === "none" || leaf === undefined || leaf.spent });
+          });
         }
         out.push({ index: r.index, vault: r.vault === undefined ? null : getAddress(r.vault), deposit: r.deposit, leaves: r.leaves, amount: formatTokenAmount(BigInt(r.amount)), status: r.status, batch: r.batch, leavesInPool });
       }

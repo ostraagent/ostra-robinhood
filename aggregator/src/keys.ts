@@ -4,9 +4,9 @@
 //                   account is the batch aggregator on-chain (the only one
 //                   that may append leaves to, seal or abandon its batches)
 //                   and pays their gas in ETH. It can never move pool funds:
-//                   sealBatch only succeeds when the leaves match the
-//                   depositors' commitments and every depositor approved the
-//                   batch.
+//                   sealBatch only succeeds when every depositor approved the
+//                   batch's exact leaves (each checks its own are there) and
+//                   the deposits add up to them.
 //
 // Created on first start and never printed.
 

@@ -7,7 +7,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { RelayerError, RelayerUnavailableError, formatTokenAmount } from "@ostraagent/core";
+import { RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount } from "@ostraagent/core";
 import { QuoteError, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 
@@ -82,7 +82,12 @@ export function registerTools(server: McpServer, agent: Agent): void {
 
   // --- the shielded pool --------------------------------------------------------------------------------
   tool("shield", "Deposits `leaves` standard leaves from the vault into the shielded pool (through the Ostra aggregator's batches).", { leaves: z.number().int().min(1).max(64) }, (a) => agent.shield.shield(a.leaves));
-  tool("unshield", "Spends `leaves` shielded leaves, each into a new private vault at a random time within windowHours (0: now).", { leaves: z.number().int().min(1).max(64), windowHours: z.number().min(0).max(168).default(0) }, (a) => agent.unshield.unshield(a.leaves, a.windowHours));
+  tool(
+    "unshield",
+    `Spends \`leaves\` shielded leaves, each into a new private vault at a random time within windowHours (default ${UNSHIELD_DEFAULT_WINDOW_HOURS}, at most ${UNSHIELD_MAX_WINDOW_HOURS}; 0: now, which lets the spends be timed together).`,
+    { leaves: z.number().int().min(1).max(64), windowHours: z.number().min(0).max(UNSHIELD_MAX_WINDOW_HOURS).default(UNSHIELD_DEFAULT_WINDOW_HOURS) },
+    (a) => agent.unshield.unshield(a.leaves, a.windowHours),
+  );
   tool("shield_status", "Shield deposits, scheduled unshields and the private vaults.", {}, async () => ({ deposits: await agent.shield.list(), unshields: await agent.unshield.list(), privateVaults: await agent.unshield.vaults() }));
   tool("auto_shield", "Turns the creator vault's auto-shield on or off (it shields what the vault holds beyond `keep` USDG).", { enabled: z.boolean(), keep: usdg.optional() }, (a) => agent.creatorShield.setAutoShield(a.enabled, a.keep));
   tool("private_withdraw", "Sends USDG from one of the agent's private vaults.", { vault: address, destination: address, amount: usdg }, async (a) => {

@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bytesToHex, concat, encodeFunctionData, getAddress, hexToBytes, keccak256, type Address, type Hex } from "viem";
+import { concat, encodeFunctionData, getAddress, hexToBytes, keccak256, type Address, type Hex } from "viem";
 import {
   LAUNCHPAD,
   MULTICALL3,
@@ -76,7 +76,7 @@ test("every recognised Ostra function is read with its arguments", () => {
   assert.ok(ab.fn === "approveBatch" && ab.batchId === 6n && ab.key === root);
   assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "cancelDeposit", args: [root] }) }).fn, "cancelDeposit");
   assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "closeDeposit", args: [root] }) }).fn, "closeDeposit");
-  const dep = encodeFunctionData({ abi: ostraPoolAbi, functionName: "depositWithAuthorization", args: [at(0xdd), root, 20_060_181n, at(0xdd), root, bytesToHex(new Uint8Array(2048)), 0n, 99n, 27, root, root] });
+  const dep = encodeFunctionData({ abi: ostraPoolAbi, functionName: "depositWithAuthorization", args: [at(0xdd), root, 20_060_181n, at(0xdd), root, 0n, 99n, 27, root, root] });
   assert.equal(parseCall({ to: d.pool, data: dep }).fn, "depositWithAuthorization");
 });
 

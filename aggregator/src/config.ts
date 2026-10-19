@@ -24,16 +24,14 @@ import { parseDeployment, type Deployment } from "@ostraagent/sdk";
 export const MIN_ANONYMITY_DEPOSITS = 8;
 
 /**
- * Most deposits one batch takes. On Solana it was 56, from the 64 accounts a
- * v1 transaction may hold. On Robinhood Chain the bound is the size of the
- * sealBatch transaction: every deposit adds its 2,048-byte commitment plus
- * 96 bytes of ABI encoding (164 + 2,144 x deposits bytes of calldata), and an
- * Arbitrum sequencer queues no transaction above max-tx-data-size, 95,000
- * bytes by default. 43 deposits make 92,356 bytes of calldata and a signed
- * transaction of 92,478 bytes; 44 would be 94,622, only 378 bytes below the
- * limit (test/config.test.ts). Gas is far from the 32,000,000
- * per-transaction limit of Robinhood Chain (ArbGasInfo, read 17 Oct 2026):
- * sealBatch of 8 deposits measured 870,749 on the fork.
+ * Most deposits one batch takes: 43. OstraPool version 1 needed this bound:
+ * every deposit added its 2,048-byte commitment to the sealBatch transaction,
+ * and an Arbitrum sequencer queues no transaction above max-tx-data-size,
+ * 95,000 bytes by default. Version 2 sends 32 bytes per deposit, so even a
+ * batch of MAX_LEAVES_PER_BATCH one-leaf deposits is far below that
+ * (test/config.test.ts); 43 is kept so batches stay as they were. Gas is far
+ * from the 32,000,000 per-transaction limit of Robinhood Chain (ArbGasInfo,
+ * read 17 Oct 2026): sealBatch of 8 deposits measured 335,757 on the fork.
  */
 export const MAX_DEPOSITS_PER_BATCH = 43;
 
@@ -56,6 +54,8 @@ export const FRESH_SECONDS = 600;
  * being complete on-chain (decided 15 Oct 2026: three MCP sweeps). Otherwise
  * the batch is abandoned (closeBatch) and built again without the deposits
  * that did not approve; those go to the back of the queue and must poll again.
+ * Every deposit of an abandoned batch must send a new leaf set first: its
+ * leaves are public in the abandoned batch.
  */
 export const APPROVAL_SECONDS = 900;
 

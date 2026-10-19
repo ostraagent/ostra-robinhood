@@ -142,8 +142,6 @@ export type DepositState = {
   approvalKeyRoot: Hex;
   /** The batch state it approved, or null. */
   approvedState: Hex | null;
-  /** keccak256 of the deposit's 2,048-byte commitment (the commitment itself is in DepositCreated). */
-  commitmentHash: Hex;
 };
 
 /** The deposit under `key`; status "none" when there is none. */
@@ -160,7 +158,6 @@ export async function readDeposit(client: PublicClient, pool: Address, key: Hex)
     approvedBatch: d.approvedBatch === 0n ? null : d.approvedBatch - 1n,
     approvalKeyRoot: d.approvalKeyRoot,
     approvedState: d.approvedState === ZERO32 ? null : d.approvedState,
-    commitmentHash: d.commitmentHash,
   };
 }
 
@@ -174,7 +171,7 @@ export type BatchState = {
   leafCount: number;
   unspent: number;
   totalAmount: bigint;
-  /** The LtHash accumulator (2,048 bytes); zero after a successful seal. */
+  /** The LtHash accumulator of the batch's leaves (2,048 bytes); batchStateOf hashes it into the state a deposit approves. */
   acc: Uint8Array;
   leaves: BatchLeaf[];
 };

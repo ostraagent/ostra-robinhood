@@ -49,7 +49,7 @@ export type UnshieldRecord = {
   /** The private vault's number. */
   index: number;
   vault: string;
-  /** The shield deposit the leaf came from, and the leaf's number in it (its key index). */
+  /** The shield deposit the leaf came from, and the leaf's key index in its leaf keychain (shield.ts leafKeyIndex). */
   shieldIndex: number;
   leaf: number;
   batch: string;
@@ -173,9 +173,9 @@ export class UnshieldService {
       const available: { shieldIndex: number; leaf: number; batch: string; leafIndex: number }[] = [];
       for (const d of await this.#shield.list()) {
         if (d.status !== "closed" || d.batch === null) continue;
-        d.leavesInPool.forEach((l, j) => {
-          if (!l.spent && !taken.has(`${l.batch}:${l.leafIndex}`)) available.push({ shieldIndex: d.index, leaf: j, batch: l.batch, leafIndex: l.leafIndex });
-        });
+        for (const l of d.leavesInPool) {
+          if (!l.spent && !taken.has(`${l.batch}:${l.leafIndex}`)) available.push({ shieldIndex: d.index, leaf: l.key, batch: l.batch, leafIndex: l.leafIndex });
+        }
       }
       if (available.length < leaves) {
         throw new Error(`${available.length} leaf(s) can be unshielded now (sealed in a batch, not spent, not scheduled); asked for ${leaves}`);

@@ -1690,6 +1690,19 @@ export const ostraPoolAbi = [
   },
   {
     "type": "function",
+    "name": "VERSION",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "appendLeaves",
     "inputs": [
       {
@@ -1905,11 +1918,6 @@ export const ostraPoolAbi = [
         "name": "approvalKeyRoot",
         "type": "bytes32",
         "internalType": "bytes32"
-      },
-      {
-        "name": "commitment",
-        "type": "bytes",
-        "internalType": "bytes"
       }
     ],
     "outputs": [],
@@ -1967,11 +1975,6 @@ export const ostraPoolAbi = [
         "name": "approvalKeyRoot",
         "type": "bytes32",
         "internalType": "bytes32"
-      },
-      {
-        "name": "commitment",
-        "type": "bytes",
-        "internalType": "bytes"
       }
     ],
     "outputs": [
@@ -2011,11 +2014,6 @@ export const ostraPoolAbi = [
         "name": "approvalKeyRoot",
         "type": "bytes32",
         "internalType": "bytes32"
-      },
-      {
-        "name": "commitment",
-        "type": "bytes",
-        "internalType": "bytes"
       },
       {
         "name": "validAfter",
@@ -2168,7 +2166,7 @@ export const ostraPoolAbi = [
             "internalType": "bytes32"
           },
           {
-            "name": "commitmentHash",
+            "name": "legacyCommitmentHash",
             "type": "bytes32",
             "internalType": "bytes32"
           }
@@ -2338,11 +2336,6 @@ export const ostraPoolAbi = [
         "name": "keys",
         "type": "bytes32[]",
         "internalType": "bytes32[]"
-      },
-      {
-        "name": "commitments",
-        "type": "bytes[]",
-        "internalType": "bytes[]"
       }
     ],
     "outputs": [],
@@ -2598,12 +2591,6 @@ export const ostraPoolAbi = [
         "type": "bytes32",
         "indexed": false,
         "internalType": "bytes32"
-      },
-      {
-        "name": "commitment",
-        "type": "bytes",
-        "indexed": false,
-        "internalType": "bytes"
       }
     ],
     "anonymous": false
@@ -2729,22 +2716,12 @@ export const ostraPoolAbi = [
   },
   {
     "type": "error",
-    "name": "BadCommitment",
-    "inputs": []
-  },
-  {
-    "type": "error",
     "name": "BadSignatureLength",
     "inputs": []
   },
   {
     "type": "error",
     "name": "BatchAmountMismatch",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "BatchCommitmentMismatch",
     "inputs": []
   },
   {

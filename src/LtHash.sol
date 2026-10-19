@@ -7,8 +7,8 @@ pragma solidity 0.8.30;
 ///         little-endian u16 lanes with wrapping addition, each leaf expanded by SHA-256 in
 ///         counter mode over "OSTRA/LTHASH/v1" (15) || counter (1) || leaf, where a leaf is
 ///         key_root (32) || amount (u64 little-endian).
-/// @dev H(A + B) = H(A) + H(B) lane-wise, so a batch can prove that its published leaves are
-///      exactly the union of the leaves its depositors committed to.
+/// @dev H(A + B) = H(A) + H(B) lane-wise, so a batch's accumulator grows leaf by leaf as leaves are
+///      appended, and its state hash (with the leaf count and total) fixes exactly the leaves it holds.
 ///
 ///      In memory an accumulator is uint256[64] in lane form: every 32-byte word holds 16 lanes
 ///      as big-endian 16-bit fields (each little-endian lane byte-swapped), so a SWAR add or

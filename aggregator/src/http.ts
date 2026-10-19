@@ -1,12 +1,13 @@
 // HTTP endpoint of the aggregator (JSON over HTTP; served to depositors
 // through an HTTPS proxy):
 //
-//   POST /v1/deposits             { deposit, depositor, depositId, leaves: [{ keyRoot, amount }] }
-//                                 the leaves of a pending deposit (deposit =
+//   POST /v1/deposits             { deposit, depositor, depositId, attempt, leaves: [{ keyRoot, amount }], signature }
+//                                 a leaf set of a pending deposit (deposit =
 //                                 its OstraPool deposit key, 0x hex, which
-//                                 depositor and depositId must derive);
-//                                 accepted only if they match its on-chain
-//                                 commitment
+//                                 depositor and depositId must derive),
+//                                 signed (EIP-191) by the depositor key and
+//                                 adding up to the deposit after the pool
+//                                 fee; "rekey" asks for a new set
 //   GET  /v1/deposits/<deposit>?at=<unix seconds>&signature=<0x hex>
 //                                 a poll signed (EIP-191) by the deposit's
 //                                 depositor key: queued, or the batch number
@@ -23,8 +24,8 @@ import { MAX_LEAVES_PER_BATCH } from "@ostraagent/sdk";
 import { applyCors } from "../../merchant/src/cors.ts";
 import { AggregatorError, type Aggregator } from "./aggregator.ts";
 
-/** Largest request body: MAX_LEAVES_PER_BATCH leaves of about 110 bytes of JSON each, with room to spare. */
-const MAX_BODY_BYTES = 256 + MAX_LEAVES_PER_BATCH * 128;
+/** Largest request body: about 400 bytes of deposit, depositor, deposit id, attempt and signature, and MAX_LEAVES_PER_BATCH leaves of about 110 bytes of JSON each, with room to spare. */
+const MAX_BODY_BYTES = 512 + MAX_LEAVES_PER_BATCH * 128;
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body, (_k, v) => (typeof v === "bigint" ? v.toString() : v));

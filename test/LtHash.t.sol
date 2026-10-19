@@ -21,7 +21,7 @@ contract LtHashHarness {
         return LtHash.stateHash(acc, uint16(keyRoots.length), amount * uint64(keyRoots.length));
     }
 
-    /// @dev Removes the leaves one commitment at a time, as SealBatch removes each deposit.
+    /// @dev Removes the leaves one at a time: subtracting a leaf's LtHash undoes adding it.
     function cancels(bytes memory total, bytes32[] calldata keyRoots, uint64 amount) external view returns (bool) {
         uint256[64] memory acc = LtHash.fromBytes(total);
         for (uint256 i = 0; i < keyRoots.length; ++i) {
