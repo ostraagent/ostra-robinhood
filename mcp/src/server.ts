@@ -9,6 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { redact } from "@ostraagent/sdk";
 import { Agent, SWEEP_SECONDS } from "./agent.ts";
 import { loadConfig } from "./config.ts";
+import { packaged } from "./packaged.ts";
 import { registerTools } from "./tools.ts";
 
 const INSTRUCTIONS =
@@ -29,7 +30,7 @@ async function main(): Promise<void> {
   const config = await loadConfig();
   rpcUrl = config.rpcUrl;
   const agent = await Agent.open(config, log);
-  const server = new McpServer({ name: "ostra-agent", version: "0.1.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "ostra-agent", version: packaged?.version ?? "0.1.0" }, { instructions: INSTRUCTIONS });
   registerTools(server, agent);
   await server.connect(new StdioServerTransport());
   log("started", { chainId: config.chainId, relayer: config.relayerUrl !== null, launchpad: config.deployment.launchpad !== undefined, feePayer: agent.keys.feePayer.address });

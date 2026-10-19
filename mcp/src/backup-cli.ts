@@ -7,6 +7,8 @@
 //   node src/backup-cli.ts import <file>   writes the seed in <file> to a new
 //                                           OSTRA_HOME (one without a seed)
 //
+// From the npm package: `npx -y @ostraagent/mcp backup export <file>` (bin.ts).
+//
 // The file is JSON {version, kdf: scrypt (N 2^17, r 8, p 1), salt, iv,
 // ciphertext, tag}: AES-256-GCM of the 32-byte seed under the scrypt key of the
 // passphrase, with "OSTRA/SEED-BACKUP/v1" as associated data. With the seed
@@ -20,6 +22,7 @@ import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import { DiskFolder, ensurePrivateDir } from "./disk.ts";
 import { BACKUP_MARKER, MASTER_FILE } from "./keys.ts";
+import { packaged } from "./packaged.ts";
 
 const AAD = Buffer.from("OSTRA/SEED-BACKUP/v1", "utf8");
 const SCRYPT = { N: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 } as const;
@@ -78,11 +81,11 @@ function hidden(prompt: string): Promise<string> {
   });
 }
 
-async function main(): Promise<void> {
-  const [command, file] = process.argv.slice(2);
+export async function runBackup(args: string[]): Promise<void> {
+  const [command, file] = args;
   const home = process.env.OSTRA_HOME !== undefined && process.env.OSTRA_HOME !== "" ? process.env.OSTRA_HOME : join(homedir(), ".ostra");
   if ((command !== "export" && command !== "import") || file === undefined) {
-    throw new Error("usage: node src/backup-cli.ts export <file> | import <file>   (OSTRA_HOME: the agent's directory)");
+    throw new Error(`usage: ${packaged === null ? "node src/backup-cli.ts" : "npx -y @ostraagent/mcp backup"} export <file> | import <file>   (OSTRA_HOME: the agent's directory)`);
   }
   if (command === "export") {
     const folder = new DiskFolder(home);
@@ -109,8 +112,9 @@ async function main(): Promise<void> {
   process.stderr.write(`the seed is in ${join(home, MASTER_FILE)}; the MCP server recovers the vaults from it (the relayer's signature escrow sends any signature still in flight)\n`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err: unknown) => {
+// Run as a script from source; the npm package runs it from bin.ts.
+if (packaged === null && import.meta.url === `file://${process.argv[1]}`) {
+  runBackup(process.argv.slice(2)).catch((err: unknown) => {
     process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(1);
   });

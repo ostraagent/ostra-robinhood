@@ -2,7 +2,8 @@
 //   master.key        the 32-byte master seed (hex, 0600), created on first use:
 //                     every vault, channel, deposit and leaf key derives from it
 //                     (core keys.ts), so it alone recovers the agent. Back it up
-//                     with `node src/backup-cli.ts export <file>`.
+//                     with `npx -y @ostraagent/mcp backup export <file>` (from
+//                     source: `node src/backup-cli.ts export <file>`).
 //   fee-payer.key     a secp256k1 key (hex, 0600) that pays gas in ETH when no
 //                     relayer is set; it never holds tokens.
 //   wots/             the WOTS store: every one-time signature, written before

@@ -41,8 +41,19 @@ after(async () => {
 async function connect(home: string): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [fileURLToPath(new URL("../src/server.ts", import.meta.url))],
-    env: { PATH: process.env.PATH ?? "", HOME: root, OSTRA_HOME: home, OSTRA_DEPLOYMENT: join(root, "deployment.json"), OSTRA_RPC_URL: fork.url },
+    // OSTRA_MCP_ENTRY runs the npm package instead: dist/ostra-mcp.js of the tarball (scripts/pack.ts)
+    // installed with npm, so that its dependencies resolve. The services are off either way.
+    args: [process.env.OSTRA_MCP_ENTRY ?? fileURLToPath(new URL("../src/server.ts", import.meta.url))],
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: root,
+      OSTRA_HOME: home,
+      OSTRA_DEPLOYMENT: join(root, "deployment.json"),
+      OSTRA_RPC_URL: fork.url,
+      OSTRA_RELAYER_URL: "off",
+      OSTRA_KEEPER_URL: "off",
+      OSTRA_AGGREGATOR_URL: "off",
+    },
     stderr: "pipe",
   });
   const client = new Client({ name: "ostra-mcp-test", version: "0.0.0" });

@@ -95,7 +95,7 @@ export const DEV_BUY_LAUNCH_GAS = 4_500_000n;
 /** The local fee payer must hold this many times a transaction's gas at the current gas price (as the keeper funds its crank: 2x). */
 const ETH_HEADROOM = 2n;
 const BACKUP_REMINDER =
-  "no encrypted backup of the master seed has been exported from this machine; the owner should run `node src/backup-cli.ts export <file>` in a terminal and keep the file and passphrase off this machine";
+  "no encrypted backup of the master seed has been exported from this machine; the owner should run `npx -y @ostraagent/mcp backup export <file>` (from source: `node src/backup-cli.ts export <file>`) in a terminal and keep the file and passphrase off this machine";
 
 export type OpenVaultResult = {
   vault: Address;

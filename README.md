@@ -284,9 +284,15 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   on a fork.
   `test/shield.fork.test.ts` runs shield, the creator vault's auto-shield, an abandoned batch with
   the new leaf sets after it, and unshield against the aggregator on a fork. `test/launchpad.fork.test.ts` runs the launchpad service on a fork.
-- `mcp/`: Ostra Agent's MCP server (`@ostraagent/mcp`, stdio, `@modelcontextprotocol/sdk` 1.32.1).
+- `mcp/`: Ostra Agent's MCP server (`@ostraagent/mcp`, stdio, `@modelcontextprotocol/sdk` 1.32.1),
+  published on npm: `npx -y @ostraagent/mcp` runs it with no configuration. `npm run bundle`
+  (`scripts/pack.ts`) builds the package in `mcp/release/`: the server, the core and the SDK bundled
+  by esbuild into one JavaScript file, with the mainnet deployment record and the URLs of Ostra's
+  relayer, keeper and aggregator baked in (`src/packaged.ts`; `off` turns a service off).
+  `scripts/smoke.ts` runs the tarball or the published version through npx.
   Its keys and records stay in OSTRA_HOME (0700; files 0600; the seed backed up with
-  `node src/backup-cli.ts export <file>`, encrypted under a passphrase typed in a terminal). Tools:
+  `npx -y @ostraagent/mcp backup export <file>`, or `node src/backup-cli.ts export <file>` from
+  source, encrypted under a passphrase typed in a terminal). Tools:
   the vault (open_vault, balance, withdraw), channels and pay, the seller side (accept_payments),
   shield and unshield, recovery, and the launchpad (pool_info, quote_swap, buy, sell, token_vault,
   transfer_token, claim_dividends, launch, set_pool_setting, set_creator_share, airdrop_fund,
