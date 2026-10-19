@@ -1,9 +1,10 @@
 // Deploys Ostra's contracts to Robinhood Chain (deploy.ts: deployOstra, then
 // deployLaunchpad) from the Foundry build, and writes the deployment record
-// every service and client reads. One account deploys and owns everything
-// (decided 19 Oct 2026): it is the beacons' owner, the pool's treasury
-// and init authority, and the owner of the hook, the launchpad and the
-// dispatcher.
+// every service and client reads. One account deploys and, at deployment, owns
+// everything (decided 19 Oct 2026): it is the beacons' owner, the pool's
+// treasury and init authority, and the owner of the hook, the launchpad and the
+// dispatcher. The beacons were then handed to OstraUpgradeOwner
+// (scripts/upgrade-owner.ts).
 //
 //   OSTRA_DEPLOYER_KEY_FILE   file (0600) with the deployer's 32-byte hex private
 //                             key (default /etc/ostra/deployer.key); never printed

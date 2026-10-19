@@ -1,17 +1,130 @@
-# Ostra on Robinhood Chain
+<p align="center">
+  <a href="https://ostraagent.xyz"><img src="https://ostraagent.xyz/favicon.svg" width="72" height="72" alt="Ostra"></a>
+</p>
 
-Ostra Agent's contracts for Robinhood Chain (chain ID 4663), ported from the Solana program in
-`ostraagent/ostra` with the same behavior. The design is "Agent Ostra — Rancangan v0.4".
+<h1 align="center">Ostra Agent on Robinhood Chain</h1>
 
-Contents:
+<p align="center">
+  The agent launchpad of Robinhood Chain: vaults that only post-quantum one-time signatures can spend,<br>
+  a shielded pool for USDG, and one Uniswap v4 hook for every launch.
+</p>
+
+<p align="center">
+  <a href="https://ostraagent.xyz"><img src="https://img.shields.io/badge/website-ostraagent.xyz-15171A" alt="Website"></a>
+  <a href="https://docs.ostraagent.xyz"><img src="https://img.shields.io/badge/docs-docs.ostraagent.xyz-15171A" alt="Documentation"></a>
+  <a href="https://robinhoodchain.blockscout.com"><img src="https://img.shields.io/badge/Robinhood%20Chain-4663-D9381E" alt="Robinhood Chain 4663"></a>
+  <a href="https://docs.ostraagent.xyz/contracts"><img src="https://img.shields.io/badge/Sourcify-18%20contracts%20verified-1F7A4D" alt="Verified on Sourcify"></a>
+  <a href="foundry.toml"><img src="https://img.shields.io/badge/Solidity-0.8.30-3E4248" alt="Solidity 0.8.30"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3E4248" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="https://ostraagent.xyz">Website</a> ·
+  <a href="https://docs.ostraagent.xyz">Documentation</a> ·
+  <a href="https://docs.ostraagent.xyz/post-quantum">Post-quantum keys</a> ·
+  <a href="https://docs.ostraagent.xyz/security">Security</a> ·
+  <a href="#deployed-contracts">Contracts</a>
+</p>
+
+## What is in this repository
+
+Everything Ostra Agent runs on Robinhood Chain mainnet: the contracts, the TypeScript SDK, the
+services (relayer, keeper, aggregator, RPC proxy) and the MCP server AI agents use.
+
+- **Post-quantum vaults.** An `OstraVault` holds one token and moves it only on a Winternitz one-time
+  signature (WOTS over Keccak-256) that the contract verifies; every spend replaces the key. No
+  elliptic-curve key of Ostra's can move a vault's funds (an owner who names recovery guardians
+  should make them vaults too), and the vaults' code changes only through `OstraUpgradeOwner`, a
+  WOTS-keyed owner whose every call waits 72 hours in public.
+- **The shielded pool.** USDG in standard 10 USDG leaves, each with its own one-time key, mixed in
+  batches and spent into new vaults. Since version 2, nothing on chain ties a deposit to its leaves.
+- **The launchpad and its hook.** One Uniswap v4 hook runs every Ostra pool from its first block:
+  the whole supply locked in tiers, a 1% hook fee (70% to the creator), anti-snipe, max buy and max
+  wallet, a circuit breaker, a market-hours and MEV-aware LP fee, graduation, and rules that a
+  creator can only change in traders' favour.
+- **Agents.** An MCP server an agent runs on its own machine: it keeps the seed, checks every
+  operation before a one-time key signs it, and pays gas in USDG through the relayer.
+
+The [documentation](https://docs.ostraagent.xyz) explains each part and links every claim to the
+lines of this repository that make it true.
+
+## Deployed contracts
+
+Robinhood Chain mainnet, chain ID 4663. Each address links to its verified source on Sourcify; the
+full record, with the outside contracts Ostra uses, is
+[`deployments/robinhood-mainnet.json`](deployments/robinhood-mainnet.json).
+
+| Contract | Role | Address |
+|---|---|---|
+| OstraHook | The Uniswap v4 hook of every Ostra pool | [`0x63A784afb8905452aDceC471a45E555F5caE68cC`](https://repo.sourcify.dev/4663/0x63A784afb8905452aDceC471a45E555F5caE68cC) |
+| OstraLaunchpad | Token, pool, locked tiers and launch fee in one transaction | [`0xfC57162C0e3f9773F97fEa8d276e957d7c43A6C5`](https://repo.sourcify.dev/4663/0xfC57162C0e3f9773F97fEa8d276e957d7c43A6C5) |
+| OstraFees | LP fee: market hours, volatility, MEV surcharge | [`0x8e79671DC9729476614C78aFcf2345D4c1963801`](https://repo.sourcify.dev/4663/0x8e79671DC9729476614C78aFcf2345D4c1963801) |
+| OstraDispatcher | Pays out fees and taxes: creator, burn, liquidity, floor bid, dividends | [`0x44Bb65164b2855f8E80B142d5Fb9bDb72E869986`](https://repo.sourcify.dev/4663/0x44Bb65164b2855f8E80B142d5Fb9bDb72E869986) |
+| OstraLocker | Holds launch liquidity, with no way to remove it | [`0xb593812363bAd70Ee381c7B54c4FC82b0BA3A4A7`](https://repo.sourcify.dev/4663/0xb593812363bAd70Ee381c7B54c4FC82b0BA3A4A7) |
+| OstraDevBuy | Launch and dev buy in one transaction | [`0x0e1Fd799E136dcfEcad5695B07Ac5DAc5B2fF4bc`](https://repo.sourcify.dev/4663/0x0e1Fd799E136dcfEcad5695B07Ac5DAc5B2fF4bc) |
+| OstraVesting | The vesting every dev buy clones | [`0xadD9C1995910457312c156E7D8120D1b447E179a`](https://repo.sourcify.dev/4663/0xadD9C1995910457312c156E7D8120D1b447E179a) |
+| OstraAirdrop | Merkle airdrop rounds; unclaimed tokens burned | [`0xBC798D956aF4c2B104FFC6106d5322294Bc103bb`](https://repo.sourcify.dev/4663/0xBC798D956aF4c2B104FFC6106d5322294Bc103bb) |
+| OstraCreatorSplit | Creator payouts shared with up to 100 recipients | [`0x987994dE6A1d5303B9e3F50977cB0321BA4D033B`](https://repo.sourcify.dev/4663/0x987994dE6A1d5303B9e3F50977cB0321BA4D033B) |
+| OstraVaultFactory | Creates every vault at its predicted address | [`0x043a15c514CFE2c797d33520bFF91a5DCdbf2979`](https://repo.sourcify.dev/4663/0x043a15c514CFE2c797d33520bFF91a5DCdbf2979) |
+| Vault beacon | Points every vault at its code | [`0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0`](https://repo.sourcify.dev/4663/0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0) |
+| OstraVault | The vaults’ code | [`0xa455cbf5Aa10cE858f3b250dc791FCD900e950BC`](https://repo.sourcify.dev/4663/0xa455cbf5Aa10cE858f3b250dc791FCD900e950BC) |
+| OstraPool | The shielded pool (beacon proxy) | [`0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6`](https://repo.sourcify.dev/4663/0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6) |
+| Pool beacon | Points the pool at its code | [`0x30669Ca534921038a531BBE27116d85bB7406fFF`](https://repo.sourcify.dev/4663/0x30669Ca534921038a531BBE27116d85bB7406fFF) |
+| OstraPool version 2 | The pool’s code | [`0xC04d4a222dC1C966640B977608bE29949b0648ec`](https://repo.sourcify.dev/4663/0xC04d4a222dC1C966640B977608bE29949b0648ec) |
+| OstraSplit factory | Revenue splits of seller channels | [`0xAAf54A483B2c7c2c5ecFc1eDED5ed1619C1bA882`](https://repo.sourcify.dev/4663/0xAAf54A483B2c7c2c5ecFc1eDED5ed1619C1bA882) |
+| OstraUpgradeOwner | Owns both beacons: WOTS key, 72-hour public delay | [`0x55533a51d9bd9b06F2D179d919BB31995EF96E5e`](https://repo.sourcify.dev/4663/0x55533a51d9bd9b06F2D179d919BB31995EF96E5e) |
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `src/` | The contracts: `Wots`, `LtHash`, `OstraVault`, `OstraVaultFactory`, `OstraPool`, `OstraSplit`, `OstraUpgradeOwner` |
+| `src/launchpad/` | The launchpad: hook, launchpad, token, fees, dispatcher, locker, dev buy, vesting, airdrop, creator split |
+| `test/` | Foundry tests; the `*.fork.t.sol` files run on a fork of Robinhood Chain mainnet |
+| `sdk/` | `@ostraagent/sdk`: WOTS, messages, reads, quotes, deploy and upgrade scripts |
+| `core/` | `@ostraagent/core`: the agent's logic shared by the MCP server and the web app |
+| `mcp/` | `@ostraagent/mcp`: the MCP server (stdio) |
+| `relayer/`, `keeper/`, `merchant/` | The relayer that lets agents pay gas in USDG, and the payment services behind it |
+| `aggregator/` | Builds the shielded pool's batches |
+| `rpc-proxy/` | The read-only RPC proxy for the web app |
+| `deployments/` | The mainnet deployment record |
+| `ops/` | systemd units and nginx server blocks |
+| `vectors/` | WOTS and LtHash test vectors shared by Solidity and TypeScript |
+
+## Build and test
+
+Foundry with solc 0.8.30, and Node 24 or later. The fork tests run against real mainnet contracts,
+never mocks.
+
+The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
+block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
+never printed: anvil's errors are passed on with it replaced. `core/test/recover-logs.test.ts` runs
+against mainnet itself with `OSTRA_LIMITED_RPC`, an RPC that limits eth_getLogs (Alchemy Free: 10
+blocks a request), and checks that channel recovery still reads every log window.
+
+```
+node vectors/generate.ts   # regenerates vectors/vectors.json from an SDK source (OSTRA_SDK_SRC)
+forge test -vv             # Vault.fork.t.sol forks Robinhood Chain mainnet (rpc_endpoints.robinhood)
+cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out) and anvil
+node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
+cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
+cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
+cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
+cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
+cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
+cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
+cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
+```
+
+## Components in detail
 
 - `src/Wots.sol`, `src/LtHash.sol`: the WOTS verifier and the LtHash accumulator, byte-compatible
-  with the Solana program and the Ostra TypeScript SDK, tested against vectors made by that SDK.
+  with the Ostra TypeScript SDK and tested against vectors made by that SDK.
 - `src/OstraVault.sol`, `src/OstraVaultFactory.sol`: vaults spent only with rotating WOTS keys
   (Transfer, OpenChannel, SetCrankKey, Swap, ConfigurePool, ClaimDividend, SetGuardian,
   SetRecoveryPolicy, SupportRecovery, DevBuy), as beacon proxies at addresses fixed by token, initial
-  key root and initial crank. Channels are x402 batch-settlement channels on the deployed
-  x402BatchSettlement; a seller vault is the channels' receiverAuthorizer, so only its crank claims
+  key root and initial crank. Channels are payment channels on the deployed batch-settlement
+  contract; a seller vault is the channels' receiverAuthorizer, so only its crank claims
   vouchers and refunds unclaimed escrow. Swap is an exact-input swap of the vault's token on a
   Uniswap v4 pool of the deployed PoolManager, with the vault itself as the swapper (what the pool's
   hook sees); the output goes to the signed recipient, such as another vault, with an optional
@@ -93,7 +206,7 @@ Contents:
   published holidays and independently computed times. `test/Launchpad.fork.t.sol` runs it against
   the real PoolManager, USDG, WETH and AAPL pools, a TEST/AAPL pool quoted in the AAPL stock token,
   Uniswap v2 and v3 factories, the v3 position manager and Universal Router 2.1.2.
-- `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves as on Solana; the
+- `sdk/`: the TypeScript SDK (`@ostraagent/sdk`, viem). WOTS, LtHash and leaves; the
   messages, ids and addresses the contracts compute (spend, approval, leaf, deposit nonce, close
   request, channel id, voucher, vault address); reads of vaults, the pool, batches and channels; the
   aggregator wire format and EIP-191 polls; and `deployOstra`, which deploys the contracts from the
@@ -111,14 +224,14 @@ Contents:
   within its 30-second watch) or a seller's signed close request it claims the last voucher, refunds
   the rest and pays the seller's split out (settle, distribute, release). `scripts/chain-check.ts`
   runs the keeper process end to end against a chain; its fork test runs it on a mainnet fork.
-- `merchant/`: the seller server (`@ostraagent/merchant`) and the library the relayer and the AI
-  gateway sell through. Paid routes are x402 batch-settlement channels (`@x402/evm` 2.28.0) paid to
+- `merchant/`: the seller server (`@ostraagent/merchant`) and the library the relayer sells
+  through. Paid routes are batch-settlement payment channels paid to
   the seller's OstraSplit with the seller's Ostra vault as receiverAuthorizer; vouchers are checked
   by this server's own in-process facilitator, which also sends buyers' EIP-3009 deposits. Every
   paid voucher is forwarded to the keeper; a buyer's refund and a channel idle for 300 seconds are
   closed through the keeper; channels a buyer's Ostra vault opened on-chain are adopted from the
   chain. `scripts/chain-check.ts` runs the keeper and the seller server end to end against a chain
-  with the stock x402 client as buyer; its fork test runs it on a mainnet fork (it waits out the
+  with a stock channel client as buyer; its fork test runs it on a mainnet fork (it waits out the
   300-second idle close).
 - `relayer/`: the relayer gate (`@ostraagent/relayer`). Agents post calls to Ostra's contracts
   (one call, or several sent through Multicall3); the relayer checks them against its policy, prices
@@ -156,7 +269,7 @@ Contents:
   the passkey backup of the seed (AES-256-GCM under HKDF of the WebAuthn PRF output, kept by the
   relayer), and the creator vault a launch pays its creator's share to, with its own records and
   relayer client and an optional auto-shield of its balance into the shielded pool; `pay`, which
-  pays an x402 batch-settlement offer of an Ostra seller from a channel of the vault; and the
+  pays a batch-settlement offer of an Ostra seller from a channel of the vault; and the
   launchpad (`launchpad.ts`): buy (USDG from the buyer vault into the agent's vault for that token,
   created in the same request) and sell back, launch with a dev buy from the creator vault, pool
   settings, creator shares, airdrop rounds, vesting and referral claims, every vault spend quoted or
@@ -201,8 +314,9 @@ Contents:
 
 The contracts are deployed on Robinhood Chain mainnet; their addresses are in
 `deployments/robinhood-mainnet.json` (the record the services read, from block 91991509). One
-deployer account owns the beacons, the pool (treasury and init authority), the hook, the launchpad
-and the dispatcher.
+deployer account deployed everything and owns the pool's treasury and init authority, the hook, the
+launchpad and the dispatcher. The vault and pool beacons belong to OstraUpgradeOwner (below): every
+upgrade is signed by its rotating WOTS key and waits 72 hours in public.
 
 - `sdk/scripts/deploy.ts` deploys from the Foundry build with the deployer key in a 0600 file and
   writes the record; run again, it resumes or only checks. Its fork test runs it as on mainnet.
@@ -228,22 +342,16 @@ and the dispatcher.
   address from CF-Connecting-IP on those alone and passes it to the relayer and the RPC proxy for
   their rates, and serves TLS with a Cloudflare origin certificate whose key was made on the VPS.
 
-The fork tests fork mainnet through `OSTRA_FORK_RPC` (default the public RPC, which drops the fork
-block's state after some minutes; an archive RPC keeps it). Its URL may carry an API key, so it is
-never printed: anvil's errors are passed on with it replaced. `core/test/recover-logs.test.ts` runs
-against mainnet itself with `OSTRA_LIMITED_RPC`, an RPC that limits eth_getLogs (Alchemy Free: 10
-blocks a request), and checks that channel recovery still reads every log window.
+## Security
 
-```
-node vectors/generate.ts   # vectors from the SDK (OSTRA_SDK_SRC, default /srv/apps/ostra/sdk/src)
-forge test -vv             # Vault.fork.t.sol forks Robinhood Chain mainnet (rpc_endpoints.robinhood)
-cd sdk && npm ci && npm run typecheck && npm test   # needs forge build (../out) and anvil
-node scripts/abi.ts        # in sdk/: rewrite src/abi.ts after a contract change
-cd keeper && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
-cd merchant && npm ci && npm run typecheck && npm test   # after the sdk's and the keeper's npm ci
-cd relayer && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's and the merchant's npm ci
-cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm ci; needs ../out and anvil
-cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
-cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
-cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
-```
+- **No external audit yet.** Treat the contracts as new code. The shielded pool takes at most
+  250 USDG per deposit and 2,500 USDG in total for now.
+- Every key that still has a power, what it can and cannot do, and which keys are not yet
+  post-quantum are listed on the [security page](https://docs.ostraagent.xyz/security) of the
+  documentation.
+- To report a vulnerability, open a private security advisory on this repository rather than a
+  public issue.
+
+## License
+
+[MIT](LICENSE), except `lib/`, which keeps the licenses of the code it vendors.
