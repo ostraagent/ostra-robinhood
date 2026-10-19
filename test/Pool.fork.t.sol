@@ -584,7 +584,8 @@ contract PoolForkTest is Test {
     /// @dev deployments/robinhood-mainnet.json
     address internal constant LIVE_POOL = 0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6;
     address internal constant LIVE_POOL_BEACON = 0x30669Ca534921038a531BBE27116d85bB7406fFF;
-    address internal constant LIVE_POOL_IMPLEMENTATION = 0x5b588aFc9436d15CD58758b77C9D8E5CA26984cb;
+    /// @dev The version 1 implementation the live pool ran until 19 Oct 2026 (Sourcify-verified).
+    address internal constant V1_POOL_IMPLEMENTATION = 0x5b588aFc9436d15CD58758b77C9D8E5CA26984cb;
 
     struct PoolSnapshot {
         address token;
@@ -614,7 +615,13 @@ contract PoolForkTest is Test {
 
     function _upgradeLivePool() internal returns (PoolSnapshot memory before) {
         UpgradeableBeacon beacon = UpgradeableBeacon(LIVE_POOL_BEACON);
-        assertEq(beacon.implementation(), LIVE_POOL_IMPLEMENTATION);
+        // The live pool runs version 2 since 19 Oct 2026: on the fork it is put back on version 1 first, so the
+        // upgrade from version 1 is what is tested, whatever the live pool runs.
+        if (beacon.implementation() != V1_POOL_IMPLEMENTATION) {
+            vm.prank(beacon.owner());
+            beacon.upgradeTo(V1_POOL_IMPLEMENTATION);
+        }
+        assertEq(beacon.implementation(), V1_POOL_IMPLEMENTATION);
         OstraPool live = OstraPool(LIVE_POOL);
         before = _snapshot(live);
         bytes32[] memory states = new bytes32[](before.batchCount);

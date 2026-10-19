@@ -13,6 +13,7 @@ export const CONTRACTS: Readonly<Record<string, readonly [string, string]>> = {
   ostraVaultAbi: ["OstraVault.sol", "OstraVault"],
   ostraVaultFactoryAbi: ["OstraVaultFactory.sol", "OstraVaultFactory"],
   ostraPoolAbi: ["OstraPool.sol", "OstraPool"],
+  ostraUpgradeOwnerAbi: ["OstraUpgradeOwner.sol", "OstraUpgradeOwner"],
   ostraSplitAbi: ["OstraSplit.sol", "OstraSplit"],
   ostraSplitFactoryAbi: ["OstraSplit.sol", "OstraSplitFactory"],
   x402BatchSettlementAbi: ["IX402BatchSettlement.sol", "IX402BatchSettlement"],

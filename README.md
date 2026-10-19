@@ -37,6 +37,14 @@ Contents:
   pool is upgraded through its beacon (`sdk/scripts/upgrade-pool.ts`, same storage layout).
   `test/Pool.fork.t.sol` runs it on the mainnet fork with the real USDG, including that upgrade of
   the live pool.
+- `src/OstraUpgradeOwner.sol`: the owner of the vault and pool beacons. Every call it makes (an
+  upgrade, a change of owner, the final renounceOwnership) is signed by a rotating WOTS one-time key,
+  never an ECDSA key, and waits 72 hours in public before anyone may execute it, so every vault owner
+  can withdraw before an upgrade it does not accept. A valid cancel never reverts (a cancel that lost
+  the race to execute only rotates the key), so no third party can leave a signature public without
+  its key rotating. Without the owner seed and its passphrase no upgrade can ever be scheduled again:
+  the beacons then stay as they are, as if renounced. `test/UpgradeOwner.fork.t.sol` hands the live
+  beacons to it on the mainnet fork.
 - `src/launchpad/`: the Ostra launchpad on the deployed Uniswap v4 PoolManager. `OstraLaunchpad`
   launches a fixed-supply `OstraToken` whose whole supply goes into single-sided tiers of one pool
   (the top tier open to the highest price), held forever by `OstraLocker`; `OstraHook`, the pools'
@@ -198,6 +206,12 @@ and the dispatcher.
 
 - `sdk/scripts/deploy.ts` deploys from the Foundry build with the deployer key in a 0600 file and
   writes the record; run again, it resumes or only checks. Its fork test runs it as on mainnet.
+- `sdk/scripts/upgrade-owner.ts` makes the owner seed (encrypted under a passphrase typed without
+  echo; never written in the clear), deploys OstraUpgradeOwner and hands both beacons to it, then
+  schedules, cancels and executes calls. Its keychain is bound to the chain and the owner contract's
+  address; a call is recorded before it is signed, and a signed call that did not land is sent again,
+  identical, before anything new is signed, so no key signs twice (keep the state directory with the
+  seed). One run at a time. Its fork test runs it against the live beacons.
 - `sdk/scripts/upgrade-pool.ts` upgrades the pool to OstraPool version 2 with the beacon owner's key
   (only an empty pool), compares every pool setting before and after, and rewrites
   `poolImplementation` in the record; run again, it only checks. Its fork test upgrades the live

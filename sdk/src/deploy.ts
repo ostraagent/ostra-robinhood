@@ -7,7 +7,9 @@
 //      BeaconProxy initialized for USDG with the decided fee and limits;
 //   3. OstraSplitFactory.
 // Both beacons are owned by `beaconOwner` (upgradeable until the Phase 4
-// conditions are met, then released). Every step is checked on chain before
+// conditions are met, then released). On mainnet the deployer then hands them
+// to OstraUpgradeOwner (scripts/upgrade-owner.ts): WOTS-signed calls behind a
+// 72-hour delay. Every step is checked on chain before
 // the next one, and the result is checked again as a whole.
 //
 // deployLaunchpad adds the launchpad (src/launchpad/): OstraFees, OstraHook at

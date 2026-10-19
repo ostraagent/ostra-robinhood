@@ -11,16 +11,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createWalletClient, getAddress, http, numberToHex, type Address, type Hex } from "viem";
+import { getAddress, numberToHex, type Address, type Hex } from "viem";
 import { ostraPoolAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
 import { USDG } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
-import { startFork, type Fork } from "./fork.ts";
+import { handBeaconsTo, startFork, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/upgrade-pool.ts", import.meta.url));
 const live = parseDeployment(JSON.parse(readFileSync(fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url)), "utf8")));
+/** The version 1 implementation the live pool ran until 19 Oct 2026 (Sourcify-verified). */
+const V1_POOL_IMPLEMENTATION = getAddress("0x5b588aFc9436d15CD58758b77C9D8E5CA26984cb");
 /** anvil's development account 3 (a public test key, used on the fork only). */
 const DEV_KEY_3 = "0x7c852118294e51e653712a81e05800f5f2b2a8ae56a8a0b82e3d9e0a6c0ce58b";
 
@@ -57,18 +59,15 @@ test("upgrades the live pool from version 1 to 2 with the beacon owner's key, ke
   const testOwner = fork.accounts[3]?.address;
   if (testOwner === undefined) throw new Error("no fork account 3");
 
-  // The live beacons go to the test key on the fork.
-  assert.equal(getAddress((await read(live.poolBeacon, upgradeableBeaconAbi, "owner")) as Address), live.beaconOwner);
-  await rpc("anvil_impersonateAccount", [live.beaconOwner]);
-  await rpc("anvil_setBalance", [live.beaconOwner, numberToHex(10n ** 18n)]);
-  const ownerWallet = createWalletClient({ account: live.beaconOwner, chain: robinhoodChain, transport: http(fork.url) });
-  for (const beacon of [live.poolBeacon, live.vaultBeacon]) {
-    const hash: Hex = await ownerWallet.writeContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "transferOwnership", args: [testOwner as Address], account: live.beaconOwner, chain: robinhoodChain });
+  // The live beacons go to the test key on the fork, and the pool goes back to version 1 there (the live pool
+  // runs version 2 since 19 Oct 2026), so the upgrade from version 1 is what is run, whatever mainnet runs.
+  await handBeaconsTo(fork, [live.poolBeacon, live.vaultBeacon], testOwner);
+  await fork.setBalance(testOwner, 10n ** 18n);
+  if (getAddress((await read(live.poolBeacon, upgradeableBeaconAbi, "implementation")) as Address) !== V1_POOL_IMPLEMENTATION) {
+    const hash: Hex = await fork.wallet(fork.accounts[3]!).writeContract({ address: live.poolBeacon, abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [V1_POOL_IMPLEMENTATION], account: fork.accounts[3]!, chain: robinhoodChain });
     assert.equal((await fork.client.waitForTransactionReceipt({ hash })).status, "success");
   }
-  await rpc("anvil_stopImpersonatingAccount", [live.beaconOwner]);
-  await fork.setBalance(testOwner, 10n ** 18n);
-  const d = { ...live, beaconOwner: testOwner };
+  const d = { ...live, beaconOwner: testOwner, poolImplementation: V1_POOL_IMPLEMENTATION };
   writeFileSync(record, `${JSON.stringify(d, null, 2)}\n`, { mode: 0o644 });
   writeFileSync(key, `${DEV_KEY_3}\n`, { mode: 0o600 });
   writeFileSync(rpcFile, `${fork.url}\n`, { mode: 0o600 });
@@ -89,7 +88,7 @@ test("upgrades the live pool from version 1 to 2 with the beacon owner's key, ke
   assert.notEqual(held.status, 0);
   assert.match(held.stderr, /only an empty pool is upgraded/);
   await rpc("anvil_dealERC20", [d.pool, USDG, numberToHex(0n)]);
-  assert.equal(getAddress((await read(d.poolBeacon, upgradeableBeaconAbi, "implementation")) as Address), live.poolImplementation);
+  assert.equal(getAddress((await read(d.poolBeacon, upgradeableBeaconAbi, "implementation")) as Address), V1_POOL_IMPLEMENTATION);
 
   const first = run(env);
   assert.equal(first.status, 0, first.stderr);
@@ -97,8 +96,8 @@ test("upgrades the live pool from version 1 to 2 with the beacon owner's key, ke
   assert.ok(!first.stdout.includes(DEV_KEY_3.slice(2)) && !first.stderr.includes(DEV_KEY_3.slice(2)), "the key is never printed");
   assert.ok(!first.stdout.includes(fork.url) && !first.stderr.includes(fork.url), "the RPC URL is never printed");
   const written = parseDeployment(JSON.parse(readFileSync(record, "utf8")));
-  assert.notEqual(written.poolImplementation, live.poolImplementation);
-  assert.deepEqual({ ...written, poolImplementation: live.poolImplementation }, d, "only poolImplementation changes in the record");
+  assert.notEqual(written.poolImplementation, V1_POOL_IMPLEMENTATION);
+  assert.deepEqual({ ...written, poolImplementation: V1_POOL_IMPLEMENTATION }, d, "only poolImplementation changes in the record");
   assert.equal(getAddress((await read(d.poolBeacon, upgradeableBeaconAbi, "implementation")) as Address), written.poolImplementation);
   assert.equal(await read(d.pool, ostraPoolAbi, "VERSION"), 2);
   assert.deepEqual(await settings(), before);

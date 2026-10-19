@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   createPublicClient,
   createWalletClient,
+  getAddress,
   http,
   numberToHex,
   type Address,
@@ -17,6 +18,7 @@ import {
   type WalletClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
 import { ROBINHOOD_PUBLIC_RPC, USDG } from "../src/constants.ts";
 import { redact } from "../src/chain.ts";
@@ -141,4 +143,22 @@ export async function deployOnFork(fork: Fork): Promise<Deployment> {
 export async function deployLaunchpadOnFork(fork: Fork, d: Deployment): Promise<Deployment> {
   const [deployer] = fork.accounts as [PrivateKeyAccount];
   return deployLaunchpad({ publicClient: fork.client, walletClient: fork.wallet(deployer), outDir: OUT_DIR }, d);
+}
+
+/**
+ * Hands live beacons to `to` on the fork: each beacon's current owner (an
+ * account or a contract such as OstraUpgradeOwner) is impersonated and calls
+ * transferOwnership. Nothing changes on mainnet.
+ */
+export async function handBeaconsTo(fork: Fork, beacons: readonly Address[], to: Address): Promise<void> {
+  for (const beacon of beacons) {
+    const owner = getAddress((await fork.client.readContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "owner" })) as Address);
+    if (owner === getAddress(to)) continue;
+    await rpc(fork.url, "anvil_impersonateAccount", [owner]);
+    await rpc(fork.url, "anvil_setBalance", [owner, numberToHex(10n ** 18n)]);
+    const wallet = createWalletClient({ account: owner, chain: robinhoodChain, transport: http(fork.url) });
+    const hash = await wallet.writeContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "transferOwnership", args: [to], account: owner, chain: robinhoodChain });
+    if ((await fork.client.waitForTransactionReceipt({ hash })).status !== "success") throw new Error(`transferOwnership of ${beacon} failed on the fork`);
+    await rpc(fork.url, "anvil_stopImpersonatingAccount", [owner]);
+  }
 }

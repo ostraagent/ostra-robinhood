@@ -36,6 +36,7 @@ import {
   isAddress,
   keccak256,
   numberToHex,
+  pad,
   stringToHex,
   zeroAddress,
   type Address,
@@ -64,6 +65,7 @@ const SPEND_DOMAIN = stringToHex("OSTRA/VAULT/EVM/v1"); // bytes18
 const APPROVE_DOMAIN = stringToHex("OSTRA/APPROVE/EVM/v1"); // bytes20
 const LEAF_DOMAIN = stringToHex("OSTRA/LEAF/EVM/v1"); // bytes17
 const DEPOSIT_NONCE_DOMAIN = stringToHex("OSTRA/DEPOSIT/EVM/v2:"); // bytes21 (OstraPool version 2)
+const OWNER_DOMAIN = stringToHex("OSTRA/OWNER/EVM/v1"); // bytes18
 
 const ZERO32: Hex = `0x${"00".repeat(32)}`;
 const U64_MAX = (1n << 64n) - 1n;
@@ -853,6 +855,39 @@ export function leafMessage(a: { chainId: number; pool: Address; batchId: bigint
         nonZeroAddr(a.destination, "destination"),
         positive(a.leafAmount, U64_MAX, "leafAmount"),
       ],
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade owner (OstraUpgradeOwner, the WOTS-keyed owner of the beacons)
+// ---------------------------------------------------------------------------
+
+/** OstraUpgradeOwner.SCHEDULE and CANCEL. */
+export const UPGRADE_OWNER_ACTION = { schedule: 1, cancel: 2 } as const;
+export type UpgradeOwnerAction = (typeof UPGRADE_OWNER_ACTION)[keyof typeof UPGRADE_OWNER_ACTION];
+
+/** OstraUpgradeOwner.schedulePayload: keccak256(abi.encode(target, keccak256(data))). */
+export function upgradeOwnerSchedulePayload(target: Address, data: Hex): Hex {
+  if (!/^0x(?:[0-9a-fA-F]{2})*$/.test(data)) throw new RangeError("data must be 0x hex of whole bytes");
+  return keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [addr(target, "target"), keccak256(data)]));
+}
+
+/** The CANCEL payload of call `id`: the id as a 32-byte word. */
+export function upgradeOwnerCancelPayload(id: bigint): Hex {
+  return pad(numberToHex(uint(id, U64_MAX, "id")), { size: 32 });
+}
+
+/**
+ * OstraUpgradeOwner.message: "OSTRA/OWNER/EVM/v1" || chainid || owner || nonce (u64) || action (u8) ||
+ * payload || nextKeyRoot, signed by WOTS key `nonce` of the owner's keychain.
+ */
+export function upgradeOwnerMessage(a: { chainId: number; owner: Address; nonce: bigint; action: UpgradeOwnerAction; payload: Hex; nextKeyRoot: Hex }): Uint8Array {
+  if (a.action !== UPGRADE_OWNER_ACTION.schedule && a.action !== UPGRADE_OWNER_ACTION.cancel) throw new RangeError("unknown upgrade owner action");
+  return hexToBytes(
+    encodePacked(
+      ["bytes18", "uint256", "address", "uint64", "uint8", "bytes32", "bytes32"],
+      [OWNER_DOMAIN, chain(a.chainId), addr(a.owner, "owner"), uint(a.nonce, U64_MAX, "nonce"), a.action, bytes32(a.payload, "payload"), nonZero32(a.nextKeyRoot, "nextKeyRoot")],
     ),
   );
 }
