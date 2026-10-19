@@ -68,7 +68,14 @@ async function main(): Promise<void> {
     if (existsSync(out)) {
       d = parseDeployment(JSON.parse(readFileSync(out, "utf8")));
       if (d.chainId !== chainId) throw new Error(`${out} is a deployment on chain ${d.chainId}`);
-      if (d.beaconOwner !== account.address) throw new Error(`${out} was deployed by ${d.beaconOwner}, not by this deployer`);
+      // The beacons stay the deployer's until they are handed to OstraUpgradeOwner (scripts/upgrade-owner.ts), which
+      // rewrites beaconOwner to the owner contract; the pool's treasury and init authority, checked next, stay the
+      // deployer's either way. An account with an EIP-7702 delegation (code 0xef0100 followed by the delegate) is
+      // still an account, not the owner contract.
+      if (d.beaconOwner !== account.address) {
+        const code = await publicClient.getCode({ address: d.beaconOwner });
+        if (code === undefined || code.startsWith("0xef0100")) throw new Error(`${out} was deployed by ${d.beaconOwner}, not by this deployer`);
+      }
       await checkDeployment(publicClient, d, { treasury: account.address, poolAuthority: account.address });
       log("found", { record: out, launchpad: d.launchpad !== undefined });
     }
