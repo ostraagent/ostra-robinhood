@@ -12,6 +12,7 @@ export * from "./keys.ts";
 export * from "./launchpad.ts";
 export * from "./passkey.ts";
 export * from "./pay.ts";
+export * from "./publish.ts";
 export * from "./pending.ts";
 export * from "./random.ts";
 export * from "./relay.ts";

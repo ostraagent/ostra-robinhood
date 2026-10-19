@@ -71,7 +71,7 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata", "upload_image", "publish_profile", "publish_token_metadata"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     assert.equal(((await stat(home)).mode & 0o777).toString(8), "700");
@@ -144,6 +144,9 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
     assert.ok(moved.ok && moved.json.status === "sent", moved.text);
     const me = await call(client, "profile");
     assert.ok(me.ok && me.json.profileUri === "ipfs://bafkreiprofileone" && me.json.agentId === registered.json.agentId, me.text);
+    // Publishing goes through the relayer's uploader: without a relayer it is refused before anything is signed.
+    const unpublished = await call(client, "publish_profile", { name: "Ostra MCP Agent" });
+    assert.ok(!unpublished.ok && /OSTRA_RELAYER_URL/.test(unpublished.text), unpublished.text);
     const meta = await call(client, "set_token_metadata", { token, uri: "ipfs://bafkreitokenone" });
     assert.ok(meta.ok && meta.json.status === "sent", meta.text);
     const page = await call(client, "token_info", { token });

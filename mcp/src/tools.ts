@@ -4,10 +4,11 @@
 // unless its message says otherwise. Amounts are decimal strings: USDG with
 // at most 6 decimals, launched tokens with at most 18.
 
+import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount } from "@ostraagent/core";
+import { MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
 import { QuoteError, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 
@@ -19,6 +20,14 @@ const units = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/, "an amount: 
 const slippage = z.number().int().min(0).max(1_000).optional().describe("slippage in bps (default 100 = 1%, at most 1000)");
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "32 bytes of 0x hex");
 const uri = z.string().max(256).regex(/^(ipfs|https):\/\/[^\s]+$/, "an ipfs:// or https:// URI of at most 256 bytes");
+/** What a profile or a token's metadata tells: texts and https links; image an ipfs:// or https:// URI (upload_image makes one). */
+const publicFields = {
+  description: z.string().max(1_000).optional(),
+  image: uri.optional(),
+  website: z.string().url().max(200).optional(),
+  x: z.string().url().max(200).optional().describe("the X (Twitter) profile link"),
+  telegram: z.string().url().max(200).optional(),
+};
 
 /** A tool's answer: its result as JSON, or the error, with what kind of error it is. */
 async function run(fn: () => Promise<unknown>, rpcUrl: string): Promise<CallToolResult> {
@@ -177,6 +186,28 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool("register_agent", "Registers the agent in the ERC-8004 Identity Registry, once: its creator vault owns the identity and is its agentWallet; uri is its ERC-8004 registration file.", { uri }, (a) => lp().registerAgent(a.uri));
   tool("set_agent_uri", "Points the agent's ERC-8004 identity at a new registration file.", { uri }, (a) => lp().setAgentUri(a.uri));
+  tool(
+    "upload_image",
+    `Pins an image file on this machine (PNG, JPEG, WebP or GIF, at most ${MAX_UPLOAD_IMAGE_BYTES} bytes) to IPFS through the Ostra uploader and returns its ipfs:// URI, for a profile or a token's metadata.`,
+    { path: z.string().min(1).max(4_096) },
+    async (a) => {
+      const s = await stat(a.path);
+      if (!s.isFile() || s.size === 0 || s.size > MAX_UPLOAD_IMAGE_BYTES) throw new RangeError(`${a.path} must be a file of 1 to ${MAX_UPLOAD_IMAGE_BYTES} bytes`);
+      return { uri: await uploadImage(agent.config.relayerUrl, new Uint8Array(await readFile(a.path))) };
+    },
+  );
+  tool(
+    "publish_profile",
+    "Publishes the agent's profile: builds its ERC-8004 registration file (name, description, image, links, its creator vault as agentWallet), pins it to IPFS, sets it in OstraRegistry and, once the agent is registered, points its ERC-8004 identity at it.",
+    { name: z.string().min(1).max(64), ...publicFields },
+    (a) => lp().publishProfile(a),
+  );
+  tool(
+    "publish_token_metadata",
+    "Publishes the metadata of a token this agent launched (description, image, website, X, Telegram): pins it to IPFS and sets it in OstraRegistry from the creator vault.",
+    { token: address, ...publicFields },
+    (a) => lp().publishTokenMetadata(a),
+  );
   tool(
     "set_token_metadata",
     "Sets the metadata of a token this agent launched (a JSON file with image, description, website, X, Telegram), from its creator vault: only the pool's creator vault can.",

@@ -93,6 +93,7 @@ import {
 import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { tokenBalance, tokenDecimals } from "./chain.ts";
 import { LOG_WINDOW_BLOCKS } from "./channels.ts";
+import { profileFile, tokenMetadataFile, uploadJson, type PublicFields } from "./publish.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
@@ -1111,5 +1112,34 @@ export class LaunchpadService {
     const pool = await this.#pool(a.token);
     if (getAddress(pool.config.creatorVault) !== vault) throw new Error(`${pool.token} was launched by the creator vault ${getAddress(pool.config.creatorVault)}, not by this agent's ${vault}; nothing was signed`);
     return this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.SET_TOKEN_METADATA, setTokenMetadataParams({ token: pool.token, poolId: pool.id, uri: a.uri }), "token metadata");
+  }
+
+  /**
+   * Publishes the agent's profile: builds its ERC-8004 registration file (name, description, image, links, the
+   * creator vault as its agentWallet, its registration once it has one), pins it through the uploader, sets it in
+   * OstraRegistry, and points the ERC-8004 identity at it too when the agent is registered.
+   */
+  async publishProfile(p: PublicFields & { name: string }): Promise<{ uri: string; profile: VaultOperationResult; agentUri: VaultOperationResult | null }> {
+    const vault = await this.#identityVault();
+    const record = await this.#agentRecord();
+    const file = profileFile({ ...p, vault, agentId: record?.agentId ?? null });
+    const uri = await uploadJson(this.#config.relayerUrl, file);
+    const profile = await this.setProfile(uri);
+    if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null };
+    return { uri, profile, agentUri: await this.setAgentUri(uri) };
+  }
+
+  /** Publishes the metadata of a token this agent launched (description, image, links), pins it and sets it in OstraRegistry. */
+  async publishTokenMetadata(a: PublicFields & { token: string }): Promise<{ uri: string; result: VaultOperationResult }> {
+    const vault = await this.#identityVault();
+    const pool = await this.#pool(a.token);
+    if (getAddress(pool.config.creatorVault) !== vault) throw new Error(`${pool.token} was launched by the creator vault ${getAddress(pool.config.creatorVault)}, not by this agent's ${vault}; nothing was signed`);
+    const [name, symbol] = await Promise.all([
+      this.#client.readContract({ address: pool.token, abi: ostraTokenAbi, functionName: "name" }) as Promise<string>,
+      this.#client.readContract({ address: pool.token, abi: ostraTokenAbi, functionName: "symbol" }) as Promise<string>,
+    ]);
+    const { token: _token, ...fields } = a;
+    const uri = await uploadJson(this.#config.relayerUrl, tokenMetadataFile({ ...fields, token: pool.token, name, symbol, creatorVault: vault }));
+    return { uri, result: await this.setTokenMetadata({ token: pool.token, uri }) };
   }
 }
