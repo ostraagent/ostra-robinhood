@@ -13,8 +13,9 @@
 //   tokens    name, symbol and total supply, the pool's graduation, the
 //             metadata URI in OstraRegistry and the creator's profile URI,
 //             with the JSON files they point at (data, never instructions)
-//   prices    ETH/USD from Chainlink; a USDG pool's quote is $1; other quotes
-//             (stock tokens, other ERC-20s) have no USD price here
+//   prices    ETH/USD from Chainlink; a USDG pool's quote is $1; a listed
+//             stock token's (sdk pairs.ts) from its Chainlink feed times its
+//             uiMultiplier; other quotes have no USD price here
 //
 // Logs are read in windows that shrink when the RPC refuses one and grow back
 // after it answers; the state is written to a JSON file after every scan that
@@ -28,9 +29,11 @@ import {
   UNISWAP_UNIVERSAL_ROUTER,
   UNISWAP_V4_POOL_MANAGER,
   chainlinkAggregatorAbi,
+  findLaunchPair,
   ostraHookAbi,
   ostraRegistryAbi,
   ostraTokenAbi,
+  readPairUsdPrice,
   usdgAbi,
   type Deployment,
   type PoolKey,
@@ -215,6 +218,8 @@ export class Indexer {
   #window = WINDOW_START;
   #ethUsd: number | null = null;
   #ethUsdAt = 0;
+  /** The USD price of each listed stock token a launched pool pairs with. */
+  #stockUsd = new Map<Address, number>();
   #latest = 0n;
   #blockTimes = new Map<bigint, number>();
   #running = false;
@@ -438,6 +443,18 @@ export class Indexer {
       } catch (err) {
         this.#log("eth_usd_failed", { reason: (err as Error).message.slice(0, 200) });
       }
+      for (const quote of new Set(this.#state.launches.map((l) => getAddress(l.quote)))) {
+        const pair = findLaunchPair(quote);
+        if (pair === null || pair.kind !== "stock") continue;
+        try {
+          const price = await readPairUsdPrice(this.#client, pair);
+          this.#stockUsd.set(pair.address, Number(price.priceE8) / 1e8);
+        } catch (err) {
+          // A feed older than readPairUsdPrice accepts: no USD value rather than an old one. Other failures keep the last price.
+          if (/last updated/.test((err as Error).message)) this.#stockUsd.delete(pair.address);
+          this.#log("stock_usd_failed", { quote, reason: (err as Error).message.slice(0, 200) });
+        }
+      }
     }
     for (const launch of this.#state.launches) {
       const details = this.#state.tokens[launch.token];
@@ -499,7 +516,7 @@ export class Indexer {
   #quoteUsd(quote: Address, d: Deployment): number | null {
     if (quote === zeroAddress) return this.#ethUsd;
     if (getAddress(quote) === getAddress(d.token)) return 1;
-    return null;
+    return this.#stockUsd.get(getAddress(quote)) ?? null;
   }
 
   #summary(launch: Launch, d: Deployment, nowSec: number): TokenSummary | null {

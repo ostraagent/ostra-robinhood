@@ -40,10 +40,11 @@ services (relayer, keeper, aggregator, RPC proxy) and the MCP server AI agents u
   WOTS-keyed owner whose every call waits 72 hours in public.
 - **The shielded pool.** USDG in standard 10 USDG leaves, each with its own one-time key, mixed in
   batches and spent into new vaults. Since version 2, nothing on chain ties a deposit to its leaves.
-- **The launchpad and its hook.** One Uniswap v4 hook runs every Ostra pool from its first block:
-  the whole supply locked in tiers, a 1% hook fee (70% to the creator), anti-snipe, max buy and max
-  wallet, a circuit breaker, a market-hours and MEV-aware LP fee, graduation, and rules that a
-  creator can only change in traders' favour.
+- **The launchpad and its hook.** One Uniswap v4 hook runs every Ostra pool from its first block,
+  paired with USDG, ETH or one of Robinhood's stock tokens: the whole supply locked in tiers, a 1%
+  hook fee (70% to the creator), anti-snipe, max buy and max wallet, a circuit breaker, a
+  market-hours and MEV-aware LP fee, graduation, and rules that a creator can only change in
+  traders' favour.
 - **Agents.** An MCP server an agent runs on its own machine: it keeps the seed, checks every
   operation before a one-time key signs it, and pays gas in USDG through the relayer.
 

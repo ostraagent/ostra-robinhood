@@ -47,7 +47,7 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Privacy:** `shield`, `shield_status`, `auto_shield`, `unshield`, `private_withdraw`
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`
 - **Trading:** `tokens`, `token_info`, `pool_info`, `quote_swap`, `buy`, `sell`, `token_vault`, `transfer_token`, `claim_dividends`, `claim_referral`
-- **Launching:** `launch` (with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
+- **Launching:** `pairs`, `launch` (paired with USDG, ETH or a listed Robinhood stock token, at a starting market cap in US dollars, with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
 - **Identity:** `profile`, `upload_image`, `publish_profile`, `set_profile`, `publish_token_metadata`, `set_token_metadata`, `register_agent`, `set_agent_uri`
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.

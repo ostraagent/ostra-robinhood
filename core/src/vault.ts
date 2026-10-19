@@ -254,8 +254,10 @@ export class VaultService {
 
   constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null, vaultToken: Address | null = null) {
     if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
-    if ((kind === "token") !== (vaultToken !== null)) throw new Error("a token vault, and only a token vault, names its token");
-    if (vaultToken !== null && getAddress(vaultToken) === config.deployment.token) throw new Error(`the vault in ${vaultToken} is the buyer vault, not a token vault`);
+    // A token vault names its token; a creator vault may name a pair's token (a stock token, WETH for ETH) instead of USDG.
+    if (kind === "token" && vaultToken === null) throw new Error("a token vault names its token");
+    if (vaultToken !== null && kind !== "token" && kind !== "creator") throw new Error("only a token vault or a creator vault names its token");
+    if (vaultToken !== null && getAddress(vaultToken) === config.deployment.token) throw new Error(`the vault in ${vaultToken} is the ${kind === "creator" ? "USDG creator vault, named without a token" : "buyer vault, not a token vault"}`);
     this.kind = kind;
     this.token = vaultToken === null ? config.deployment.token : getAddress(vaultToken);
     this.privateIndex = privateIndex;
@@ -283,9 +285,14 @@ export class VaultService {
     this.#initCrank = getAddress(crank);
   }
 
+  /** A vault in the deployment's token (USDG); else a token vault or a pair's creator vault, paid for by the buyer vault. */
+  #inUsdg(): boolean {
+    return this.token === this.#config.deployment.token;
+  }
+
   #missing(): string {
     if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; unshield creates it`;
-    if (this.kind === "creator") return "this agent has no creator vault yet; open it before a launch names it";
+    if (this.kind === "creator") return `this agent has no creator vault${this.#inUsdg() ? "" : ` in ${this.token}`} yet; open it before a launch names it`;
     if (this.kind === "token") return `this agent has no vault in ${this.token} yet; buying the token creates it`;
     return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
   }
@@ -359,6 +366,9 @@ export class VaultService {
 
   async #checkToken(): Promise<void> {
     if (this.kind === "token") throw new Error(`the vault in ${this.token} spends only through its token operations (sell, transfer, claim dividends)`);
+    // A pair's creator vault (in a stock token or WETH) is spent from only through the launchpad: the launch, its pool's
+    // settings and paying its payouts out; it neither withdraws USDG nor opens channels.
+    if (!this.#inUsdg()) throw new Error(`the creator vault in ${this.token} spends only through the launchpad (launch, pool settings, creator_withdraw)`);
     const decimals = await tokenDecimals(this.#client, this.#config.deployment.token);
     if (decimals !== TOKEN_DECIMALS) throw new Error(`token ${this.#config.deployment.token} has ${decimals} decimals; this package supports ${TOKEN_DECIMALS}`);
   }
@@ -406,7 +416,7 @@ export class VaultService {
 
   /** The vaults that open relayer channels and pay their own requests: the buyer, a private and the creator vault (not the seller vault nor a token vault). */
   #paysRelayer(): boolean {
-    return this.kind !== "seller" && this.kind !== "token";
+    return this.kind !== "seller" && this.kind !== "token" && this.#inUsdg();
   }
 
   #options(extra: SendOptions = {}): SendOptions {
@@ -429,7 +439,7 @@ export class VaultService {
   open(): Promise<OpenVaultResult> {
     return this.#serial(async () => {
       if (this.kind === "private") throw new Error("a private vault is created by unshield, together with the leaf spent into it");
-      if (this.kind !== "token") await this.#checkToken();
+      if (this.kind !== "token" && this.#inUsdg()) await this.#checkToken();
       const vault = await this.vaultAddress();
       const token = this.token;
       const softLimit = formatTokenAmount(VAULT_SOFT_LIMIT);
@@ -440,10 +450,11 @@ export class VaultService {
         return found;
       }
       await this.requireEth(CREATE_VAULT_GAS, "open the vault");
-      // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault and a token vault are paid up front by the buyer vault.
-      const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" || this.kind === "token" }));
+      // The relayer creates the buyer vault before payment (a debt of the vault); the seller vault, a token vault and a
+      // pair's creator vault (in another token than USDG) are paid up front by the buyer vault.
+      const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" || !this.#paysRelayer() }));
       const result: OpenVaultResult = { vault, token, nonce: "0", created: true, txHash, softLimit };
-      if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator")) {
+      if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator") && this.#paysRelayer()) {
         result.note =
           "the Ostra relayer paid the vault's creation; the vault owes that price, paid with the first voucher of its channel to the relayer, " +
           "which this server opens from the vault once it holds tokens (nothing else is relayed for the vault until then)";
@@ -500,6 +511,7 @@ export class VaultService {
   status(): Promise<BalanceResult> {
     return this.#serial(async () => {
       if (this.kind === "token") throw new Error(`the vault in ${this.token} is read with its token's tools (token_vault)`);
+      if (!this.#inUsdg()) throw new Error(`the creator vault in ${this.token} is read with the launchpad's pair tools`);
       const vault = await this.vaultAddress();
       const token = this.#config.deployment.token;
       const v = await this.#read(vault);
@@ -570,7 +582,7 @@ export class VaultService {
       throw new Error("the stored signature does not belong to this vault and nonce");
     }
     const token = this.#config.deployment.token;
-    if (header.action === VAULT_ACTION.TRANSFER && this.kind !== "token") {
+    if (header.action === VAULT_ACTION.TRANSFER && this.#inUsdg()) {
       const t = decodeVaultTransferMessage(message);
       await this.#notFrozen(t.to, "the destination of a withdrawal signed earlier,");
       const params = transferParams({ to: t.to, amount: t.amount });

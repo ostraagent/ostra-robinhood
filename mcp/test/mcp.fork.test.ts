@@ -7,7 +7,9 @@
 // refused before signing; a launch with a dev buy, a buy and a sell, the
 // pool's view; the token list and a token's page; the creator vault's
 // profile, its ERC-8004 registration (against the live Identity Registry) and
-// the token's metadata; errors for bad input. The keys stay in OSTRA_HOME (0700) and
+// the token's metadata; the pairs (USDG, ETH, the stock tokens) and a launch
+// paired with NVDA, whose pool a vault without NVDA cannot buy; errors for bad
+// input. The keys stay in OSTRA_HOME (0700) and
 // a second server on the same OSTRA_HOME finds the same vault.
 
 import assert from "node:assert/strict";
@@ -63,8 +65,8 @@ async function connect(home: string): Promise<Client> {
 
 type Answer = { ok: boolean; text: string; json: Record<string, unknown> };
 
-async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<Answer> {
-  const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content: { type: string; text: string }[] };
+async function call(client: Client, name: string, args: Record<string, unknown> = {}, timeout?: number): Promise<Answer> {
+  const r = (await client.callTool({ name, arguments: args }, undefined, timeout === undefined ? undefined : { timeout })) as { isError?: boolean; content: { type: string; text: string }[] };
   const text = r.content[0]?.text ?? "";
   let json: Record<string, unknown> = {};
   try {
@@ -82,7 +84,7 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata", "upload_image", "publish_profile", "publish_token_metadata"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata", "upload_image", "publish_profile", "publish_token_metadata", "pairs", "fund_creator_vault", "creator_withdraw"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     assert.equal(((await stat(home)).mode & 0o777).toString(8), "700");
@@ -164,6 +166,31 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
     const pageJson = page.json as { metadata: { uri: string }; creator: { vault: string; profileUri: string } };
     assert.ok(page.ok && pageJson.metadata.uri === "ipfs://bafkreitokenone" && pageJson.creator.profileUri === "ipfs://bafkreiprofileone", page.text);
     assert.equal(getAddress(pageJson.creator.vault), getAddress(launched.json.creatorVault as string));
+
+    // The pairs: USDG, ETH and the 32 stock tokens, each priced; a launch paired with NVDA, without a dev buy.
+    // On a fresh fork the first read of each stock token and feed fetches its code and storage from the forked RPC:
+    // that first call took 63.5 s (19 Oct 2026; the same call again 0.65 s, and on mainnet 0.4 s through an archive
+    // RPC, 6.6 s through the public RPC), over the client's default 60 s, so it gets 5 minutes.
+    const pairs = await call(client, "pairs", {}, 300_000);
+    const pairRows = JSON.parse(pairs.text) as { symbol: string; kind: string; creatorVault: string; priceUsd: string | null }[];
+    assert.ok(pairs.ok && pairRows.length === 34 && pairRows[0]?.symbol === "USDG" && pairRows[1]?.symbol === "ETH" && pairRows.filter((r) => r.kind === "stock").length === 32, pairs.text);
+    assert.ok(pairRows.every((r) => r.priceUsd !== null && Number(r.priceUsd) > 0), pairs.text);
+    const nvda = pairRows.find((r) => r.symbol === "NVDA");
+    assert.ok(nvda !== undefined, pairs.text);
+    const notOffered = await call(client, "launch", { name: "Not Offered", symbol: "NOPE", pair: "DOGE", marketCap: "20000" });
+    assert.equal(notOffered.ok, false);
+    const stockLaunch = await call(client, "launch", { name: "Ostra MCP Stock", symbol: "OMST", pair: "NVDA", marketCap: "20000" });
+    assert.ok(stockLaunch.ok && stockLaunch.json.status === "launched" && stockLaunch.json.pair === "NVDA" && stockLaunch.json.marketCapUsd === "20000" && Number(stockLaunch.json.marketCapInPair) > 0, stockLaunch.text);
+    assert.equal(getAddress(stockLaunch.json.creatorVault as string), getAddress(nvda.creatorVault));
+    const stockInfo = await call(client, "pool_info", { token: stockLaunch.json.token as string });
+    assert.ok(stockInfo.ok && stockInfo.json.symbol === "OMST", stockInfo.text);
+    const noNvda = await call(client, "buy", { token: stockLaunch.json.token as string, amount: "0.01" });
+    assert.ok(!noNvda.ok && /vault in NVDA holds 0, less than 0.01/.test(noNvda.text), noNvda.text);
+    // NVDA paid into the USDG vault would stay there for good: refused before anything is signed.
+    const stranded = await call(client, "claim_referral", { pair: "NVDA", referrer: vault });
+    assert.ok(!stranded.ok && /stuck there for good/.test(stranded.text), stranded.text);
+    const launches2 = JSON.parse((await call(client, "launches")).text) as unknown[];
+    assert.equal(launches2.length, 2);
   } finally {
     await client.close();
   }

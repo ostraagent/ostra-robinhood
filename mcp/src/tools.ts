@@ -2,14 +2,16 @@
 // checked (quoted or simulated with a throwaway key) before the agent's
 // one-time key signs it, so a refusal means nothing was signed or spent
 // unless its message says otherwise. Amounts are decimal strings: USDG with
-// at most 6 decimals, launched tokens with at most 18.
+// at most 6 decimals, launched tokens, stock tokens and ETH with at most 18.
+// A launch pairs with USDG, ETH or a listed stock token (the `pairs` tool);
+// its market cap is in US dollars.
 
 import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
-import { QuoteError, redact } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, QuoteError, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
@@ -17,6 +19,8 @@ const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v ==
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "an address: 0x and 40 hex characters");
 const usdg = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/, "a USDG amount: a plain decimal with at most 6 decimals");
 const units = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/, "an amount: a plain decimal with at most 18 decimals");
+/** A pair Ostra offers (sdk pairs.ts): USDG, ETH or a listed stock token's ticker. */
+const pair = z.enum(LAUNCH_PAIRS.map((p) => p.symbol) as [string, ...string[]]);
 const slippage = z.number().int().min(0).max(1_000).optional().describe("slippage in bps (default 100 = 1%, at most 1000)");
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "32 bytes of 0x hex");
 const uri = z.string().max(256).regex(/^(ipfs|https):\/\/[^\s]+$/, "an ipfs:// or https:// URI of at most 256 bytes");
@@ -117,45 +121,68 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("pool_info", "A token the Ostra launchpad launched: price, market cap, taxes, circuit breaker band, airdrop round, creator shares.", { token: address }, (a) => lp().poolInfo(a.token));
   tool(
     "quote_swap",
-    "Quotes a buy (USDG in) or sell (token in) as it would be signed now: expected and minimum output, the gas the swap reserves, the share of the circuit breaker's room used. Nothing is signed.",
+    "Quotes a buy (the pool's pair in: USDG or a stock token) or sell (token in) as it would be signed now: expected and minimum output, the gas the swap reserves, the share of the circuit breaker's room used. Nothing is signed.",
     { side: z.enum(["buy", "sell"]), token: address, amount: units, slippageBps: slippage, referrer: address.optional() },
     (a) => lp().quote({ side: a.side, token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
   tool(
     "buy",
-    "Buys a launched token with USDG from the vault; the tokens go to the agent's vault for that token (created in the same transaction).",
-    { token: address, amount: usdg, slippageBps: slippage, referrer: address.optional() },
+    "Buys a launched token with its pool's pair: USDG from the vault, or a stock token from the agent's vault of that stock token (pairs: tradingVault). The tokens go to the agent's vault for that token (created in the same transaction). An ETH pool is traded from a wallet, not a vault.",
+    { token: address, amount: units.describe("in the pool's pair: USDG (6 decimals) or the stock token (18)"), slippageBps: slippage, referrer: address.optional() },
     (a) => lp().buy({ token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
   tool(
     "sell",
-    "Sells a launched token from the agent's token vault for USDG into the vault.",
+    "Sells a launched token from the agent's token vault for its pool's pair, into the agent's vault of that pair (USDG: the vault).",
     { token: address, amount: units, slippageBps: slippage, referrer: address.optional() },
     (a) => lp().sell({ token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
   tool("token_vault", "The agent's vault for a launched token: address, balance, dividends to claim.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
   tool("transfer_token", "Sends a launched token from the agent's token vault to an address.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
   tool("claim_dividends", "Claims the dividends the agent's token vault earned, into the agent's vault of the dividend token.", { token: address }, (a) => lp().claimDividends(a.token));
-  tool("claim_referral", "Claims the USDG that swaps naming `referrer` (default: the agent's vault) earned it.", { referrer: address.optional() }, (a) => lp().claimReferral(a.referrer === undefined ? {} : { referrer: a.referrer }));
+  tool(
+    "claim_referral",
+    "Claims what swaps naming `referrer` earned it in a pair (default USDG; referrer default: the agent's vault of that pair's token; ETH earnings are paid in WETH to the referrer named).",
+    { referrer: address.optional(), pair: pair.optional() },
+    (a) => lp().claimReferral({ ...(a.referrer === undefined ? {} : { referrer: a.referrer }), ...(a.pair === undefined ? {} : { pair: a.pair }) }),
+  );
 
   // --- the launchpad: launching (the creator vault) ------------------------------------------------------------
-  tool("fund_creator_vault", "Moves USDG from the vault into the creator vault, which pays launches, dev buys and airdrops (and its own relayer requests).", { amount: usdg }, (a) => lp().fundCreatorVault(a.amount));
-  tool("creator_withdraw", "Sends USDG from the creator vault (default: to the agent's vault): creator payouts it received, for example.", { amount: usdg, destination: address.optional() }, async (a) => agent.creator.withdraw(a.destination ?? (await agent.buyer.vaultAddress()), a.amount));
+  tool(
+    "pairs",
+    "The pairs a launch can take (USDG, ETH and the listed stock tokens), each with its USD price now, this agent's creator vault for it (what that pair's dev buys are paid from, and what owns its pools and receives their creator payouts) and the agent's vault of its token (what its pools are bought with).",
+    {},
+    () => lp().pairs({ prices: true }),
+  );
+  tool(
+    "fund_creator_vault",
+    "Moves funds into the creator vault of a pair (default USDG): USDG from the vault (USDG launches, dev buys, airdrops and the USDG creator vault's relayer requests); a stock token or WETH from the agent's vault of it. Funds can also be sent straight to a pair's creator vault (pairs).",
+    { amount: units.describe("in the pair's token: USDG (6 decimals), WETH or the stock token (18)"), pair: pair.optional() },
+    (a) => lp().fundCreatorVault(a.amount, a.pair ?? "USDG"),
+  );
+  tool(
+    "creator_withdraw",
+    "Sends funds from the creator vault of a pair (default USDG; default destination: the agent's vault of that token; a WETH creator vault names it): creator payouts it received, for example.",
+    { amount: units.describe("in the pair's token"), destination: address.optional(), pair: pair.optional() },
+    (a) => lp().creatorWithdraw({ amount: a.amount, ...(a.destination === undefined ? {} : { destination: a.destination }), ...(a.pair === undefined ? {} : { pair: a.pair }) }),
+  );
   tool(
     "launch",
-    "Launches a token on the Ostra launchpad from the creator vault (USDG pool, 1 billion supply), optionally with a dev buy paid by the creator vault in the same transaction and vesting to the agent's token vault. The relayer fronts the 0.0002 ETH launch fee and charges it in USDG. The launch is simulated first; nothing is signed if it would fail. `options` sets LaunchParams fields (taxes, buckets, anti-snipe, limits, graduation, circuit breaker) beyond Ostra's defaults.",
+    "Launches a token on the Ostra launchpad (1 billion supply) paired with USDG (default), ETH or a listed stock token (pairs), from the agent's creator vault of that pair, optionally with a dev buy in the pair's token paid by that creator vault in the same transaction and vesting to the agent's token vault. The market cap is in US dollars, set in the pair's token at its price now (Chainlink for ETH and stocks). The relayer fronts the 0.0002 ETH launch fee and charges it in USDG. The launch is simulated first; nothing is signed if it would fail. `options` sets LaunchParams fields (taxes, buckets, anti-snipe, limits, graduation, circuit breaker) beyond Ostra's defaults.",
     {
       name: z.string().min(1).max(64),
       symbol: z.string().regex(/^[A-Za-z0-9]{1,11}$/),
-      marketCap: usdg.optional().describe("the starting market cap in USDG (or startTick)"),
+      pair: pair.optional().describe("the pool's pair: USDG (default), ETH or a listed stock token's ticker"),
+      marketCap: usdg.optional().describe("the starting market cap in US dollars (or startTick)"),
       startTick: z.number().int().optional(),
-      devBuy: z.object({ amount: usdg, cliffDays: z.number().min(7).max(365).optional(), vestingDays: z.number().min(0).max(365).optional() }).optional(),
+      devBuy: z.object({ amount: units.describe("in the pair's token"), cliffDays: z.number().min(7).max(365).optional(), vestingDays: z.number().min(0).max(365).optional() }).optional(),
       options: z.record(z.string(), z.unknown()).optional(),
     },
     (a) =>
       lp().launch({
         name: a.name,
         symbol: a.symbol,
+        ...(a.pair === undefined ? {} : { pair: a.pair }),
         ...(a.marketCap === undefined ? {} : { marketCap: a.marketCap }),
         ...(a.startTick === undefined ? {} : { startTick: a.startTick }),
         ...(a.devBuy === undefined ? {} : { devBuy: { amount: a.devBuy.amount, ...(a.devBuy.cliffDays === undefined ? {} : { cliffDays: a.devBuy.cliffDays }), ...(a.devBuy.vestingDays === undefined ? {} : { vestingDays: a.devBuy.vestingDays }) } }),

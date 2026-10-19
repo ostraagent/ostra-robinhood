@@ -57,6 +57,20 @@
 //      buy. A buy from the buyer vault creates the agent's token vault in the
 //      same request; selling all of it back (the token vault's spend paid by
 //      the buyer vault) returns USDG to the buyer vault.
+//  12. A launch paired with a Robinhood stock token (when OSTRA_CHECK_PAIRS
+//      names one): the pairs list names the agent's vaults for it; moving the
+//      stock token from the agent's vault of it creates that vault and the
+//      stock token's creator vault, paid up front from the buyer vault's
+//      relayer channel; the launch with a dev buy in the stock token is sent
+//      from that creator vault, the buyer vault's relayer channel fronting the
+//      fee, at a starting market cap in US dollars set in the stock token at
+//      its Chainlink price; a buy paid in the stock token from its vault, and
+//      selling it all back into that vault; the pool's creator payout in the
+//      stock token; the creator vault sending the stock token back.
+//  13. A launch paired with ETH (with step 12): the WETH creator vault, funded
+//      before it exists, pays a dev buy in WETH; the pool trades against ETH,
+//      so a buy from a vault is refused and nothing is signed; the WETH
+//      creator vault sends its WETH out.
 // Whether the checks pass or a step fails, the run then cleans up: every
 // relayer channel still holding unclaimed escrow is closed through the keeper
 // (signed with the relayer's merchant key), and the vaults, the relayer
@@ -80,6 +94,13 @@
 //   OSTRA_CHECK_RECOVER    optional: the name of a run directory (run-...) in
 //                          OSTRA_CHECK_STATE whose cleanup did not finish; the
 //                          check then runs only that cleanup, from that run's keys
+//   OSTRA_CHECK_PAIRS      optional: the ticker of a stock token Ostra offers as a
+//                          pair (pairs.ts), which runs steps 12 and 13; the funder
+//                          then also holds PAIR_STOCK_FUNDING of that stock token
+//                          and PAIR_WETH_FUNDING more ETH, and the relayer gets
+//                          PAIR_RELAYER_GAS more; the buyer vault, whose relayer
+//                          channel pays both launches, gets three times the price
+//                          of a launch plus PAIR_BUYER_ROOM more USDG
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -87,7 +108,7 @@ import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { bytesToHex, createPublicClient, createWalletClient, encodeFunctionData, getAddress, hexToBytes, parseEventLogs, zeroAddress, type Address, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, createPublicClient, createWalletClient, encodeFunctionData, getAddress, hexToBytes, parseAbi, parseEventLogs, zeroAddress, type Address, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
 import { toClientEvmSigner } from "@x402/evm";
@@ -95,6 +116,13 @@ import { BatchSettlementEvmScheme, type BatchSettlementClientContext } from "@x4
 import {
   CHAINLINK_ETH_USD,
   FileWotsStore,
+  WETH,
+  findLaunchPair,
+  ostraDispatcherAbi,
+  ostraLaunchpadAbi,
+  readPairUsdPrice,
+  usdToQuoteUnits,
+  type LaunchPair,
   LAUNCHPAD,
   NO_DEV_BUY,
   WOTS_SIGNATURE_LEN,
@@ -133,6 +161,20 @@ import { MemoryFolder } from "../test/memory-folder.ts";
 const RELAYER_GAS_BUDGET = 40n * 1_500_000n + 5_000_000n;
 /** Gas the agent's fee payer is funded for: three vault spends sent by itself, with headroom. */
 const FEE_PAYER_GAS_BUDGET = 4n * 400_000n * 2n;
+/** Steps 12 and 13: the stock token the funder sends to the agent's vault of it (base units, 18 decimals: 0.2). */
+const PAIR_STOCK_FUNDING = 200_000_000_000_000_000n;
+/** Step 13: the ETH the funder wraps and sends to the WETH creator vault (0.001). */
+const PAIR_WETH_FUNDING = 1_000_000_000_000_000n;
+/** Steps 12 and 13: more relayer gas (about twenty relayed transactions and two launches), plus two launch fees. */
+const PAIR_RELAYER_GAS = 20n * 1_500_000n + 2n * 5_000_000n;
+/** Steps 12 and 13: the buyer vault's relayer channel pays both launches (three times the price of a launch is sent for them) and every other operation of both steps (this much more USDG). */
+const PAIR_BUYER_ROOM = "4";
+/** A stock token's dev buy, buy and creator withdrawal in step 12 (0.05, 0.02, 0.01), and the WETH dev buy of step 13 (0.0005). */
+const PAIR_DEV_BUY = "0.05";
+const PAIR_BUY = "0.02";
+const PAIR_WITHDRAW = "0.01";
+const ETH_DEV_BUY = "0.0005";
+const wethAbi = parseAbi(["function deposit() payable"]);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
 
@@ -238,6 +280,9 @@ async function main(): Promise<void> {
   const stateDir = required("OSTRA_CHECK_STATE");
   const recoverRun = process.env.OSTRA_CHECK_RECOVER === undefined || process.env.OSTRA_CHECK_RECOVER === "" ? undefined : process.env.OSTRA_CHECK_RECOVER;
   if (recoverRun !== undefined && !/^run-[0-9]+$/.test(recoverRun)) throw new Error("OSTRA_CHECK_RECOVER must be a run directory name (run-<number>)");
+  const pairsText = process.env.OSTRA_CHECK_PAIRS === undefined || process.env.OSTRA_CHECK_PAIRS === "" ? undefined : process.env.OSTRA_CHECK_PAIRS;
+  const stockPair: LaunchPair | undefined = pairsText === undefined ? undefined : (findLaunchPair(pairsText) ?? undefined);
+  if (pairsText !== undefined && (stockPair === undefined || stockPair.kind !== "stock")) throw new Error(`OSTRA_CHECK_PAIRS must be the ticker of a stock token Ostra offers as a pair, not ${pairsText}`);
 
   const transport = retryingHttp(rpcUrl);
   const client = createPublicClient({ chain: robinhoodChain, transport }) as PublicClient;
@@ -249,6 +294,8 @@ async function main(): Promise<void> {
     return BigInt(whole as string) * unit + BigInt(fraction.padEnd(decimals, "0"));
   };
   const balance = (owner: Address) => client.readContract({ address: token, abi: usdgAbi, functionName: "balanceOf", args: [owner] });
+  /** `owner`'s balance of any ERC-20 (`usdgAbi` has the ERC-20 reads). */
+  const balanceIn = (erc20: Address, owner: Address) => client.readContract({ address: erc20, abi: usdgAbi, functionName: "balanceOf", args: [owner] });
   const walletOf = (account: PrivateKeyAccount) => createWalletClient({ account, chain: robinhoodChain, transport });
   const send = async (account: PrivateKeyAccount, to: Address, data: Hex): Promise<Hex> => {
     const hash = await walletOf(account).sendTransaction({ account, chain: robinhoodChain, to, data });
@@ -314,7 +361,8 @@ async function main(): Promise<void> {
   let relayerKeys: MerchantKeys | undefined;
   let feeSplit: { recipient: Address; bps: number } | undefined;
   let relayerAccount: PrivateKeyAccount | undefined;
-  const vaults: { name: string; keys: WotsKeychain; vault: Address }[] = [{ name: "the buyer vault", keys: buyerKeys, vault: buyerVault }];
+  /** The run's vaults, each with its token (default USDG), whose tokens the cleanup returns to the funder. */
+  const vaults: { name: string; keys: WotsKeychain; vault: Address; token?: Address }[] = [{ name: "the buyer vault", keys: buyerKeys, vault: buyerVault }];
 
   /** Closes every unfinished relayer channel through the keeper and returns the run's funds to the funder. */
   const cleanup = async () => {
@@ -361,11 +409,11 @@ async function main(): Promise<void> {
           await send(funder, v.vault, encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, `0x${pending.signature}`] }));
           console.log(`${v.name}: landed the spend its key ${current.nonce} had signed (action ${signed.action})`);
         }
-        const amount = await balance(v.vault);
+        const amount = await balanceIn(v.token ?? token, v.vault);
         const state = await readVault(client, d, v.vault);
         if (amount > 0n && state !== null) {
           await send(funder, v.vault, spendData(await signVaultTransfer(v.keys, state, { chainId: d.chainId, to: funder.address, amount })));
-          console.log(`${v.name} returned ${amount} base units to the funder`);
+          console.log(`${v.name} returned ${amount} base units${v.token === undefined ? "" : ` of ${v.token}`} to the funder`);
         }
       } catch (err) {
         check(false, `cleanup: return the tokens of ${v.name}`, err instanceof Error ? err.message : String(err));
@@ -403,6 +451,19 @@ async function main(): Promise<void> {
     const creatorChain = keys.creatorKeychain(d.chainId, token);
     const creatorVault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot: bytesToHex(creatorChain.keyRoot(0n)), initialCrank: zeroAddress });
     if (d.launchpad !== undefined) vaults.push({ name: "the creator vault", keys: creatorChain, vault: creatorVault });
+    // Steps 12 and 13: the agent's vault of the stock token, the creator vaults of the stock token and of WETH.
+    const vaultOf = (chain: WotsKeychain, inToken: Address) => vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: inToken, initialKeyRoot: bytesToHex(chain.keyRoot(0n)), initialCrank: zeroAddress });
+    const stockChain = stockPair === undefined ? undefined : keys.vaultKeychain(d.chainId, stockPair.address);
+    const stockCreatorChain = stockPair === undefined ? undefined : keys.creatorKeychain(d.chainId, stockPair.address);
+    const wethCreatorChain = keys.creatorKeychain(d.chainId, WETH);
+    const stockVault = stockPair === undefined || stockChain === undefined ? undefined : vaultOf(stockChain, stockPair.address);
+    const stockCreatorVault = stockPair === undefined || stockCreatorChain === undefined ? undefined : vaultOf(stockCreatorChain, stockPair.address);
+    const wethCreatorVault = vaultOf(wethCreatorChain, WETH);
+    if (d.launchpad !== undefined && stockPair !== undefined && stockChain !== undefined && stockCreatorChain !== undefined && stockVault !== undefined && stockCreatorVault !== undefined) {
+      vaults.push({ name: `the ${stockPair.symbol} vault`, keys: stockChain, vault: stockVault, token: stockPair.address });
+      vaults.push({ name: `the ${stockPair.symbol} creator vault`, keys: stockCreatorChain, vault: stockCreatorVault, token: stockPair.address });
+      vaults.push({ name: "the WETH creator vault", keys: wethCreatorChain, vault: wethCreatorVault, token: WETH });
+    }
     if (recoverRun !== undefined) return;
 
     await send(funder, d.vaultFactory, encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [token, bytesToHex(relayerVaultKeys.keyRoot(0n)), zeroAddress] }));
@@ -411,7 +472,12 @@ async function main(): Promise<void> {
     await send(funder, relayerVault, spendData(await signVaultSetCrankKey(relayerVaultKeys, rv, { chainId: d.chainId, crank: await crankOf(relayerKeys.merchant) })));
     const { maxFeePerGas } = await client.estimateFeesPerGas();
     await walletOf(funder)
-      .sendTransaction({ account: funder, chain: robinhoodChain, to: relayerAccount.address, value: RELAYER_GAS_BUDGET * maxFeePerGas + LAUNCHPAD.FEE_WEI })
+      .sendTransaction({
+        account: funder,
+        chain: robinhoodChain,
+        to: relayerAccount.address,
+        value: RELAYER_GAS_BUDGET * maxFeePerGas + LAUNCHPAD.FEE_WEI + (stockPair === undefined ? 0n : PAIR_RELAYER_GAS * maxFeePerGas + 2n * LAUNCHPAD.FEE_WEI),
+      })
       .then((hash) => client.waitForTransactionReceipt({ hash }));
     relayer = new Proc("relayer", fileURLToPath(new URL("../../relayer/src/server.ts", import.meta.url)), {
       ...baseEnv,
@@ -663,6 +729,140 @@ async function main(): Promise<void> {
         "selling it all back through the relayer (the token vault's spend paid by the buyer vault) pays the USDG to the buyer vault",
         { sold, paidOut: paidOut.map((l) => l.args.value) },
       );
+
+      // --- 12. a launch paired with a stock token -----------------------------------------------------------------------------
+      if (stockPair !== undefined && stockVault !== undefined && stockCreatorVault !== undefined) {
+        const T = stockPair.symbol;
+        const stock = stockPair.address;
+        const units = (text: string) => {
+          const [whole, fraction = ""] = text.split(".");
+          return BigInt(whole as string) * 10n ** 18n + BigInt(fraction.padEnd(18, "0"));
+        };
+        const funderStock = await balanceIn(stock, funder.address);
+        if (funderStock < PAIR_STOCK_FUNDING) throw new Error(`the funder holds ${funderStock} base units of ${T}, less than the ${PAIR_STOCK_FUNDING} steps 12 and 13 need`);
+        // The buyer vault's relayer channel pays every operation of these steps: the two launches at the fork's gas
+        // price (step 11's launchUnits, three times for room) and the other operations.
+        const pairBuyerFunding = ((3n * launchUnits + tokens(PAIR_BUYER_ROOM) + tokens("0.01") - 1n) / tokens("0.01")) * tokens("0.01");
+        await send(funder, token, encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [buyerVault, pairBuyerFunding] }));
+
+        const listed = await lp.pairs();
+        const row = listed.find((r) => r.symbol === T);
+        check(
+          listed.length === 34 && listed[0]?.symbol === "USDG" && listed[1]?.symbol === "ETH" && row?.creatorVault === stockCreatorVault && row.tradingVault === stockVault && listed[1]?.creatorVault === wethCreatorVault,
+          `the pairs list (USDG, ETH, 32 stock tokens) names the agent's ${T} creator vault, ${T} vault and WETH creator vault at the addresses of its keys`,
+          { row, eth: listed[1] },
+        );
+
+        await send(funder, stock, encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [stockVault, PAIR_STOCK_FUNDING] }));
+        const half = PAIR_STOCK_FUNDING / 2n;
+        await lp.fundCreatorVault(formatUnitsAmount(half, 18), T);
+        check(
+          (await readVault(client, d, stockVault)) !== null &&
+            (await readVault(client, d, stockCreatorVault)) !== null &&
+            (await balanceIn(stock, stockVault)) === PAIR_STOCK_FUNDING - half &&
+            (await balanceIn(stock, stockCreatorVault)) === half &&
+            (await relayerClient.vaultState(stockVault)).debt === 0n &&
+            (await relayerClient.vaultState(stockCreatorVault)).debt === 0n,
+          `moving ${T} from the agent's ${T} vault creates it and the ${T} creator vault, paid up front from the buyer vault's relayer channel, and moves exactly the amount`,
+          { stockVault: await balanceIn(stock, stockVault), creator: await balanceIn(stock, stockCreatorVault) },
+        );
+
+        const price = await readPairUsdPrice(client, stockPair);
+        const relayerEthBeforeStock = await client.getBalance({ address: relayerAccount.address });
+        const stockLaunch = await lp.launch({ name: "Ostra Stock Check", symbol: "OSTK", pair: T, marketCap: "20000", devBuy: { amount: PAIR_DEV_BUY, cliffDays: 7, vestingDays: 0 } });
+        if (stockLaunch.status !== "launched") throw new Error(`the ${T} launch did not land: ${toJson(stockLaunch)}`);
+        const stockLaunched = parseEventLogs({ abi: ostraLaunchpadAbi, logs: (await client.getTransactionReceipt({ hash: stockLaunch.txHash })).logs, eventName: "Launched" });
+        const relayedStock = await relayer.waitEvent((e) => e.event === "relayed" && e.txHash === stockLaunch.txHash, 30);
+        const devPaidStock = units(stockLaunch.devBuy?.paid ?? "0");
+        check(
+          stockLaunch.pair === T &&
+            stockLaunched.length === 1 &&
+            getAddress(stockLaunched[0]?.args.quote as Address) === stock &&
+            getAddress(stockLaunched[0]?.args.creatorVault as Address) === stockCreatorVault &&
+            stockLaunch.creatorVault === stockCreatorVault &&
+            stockLaunch.marketCapUsd === "20000" &&
+            stockLaunch.marketCapInPair === formatUnitsAmount(usdToQuoteUnits(20_000_000_000n, price.priceE8, 18), 18) &&
+            stockLaunch.devBuy !== null &&
+            devPaidStock > 0n &&
+            (await balanceIn(stock, stockCreatorVault)) === half - devPaidStock &&
+            relayedStock !== undefined &&
+            String(relayedStock.value) === LAUNCHPAD.FEE_WEI.toString() &&
+            relayerEthBeforeStock - (await client.getBalance({ address: relayerAccount.address })) >= LAUNCHPAD.FEE_WEI,
+          `a launch paired with ${T}: the ${T} creator vault pays the dev buy in ${T}, the buyer vault's relayer channel the ETH fee the relayer fronts; the $20,000 market cap is set in ${T} at its Chainlink price`,
+          { stockLaunch, quote: stockLaunched[0]?.args.quote, relayedStock, priceE8: price.priceE8 },
+        );
+
+        const ostkOf = (who: Address) => client.readContract({ address: stockLaunch.token, abi: ostraTokenAbi, functionName: "balanceOf", args: [who] });
+        const stockBeforeBuy = await balanceIn(stock, stockVault);
+        const stockBought = await lp.buy({ token: stockLaunch.token, amount: PAIR_BUY });
+        const ostkHeld = await ostkOf(stockLaunch.tokenVault);
+        check(
+          stockBought.status === "sent" && stockBought.swapped && stockBought.from === stockVault && ostkHeld > 0n && stockBeforeBuy - (await balanceIn(stock, stockVault)) === units(stockBought.amountIn),
+          `a buy of the ${T} pool is paid in ${T} from the agent's ${T} vault and lands the tokens in its token vault`,
+          stockBought,
+        );
+        const stockSold = await lp.sell({ token: stockLaunch.token, amount: formatUnitsAmount(ostkHeld, 18) });
+        const stockPaidOut =
+          stockSold.status === "sent"
+            ? parseEventLogs({ abi: usdgAbi, logs: (await client.getTransactionReceipt({ hash: stockSold.txHash })).logs, eventName: "Transfer" }).filter((l) => getAddress(l.address) === stock && getAddress(l.args.to) === stockVault)
+            : [];
+        check(
+          stockSold.status === "sent" && stockSold.swapped && stockSold.to === stockVault && (await ostkOf(stockLaunch.tokenVault)) === 0n && stockPaidOut.length === 1 && units(stockSold.amountOut) === stockPaidOut[0]?.args.value,
+          `selling it all back pays ${T} into the agent's ${T} vault`,
+          { stockSold, paidOut: stockPaidOut.map((l) => l.args.value) },
+        );
+
+        const creatorBeforePayout = await balanceIn(stock, stockCreatorVault);
+        const dispatched = await send(funder, lpd.dispatcher, encodeFunctionData({ abi: ostraDispatcherAbi, functionName: "dispatch", args: [stockLaunch.poolId] }));
+        const payout = parseEventLogs({ abi: usdgAbi, logs: (await client.getTransactionReceipt({ hash: dispatched })).logs, eventName: "Transfer" }).filter((l) => getAddress(l.address) === stock && getAddress(l.args.to) === stockCreatorVault);
+        const paidCreator = payout.reduce((sum, l) => sum + l.args.value, 0n);
+        check(
+          paidCreator > 0n && (await balanceIn(stock, stockCreatorVault)) - creatorBeforePayout === paidCreator,
+          `the pool's creator payout (its share of the hook fee) is paid in ${T} to the ${T} creator vault`,
+          { paidCreator },
+        );
+
+        const stockVaultBeforeWithdraw = await balanceIn(stock, stockVault);
+        const creatorBeforeWithdraw = await balanceIn(stock, stockCreatorVault);
+        const withdrawn = (await lp.creatorWithdraw({ amount: PAIR_WITHDRAW, pair: T })) as { status?: string };
+        check(
+          withdrawn.status === "sent" && (await balanceIn(stock, stockVault)) - stockVaultBeforeWithdraw === units(PAIR_WITHDRAW) && creatorBeforeWithdraw - (await balanceIn(stock, stockCreatorVault)) === units(PAIR_WITHDRAW),
+          `the ${T} creator vault sends ${T} back to the agent's ${T} vault through the relayer`,
+          withdrawn,
+        );
+
+        // --- 13. a launch paired with ETH -------------------------------------------------------------------------------------------
+        await walletOf(funder)
+          .writeContract({ account: funder, chain: robinhoodChain, address: WETH, abi: wethAbi, functionName: "deposit", value: PAIR_WETH_FUNDING })
+          .then((hash) => client.waitForTransactionReceipt({ hash }));
+        // Sent before the vault exists: its address is fixed by its keys.
+        await send(funder, WETH, encodeFunctionData({ abi: usdgAbi, functionName: "transfer", args: [wethCreatorVault, PAIR_WETH_FUNDING] }));
+        const ethLaunch = await lp.launch({ name: "Ostra ETH Check", symbol: "OETH", pair: "ETH", marketCap: "20000", devBuy: { amount: ETH_DEV_BUY, cliffDays: 7, vestingDays: 0 } });
+        if (ethLaunch.status !== "launched") throw new Error(`the ETH launch did not land: ${toJson(ethLaunch)}`);
+        const ethLaunched = parseEventLogs({ abi: ostraLaunchpadAbi, logs: (await client.getTransactionReceipt({ hash: ethLaunch.txHash })).logs, eventName: "Launched" });
+        const devPaidEth = units(ethLaunch.devBuy?.paid ?? "0");
+        const wethLeft = await balanceIn(WETH, wethCreatorVault);
+        check(
+          ethLaunch.pair === "ETH" &&
+            ethLaunched.length === 1 &&
+            getAddress(ethLaunched[0]?.args.quote as Address) === zeroAddress &&
+            ethLaunch.creatorVault === wethCreatorVault &&
+            devPaidEth > 0n &&
+            wethLeft + devPaidEth === PAIR_WETH_FUNDING,
+          "a launch paired with ETH from the agent's WETH creator vault (funded before it existed): the dev buy is paid in WETH, the pool trades against ETH",
+          { ethLaunch, quote: ethLaunched[0]?.args.quote, wethLeft },
+        );
+        const buyerNonceBefore = (await readVault(client, d, buyerVault))?.nonce;
+        const ethBuy = await lp.buy({ token: ethLaunch.token, amount: "0.0001" }).then(() => "", (err: unknown) => (err instanceof Error ? err.message : String(err)));
+        check(/traded from a wallet; nothing was signed/.test(ethBuy) && (await readVault(client, d, buyerVault))?.nonce === buyerNonceBefore, "an ETH pool is not bought from a vault: refused, nothing signed", ethBuy);
+        const funderWethBefore = await balanceIn(WETH, funder.address);
+        const wethOut = (await lp.creatorWithdraw({ amount: formatUnitsAmount(wethLeft, 18), pair: "ETH", destination: funder.address })) as { status?: string };
+        check(
+          wethOut.status === "sent" && (await balanceIn(WETH, wethCreatorVault)) === 0n && (await balanceIn(WETH, funder.address)) - funderWethBefore === wethLeft,
+          "the WETH creator vault sends its WETH out through the relayer",
+          wethOut,
+        );
+      }
     }
   } catch (err) {
     runError = err;
