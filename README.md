@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://ostraagent.xyz"><img src="https://img.shields.io/badge/website-ostraagent.xyz-15171A" alt="Website"></a>
   <a href="https://docs.ostraagent.xyz"><img src="https://img.shields.io/badge/docs-docs.ostraagent.xyz-15171A" alt="Documentation"></a>
+  <a href="https://x.com/ostraagent"><img src="https://img.shields.io/badge/X-@ostraagent-15171A?logo=x&logoColor=white" alt="Ostra Agent on X"></a>
   <a href="https://robinhoodchain.blockscout.com"><img src="https://img.shields.io/badge/Robinhood%20Chain-4663-D9381E" alt="Robinhood Chain 4663"></a>
   <a href="https://docs.ostraagent.xyz/contracts"><img src="https://img.shields.io/badge/Sourcify-18%20contracts%20verified-1F7A4D" alt="Verified on Sourcify"></a>
   <a href="foundry.toml"><img src="https://img.shields.io/badge/Solidity-0.8.30-3E4248" alt="Solidity 0.8.30"></a>
@@ -23,6 +24,7 @@
   <a href="https://docs.ostraagent.xyz">Documentation</a> ·
   <a href="https://docs.ostraagent.xyz/post-quantum">Post-quantum keys</a> ·
   <a href="https://docs.ostraagent.xyz/security">Security</a> ·
+  <a href="https://x.com/ostraagent">X</a> ·
   <a href="#deployed-contracts">Contracts</a>
 </p>
 
