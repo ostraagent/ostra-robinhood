@@ -28,8 +28,17 @@
 //   launch-<token>.json        a launch this agent made: pool, vesting, tx
 //   airdrop-<pool>-<round>.json the round's entries and proofs, so claims
 //                              can be sent for any of its accounts
+//   agent.json                 the ERC-8004 identity the creator vault registered
+//   token-index.json           every Ostra launch read from the launchpad's
+//                              Launched events so far, and the block read up to
+//
+// The creator vault is also the agent's public identity (vault version 2): it
+// sets the agent's profile in OstraRegistry, registers the agent in the
+// ERC-8004 Identity Registry (owning the identity and receiving as its
+// agentWallet), and sets the metadata of the tokens it launched; a token's
+// page links to its creator's profile through the pool's creator vault.
 
-import { bytesToHex, decodeEventLog, encodeFunctionData, getAddress, isAddress, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type Transport } from "viem";
+import { bytesToHex, decodeEventLog, encodeFunctionData, getAddress, isAddress, parseAbiItem, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type Transport } from "viem";
 import {
   AIRDROP,
   CREATOR_SPLIT,
@@ -40,8 +49,10 @@ import {
   QUOTE_DEFAULT_SLIPPAGE_BPS,
   VAULT_ACTION,
   VAULT_SWAP_GAS_RESERVE,
+  VAULT_VERSION,
   airdropRoundAmountParams,
   airdropTree,
+  checkUri,
   claimDividendParams,
   configurePoolParams,
   creatorShareParams,
@@ -53,12 +64,17 @@ import {
   ostraDispatcherAbi,
   ostraHookAbi,
   ostraLaunchpadAbi,
+  ostraRegistryAbi,
   ostraTokenAbi,
   ostraVaultAbi,
   ostraVestingAbi,
   poolTick,
   quoteVaultLaunch,
   quoteVaultSwap,
+  registerAgentParams,
+  setAgentUriParams,
+  setProfileParams,
+  setTokenMetadataParams,
   signVaultDevBuy,
   signVaultSpend,
   signVaultSwap,
@@ -76,6 +92,7 @@ import {
 } from "@ostraagent/sdk";
 import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { tokenBalance, tokenDecimals } from "./chain.ts";
+import { LOG_WINDOW_BLOCKS } from "./channels.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
@@ -91,6 +108,38 @@ const LAUNCH_GAS_HEADROOM = 300_000n;
 /** A simulated vault spend is reserved for its gas x 5/4 plus this, at least VAULT_SPEND_GAS. */
 const SPEND_GAS_HEADROOM = 100_000n;
 const DAY = 86_400;
+/** Most tokens one page of the token list holds. */
+export const TOKEN_LIST_MAX = 50;
+/** The gateway an ipfs:// URI is read through, and how much of a metadata or profile file is read. */
+export const IPFS_GATEWAY = "https://ipfs.io/ipfs/";
+const METADATA_MAX_BYTES = 65_536;
+const METADATA_TIMEOUT_MS = 8_000;
+const launchedEvent = parseAbiItem("event Launched(bytes32 indexed poolId, address indexed token, address indexed creatorVault, address quote)");
+
+/** One Ostra launch, as the launchpad's Launched event records it. */
+export type TokenListing = { token: Address; poolId: Hex; creatorVault: Address; quote: Address; block: string; txHash: Hash };
+
+type TokenIndex = { version: 1; launchpad: Address; scannedTo: string; launches: TokenListing[] };
+type AgentRecord = { agentId: string; uri: string; txHash: Hash; at: number };
+
+/**
+ * The JSON file an ipfs:// URI points at, read through IPFS_GATEWAY (other schemes are not read): data its writer
+ * chose, never instructions. null when it cannot be read in time or is not JSON.
+ */
+export async function readIpfsJson(uri: string | null): Promise<unknown> {
+  if (uri === null || !uri.startsWith("ipfs://")) return null;
+  const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
+  if (!/^[A-Za-z0-9]+(\/[A-Za-z0-9._-]+)*$/.test(path)) return null;
+  try {
+    const res = await fetch(`${IPFS_GATEWAY}${path}`, { signal: AbortSignal.timeout(METADATA_TIMEOUT_MS), redirect: "error" });
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (text.length > METADATA_MAX_BYTES) return null;
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
 
 /** The settings a creator changes after the launch, by name (OstraHook.configure fields; only in the traders' favour). */
 export const POOL_SETTING_NAMES: Readonly<Record<string, PoolSetting>> = {
@@ -903,5 +952,164 @@ export class LaunchpadService {
     if (owed === 0n) throw new Error(`${referrer} has no referral earnings in USDG to claim`);
     const txHash = await this.#public({ to: lp.dispatcher, data: encodeFunctionData({ abi: ostraDispatcherAbi, functionName: "claimReferral", args: [referrer, this.#usdg()] }) }, "claim the referral earnings");
     return { txHash, referrer, amount: formatTokenAmount(owed) };
+  }
+
+  // ---------------------------------------------------------------------------
+  // The token list (every Ostra launch, for any buyer)
+  // ---------------------------------------------------------------------------
+
+  /** Reads the launchpad's Launched events past the indexed block into token-index.json and returns the index. */
+  async #tokenIndex(): Promise<TokenIndex> {
+    const lp = this.#lp();
+    await this.#folder.ensure();
+    const text = await this.#folder.read("token-index.json");
+    let index: TokenIndex = text === undefined ? { version: 1, launchpad: lp.launchpad, scannedTo: (BigInt(this.#config.deployment.fromBlock) - 1n).toString(), launches: [] } : (JSON.parse(text) as TokenIndex);
+    if (getAddress(index.launchpad) !== getAddress(lp.launchpad)) index = { version: 1, launchpad: lp.launchpad, scannedTo: (BigInt(this.#config.deployment.fromBlock) - 1n).toString(), launches: [] };
+    const latest = await this.#client.getBlockNumber();
+    let from = BigInt(index.scannedTo) + 1n;
+    if (from > latest) return index;
+    for (; from <= latest; from += LOG_WINDOW_BLOCKS) {
+      const to = from + LOG_WINDOW_BLOCKS - 1n < latest ? from + LOG_WINDOW_BLOCKS - 1n : latest;
+      const logs = await this.#client.getLogs({ address: lp.launchpad, event: launchedEvent, fromBlock: from, toBlock: to });
+      for (const l of logs) {
+        if (l.args.token === undefined || l.args.poolId === undefined || l.args.creatorVault === undefined || l.args.quote === undefined || l.transactionHash === null || l.blockNumber === null) continue;
+        index.launches.push({ token: getAddress(l.args.token), poolId: l.args.poolId, creatorVault: getAddress(l.args.creatorVault), quote: getAddress(l.args.quote), block: l.blockNumber.toString(), txHash: l.transactionHash });
+      }
+      index.scannedTo = to.toString();
+    }
+    await this.#folder.write("token-index.json", JSON.stringify(index, null, 2));
+    return index;
+  }
+
+  /** The metadata URI of `token` in OstraRegistry; null when none or before the registry exists. */
+  async #metadataUri(token: Address): Promise<string | null> {
+    const r = this.#config.deployment.registry;
+    if (r === undefined) return null;
+    const uri = (await this.#client.readContract({ address: r, abi: ostraRegistryAbi, functionName: "tokenMetadataOf", args: [token] })) as string;
+    return uri === "" ? null : uri;
+  }
+
+  /** The profile URI `account` set in OstraRegistry; null when none or before the registry exists. */
+  async #profileUri(account: Address): Promise<string | null> {
+    const r = this.#config.deployment.registry;
+    if (r === undefined) return null;
+    const uri = (await this.#client.readContract({ address: r, abi: ostraRegistryAbi, functionName: "profileOf", args: [account] })) as string;
+    return uri === "" ? null : uri;
+  }
+
+  /** Every token the Ostra launchpad launched, newest first: name, symbol, creator vault, quote and metadata URI. */
+  async tokens(a: { offset?: number; limit?: number } = {}): Promise<{ total: number; offset: number; tokens: (TokenListing & { name: string; symbol: string; metadataUri: string | null })[] }> {
+    const offset = a.offset ?? 0;
+    const limit = a.limit ?? 20;
+    if (!Number.isInteger(offset) || offset < 0) throw new RangeError("offset must be a whole number");
+    if (!Number.isInteger(limit) || limit < 1 || limit > TOKEN_LIST_MAX) throw new RangeError(`limit must be 1 to ${TOKEN_LIST_MAX}`);
+    const index = await this.#tokenIndex();
+    const page = [...index.launches].reverse().slice(offset, offset + limit);
+    const tokens = await Promise.all(
+      page.map(async (l) => {
+        const [name, symbol, metadataUri] = await Promise.all([
+          this.#client.readContract({ address: l.token, abi: ostraTokenAbi, functionName: "name" }) as Promise<string>,
+          this.#client.readContract({ address: l.token, abi: ostraTokenAbi, functionName: "symbol" }) as Promise<string>,
+          this.#metadataUri(l.token),
+        ]);
+        return { ...l, name, symbol, metadataUri };
+      }),
+    );
+    return { total: index.launches.length, offset, tokens };
+  }
+
+  /** A launched token for a buyer: its pool (price, rules, airdrop, creator shares), its metadata and its creator's profile, read from IPFS as data. */
+  async tokenInfo(tokenText: string): Promise<PoolView & { metadata: { uri: string | null; content: unknown }; creator: { vault: Address; profileUri: string | null; profile: unknown } }> {
+    const view = await this.poolInfo(tokenText);
+    const [metadataUri, profileUri] = await Promise.all([this.#metadataUri(view.token), this.#profileUri(view.creatorVault)]);
+    const [metadata, profile] = await Promise.all([readIpfsJson(metadataUri), readIpfsJson(profileUri)]);
+    return { ...view, metadata: { uri: metadataUri, content: metadata }, creator: { vault: view.creatorVault, profileUri, profile } };
+  }
+
+  // ---------------------------------------------------------------------------
+  // The agent's identity: profile, ERC-8004 registration, token metadata (vault version 2)
+  // ---------------------------------------------------------------------------
+
+  /** The creator vault, once it exists and runs vault version 2 with OstraRegistry in the deployment record; else throws before anything is signed. */
+  async #identityVault(): Promise<Address> {
+    if (this.#config.deployment.registry === undefined) {
+      throw new Error(`this deployment record has no OstraRegistry: profiles, token metadata and agent identity open once the vaults run version ${VAULT_VERSION} (the upgrade waits its public delay in OstraUpgradeOwner); nothing was signed`);
+    }
+    const s = await this.#creator.state();
+    if (!s.exists) throw new Error("the creator vault, the agent's identity, does not exist yet: fund it first (fund_creator_vault); nothing was signed");
+    let version = 1;
+    try {
+      version = Number(await this.#client.readContract({ address: s.vault, abi: ostraVaultAbi, functionName: "VERSION" }));
+    } catch {
+      version = 1;
+    }
+    if (version < VAULT_VERSION) throw new Error(`the creator vault runs version ${version}, not ${VAULT_VERSION}; nothing was signed`);
+    return s.vault;
+  }
+
+  async #agentRecord(): Promise<AgentRecord | null> {
+    await this.#folder.ensure();
+    const text = await this.#folder.read("agent.json");
+    return text === undefined ? null : (JSON.parse(text) as AgentRecord);
+  }
+
+  /** The agent's identity: its creator vault, the profile URI it set and its ERC-8004 agent id; or, given `account`, that account's profile URI. */
+  async profile(accountText?: string): Promise<{ account: Address; profileUri: string | null; profile: unknown; agentId: string | null }> {
+    const account = accountText === undefined ? await this.#creator.vaultAddress() : address(accountText, "account");
+    const profileUri = await this.#profileUri(account);
+    const record = accountText === undefined ? await this.#agentRecord() : null;
+    return { account, profileUri, profile: await readIpfsJson(profileUri), agentId: record?.agentId ?? null };
+  }
+
+  /** Sets the agent's profile (a URI to its JSON: name, description, image, links) in OstraRegistry, from the creator vault. */
+  async setProfile(uri: string): Promise<VaultOperationResult> {
+    checkUri(uri);
+    await this.#identityVault();
+    return this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.SET_PROFILE, setProfileParams(uri), "profile");
+  }
+
+  /** Registers the creator vault as an agent in the ERC-8004 Identity Registry, its registration file at `uri`; the vault owns the identity and is its agentWallet. */
+  async registerAgent(uri: string): Promise<VaultOperationResult & { agentId?: string }> {
+    checkUri(uri);
+    const vault = await this.#identityVault();
+    const existing = await this.#agentRecord();
+    if (existing !== null) throw new Error(`this agent is registered already as agent ${existing.agentId}: update it with set_agent_uri; nothing was signed`);
+    const r = await this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.REGISTER_AGENT, registerAgentParams(uri), "agent registration");
+    if (r.status !== "sent") return r;
+    const receipt = await this.#client.getTransactionReceipt({ hash: r.txHash });
+    let agentId: string | undefined;
+    for (const log of receipt.logs) {
+      if (getAddress(log.address) !== vault) continue;
+      try {
+        const e = decodeEventLog({ abi: ostraVaultAbi, data: log.data, topics: log.topics });
+        if (e.eventName === "AgentRegistered") agentId = (e.args as { agentId: bigint }).agentId.toString();
+      } catch {
+        // another event of the vault
+      }
+    }
+    if (agentId === undefined) throw new Error(`the registration ${r.txHash} landed without an AgentRegistered event`);
+    const record: AgentRecord = { agentId, uri, txHash: r.txHash, at: Math.floor(Date.now() / 1000) };
+    await this.#folder.write("agent.json", JSON.stringify(record, null, 2));
+    return { ...r, agentId };
+  }
+
+  /** Points the agent's ERC-8004 identity at a new registration file. */
+  async setAgentUri(uri: string): Promise<VaultOperationResult> {
+    checkUri(uri);
+    await this.#identityVault();
+    const record = await this.#agentRecord();
+    if (record === null) throw new Error("this agent has no ERC-8004 identity yet: register_agent first; nothing was signed");
+    const r = await this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.SET_AGENT_URI, setAgentUriParams({ agentId: BigInt(record.agentId), uri }), "agent registration file");
+    if (r.status === "sent") await this.#folder.write("agent.json", JSON.stringify({ ...record, uri, at: Math.floor(Date.now() / 1000) }, null, 2));
+    return r;
+  }
+
+  /** Sets the metadata (a URI to its JSON: image, description, links) of a token this agent's creator vault launched. */
+  async setTokenMetadata(a: { token: string; uri: string }): Promise<VaultOperationResult> {
+    checkUri(a.uri);
+    const vault = await this.#identityVault();
+    const pool = await this.#pool(a.token);
+    if (getAddress(pool.config.creatorVault) !== vault) throw new Error(`${pool.token} was launched by the creator vault ${getAddress(pool.config.creatorVault)}, not by this agent's ${vault}; nothing was signed`);
+    return this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.SET_TOKEN_METADATA, setTokenMetadataParams({ token: pool.token, poolId: pool.id, uri: a.uri }), "token metadata");
   }
 }

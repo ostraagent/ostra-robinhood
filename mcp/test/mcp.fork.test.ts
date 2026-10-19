@@ -5,7 +5,9 @@
 // listed; the vault is opened and funded; a withdrawal; the creator vault is
 // funded; a launch whose dev buy the contract refuses comes back as an error
 // refused before signing; a launch with a dev buy, a buy and a sell, the
-// pool's view; errors for bad input. The keys stay in OSTRA_HOME (0700) and
+// pool's view; the token list and a token's page; the creator vault's
+// profile, its ERC-8004 registration (against the live Identity Registry) and
+// the token's metadata; errors for bad input. The keys stay in OSTRA_HOME (0700) and
 // a second server on the same OSTRA_HOME finds the same vault.
 
 import assert from "node:assert/strict";
@@ -69,7 +71,7 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     assert.equal(((await stat(home)).mode & 0o777).toString(8), "700");
@@ -120,6 +122,34 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
     assert.ok(lowered.ok && lowered.json.status === "sent", lowered.text);
     const launches = JSON.parse((await call(client, "launches")).text) as unknown[];
     assert.equal(launches.length, 1);
+
+    // Every Ostra launch, for any buyer: the one launch, newest first, and its page.
+    const listed = await call(client, "tokens", { limit: 5 });
+    assert.ok(listed.ok && listed.json.total === 1, listed.text);
+    const first = (listed.json.tokens as { token: string; symbol: string; metadataUri: string | null }[])[0];
+    assert.equal(getAddress(first?.token ?? "0x"), getAddress(token));
+    assert.equal(first?.symbol, "OMCP");
+    assert.equal(first?.metadataUri, null);
+
+    // The creator vault's identity: profile, ERC-8004 registration, then the token's metadata.
+    const badUri = await call(client, "set_profile", { uri: "not a uri" });
+    assert.equal(badUri.ok, false);
+    const profiled = await call(client, "set_profile", { uri: "ipfs://bafkreiprofileone" });
+    assert.ok(profiled.ok && profiled.json.status === "sent", profiled.text);
+    const registered = await call(client, "register_agent", { uri: "ipfs://bafkreiagentone" });
+    assert.ok(registered.ok && registered.json.status === "sent" && typeof registered.json.agentId === "string", registered.text);
+    const twice = await call(client, "register_agent", { uri: "ipfs://bafkreiagenttwo" });
+    assert.ok(!twice.ok && /registered already/.test(twice.text), twice.text);
+    const moved = await call(client, "set_agent_uri", { uri: "ipfs://bafkreiagenttwo" });
+    assert.ok(moved.ok && moved.json.status === "sent", moved.text);
+    const me = await call(client, "profile");
+    assert.ok(me.ok && me.json.profileUri === "ipfs://bafkreiprofileone" && me.json.agentId === registered.json.agentId, me.text);
+    const meta = await call(client, "set_token_metadata", { token, uri: "ipfs://bafkreitokenone" });
+    assert.ok(meta.ok && meta.json.status === "sent", meta.text);
+    const page = await call(client, "token_info", { token });
+    const pageJson = page.json as { metadata: { uri: string }; creator: { vault: string; profileUri: string } };
+    assert.ok(page.ok && pageJson.metadata.uri === "ipfs://bafkreitokenone" && pageJson.creator.profileUri === "ipfs://bafkreiprofileone", page.text);
+    assert.equal(getAddress(pageJson.creator.vault), getAddress(launched.json.creatorVault as string));
   } finally {
     await client.close();
   }
