@@ -17,7 +17,9 @@
 //     in one transaction;
 //   * a ninth deposit no batch takes (fewer than eight): once
 //     DEPOSIT_TIMEOUT_SECONDS have passed on the chain, the sweep cancels it
-//     and the pool refunds it in full to the vault.
+//     and the pool refunds it in full to the vault;
+//   * a deposit the pool has no room for (its total limit) is refused before
+//     anything is signed: nothing leaves the vault and nothing is recorded.
 // The aggregator's pass runs when the test calls it instead of every 30
 // seconds, so the test does not wait for its timer, and the wall clock the
 // aggregator and the agent read (Date.now) is moved forward past the approval
@@ -234,5 +236,13 @@ test("eight shield deposits, one of them the creator vault's auto-shield, are se
   const refunded = (await shield.list()).find((s) => s.index === lone.index);
   assert.equal(refunded?.status, "closed");
   assert.equal(await balanceOf(opened.vault), amount);
+
+  // The pool counts every token it holds against maxTotal; filled to one unit short of the room a leaf needs,
+  // it cannot take the deposit, so shield refuses it before the vault sends anything to a depositor key.
+  await fork.dealUsdg(d.pool, p.maxTotal - amount + 1n);
+  const recorded = (await shield.list()).length;
+  await assert.rejects(shield.shield(1), /the pool has room for .*; nothing was signed/);
+  assert.equal(await balanceOf(opened.vault), amount, "nothing left the vault");
+  assert.equal((await shield.list()).length, recorded, "no deposit was recorded");
   Date.now = realNow;
 });

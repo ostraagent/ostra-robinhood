@@ -324,7 +324,7 @@ export class ShieldService {
     if (p.maxDeposit === 0n) return null;
     const vault = await this.#vault.vaultAddress();
     const available = (await tokenBalance(this.#client, this.#token(), vault)) - parseTokenAmount(setting.keep);
-    const room = p.maxTotal - (await tokenBalance(this.#client, this.#token(), this.#pool()));
+    const room = await this.#room(p.maxTotal);
     const most = maxLeavesPerDeposit(p.maxDeposit, p.feeBps);
     let leaves = 0;
     while (leaves < most && depositForLeaves(leaves + 1, p.feeBps) <= available && depositForLeaves(leaves + 1, p.feeBps) <= room) leaves += 1;
@@ -500,13 +500,17 @@ export class ShieldService {
     if (p.maxDeposit === 0n) throw new Error("the pool does not accept deposits (no deposit limit)");
     const most = maxLeavesPerDeposit(p.maxDeposit, p.feeBps);
     if (leaves > most) throw new RangeError(`one deposit holds at most ${most} leaves (the pool's largest deposit is ${formatTokenAmount(p.maxDeposit)})`);
+    const amount = depositForLeaves(leaves, p.feeBps);
+    // The pool counts every token it holds against maxTotal: a deposit it has no room for would revert after the
+    // vault funded the depositor key, so it is refused here, before anything is signed or moved.
+    const room = await this.#room(p.maxTotal);
+    if (amount > room) throw new RangeError(`the pool has room for ${formatTokenAmount(room)} more, and a deposit of ${leaves} leaves is ${formatTokenAmount(amount)}; nothing was signed`);
     const terms = await this.#aggregator("GET", "/v1/terms");
     if (terms.chainId !== this.#config.chainId || typeof terms.pool !== "string" || getAddress(terms.pool) !== pool || typeof terms.token !== "string" || getAddress(terms.token) !== this.#token()) {
       throw new Error(`the aggregator serves pool ${String(terms.pool)} on chain ${String(terms.chainId)}, not ${pool} on ${this.#config.chainId}`);
     }
     if (typeof terms.aggregator !== "string") throw new Error("the aggregator's terms name no aggregator account");
     const aggregatorAccount = getAddress(terms.aggregator);
-    const amount = depositForLeaves(leaves, p.feeBps);
     const status = await this.#vault.status();
     if (!status.vaultExists) throw new Error("open the vault and fund it first (open_vault)");
 
@@ -557,11 +561,23 @@ export class ShieldService {
     };
   }
 
-  /** Steps 1 and 2: the depositor key gets the tokens from the vault, then the deposit is submitted with its EIP-3009 authorization. */
+  /** What the pool can still take under its total limit: maxTotal less every token it holds (OstraPool._recordDeposit). */
+  async #room(maxTotal: bigint): Promise<bigint> {
+    const held = await tokenBalance(this.#client, this.#token(), this.#pool());
+    return held >= maxTotal ? 0n : maxTotal - held;
+  }
+
+  /**
+   * Steps 1 and 2: the depositor key gets the tokens from the vault, then the deposit is submitted with its EIP-3009 authorization.
+   * Neither step runs while the pool has no room for the deposit: nothing leaves the vault, and tokens the key already holds
+   * wait there; the sweep tries again.
+   */
   async #fundAndDeposit(record: ShieldRecord): Promise<void> {
     const signer = this.#signer(record);
     const amount = BigInt(record.amount);
     if ((await this.#readDeposit(record)).status === "none") {
+      const room = await this.#room((await readPool(this.#client, this.#pool())).maxTotal);
+      if (amount > room) throw new Error(`the pool has room for ${formatTokenAmount(room)} more, and deposit ${record.index} is ${formatTokenAmount(amount)}; it waits until there is room`);
       const held = await tokenBalance(this.#client, this.#token(), signer.address);
       if (held < amount) {
         for (let attempt = 0; attempt < 2; attempt++) {
