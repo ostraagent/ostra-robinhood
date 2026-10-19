@@ -12,9 +12,12 @@ import {
   ERC8004_IDENTITY_REGISTRY,
   ERC8004_REPUTATION_REGISTRY,
   MULTICALL3,
+  PERMIT2,
   ROBINHOOD_CHAIN_ID,
+  UNISWAP_UNIVERSAL_ROUTER,
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_POOL_MANAGER_CODE_HASH,
+  UNISWAP_V4_QUOTER,
   USDG,
   USDG_DECIMALS,
   USDG_EIP712_DOMAIN,
@@ -48,6 +51,9 @@ test("the fork is Robinhood Chain and every contract the SDK names has code", as
     ERC8004_REPUTATION_REGISTRY,
     MULTICALL3,
     UNISWAP_V4_POOL_MANAGER,
+    UNISWAP_UNIVERSAL_ROUTER,
+    UNISWAP_V4_QUOTER,
+    PERMIT2,
   };
   for (const [name, address] of Object.entries(named)) {
     const code = await fork.client.getCode({ address });

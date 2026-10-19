@@ -87,6 +87,8 @@ full record, with the outside contracts Ostra uses, is
 | `relayer/`, `keeper/`, `merchant/` | The relayer that lets agents pay gas in USDG, and the payment services behind it |
 | `aggregator/` | Builds the shielded pool's batches |
 | `rpc-proxy/` | The read-only RPC proxy for the web app |
+| `indexer/` | The launchpad's tokens, trades and price candles, read from the chain's logs, for the web app |
+| `uploader/` | Pins agents' profiles, token metadata and images to IPFS |
 | `deployments/` | The mainnet deployment record |
 | `ops/` | systemd units and nginx server blocks |
 | `vectors/` | WOTS and LtHash test vectors shared by Solidity and TypeScript |
@@ -114,6 +116,8 @@ cd aggregator && npm ci && npm run typecheck && npm test   # after the sdk's npm
 cd core && npm ci && npm run typecheck && npm test   # after the sdk's, the keeper's, the merchant's, the relayer's and the aggregator's npm ci
 cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
 cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
+cd indexer && npm ci && npm run typecheck && npm test   # after the sdk's and the core's npm ci; needs ../out and anvil
+cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs with OSTRA_PINATA_JWT_FILE
 ```
 
 ## Components in detail
@@ -305,10 +309,24 @@ cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the
   request per POST to the private RPC (OSTRA_RPC_URL, never in an answer or a log line), only the
   eth_ reads and simulations core and the SDK call (eth_call, eth_simulateV1, eth_getLogs only for
   one channel's ChannelOpened logs over at most 10,000,000 blocks, and the like); anything that
-  sends is refused (403), since the web app's transactions go through the relayer. Rates per
+  sends is refused (403), since the web app's transactions go through the relayer or the visitor's own wallet. Rates per
   client IP and in total (OSTRA_RPC_PROXY_PER_IP, OSTRA_RPC_PROXY_TOTAL) have no default; over a
   rate it answers 429 with Retry-After. The chain is checked by eth_chainId at start. Its tests run
   viem's calls through it against a mainnet fork.
+- `indexer/`: the web app's market data (`@ostraagent/indexer`). It reads OstraLaunchpad's Launched
+  events and the PoolManager's Swap events of those pools from the deployment's first block, in log
+  windows that shrink when the RPC refuses one, with each token's name, supply, graduation and the
+  metadata and profile files OstraRegistry points at; prices in USD from Chainlink's ETH/USD (a USDG
+  pool's quote is $1). A swap through Uniswap's Universal Router is the transaction sender's; a
+  vault's swap is the vault's. Its state is a JSON file, so a restart resumes where it stopped; its
+  read-only JSON API (tokens, trades, candles, agents) is served under /api/v1 on the web app's host.
+- `uploader/`: pins images (PNG, JPEG, WebP, GIF up to 1 MB, checked by their first bytes) and JSON
+  files up to 16 KB to IPFS through Pinata, with limits per client address and a daily byte budget;
+  served under /v1/ipfs/ on the relayer's host.
+- Wallet swaps (`core/src/wallet-swap.ts`): a wallet that is not an Ostra vault buys and sells
+  through Uniswap's Universal Router (Permit2 for an ERC-20 input, signed for exactly the amount,
+  valid 20 minutes), quoted by Uniswap's V4Quoter as the wallet's own call; the hook applies the
+  same rules to every swap.
 
 ## Running on mainnet
 

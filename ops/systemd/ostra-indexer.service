@@ -1,0 +1,27 @@
+# Ostra indexer: the launchpad's tokens, their trades and price candles, for the web app (indexer/src/main.ts).
+# Installed with @NODE@ replaced by the path of node; nginx serves its API under /api/ on app.ostraagent.xyz.
+[Unit]
+Description=Ostra indexer: the launchpad's tokens, trades and candles for the web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/indexer
+Environment=OSTRA_DEPLOYMENT=/srv/apps/ostra-robinhood/deployments/robinhood-mainnet.json
+Environment=OSTRA_RPC_URL_FILE=/etc/ostra/robinhood-rpc.url
+Environment=OSTRA_INDEXER_LOGS_RPC=https://rpc.mainnet.chain.robinhood.com
+Environment=OSTRA_INDEXER_LISTEN=127.0.0.1:4900
+Environment=OSTRA_INDEXER_STATE=/var/lib/ostra-indexer/state.json
+Environment=OSTRA_INDEXER_EVERY_MS=3000
+ExecStart=@NODE@ src/main.ts
+Restart=always
+RestartSec=5
+StateDirectory=ostra-indexer
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

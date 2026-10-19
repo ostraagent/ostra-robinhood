@@ -1,0 +1,99 @@
+// The indexer's HTTP API, read-only JSON for the web app, served under /api/v1
+// on the web app's own host (app.ostraagent.xyz, nginx in front: same origin,
+// so no CORS, and nginx limits the request rate per client).
+//
+//   GET /api/v1/health
+//   GET /api/v1/tokens?sort=new|marketcap|volume|active&q=&offset=&limit=
+//   GET /api/v1/tokens/<token>
+//   GET /api/v1/tokens/<token>/trades?limit=&before=<block>:<logIndex>
+//   GET /api/v1/tokens/<token>/candles?interval=60|300|900|3600|14400|86400
+//   GET /api/v1/agents/<creator vault>
+
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { isAddress } from "viem";
+import { CANDLE_INTERVALS, type Indexer } from "./indexer.ts";
+
+const MAX_LIMIT = 100;
+const SORTS = new Set(["new", "marketcap", "volume", "active"]);
+
+function send(res: ServerResponse, status: number, body: unknown, maxAge = 2): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": status === 200 ? `public, max-age=${maxAge}` : "no-store",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(text);
+}
+
+function intParam(url: URL, name: string, fallback: number, max: number): number | null {
+  const v = url.searchParams.get(name);
+  if (v === null || v === "") return fallback;
+  if (!/^[0-9]{1,9}$/.test(v)) return null;
+  const n = Number(v);
+  return n > max ? null : n;
+}
+
+export function handle(indexer: Indexer, req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, { error: "method_not_allowed" });
+  const url = new URL(req.url ?? "/", "http://indexer.local");
+  const parts = url.pathname.split("/").filter((p) => p !== "");
+  if (parts[0] !== "api" || parts[1] !== "v1") return send(res, 404, { error: "not_found" });
+  const [, , resource, id, sub] = parts;
+  if (parts.length > 5) return send(res, 404, { error: "not_found" });
+  if (resource === "health" && id === undefined) return send(res, 200, indexer.health(), 1);
+  if (resource === "tokens" && id === undefined) {
+    const sort = url.searchParams.get("sort") ?? "new";
+    if (!SORTS.has(sort)) return send(res, 400, { error: "bad_sort" });
+    const q = url.searchParams.get("q");
+    if (q !== null && q.length > 64) return send(res, 400, { error: "bad_query" });
+    const offset = intParam(url, "offset", 0, 1_000_000);
+    const limit = intParam(url, "limit", 30, MAX_LIMIT);
+    if (offset === null || limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+    return send(res, 200, indexer.tokens({ sort: sort as "new", q, offset, limit }));
+  }
+  if (resource === "tokens" && id !== undefined) {
+    if (!isAddress(id, { strict: false })) return send(res, 400, { error: "bad_address" });
+    if (sub === undefined) {
+      const t = indexer.token(id);
+      return t === null ? send(res, 404, { error: "unknown_token" }) : send(res, 200, t);
+    }
+    if (sub === "trades") {
+      const limit = intParam(url, "limit", 50, MAX_LIMIT);
+      if (limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+      const beforeText = url.searchParams.get("before");
+      let before: { block: bigint; logIndex: number } | null = null;
+      if (beforeText !== null) {
+        const m = /^([0-9]{1,15}):([0-9]{1,6})$/.exec(beforeText);
+        if (m === null) return send(res, 400, { error: "bad_before" });
+        before = { block: BigInt(m[1] as string), logIndex: Number(m[2]) };
+      }
+      const trades = indexer.trades(id, { limit, before });
+      return trades === null ? send(res, 404, { error: "unknown_token" }) : send(res, 200, { trades });
+    }
+    if (sub === "candles") {
+      const interval = intParam(url, "interval", 300, 86_400);
+      if (interval === null || !CANDLE_INTERVALS.has(interval)) return send(res, 400, { error: "bad_interval" });
+      const candles = indexer.candles(id, interval);
+      return candles === null ? send(res, 404, { error: "unknown_token" }) : send(res, 200, { interval, candles });
+    }
+    return send(res, 404, { error: "not_found" });
+  }
+  if (resource === "agents" && id !== undefined && sub === undefined) {
+    if (!isAddress(id, { strict: false })) return send(res, 400, { error: "bad_address" });
+    return send(res, 200, indexer.agent(id), 5);
+  }
+  return send(res, 404, { error: "not_found" });
+}
+
+export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void): Server {
+  return createServer((req, res) => {
+    try {
+      handle(indexer, req, res);
+    } catch (err) {
+      log("request_failed", { path: (req.url ?? "").slice(0, 200), reason: (err as Error).message.slice(0, 200) });
+      if (!res.headersSent) send(res, 500, { error: "internal" });
+      else res.end();
+    }
+  });
+}

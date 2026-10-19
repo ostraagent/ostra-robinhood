@@ -53,6 +53,16 @@ export const WETH: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 /** The deterministic CREATE2 deployer (github.com/Arachnid/deterministic-deployment-proxy): OstraHook is mined with it. */
 export const CREATE2_DEPLOYER: Address = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 
+/**
+ * Uniswap's v4 periphery on chain 4663 (Uniswap's v4 deployments page; sources verified on Sourcify, checked
+ * 19 Oct 2026; each names UNISWAP_V4_POOL_MANAGER as its pool manager). A wallet that is not an Ostra vault swaps
+ * through the Universal Router (command V4_SWAP, IV4Router.ExactInputSingleParams with minHopPriceX36), quotes with
+ * the V4Quoter, and lets the router take an ERC-20 input through Permit2.
+ */
+export const UNISWAP_UNIVERSAL_ROUTER: Address = "0x8876789976dEcBfCbBbe364623C63652db8C0904";
+export const UNISWAP_V4_QUOTER: Address = "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94";
+export const PERMIT2: Address = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+
 /** Multicall3, used to send more than one call in one transaction. */
 export const MULTICALL3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11";
 /** Arbitrum's NodeInterface (gasEstimateComponents: the L1 part of a gas estimate). */

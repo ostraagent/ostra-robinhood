@@ -68,7 +68,6 @@ import {
   ostraTokenAbi,
   ostraVaultAbi,
   ostraVestingAbi,
-  poolTick,
   quoteVaultLaunch,
   quoteVaultSwap,
   registerAgentParams,
@@ -85,13 +84,13 @@ import {
   type DevBuyTerms,
   type LaunchParams,
   type LaunchpadDeployment,
-  type PoolKey,
   type PoolSetting,
   type RelayCall,
   type SwapQuote,
 } from "@ostraagent/sdk";
 import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { tokenBalance, tokenDecimals } from "./chain.ts";
+import { quoteOfPool, readLaunchedPool, readPoolView, type LaunchedPool as Pool, type PoolView } from "./pools.ts";
 import { LOG_WINDOW_BLOCKS } from "./channels.ts";
 import { profileFile, tokenMetadataFile, uploadJson, type PublicFields } from "./publish.ts";
 import type { Config } from "./config.ts";
@@ -133,10 +132,28 @@ export async function readIpfsJson(uri: string | null): Promise<unknown> {
   if (!/^[A-Za-z0-9]+(\/[A-Za-z0-9._-]+)*$/.test(path)) return null;
   try {
     const res = await fetch(`${IPFS_GATEWAY}${path}`, { signal: AbortSignal.timeout(METADATA_TIMEOUT_MS), redirect: "error" });
-    if (!res.ok) return null;
-    const text = await res.text();
-    if (text.length > METADATA_MAX_BYTES) return null;
-    return JSON.parse(text) as unknown;
+    if (!res.ok || res.body === null) return null;
+    // Read at most METADATA_MAX_BYTES: a larger file is dropped without being held in memory whole.
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > METADATA_MAX_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const c of chunks) {
+      bytes.set(c, at);
+      at += c.length;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
     return null;
   }
@@ -198,34 +215,6 @@ export type SwapResult =
       note?: string;
     }
   | { status: "resent_pending"; resent: unknown; vaultNonce: string; note: string };
-
-export type PoolView = {
-  token: Address;
-  poolId: Hex;
-  name: string;
-  symbol: string;
-  quote: Address;
-  creatorVault: Address;
-  graduated: boolean;
-  tokensSold: string;
-  quoteRaised: string;
-  /** Price of one token in the quote, and the market cap of the whole supply at it. */
-  price: string;
-  marketCap: string;
-  tick: number;
-  /** The circuit breaker: the band this transaction's swaps may move the price in (null: off). */
-  band: { lower: number; upper: number } | null;
-  buyTaxBps: number;
-  sellTaxBps: number;
-  antiSnipeBps: number;
-  maxBuy: string | null;
-  dividendToken: Address | null;
-  launchedAt: string;
-  airdrop: { round: number; open: boolean; amount: string; claimed: string; endsAt: string | null; available: string; nextRoundAmount: string };
-  creatorShares: { recipient: Address; bps: number }[];
-};
-
-type Pool = { token: Address; id: Hex; key: PoolKey; config: Record<string, unknown> & { token: Address; creatorVault: Address; tokenIs0: boolean; dividendToken: Address } };
 
 function nowIso(seconds: bigint): string {
   return new Date(Number(seconds) * 1000).toISOString();
@@ -317,88 +306,18 @@ export class LaunchpadService {
   // ---------------------------------------------------------------------------
 
   /** The pool of `tokenText`, a token the Ostra launchpad launched. */
-  async #pool(tokenText: string): Promise<Pool> {
-    const lp = this.#lp();
-    const token = address(tokenText, "token");
-    const id = (await this.#client.readContract({ address: lp.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [token] })) as Hex;
-    if (BigInt(id) === 0n) throw new Error(`${token} is not a token the Ostra launchpad launched`);
-    const [key, config] = await Promise.all([
-      this.#client.readContract({ address: lp.hook, abi: ostraHookAbi, functionName: "poolKey", args: [id] }) as Promise<PoolKey>,
-      this.#client.readContract({ address: lp.hook, abi: ostraHookAbi, functionName: "poolConfig", args: [id] }) as Promise<Pool["config"]>,
-    ]);
-    return { token, id, key, config };
+  #pool(tokenText: string): Promise<Pool> {
+    return readLaunchedPool(this.#client, this.#lp(), tokenText);
   }
 
   /** The pool's quote currency (address(0): ETH). */
   #quoteOf(pool: Pool): Address {
-    return getAddress(pool.config.tokenIs0 ? pool.key.currency1 : pool.key.currency0);
+    return quoteOfPool(pool);
   }
 
   /** A launched token's pool: price, rules, circuit breaker, airdrop round and creator shares. */
-  async poolInfo(tokenText: string): Promise<PoolView> {
-    const lp = this.#lp();
-    const pool = await this.#pool(tokenText);
-    const c = pool.config as unknown as {
-      tokenIs0: boolean;
-      creatorVault: Address;
-      maxBuy: bigint;
-      dividendToken: Address;
-      launchedAt: number;
-      maxTxMoveTicks: number;
-    };
-    const quote = this.#quoteOf(pool);
-    const quoteDecimals = quote === zeroAddress ? 18 : await tokenDecimals(this.#client, quote);
-    const read = <T>(address: Address, abi: readonly unknown[], functionName: string, args: readonly unknown[] = []) =>
-      this.#client.readContract({ address, abi: abi as never, functionName: functionName as never, args: args as never }) as Promise<T>;
-    const [state, rates, tick, name, symbol, round, available, nextAmount, shares] = await Promise.all([
-      read<{ graduated: boolean; supply: bigint; tokensSold: bigint; quoteRaised: bigint }>(lp.hook, ostraHookAbi, "poolState", [pool.id]),
-      read<readonly [bigint, bigint, bigint]>(lp.hook, ostraHookAbi, "rates", [pool.id]),
-      poolTick(this.#client, pool.id),
-      read<string>(pool.token, ostraTokenAbi, "name"),
-      read<string>(pool.token, ostraTokenAbi, "symbol"),
-      read<{ amount: bigint; claimed: bigint; endsAt: number; number: number; open: boolean }>(lp.airdrop, ostraAirdropAbi, "round", [pool.id]),
-      read<bigint>(lp.airdrop, ostraAirdropAbi, "available", [pool.id]),
-      read<bigint>(lp.airdrop, ostraAirdropAbi, "nextRoundAmount", [pool.id]),
-      read<readonly [readonly Address[], readonly number[]]>(lp.creatorSplit, ostraCreatorSplitAbi, "recipients", [pool.id]),
-    ]);
-    const band = c.maxTxMoveTicks === 0 ? null : await read<readonly [number, number]>(lp.hook, ostraHookAbi, "txMoveBand", [pool.id]);
-    // The tick prices currency0 in currency1, raw unit for raw unit.
-    const raw = Math.pow(1.0001, tick);
-    const perRaw = c.tokenIs0 ? raw : 1 / raw;
-    const price = (perRaw * 10 ** 18) / 10 ** quoteDecimals;
-    const supply = Number(state.supply) / 1e18;
-    const fmtQuote = (v: bigint) => formatUnitsAmount(v < 0n ? 0n : v, quoteDecimals);
-    return {
-      token: pool.token,
-      poolId: pool.id,
-      name,
-      symbol,
-      quote,
-      creatorVault: getAddress(c.creatorVault),
-      graduated: state.graduated,
-      tokensSold: formatUnitsAmount(state.tokensSold < 0n ? 0n : state.tokensSold, 18),
-      quoteRaised: fmtQuote(state.quoteRaised),
-      price: price.toPrecision(6),
-      marketCap: (price * supply).toFixed(2),
-      tick,
-      band: band === null ? null : { lower: band[0], upper: band[1] },
-      buyTaxBps: Number(rates[0]),
-      sellTaxBps: Number(rates[1]),
-      antiSnipeBps: Number(rates[2]),
-      maxBuy: c.maxBuy === 0n ? null : formatUnitsAmount(c.maxBuy, 18),
-      dividendToken: getAddress(c.dividendToken) === zeroAddress ? null : getAddress(c.dividendToken),
-      launchedAt: nowIso(BigInt(c.launchedAt)),
-      airdrop: {
-        round: round.number,
-        open: round.open,
-        amount: formatUnitsAmount(round.amount, 18),
-        claimed: formatUnitsAmount(round.claimed, 18),
-        endsAt: round.number === 0 ? null : nowIso(BigInt(round.endsAt)),
-        available: formatUnitsAmount(available, 18),
-        nextRoundAmount: formatUnitsAmount(nextAmount, 18),
-      },
-      creatorShares: shares[0].map((recipient, i) => ({ recipient: getAddress(recipient), bps: Number(shares[1][i]) })),
-    };
+  poolInfo(tokenText: string): Promise<PoolView> {
+    return readPoolView(this.#client, this.#lp(), tokenText);
   }
 
   /** The agent's vault for a launched token: its address, whether it exists, the balance and the dividends it can claim. */
