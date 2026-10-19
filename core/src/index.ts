@@ -17,6 +17,7 @@ export * from "./pending.ts";
 export * from "./pools.ts";
 export * from "./random.ts";
 export * from "./relay.ts";
+export * from "./seed-backup.ts";
 export * from "./sessions.ts";
 export * from "./shield.ts";
 export * from "./storage.ts";

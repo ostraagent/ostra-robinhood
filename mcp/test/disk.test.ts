@@ -7,6 +7,7 @@ import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { openSeedBackup, sealSeedBackup } from "@ostraagent/core";
 import { openSeedWithPassphrase, sealSeedWithPassphrase } from "../src/backup-cli.ts";
 import { DiskFolder } from "../src/disk.ts";
 import { openKeys } from "../src/keys.ts";
@@ -70,4 +71,17 @@ test("the seed backup opens with its passphrase only", async () => {
   const b = JSON.parse(sealed) as { ciphertext: string };
   const tampered = JSON.stringify({ ...JSON.parse(sealed), ciphertext: (b.ciphertext[0] === "0" ? "1" : "0") + b.ciphertext.slice(1) });
   await assert.rejects(openSeedWithPassphrase(tampered, "correct horse battery"), /does not open/);
+});
+
+test("the web app's seed backup (core seed-backup.ts) and this package's open each other's files", async () => {
+  const seed = new Uint8Array(32).map((_, i) => 255 - i);
+  const fromWeb = await sealSeedBackup(seed, "correct horse battery");
+  assert.deepEqual(await openSeedWithPassphrase(fromWeb, "correct horse battery"), seed);
+  const fromMcp = await sealSeedWithPassphrase(seed, "correct horse battery");
+  assert.deepEqual(await openSeedBackup(fromMcp, "correct horse battery"), seed);
+  assert.deepEqual(Object.keys(JSON.parse(fromWeb) as object), Object.keys(JSON.parse(fromMcp) as object));
+  await assert.rejects(openSeedBackup(fromMcp, "wrong passphrase!!"), /does not open/);
+  await assert.rejects(openSeedWithPassphrase(fromWeb, "wrong passphrase!!"), /does not open/);
+  await assert.rejects(sealSeedBackup(seed, "too short"), /at least 12/);
+  await assert.rejects(openSeedBackup("{}", "correct horse battery"), /not an Ostra seed backup/);
 });
