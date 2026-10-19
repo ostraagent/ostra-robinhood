@@ -7,6 +7,7 @@
 
 import {
   createWalletClient,
+  encodeFunctionData,
   formatEther,
   type Abi,
   type Address,
@@ -23,9 +24,10 @@ export type Call = { address: Address; abi: Abi; functionName: string; args: rea
 export type Sent = { hash: Hash; gasUsed: bigint };
 
 /**
- * A crank with less ETH than a call's maximum cost (gas estimate x
- * maxFeePerGas) gets twice that cost from the fee payer first (decided 17 Oct
- * 2026): one top-up covers the call even if the fee rises before it lands.
+ * A crank with less ETH than a call's maximum cost (the prepared
+ * transaction's gas x maxFeePerGas) gets twice that cost from the fee payer
+ * first (decided 17 Oct 2026): one top-up covers the call even if the fee
+ * rises before it lands.
  */
 export const CRANK_TOP_UP_FACTOR = 2n;
 
@@ -69,12 +71,25 @@ export class Sender {
     return this.#locked(this.#feePayer.address, () => this.#sendNow(this.#feePayer, call));
   }
 
-  /** Sends `call` from `crank`, topping the crank up from the fee payer when it cannot pay the call's maximum cost. */
+  /**
+   * Sends `call` from `crank`, topping the crank up from the fee payer when it cannot pay the call's maximum cost.
+   * The call is simulated first (a revert is reported with its reason; nothing is topped up or sent), then the
+   * transaction is prepared once and that exact transaction is signed and sent: the top-up is measured against
+   * the gas and maxFeePerGas it carries. A second fee estimate at send time can differ (eth_fillTransaction,
+   * where the node offers it, prices fees its own way), and a crank topped up for the first one can fall short.
+   */
   fromCrank(crank: PrivateKeyAccount, call: Call): Promise<Sent> {
     return this.#locked(crank.address, async () => {
-      const gas = await this.#client.estimateContractGas({ ...call, account: crank } as Parameters<PublicClient["estimateContractGas"]>[0]);
-      const { maxFeePerGas } = await this.#client.estimateFeesPerGas();
-      const cost = gas * maxFeePerGas;
+      await this.#client.simulateContract({ ...call, account: crank } as Parameters<PublicClient["simulateContract"]>[0]);
+      const wallet = createWalletClient({ account: crank, chain: robinhoodChain, transport: this.#transport });
+      const request = await wallet.prepareTransactionRequest({
+        to: call.address,
+        data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args } as Parameters<typeof encodeFunctionData>[0]),
+      });
+      const { gas, maxFeePerGas, gasPrice } = request as { gas?: bigint; maxFeePerGas?: bigint; gasPrice?: bigint };
+      const feePerGas = maxFeePerGas ?? gasPrice;
+      if (gas === undefined || feePerGas === undefined) throw new Error(`${call.functionName}: the prepared transaction has no gas or fee`);
+      const cost = gas * feePerGas;
       const balance = await this.#client.getBalance({ address: crank.address });
       if (balance < cost) {
         const value = cost * CRANK_TOP_UP_FACTOR;
@@ -87,7 +102,10 @@ export class Sender {
         });
         this.#log("crank_topped_up", { crank: crank.address, eth: formatEther(value), tx: hash });
       }
-      return this.#sendNow(crank, call);
+      const hash = await wallet.sendRawTransaction({ serializedTransaction: await wallet.signTransaction(request as Parameters<typeof wallet.signTransaction>[0]) });
+      const receipt = await this.#client.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") throw new Error(`${call.functionName} transaction ${hash} reverted`);
+      return { hash, gasUsed: receipt.gasUsed };
     });
   }
 }
