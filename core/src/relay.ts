@@ -71,6 +71,7 @@ import {
   RelaySimulationError,
   VAULT_ACTION,
   type ChannelConfig,
+  type ChannelState,
   type EthUsdSource,
   type RelayCall,
 } from "@ostraagent/sdk";
@@ -95,6 +96,14 @@ const MAX_STEPS = 8;
 const MAX_RESENDS = 3;
 /** How long a transaction the relayer reports is waited for on this RPC. */
 const LANDED_TIMEOUT_MS = 60_000;
+/**
+ * Reads of a channel the relayer just opened before it is taken as empty: a
+ * load-balanced RPC (the public one) can answer from a node a few blocks
+ * behind the one that gave the open's receipt (seen on mainnet, 19 Oct 2026:
+ * 12 blocks), so an empty read right after the open is read again.
+ */
+const OPEN_READ_TRIES = 20;
+const OPEN_READ_INTERVAL_MS = 500;
 const BPS_DENOMINATOR = 10_000;
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -744,7 +753,7 @@ export class RelayerClient implements Sender {
    * records it, and pays the open and the vault's debt with its first
    * voucher (the same request sent again).
    */
-  async #payOpen(calls: readonly RelayCall[], channel: Hex, paymentDue: bigint, debt: bigint): Promise<Hash> {
+  async #payOpen(calls: readonly RelayCall[], channel: Hex, openTx: Hash, paymentDue: bigint, debt: bigint): Promise<Hash> {
     const facts = await this.facts();
     const d = this.#config.deployment;
     const vault = await this.#buyerVault().vaultAddress();
@@ -758,7 +767,7 @@ export class RelayerClient implements Sender {
     }
     const voucherKey = this.#keys.channelVoucherSigner(this.#config.chainId, d.token, config.salt);
     if (voucherKey.address !== getAddress(config.payerAuthorizer)) throw new Error(`the voucher key of relayer channel ${channel} is not derived from this machine's master seed`);
-    const ch = await readChannel(this.#client, d.batchSettlement, id);
+    const ch = await this.#openedChannel(id, openTx);
     if (ch.balance !== found.amount || ch.pendingWithdrawal !== null) throw new Error(`relayer channel ${channel} does not hold its deposit of ${found.amount}`);
     const most = debt + (await this.#spendBound());
     if (paymentDue > most) throw new Error(`the relayer asks ${formatTokenAmount(paymentDue)} for the open of channel ${channel}, more than an open's price and the vault's debt (${formatTokenAmount(most)})`);
@@ -786,7 +795,23 @@ export class RelayerClient implements Sender {
   /** Pays an open the relayer sent before payment that this machine did not pay (it stopped, or was restored from the seed). */
   async #payUnpaidOpen(unpaid: UnpaidOpen, debt: bigint): Promise<void> {
     if (unpaid.calls.length === 0) throw new Error(`the relayer holds an unpaid open of channel ${unpaid.channel} without its calls; it cannot be paid from here`);
-    await this.#landed(await this.#payOpen(unpaid.calls, unpaid.channel, unpaid.amount, debt));
+    await this.#landed(await this.#payOpen(unpaid.calls, unpaid.channel, unpaid.txHash, unpaid.amount, debt));
+  }
+
+  /**
+   * Channel `id` as its open `openTx` left it: the open's receipt on this RPC
+   * first (it must have landed and succeeded), then reads until the channel
+   * shows on the node that answers, for at most OPEN_READ_TRIES reads.
+   */
+  async #openedChannel(id: Hex, openTx: Hash): Promise<ChannelState> {
+    await this.#landed(openTx);
+    const settlement = this.#config.deployment.batchSettlement;
+    let ch = await readChannel(this.#client, settlement, id);
+    for (let i = 1; i < OPEN_READ_TRIES && ch.balance === 0n && ch.pendingWithdrawal === null; i++) {
+      await new Promise((resolve) => setTimeout(resolve, OPEN_READ_INTERVAL_MS));
+      ch = await readChannel(this.#client, settlement, id);
+    }
+    return ch;
   }
 
   /** Waits until `hash` has a successful receipt on this RPC. */
@@ -844,7 +869,7 @@ export class RelayerClient implements Sender {
           // An open to the relayer's vault, relayed before payment: its first voucher pays it now.
           const hash =
             typeof b.paymentDue === "string" && typeof b.channel === "string"
-              ? await this.#payOpen(calls, b.channel as Hex, BigInt(b.paymentDue), (await this.vaultState(await this.#buyerVault().vaultAddress())).debt)
+              ? await this.#payOpen(calls, b.channel as Hex, b.txHash as Hash, BigInt(b.paymentDue), (await this.vaultState(await this.#buyerVault().vaultAddress())).debt)
               : (b.txHash as Hash);
           await this.#landed(hash);
           return hash;
