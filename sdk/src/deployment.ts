@@ -20,6 +20,8 @@ export type Deployment = {
   beaconOwner: Address;
   /** Block of the first deployment transaction: services read events from here. */
   fromBlock: string;
+  /** OstraRegistry (profiles and token metadata), which version 2 vaults write to; absent before it was deployed. */
+  registry?: Address;
   /** The launchpad (deployLaunchpad), when it is deployed. */
   launchpad?: LaunchpadDeployment;
 };
@@ -67,6 +69,10 @@ export function parseDeployment(value: unknown): Deployment {
     const a = v[field];
     if (typeof a !== "string" || !isAddress(a, { strict: false })) throw new Error(`deployment ${field} is not an address`);
     out[field] = getAddress(a);
+  }
+  if (v.registry !== undefined) {
+    if (typeof v.registry !== "string" || !isAddress(v.registry, { strict: false })) throw new Error("deployment registry is not an address");
+    out.registry = getAddress(v.registry);
   }
   if (v.launchpad !== undefined) {
     if (typeof v.launchpad !== "object" || v.launchpad === null) throw new Error("deployment launchpad must be an object");

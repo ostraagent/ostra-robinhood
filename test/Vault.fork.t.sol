@@ -11,6 +11,7 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
+import {OstraRegistry} from "../src/OstraRegistry.sol";
 import {OstraVault} from "../src/OstraVault.sol";
 import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
 import {OstraSplit, OstraSplitFactory} from "../src/OstraSplit.sol";
@@ -40,6 +41,13 @@ contract UnlockedSubmitter is IUnlockCallback {
     }
 }
 
+/// @notice The ERC-8004 Identity Registry's functions the tests read.
+interface IIdentityRegistryView {
+    function ownerOf(uint256 agentId) external view returns (address);
+    function tokenURI(uint256 agentId) external view returns (string memory);
+    function getAgentWallet(uint256 agentId) external view returns (address);
+}
+
 contract VaultForkTest is Test {
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
@@ -47,11 +55,14 @@ contract VaultForkTest is Test {
     address internal constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
     uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
     uint40 internal constant GRACE = 900;
+    /// @dev The ERC-8004 Identity Registry on Robinhood Chain (erc-8004/erc-8004-contracts README).
+    address internal constant IDENTITY_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
 
     IX402BatchSettlement internal batch = IX402BatchSettlement(BATCH);
     IERC20 internal usdg = IERC20(USDG);
     OstraVaultFactory internal factory;
     OstraSplitFactory internal splitFactory;
+    OstraRegistry internal registry;
 
     // Keychains: one per vault, all from one test master secret.
     bytes32 internal constant MASTER = keccak256("OSTRA/EVM/TEST/master");
@@ -71,8 +82,11 @@ contract VaultForkTest is Test {
         assertGt(USDG.code.length, 0);
         assertGt(POOL_MANAGER.code.length, 0);
         assertEq(batch.MIN_WITHDRAW_DELAY(), GRACE);
-        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER);
+        assertGt(IDENTITY_REGISTRY.code.length, 0);
+        registry = new OstraRegistry();
+        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER, address(registry), IDENTITY_REGISTRY);
         assertEq(address(implementation.POOL_MANAGER()), POOL_MANAGER);
+        assertEq(implementation.VERSION(), 2);
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(implementation), address(this));
         factory = new OstraVaultFactory(address(beacon));
         splitFactory = new OstraSplitFactory();
@@ -233,7 +247,7 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(10, bytes32(0), "", signature);
+        vault.spend(14, bytes32(0), "", signature);
         // DevBuy: abi.encode(devBuy, launchHash, amount), 96 bytes.
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(9, bytes32(0), new bytes(64), signature);
@@ -925,5 +939,62 @@ contract VaultForkTest is Test {
         (bytes32 n2, bytes memory sig2) = _sign(guardian, G1, 8, abi.encode(address(guardian), bytes32(uint256(1))));
         vm.expectRevert(OstraVault.BadParams.selector);
         guardian.spend(8, n2, abi.encode(address(guardian), bytes32(uint256(1))), sig2);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Profile and agent identity (OstraRegistry, the ERC-8004 Identity Registry)
+    // ---------------------------------------------------------------------------------------------
+
+    function test_aVaultSetsItsProfileAndOwnsItsAgentIdentity() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        IIdentityRegistryView identity = IIdentityRegistryView(IDENTITY_REGISTRY);
+
+        _spend(vault, BUYER, vault.ACTION_SET_PROFILE(), abi.encode("ipfs://profile-one"));
+        assertEq(registry.profileOf(address(vault)), "ipfs://profile-one");
+
+        vm.recordLogs();
+        _spend(vault, BUYER, vault.ACTION_REGISTER_AGENT(), abi.encode("ipfs://agent-one"));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 agentId;
+        bool found;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(vault) && logs[i].topics[0] == OstraVault.AgentRegistered.selector) {
+                agentId = uint256(logs[i].topics[1]);
+                found = true;
+            }
+        }
+        assertTrue(found, "AgentRegistered");
+        assertEq(identity.ownerOf(agentId), address(vault));
+        assertEq(identity.getAgentWallet(agentId), address(vault));
+        assertEq(identity.tokenURI(agentId), "ipfs://agent-one");
+
+        _spend(vault, BUYER, vault.ACTION_SET_AGENT_URI(), abi.encode(agentId, "ipfs://agent-two"));
+        assertEq(identity.tokenURI(agentId), "ipfs://agent-two");
+        assertEq(vault.nonce(), 3);
+
+        // Only the Identity Registry may hand the vault a token.
+        vm.expectRevert(OstraVault.Unauthorized.selector);
+        vault.onERC721Received(address(this), address(this), 1, "");
+    }
+
+    function test_profileAndIdentitySpendsRefuseMalformedUris() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        uint8 setProfile = vault.ACTION_SET_PROFILE();
+        bytes[] memory bad = new bytes[](5);
+        bad[0] = abi.encode("");
+        bad[1] = abi.encode(string(new bytes(257)));
+        bad[2] = bytes.concat(abi.encode("ipfs://x"), bytes32(0));
+        bad[3] = abi.encode(uint256(64), uint256(8), bytes32("ipfs://x"));
+        bad[4] = new bytes(31);
+        for (uint256 i; i < bad.length; ++i) {
+            (bytes32 next, bytes memory signature) = _sign(vault, BUYER, setProfile, bad[i]);
+            vm.expectRevert(OstraVault.BadParams.selector);
+            vault.spend(setProfile, next, bad[i], signature);
+        }
+        // The longest URI passes; an action past the last one is refused.
+        _spend(vault, BUYER, setProfile, abi.encode(string(new bytes(256))));
+        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 14, abi.encode("ipfs://x"));
+        vm.expectRevert(OstraVault.BadAction.selector);
+        vault.spend(14, n2, abi.encode("ipfs://x"), s2);
     }
 }

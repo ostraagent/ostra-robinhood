@@ -1,8 +1,9 @@
 // Deploys Ostra's contracts from the Foundry build (Node only; exported by
 // the SDK's Node entry). One path for the fork tests and for mainnet:
-//   1. OstraVault implementation (bound to x402BatchSettlement and the
-//      Uniswap v4 PoolManager), its UpgradeableBeacon, and OstraVaultFactory
-//      on that beacon;
+//   1. OstraRegistry (profiles and token metadata; no owner), then the
+//      OstraVault implementation (bound to x402BatchSettlement, the Uniswap v4
+//      PoolManager, OstraRegistry and the ERC-8004 Identity Registry), its
+//      UpgradeableBeacon, and OstraVaultFactory on that beacon;
 //   2. OstraPool implementation, its UpgradeableBeacon, and the pool as a
 //      BeaconProxy initialized for USDG with the decided fee and limits;
 //   3. OstraSplitFactory.
@@ -32,6 +33,7 @@ import {
   ostraLaunchpadAbi,
   ostraLockerAbi,
   ostraPoolAbi,
+  ostraRegistryAbi,
   ostraSplitFactoryAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
@@ -39,6 +41,7 @@ import {
 } from "./abi.ts";
 import {
   CREATE2_DEPLOYER,
+  ERC8004_IDENTITY_REGISTRY,
   LAUNCHPAD,
   POOL_FEE_BPS,
   POOL_MAX_DEPOSIT,
@@ -46,6 +49,8 @@ import {
   ROBINHOOD_CHAIN_ID,
   UNISWAP_V4_POOL_MANAGER,
   USDG,
+  VAULT_MAX_URI_LENGTH,
+  VAULT_VERSION,
   WETH,
   X402_BATCH_SETTLEMENT,
 } from "./constants.ts";
@@ -99,9 +104,12 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     if (norm(got) !== norm(want)) throw new Error(`${what}: ${String(got)}, expected ${String(want)}`);
   };
 
+  const registry = await deploy("OstraRegistry", ostraRegistryAbi, creationCode(o.outDir, "OstraRegistry.sol", "OstraRegistry"), []);
   const vaultImplementation = await deploy("OstraVault", ostraVaultAbi, creationCode(o.outDir, "OstraVault.sol", "OstraVault"), [
     X402_BATCH_SETTLEMENT,
     UNISWAP_V4_POOL_MANAGER,
+    registry,
+    ERC8004_IDENTITY_REGISTRY,
   ]);
   expect("vault implementation BATCH_SETTLEMENT", await read(vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), X402_BATCH_SETTLEMENT);
   expect("vault implementation POOL_MANAGER", await read(vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
@@ -138,6 +146,7 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     splitFactory,
     beaconOwner: getAddress(o.beaconOwner),
     fromBlock: (fromBlock ?? 0n).toString(),
+    registry,
   };
   await checkDeployment(o.publicClient, d, { treasury: o.treasury, poolAuthority: o.poolAuthority });
   return d;
@@ -156,6 +165,13 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
   same("vault factory beacon", await read(d.vaultFactory, ostraVaultFactoryAbi, "BEACON"), d.vaultBeacon);
   same("vault implementation settlement", await read(d.vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), d.batchSettlement);
   same("vault implementation pool manager", await read(d.vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
+  // A record without a registry is one whose vaults still run version 1 (no REGISTRY to read).
+  if (d.registry !== undefined) {
+    same("vault implementation version", await read(d.vaultImplementation, ostraVaultAbi, "VERSION"), VAULT_VERSION);
+    same("vault implementation registry", await read(d.vaultImplementation, ostraVaultAbi, "REGISTRY"), d.registry);
+    same("vault implementation identity registry", await read(d.vaultImplementation, ostraVaultAbi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
+    same("registry URI limit", await read(d.registry, ostraRegistryAbi, "MAX_URI_LENGTH"), VAULT_MAX_URI_LENGTH);
+  }
   same("pool beacon implementation", await read(d.poolBeacon, upgradeableBeaconAbi, "implementation"), d.poolImplementation);
   same("pool beacon owner", await read(d.poolBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
   same("pool token", await read(d.pool, ostraPoolAbi, "token"), d.token);

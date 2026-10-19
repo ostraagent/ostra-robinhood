@@ -39,6 +39,18 @@ interface IOstraDevBuyLaunch {
     function pendingLaunch(address vault) external view returns (bytes32);
 }
 
+/// @notice What SetProfile and SetTokenMetadata spends call (OstraRegistry).
+interface IOstraRegistry {
+    function setProfile(string calldata uri) external;
+    function setTokenMetadata(address token, bytes32 poolId, string calldata uri) external;
+}
+
+/// @notice What RegisterAgent and SetAgentUri spends call: the ERC-8004 Identity Registry.
+interface IAgentIdentityRegistry {
+    function register(string calldata agentURI) external returns (uint256 agentId);
+    function setAgentURI(uint256 agentId, string calldata newURI) external;
+}
+
 /// @title OstraVault
 /// @notice Holds one token for an agent and spends it only with a rotating WOTS one-time key, the
 ///         Robinhood Chain port of the Ostra Solana program's Vault (program/src/instructions/vault.rs
@@ -85,6 +97,16 @@ interface IOstraDevBuyLaunch {
 ///                  only while it is launching exactly the launch the owner signed (devBuy.pendingLaunch(this vault)
 ///                  == launchHash, the hash of every launch and dev buy parameter, OstraDevBuy.launchHash). So the
 ///                  signature, public once sent, can only ever make that launch, whoever submits it.
+/// * 10 SetProfile: params abi.encode(string uri). Sets this vault's profile in OstraRegistry (REGISTRY).
+/// * 11 SetTokenMetadata: params abi.encode(address token, bytes32 poolId, string uri). Sets a launched token's
+///                  metadata in OstraRegistry, which accepts it only from the creator vault of the token's pool.
+/// * 12 RegisterAgent: params abi.encode(string uri). Registers this vault as an agent in the ERC-8004 Identity
+///                  Registry (IDENTITY_REGISTRY): the vault owns the agent's identity token and is its agentWallet.
+/// * 13 SetAgentUri: params abi.encode(uint256 agentId, string uri). Points the identity this vault owns at a
+///                  new registration file.
+///                  The four call only those two contracts, with no value, and their URIs are 1 to
+///                  MAX_URI_LENGTH bytes, ABI-encoded exactly (no trailing bytes). No spend can transfer an
+///                  identity token, so an identity stays with the vault that registered it.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
@@ -116,6 +138,15 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_SET_RECOVERY_POLICY = 7;
     uint8 public constant ACTION_SUPPORT_RECOVERY = 8;
     uint8 public constant ACTION_DEV_BUY = 9;
+    uint8 public constant ACTION_SET_PROFILE = 10;
+    uint8 public constant ACTION_SET_TOKEN_METADATA = 11;
+    uint8 public constant ACTION_REGISTER_AGENT = 12;
+    uint8 public constant ACTION_SET_AGENT_URI = 13;
+
+    /// @notice The implementation version: 2 adds the profile, token metadata and agent identity spends.
+    uint8 public constant VERSION = 2;
+    /// @notice Longest URI a SetProfile, SetTokenMetadata, RegisterAgent or SetAgentUri spend may carry.
+    uint256 public constant MAX_URI_LENGTH = 256;
 
     /// @notice Bounds of a Swap's signed `swapGas`, the gas its PoolManager call gets exactly (so the sender's gas
     ///         limit never decides whether a swap fails).
@@ -140,6 +171,10 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     IX402BatchSettlement public immutable BATCH_SETTLEMENT;
     /// @notice The Uniswap v4 PoolManager this vault swaps on.
     IPoolManager public immutable POOL_MANAGER;
+    /// @notice The OstraRegistry this vault sets its profile and its launches' metadata in.
+    IOstraRegistry public immutable REGISTRY;
+    /// @notice The ERC-8004 Identity Registry this vault registers as an agent in.
+    IAgentIdentityRegistry public immutable IDENTITY_REGISTRY;
 
     IERC20 public token;
     bytes32 public initialKeyRoot;
@@ -191,6 +226,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     event RecoverySupported(uint32 indexed round, bytes32 indexed newKeyRoot, address indexed guardian, uint256 support);
     event RecoveryStarted(uint32 indexed round, bytes32 indexed newKeyRoot, uint64 executableAt);
     event Recovered(uint32 indexed round, bytes32 indexed newKeyRoot);
+    event AgentRegistered(uint256 indexed agentId);
 
     error BadAction();
     error BadParams();
@@ -213,9 +249,14 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     error NoRecovery();
     error RecoveryNotReady();
 
-    constructor(address batchSettlement, address poolManager) EIP712("Ostra Vault", "1") {
+    constructor(address batchSettlement, address poolManager, address registry, address identityRegistry)
+        EIP712("Ostra Vault", "1")
+    {
+        if (registry == address(0) || identityRegistry == address(0)) revert BadParams();
         BATCH_SETTLEMENT = IX402BatchSettlement(batchSettlement);
         POOL_MANAGER = IPoolManager(poolManager);
+        REGISTRY = IOstraRegistry(registry);
+        IDENTITY_REGISTRY = IAgentIdentityRegistry(identityRegistry);
         _disableInitializers();
     }
 
@@ -292,6 +333,16 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (msg.sender != devBuy || launchHash == bytes32(0)) revert Unauthorized();
             if (IOstraDevBuyLaunch(devBuy).pendingLaunch(address(this)) != launchHash) revert Unauthorized();
             if (amount != 0) token.safeTransfer(devBuy, amount);
+        } else if (action == ACTION_SET_PROFILE) {
+            REGISTRY.setProfile(abi.decode(params, (string)));
+        } else if (action == ACTION_SET_TOKEN_METADATA) {
+            (address launched, bytes32 poolId, string memory uri) = abi.decode(params, (address, bytes32, string));
+            REGISTRY.setTokenMetadata(launched, poolId, uri);
+        } else if (action == ACTION_REGISTER_AGENT) {
+            emit AgentRegistered(IDENTITY_REGISTRY.register(abi.decode(params, (string))));
+        } else if (action == ACTION_SET_AGENT_URI) {
+            (uint256 agentId, string memory uri) = abi.decode(params, (uint256, string));
+            IDENTITY_REGISTRY.setAgentURI(agentId, uri);
         } else {
             (address vault, bytes32 newKeyRoot) = abi.decode(params, (address, bytes32));
             if (vault == address(0) || vault == address(this) || newKeyRoot == bytes32(0)) revert BadParams();
@@ -318,9 +369,33 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 64) revert BadParams();
         } else if (action == ACTION_DEV_BUY) {
             if (params.length != 96) revert BadParams();
+        } else if (action == ACTION_SET_PROFILE || action == ACTION_REGISTER_AGENT) {
+            _checkUriParams(params, 1);
+        } else if (action == ACTION_SET_TOKEN_METADATA) {
+            _checkUriParams(params, 3);
+        } else if (action == ACTION_SET_AGENT_URI) {
+            _checkUriParams(params, 2);
         } else {
             revert BadAction();
         }
+    }
+
+    /// @dev params is the ABI encoding of `heads` words whose last is a string: that word points just past the
+    ///      heads, the string is 1 to MAX_URI_LENGTH bytes, and nothing follows its padding.
+    function _checkUriParams(bytes calldata params, uint256 heads) private pure {
+        uint256 headsEnd = 32 * heads;
+        if (params.length < headsEnd + 32) revert BadParams();
+        if (uint256(bytes32(params[headsEnd - 32:headsEnd])) != headsEnd) revert BadParams();
+        uint256 length = uint256(bytes32(params[headsEnd:headsEnd + 32]));
+        if (length == 0 || length > MAX_URI_LENGTH) revert BadParams();
+        if (params.length != headsEnd + 32 + ((length + 31) / 32) * 32) revert BadParams();
+    }
+
+    /// @notice Accepts the identity token the ERC-8004 Identity Registry mints to this vault (RegisterAgent), and
+    ///         nothing else.
+    function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
+        if (msg.sender != address(IDENTITY_REGISTRY)) revert Unauthorized();
+        return this.onERC721Received.selector;
     }
 
     function _openChannel(bytes calldata params) private {

@@ -74,6 +74,11 @@ export const POOL_MAX_TOTAL = 2_500_000_000n;
 export const VAULT_SWAP_GAS_RESERVE = 30_000;
 
 /** OstraVault spend actions. */
+/** OstraVault.VERSION of the vault code this SDK signs for (2: profile, token metadata and agent identity spends). */
+export const VAULT_VERSION = 2;
+/** OstraVault.MAX_URI_LENGTH and OstraRegistry.MAX_URI_LENGTH: the longest profile, metadata or agent URI, in bytes. */
+export const VAULT_MAX_URI_LENGTH = 256n;
+
 export const VAULT_ACTION = {
   TRANSFER: 0,
   OPEN_CHANNEL: 1,
@@ -85,6 +90,10 @@ export const VAULT_ACTION = {
   SET_RECOVERY_POLICY: 7,
   SUPPORT_RECOVERY: 8,
   DEV_BUY: 9,
+  SET_PROFILE: 10,
+  SET_TOKEN_METADATA: 11,
+  REGISTER_AGENT: 12,
+  SET_AGENT_URI: 13,
 } as const;
 
 /** OstraVault.MIN_RECOVERY_DELAY and MAX_RECOVERY_DELAY, in seconds (36 hours, 14 days). */

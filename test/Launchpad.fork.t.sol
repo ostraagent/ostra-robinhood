@@ -16,6 +16,7 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
+import {OstraRegistry} from "../src/OstraRegistry.sol";
 import {OstraVault} from "../src/OstraVault.sol";
 import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
 import {OstraAirdrop} from "../src/launchpad/OstraAirdrop.sol";
@@ -127,6 +128,8 @@ contract LaunchpadForkTest is Test {
     address internal constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
     address internal constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
+    /// @dev The ERC-8004 Identity Registry on Robinhood Chain (erc-8004/erc-8004-contracts README).
+    address internal constant IDENTITY_REGISTRY = 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432;
     uint160 internal constant HOOK_FLAGS = 0x28CC;
     address internal constant V2_FACTORY = 0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f;
     address internal constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
@@ -137,6 +140,7 @@ contract LaunchpadForkTest is Test {
     IPoolManager internal pm = IPoolManager(POOL_MANAGER);
     OstraVaultFactory internal factory;
     OstraHook internal hook;
+    OstraRegistry internal registry;
     OstraFees internal fees;
     OstraCreatorSplit internal split;
     OstraDispatcher internal dispatcher;
@@ -156,7 +160,8 @@ contract LaunchpadForkTest is Test {
         vm.createSelectFork("robinhood");
         assertGt(POOL_MANAGER.code.length, 0);
         assertGt(WETH.code.length, 0);
-        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER);
+        registry = new OstraRegistry();
+        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER, address(registry), IDENTITY_REGISTRY);
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(implementation), address(this));
         factory = new OstraVaultFactory(address(beacon));
 
@@ -2366,5 +2371,35 @@ contract LaunchpadForkTest is Test {
         airdrop.close(id);
         assertEq(IERC20(t).balanceOf(address(airdrop)), 50_000_000e18);
         assertEq(airdrop.available(id), 50_000_000e18);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Token metadata (OstraRegistry)
+    // ---------------------------------------------------------------------------------------------
+
+    function test_onlyTheCreatorVaultSetsItsTokensMetadata() public {
+        (OstraToken token, PoolKey memory key, OstraVault creatorVault) = _launchUsdg(bytes32(uint256(0x8e7a)));
+        bytes32 id = PoolId.unwrap(key.toId());
+        uint8 action = creatorVault.ACTION_SET_TOKEN_METADATA();
+
+        _spend(creatorVault, CREATOR, action, abi.encode(address(token), id, "ipfs://token-one"));
+        assertEq(registry.tokenMetadataOf(address(token)), "ipfs://token-one");
+        _spend(creatorVault, CREATOR, action, abi.encode(address(token), id, "ipfs://token-two"));
+        assertEq(registry.tokenMetadataOf(address(token)), "ipfs://token-two");
+
+        // Another vault, an account, and the creator vault naming another pool are all refused.
+        OstraVault other = _vault(USDG, BUYER);
+        uint64 n = other.nonce();
+        bytes memory params = abi.encode(address(token), id, "ipfs://not-the-creator");
+        bytes32 next = WotsSigner.keyRoot(_seed(BUYER, n + 1));
+        bytes memory signature = WotsSigner.sign(_seed(BUYER, n), other.spendMessage(action, next, params));
+        vm.expectRevert(OstraRegistry.NotCreatorVault.selector);
+        other.spend(action, next, params, signature);
+        vm.expectRevert(OstraRegistry.NotCreatorVault.selector);
+        registry.setTokenMetadata(address(token), id, "ipfs://not-the-creator");
+        vm.prank(address(creatorVault));
+        vm.expectRevert(OstraRegistry.NotCreatorVault.selector);
+        registry.setTokenMetadata(address(token), bytes32(uint256(id) ^ 1), "ipfs://wrong-pool");
+        assertEq(registry.tokenMetadataOf(address(token)), "ipfs://token-two");
     }
 }

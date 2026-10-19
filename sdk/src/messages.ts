@@ -54,6 +54,7 @@ import {
   ROBINHOOD_CHAIN_ID,
   USDG_EIP712_DOMAIN,
   VAULT_ACTION,
+  VAULT_MAX_URI_LENGTH,
   X402_BATCH_SETTLEMENT,
   X402_BATCH_SETTLEMENT_DOMAIN,
   X402_MAX_WITHDRAW_DELAY,
@@ -128,6 +129,13 @@ function wotsSignature(value: Uint8Array): Hex {
 
 export type VaultAction = (typeof VAULT_ACTION)[keyof typeof VAULT_ACTION];
 
+/** The lengths of `heads` ABI head words ending with a string of 1 to VAULT_MAX_URI_LENGTH bytes (OstraVault._checkUriParams). */
+function uriParamsLengths(heads: number): number[] {
+  const out: number[] = [];
+  for (let words = 1; words * 32 <= Number(VAULT_MAX_URI_LENGTH); words++) out.push(32 * heads + 32 + 32 * words);
+  return out;
+}
+
 /** The params lengths OstraVault._checkParamsShape accepts per action. */
 export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[]>> = {
   [VAULT_ACTION.TRANSFER]: [64],
@@ -140,6 +148,10 @@ export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[
   [VAULT_ACTION.SET_RECOVERY_POLICY]: [64],
   [VAULT_ACTION.SUPPORT_RECOVERY]: [64],
   [VAULT_ACTION.DEV_BUY]: [96],
+  [VAULT_ACTION.SET_PROFILE]: uriParamsLengths(1),
+  [VAULT_ACTION.SET_TOKEN_METADATA]: uriParamsLengths(3),
+  [VAULT_ACTION.REGISTER_AGENT]: uriParamsLengths(1),
+  [VAULT_ACTION.SET_AGENT_URI]: uriParamsLengths(2),
 };
 
 /** Throws unless `params` (hex) has a length OstraVault accepts for `action`. */
@@ -149,7 +161,24 @@ export function checkSpendParamsLength(action: number, params: Hex): void {
   if (!/^0x([0-9a-fA-F]{2})*$/.test(params) || !lengths.includes((params.length - 2) / 2)) {
     throw new RangeError(`action ${action} params must be ${lengths.join(" or ")} bytes`);
   }
+  const heads = URI_PARAMS_HEADS[action];
+  if (heads !== undefined) {
+    // As OstraVault._checkUriParams: the last head points just past the heads, and the string fills the rest exactly.
+    const word = (i: number) => BigInt(`0x${params.slice(2 + 64 * i, 2 + 64 * (i + 1))}`);
+    const length = word(heads);
+    if (word(heads - 1) !== BigInt(32 * heads) || length === 0n || length > VAULT_MAX_URI_LENGTH || (params.length - 2) / 2 !== 32 * heads + 32 + Math.ceil(Number(length) / 32) * 32) {
+      throw new RangeError(`action ${action} params are not the ABI encoding of a 1 to ${VAULT_MAX_URI_LENGTH} byte URI`);
+    }
+  }
 }
+
+/** Head words of the URI spends' params (OstraVault._checkParamsShape). */
+const URI_PARAMS_HEADS: Readonly<Partial<Record<number, number>>> = {
+  [VAULT_ACTION.SET_PROFILE]: 1,
+  [VAULT_ACTION.SET_TOKEN_METADATA]: 3,
+  [VAULT_ACTION.REGISTER_AGENT]: 1,
+  [VAULT_ACTION.SET_AGENT_URI]: 2,
+};
 
 function paramsFor(action: number, params: Hex): Hex {
   checkSpendParamsLength(action, params);
@@ -479,6 +508,57 @@ export function decodeSupportRecoveryParams(params: Hex): { vault: Address; newK
   return { vault, newKeyRoot };
 }
 
+/** A profile, token metadata or agent URI: 1 to VAULT_MAX_URI_LENGTH bytes of UTF-8, no control characters. */
+export function checkUri(value: string, name = "uri"): string {
+  const bytes = new TextEncoder().encode(value).length;
+  if (bytes === 0 || bytes > Number(VAULT_MAX_URI_LENGTH)) throw new RangeError(`${name} must be 1 to ${VAULT_MAX_URI_LENGTH} bytes`);
+  if (/[\u0000-\u001f\u007f]/.test(value)) throw new RangeError(`${name} must not hold control characters`);
+  return value;
+}
+
+/** SetProfile params: abi.encode(string uri). Sets the vault's profile in OstraRegistry. */
+export function setProfileParams(uri: string): Hex {
+  return encodeAbiParameters([{ type: "string" }], [checkUri(uri)]);
+}
+
+export function decodeSetProfileParams(params: Hex): { uri: string } {
+  const [uri] = decodeAbiParameters([{ type: "string" }], paramsFor(VAULT_ACTION.SET_PROFILE, params));
+  return { uri };
+}
+
+/** SetTokenMetadata params: abi.encode(address token, bytes32 poolId, string uri); only the pool's creator vault may send it. */
+export function setTokenMetadataParams(a: { token: Address; poolId: Hex; uri: string }): Hex {
+  return encodeAbiParameters(
+    [{ type: "address" }, { type: "bytes32" }, { type: "string" }],
+    [nonZeroAddr(a.token, "token"), nonZero32(a.poolId, "poolId"), checkUri(a.uri)],
+  );
+}
+
+export function decodeSetTokenMetadataParams(params: Hex): { token: Address; poolId: Hex; uri: string } {
+  const [token, poolId, uri] = decodeAbiParameters([{ type: "address" }, { type: "bytes32" }, { type: "string" }], paramsFor(VAULT_ACTION.SET_TOKEN_METADATA, params));
+  return { token, poolId, uri };
+}
+
+/** RegisterAgent params: abi.encode(string uri). Registers the vault in the ERC-8004 Identity Registry. */
+export function registerAgentParams(uri: string): Hex {
+  return encodeAbiParameters([{ type: "string" }], [checkUri(uri)]);
+}
+
+export function decodeRegisterAgentParams(params: Hex): { uri: string } {
+  const [uri] = decodeAbiParameters([{ type: "string" }], paramsFor(VAULT_ACTION.REGISTER_AGENT, params));
+  return { uri };
+}
+
+/** SetAgentUri params: abi.encode(uint256 agentId, string uri), for an identity the vault owns. */
+export function setAgentUriParams(a: { agentId: bigint; uri: string }): Hex {
+  return encodeAbiParameters([{ type: "uint256" }, { type: "string" }], [uint(a.agentId, U256_MAX, "agentId"), checkUri(a.uri)]);
+}
+
+export function decodeSetAgentUriParams(params: Hex): { agentId: bigint; uri: string } {
+  const [agentId, uri] = decodeAbiParameters([{ type: "uint256" }, { type: "string" }], paramsFor(VAULT_ACTION.SET_AGENT_URI, params));
+  return { agentId, uri };
+}
+
 /** The key root a recovery moves a vault to: key `nonce` (the vault's current nonce) of the new seed's keychain. */
 export function recoveryKeyRoot(newKeychain: WotsKeychain, vaultNonce: bigint): Hex {
   return bytesToHex(newKeychain.keyRoot(uint(vaultNonce, U64_MAX, "vaultNonce")));
@@ -620,6 +700,22 @@ export function signVaultSetGuardian(keychain: WotsKeychain, state: VaultKeyStat
 
 export function signVaultSetRecoveryPolicy(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; threshold: number; delay: number }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams(a) });
+}
+
+export function signVaultSetProfile(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_PROFILE, params: setProfileParams(a.uri) });
+}
+
+export function signVaultSetTokenMetadata(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; token: Address; poolId: Hex; uri: string }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_TOKEN_METADATA, params: setTokenMetadataParams(a) });
+}
+
+export function signVaultRegisterAgent(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.REGISTER_AGENT, params: registerAgentParams(a.uri) });
+}
+
+export function signVaultSetAgentUri(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; agentId: bigint; uri: string }): Promise<SignedSpend> {
+  return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_AGENT_URI, params: setAgentUriParams(a) });
 }
 
 /** Signed by the guardian's own vault key: supports moving `vault` to `newKeyRoot`. */
