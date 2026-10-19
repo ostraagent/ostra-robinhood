@@ -46,6 +46,7 @@ import {
   readPoolView,
   simulateWalletSwap,
   walletSwapCall,
+  walletSwapGasLimit,
   walletSwapNeeds,
   type Config,
   type WalletSwapQuote,
@@ -85,7 +86,9 @@ async function chainNow(): Promise<bigint> {
 }
 
 async function send(account: PrivateKeyAccount, call: { to: Address; data: Hex; value?: bigint }) {
-  const hash = await fork.wallet(account).sendTransaction({ account, chain: fork.client.chain, to: call.to, data: call.data, value: call.value ?? 0n });
+  // The gas limit the web app sends with (walletSwapGasLimit): the bare estimate ran out of gas in a swap's inner call.
+  const estimate = await fork.client.estimateGas({ account, to: call.to, data: call.data, value: call.value ?? 0n });
+  const hash = await fork.wallet(account).sendTransaction({ account, chain: fork.client.chain, to: call.to, data: call.data, value: call.value ?? 0n, gas: walletSwapGasLimit(estimate) });
   const receipt = await fork.client.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") {
     const tx = await fork.client.getTransaction({ hash });

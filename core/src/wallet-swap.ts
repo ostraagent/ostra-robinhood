@@ -284,6 +284,15 @@ export function permitSingleTypedData(chainId: number, permit: PermitSingle) {
 }
 
 /**
+ * The gas limit a wallet swap is sent with: the node's estimate plus 30% and 50,000 (what the web app sends). A swap
+ * through the Universal Router and the hook, sent with the bare estimate as its limit, ran out of gas in an inner call
+ * on a mainnet fork (limit 251,108, used 244,907, ReentrancySentryOOG; 20 Oct 2026).
+ */
+export function walletSwapGasLimit(estimate: bigint): bigint {
+  return (estimate * 13n) / 10n + 50_000n;
+}
+
+/**
  * The Universal Router call of the swap `q`: the transaction the wallet sends (to the router, with the ETH in as its
  * value). `permit` and its signature come first when walletSwapNeeds asked for one.
  */
