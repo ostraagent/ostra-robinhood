@@ -1,8 +1,8 @@
 // The quote currencies a launch through Ostra's own tools can pair with (the
 // launchpad contract takes any ERC-20; Ostra's MCP server, web app and relayer
-// offer this list only): USDG, ETH and the Robinhood stock tokens that have a
-// Chainlink price feed on Robinhood Chain, so a launch's market cap is set in
-// US dollars.
+// offer this list only): USDG, ETH, $OSTRA and the Robinhood stock tokens that
+// have a Chainlink price feed on Robinhood Chain, so a launch's market cap is
+// set in US dollars.
 //
 // Every stock token below was checked on chain 4663 on 20 Oct 2026: its
 // address is the one api.robinhood.com/rhj/assets lists for chain 4663, the
@@ -17,12 +17,21 @@
 // The equity feeds are configured for 24/5 sessions and hold their last value
 // when the market is closed (no heartbeat then), so a price is accepted up to
 // STOCK_PRICE_MAX_AGE old: a long weekend, not a stale feed.
+//
+// OSTRA's price in USD is Chainlink ETH/USD times its Pons curve's spot price
+// in ETH (the curve's ETH reserve over its token reserve, ponsCurveAbi), read on
+// chain at the time of use. Once the curve has graduated and OSTRA has migrated
+// to its own pool, the price is refused until that pool is wired here. The
+// price has 8 decimals like the others: at $0.00002 that is 2,000 units, so
+// a market cap set in OSTRA is within 0.05% of the dollars asked; under 100
+// units (a price under $0.000001) it is refused rather than set more than 1%
+// off.
 
 import { getAddress, parseAbi, zeroAddress, type Address, type PublicClient } from "viem";
-import { CHAINLINK_ETH_USD, USDG } from "./constants.ts";
-import { chainlinkAggregatorAbi } from "./external-abi.ts";
+import { CHAINLINK_ETH_USD, OSTRA, OSTRA_DECIMALS, OSTRA_PONS_CURVE, USDG } from "./constants.ts";
+import { chainlinkAggregatorAbi, ponsCurveAbi } from "./external-abi.ts";
 
-export type LaunchPairKind = "usdg" | "eth" | "stock";
+export type LaunchPairKind = "usdg" | "eth" | "ostra" | "stock";
 
 export type LaunchPair = {
   /** The ticker shown for the pair: USDG, ETH, NVDA, ... */
@@ -32,7 +41,7 @@ export type LaunchPair = {
   /** The pool's quote currency: address(0) for ETH. */
   address: Address;
   decimals: number;
-  /** The Chainlink feed of its USD price (null: USDG, one dollar). */
+  /** The Chainlink feed of its USD price (null: USDG, one dollar; OSTRA: ETH/USD, times its Pons curve's price in ETH). */
   feed: Address | null;
 };
 
@@ -50,10 +59,11 @@ const stock = (symbol: string, name: string, address: string, feed: string): Lau
   feed: getAddress(feed),
 });
 
-/** The pairs offered, in the order shown: USDG, ETH, then the stock tokens by ticker. */
+/** The pairs offered, in the order shown: USDG, ETH, OSTRA, then the stock tokens by ticker. */
 export const LAUNCH_PAIRS: readonly LaunchPair[] = [
   { symbol: "USDG", name: "Global Dollar", kind: "usdg", address: USDG, decimals: 6, feed: null },
   { symbol: "ETH", name: "Ether", kind: "eth", address: zeroAddress, decimals: 18, feed: CHAINLINK_ETH_USD },
+  { symbol: "OSTRA", name: "Ostra Agent", kind: "ostra", address: OSTRA, decimals: OSTRA_DECIMALS, feed: CHAINLINK_ETH_USD },
   stock("AAPL", "Apple", "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9", "0x6B22A786bAa607d76728168703a39Ea9C99f2cD0"),
   stock("AMZN", "Amazon", "0x12f190a9F9d7D37a250758b26824B97CE941bF54", "0xD5a1508ceD74c084eBf3cBe853e2C968fB2a651C"),
   stock("ASML", "ASML Holding", "0x47F93d52cBeC7C6D2CfC080e154002370a60dAEA", "0xB4106147E8cce40b7d46124090d373A71b70f87D"),
@@ -116,7 +126,10 @@ export type PairUsdPrice = {
   updatedAt: number;
 };
 
-/** The price of `quote` in USD now: USDG is one dollar; ETH and the stock tokens from Chainlink (a stock times its uiMultiplier). */
+/**
+ * The price of `quote` in USD now: USDG is one dollar; ETH and the stock tokens from Chainlink (a stock times its
+ * uiMultiplier); OSTRA is ETH/USD times its Pons curve's spot price in ETH, refused once the curve has graduated.
+ */
 export async function readPairUsdPrice(client: PublicClient, quote: LaunchPair): Promise<PairUsdPrice> {
   const block = await client.getBlock();
   const now = Number(block.timestamp);
@@ -134,6 +147,20 @@ export async function readPairUsdPrice(client: PublicClient, quote: LaunchPair):
     throw new Error(`the ${quote.symbol}/USD price was last updated ${Math.round((now - updatedAt) / 3600)} hours ago, older than ${Math.round(maxAge / 3600)} hours; try again once the feed updates`);
   }
   let priceE8 = answer;
+  if (quote.kind === "ostra") {
+    const [graduated, reserves] = await Promise.all([
+      client.readContract({ address: OSTRA_PONS_CURVE, abi: ponsCurveAbi, functionName: "graduated" }),
+      client.readContract({ address: OSTRA_PONS_CURVE, abi: ponsCurveAbi, functionName: "getReserves" }),
+    ]);
+    if (graduated) throw new Error("OSTRA has graduated from its Pons curve and migrated; its price is not read from its new pool yet");
+    const [ethReserve, tokenReserve] = reserves;
+    if (ethReserve <= 0n || tokenReserve <= 0n) throw new Error(`the OSTRA Pons curve reports reserves of ${ethReserve} wei and ${tokenReserve} tokens`);
+    // Both have 18 decimals: USD per whole OSTRA = USD per ETH x ETH per OSTRA.
+    priceE8 = (answer * ethReserve) / tokenReserve;
+    // With 8 decimals the price is exact to 1/priceE8: under 100 units (0.000001 USD) a market cap set in OSTRA could
+    // be more than 1% off, so it is refused rather than set wrong.
+    if (priceE8 < 100n) throw new Error(`OSTRA's price (${priceE8} x 0.00000001 USD) is too small to set a market cap in within 1%`);
+  }
   if (quote.kind === "stock") {
     const multiplier = await client.readContract({ address: quote.address, abi: stockTokenAbi, functionName: "uiMultiplier" });
     if (multiplier <= 0n) throw new Error(`${quote.symbol} reports a uiMultiplier of ${multiplier}`);

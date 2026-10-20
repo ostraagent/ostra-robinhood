@@ -13,8 +13,8 @@
 //     sells it (a Swap back to the buyer vault), transfers it and claims its
 //     dividends; its requests are paid by the buyer vault (`payer`);
 //   * the creator vault launches. For a USDG pool it is the USDG creator vault
-//     (its own records and relayer client); for a pool paired with a stock
-//     token or ETH (pairs.ts: the only pairs offered), the creator vault in
+//     (its own records and relayer client); for a pool paired with OSTRA, a
+//     stock token or ETH (pairs.ts: the only pairs offered), the creator vault in
 //     that token (WETH for ETH), keychain creatorKeychainId(chain, token), its
 //     requests paid by the buyer vault (`payer`) like a token vault's. Each
 //     one:
@@ -26,12 +26,12 @@
 //     airdrop rounds (it buys the round into OstraAirdrop, then sets the
 //     amount and starts it with the tree's root), and it receives the
 //     creator payouts (OstraCreatorSplit.release).
-// Trading a pool paired with a stock token pays from (buys) and into (sells)
-// the agent's token vault of that stock token; a pool paired with ETH is not
+// Trading a pool paired with OSTRA or a stock token pays from (buys) and into
+// (sells) the agent's token vault of that token; a pool paired with ETH is not
 // traded from a vault (a vault holds one ERC-20; an ETH pool takes native ETH),
 // only from a wallet (wallet-swap.ts). A launch's market cap is given in US
 // dollars and set in the pair's token at its price now (pairs.ts: USDG one
-// dollar, ETH and stocks from Chainlink).
+// dollar, ETH and stocks from Chainlink, OSTRA from ETH/USD and its Pons curve).
 //
 // Public calls (airdrop claim and close, vesting release and dividends,
 // referral claims, split releases) are sent for the buyer vault as payer.
@@ -202,12 +202,12 @@ export type LaunchOptions = Partial<Omit<LaunchParams, "name" | "symbol" | "salt
 export type LaunchInput = {
   name: string;
   symbol: string;
-  /** The pool's pair (pairs.ts: USDG, ETH or a stock token's ticker); default USDG. */
+  /** The pool's pair (pairs.ts: USDG, ETH, OSTRA or a stock token's ticker); default USDG. */
   pair?: string;
   /** The starting market cap in US dollars (the whole supply at the starting price), set in the pair's token at its price now; or `startTick`. */
   marketCap?: string;
   startTick?: number;
-  /** The creator's dev buy in the launch, in the pair's token (USDG, ETH as WETH, the stock token), paid from the pair's creator vault, vesting to the creator's token vault. */
+  /** The creator's dev buy in the launch, in the pair's token (USDG, ETH as WETH, OSTRA, the stock token), paid from the pair's creator vault, vesting to the creator's token vault. */
   devBuy?: { amount: string; cliffDays?: number; vestingDays?: number };
   options?: LaunchOptions;
 };
@@ -354,8 +354,8 @@ export class LaunchpadService {
 
   /**
    * The agent's creator vault for `pairText` and the sender of its operations:
-   * for USDG the USDG creator vault and its own relayer client; for a stock
-   * token or ETH, the creator vault in that token (WETH for ETH), paid for by
+   * for USDG the USDG creator vault and its own relayer client; for OSTRA, a
+   * stock token or ETH, the creator vault in that token (WETH for ETH), paid for by
    * the buyer vault.
    */
   async pairCreator(pairText: string): Promise<{ pair: LaunchPair; vault: VaultService; sender: Sender }> {
@@ -501,11 +501,11 @@ export class LaunchpadService {
       throw new Error(`the pool of ${pool.token} trades against ETH: an Ostra vault holds one ERC-20 and cannot pay or take native ETH, so this pool is traded from a wallet; nothing was signed`);
     }
     const pair = findLaunchPair(quote);
-    if (pair === null) throw new Error(`the pool of ${pool.token} trades against ${quote}, not a pair Ostra offers (USDG, ETH or a listed stock token); nothing was signed`);
+    if (pair === null) throw new Error(`the pool of ${pool.token} trades against ${quote}, not a pair Ostra offers (USDG, ETH, OSTRA or a listed stock token); nothing was signed`);
     const referrer = a.referrer === undefined ? undefined : address(a.referrer, "referrer");
     const quoteIs0 = getAddress(pool.key.currency0) === quote;
     const buying = a.side === "buy";
-    // The vault of the pool's pair pays a buy and takes a sale: the buyer vault for USDG, else the token vault of the stock token.
+    // The vault of the pool's pair pays a buy and takes a sale: the buyer vault for USDG, else the token vault of OSTRA or the stock token.
     const quoteVault = this.tokenVault(quote);
     const from = buying ? quoteVault : this.tokenVault(pool.token);
     const fromVault = await from.vaultAddress();
@@ -552,7 +552,7 @@ export class LaunchpadService {
     throw new Error(`transaction ${txHash} has no Swap of ${vault}`);
   }
 
-  /** Buys `token` with `amount` of its pool's pair (USDG from the buyer vault, a stock token from its token vault), into the agent's token vault. */
+  /** Buys `token` with `amount` of its pool's pair (USDG from the buyer vault, OSTRA or a stock token from its token vault), into the agent's token vault. */
   buy(a: { token: string; amount: string; slippageBps?: number; referrer?: string }): Promise<SwapResult> {
     return this.#swap({ ...a, side: "buy" });
   }
@@ -672,7 +672,7 @@ export class LaunchpadService {
   /**
    * Moves `amount` into the creator vault of `pairText` (default USDG): USDG
    * from the buyer vault (a launch's dev buy and the USDG creator vault's
-   * relayer requests are paid from it); a stock token or WETH from the
+   * relayer requests are paid from it); OSTRA, a stock token or WETH from the
    * agent's token vault of it (what a dev buy in that pair is paid from). The
    * creator vault is created first when it does not exist yet.
    */
@@ -704,7 +704,7 @@ export class LaunchpadService {
   async creatorWithdraw(a: { amount: string; destination?: string; pair?: string }): Promise<unknown> {
     const { pair, vault: creator, sender } = await this.pairCreator(a.pair ?? "USDG");
     const token = this.#pairToken(pair);
-    if (pair.kind !== "usdg" && pair.kind !== "stock" && a.destination === undefined) throw new RangeError(`a ${pair.symbol} creator vault holds WETH: name the destination`);
+    if (pair.kind === "eth" && a.destination === undefined) throw new RangeError(`a ${pair.symbol} creator vault holds WETH: name the destination`);
     const destination = a.destination === undefined ? await this.tokenVault(token).vaultAddress() : address(a.destination, "destination");
     await this.#notStranded(destination, token, `the ${pair.symbol} creator vault's transfer`);
     if (pair.kind === "usdg") return creator.withdraw(destination, a.amount);
@@ -908,7 +908,7 @@ export class LaunchpadService {
   // Airdrops
   // ---------------------------------------------------------------------------
 
-  /** Buys `amount` of the pool's pair worth of the token from its creator vault into OstraAirdrop, for the pool's next round (USDG and stock pools). */
+  /** Buys `amount` of the pool's pair worth of the token from its creator vault into OstraAirdrop, for the pool's next round (USDG, OSTRA and stock pools). */
   async airdropFund(a: { token: string; amount: string; slippageBps?: number }): Promise<SwapResult> {
     const lp = this.#lp();
     const { pool, pair, creator, sender } = await this.#ownPool(a.token);
@@ -1282,7 +1282,7 @@ export class LaunchpadService {
     const uri = await uploadJson(this.#config.relayerUrl, file);
     const profile = await this.setProfile(uri);
     // A token's page shows the profile of its pool's creator vault: the creator vaults of the other pairs this agent
-    // launched from (a stock token's, WETH's) carry the same profile.
+    // launched from (OSTRA's, a stock token's, WETH's) carry the same profile.
     const pairCreators: { pair: string; vault: Address; result?: VaultOperationResult; error?: string }[] = [];
     if (profile.status === "sent") {
       const pairs = new Set((await this.launches()).map((l) => (l as { pair?: string }).pair ?? "USDG").filter((x) => x !== "USDG"));

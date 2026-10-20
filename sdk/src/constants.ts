@@ -50,6 +50,19 @@ export const ERC8004_REPUTATION_REGISTRY: Address = "0x8004BAa17C55a88189AE136b1
 
 /** WETH9 on chain 4663 (the one Uniswap v4's PositionManager wraps with): an ETH pool's creator vault holds it. */
 export const WETH: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+
+/**
+ * $OSTRA, launched on Pons, and the Pons bonding curve it trades on against ETH until the curve graduates
+ * (graduated()) and OSTRA migrates (checked on chain 4663 on 20 Oct 2026: name "Ostra Agent", symbol OSTRA,
+ * 18 decimals, a supply of 1,000,000,000, burn(uint256) and burnFrom, no transfer limits; the curve's token() is
+ * OSTRA). OSTRA_CODE_HASH and OSTRA_PONS_CURVE_CODE_HASH are the keccak-256 of their runtime code then: neither is
+ * a proxy, and the fork tests check the hashes on every run.
+ */
+export const OSTRA: Address = "0x68Ff81dFFF6eccefb74706fE1e0a86320CB2Eb96";
+export const OSTRA_DECIMALS = 18;
+export const OSTRA_CODE_HASH = "0x55e96d3bbff72f192ba79b21f7735c50dd0db6ced9f185de166ee9d871c92351";
+export const OSTRA_PONS_CURVE: Address = "0xef89C3a9832Ae6f8Dc5F785484b1B5cb1120F372";
+export const OSTRA_PONS_CURVE_CODE_HASH = "0xd71963ef1e2c4c13de134e298ce13bda63e8fb453b0fa9db1bea9296433ea6a0";
 /** The deterministic CREATE2 deployer (github.com/Arachnid/deterministic-deployment-proxy): OstraHook is mined with it. */
 export const CREATE2_DEPLOYER: Address = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 

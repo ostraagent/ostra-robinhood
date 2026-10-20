@@ -13,16 +13,35 @@
 //     signing when the hook would refuse them;
 //   * an airdrop round: bought into OstraAirdrop, started with its tree,
 //     claimed for an account, closed after the claim period;
-//   * the vesting released after its cliff.
+//   * the vesting released after its cliff;
+//   * an OSTRA pair: OSTRA bought on its Pons curve into the agent's OSTRA
+//     vault, the OSTRA creator vault funded from it, a launch at a market cap
+//     in US dollars (ETH/USD times the curve's price) with a dev buy in OSTRA,
+//     a buy paid in OSTRA from the OSTRA vault and a sale back into it, the
+//     creator vault's OSTRA withdrawn to the OSTRA vault by default, and the
+//     dispatcher owing the $OSTRA buyback share in OSTRA.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { keccak256, stringToHex, type Address, type Hash, type PublicClient } from "viem";
+import { encodeFunctionData, formatUnits, keccak256, stringToHex, type Address, type Hash, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { FileWotsStore, USDG, ostraTokenAbi, readVault, retryingHttp, usdgAbi, type Deployment, type RelayCall } from "@ostraagent/sdk";
+import {
+  FileWotsStore,
+  OSTRA,
+  OSTRA_PONS_CURVE,
+  USDG,
+  ostraDispatcherAbi,
+  ostraTokenAbi,
+  ponsCurveAbi,
+  readVault,
+  retryingHttp,
+  usdgAbi,
+  type Deployment,
+  type RelayCall,
+} from "@ostraagent/sdk";
 import { deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { Keys, LaunchpadService, LocalSender, VaultService, X402_NETWORK, type Config, type Reservation, type Sender, type SendOptions } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
@@ -72,6 +91,78 @@ after(async () => {
 const someone = (name: string): Address => privateKeyToAccount(keccak256(stringToHex(`OSTRA/CORE/LAUNCHPAD-FORK/${name}`))).address;
 const usdg = (who: Address) => fork.client.readContract({ address: USDG, abi: usdgAbi, functionName: "balanceOf", args: [who] });
 const tokens = (token: Address, who: Address) => fork.client.readContract({ address: token, abi: ostraTokenAbi, functionName: "balanceOf", args: [who] });
+
+// Runs first: the next test moves the fork's clock 7 days on, past Chainlink ETH/USD's heartbeat, and OSTRA's
+// price needs ETH/USD.
+test("an OSTRA pair: fund, launch at a market cap in US dollars with a dev buy, buy and sell in OSTRA, withdraw, the buyback owed in OSTRA", { timeout: 900_000 }, async () => {
+  const client = fork.client as PublicClient;
+  const transport = retryingHttp(fork.url);
+  const feePayer = privateKeyToAccount(keccak256(stringToHex("OSTRA/CORE/LAUNCHPAD-FORK/ostra-fee-payer")));
+  await fork.setBalance(feePayer.address, 10n ** 19n);
+  const keys = new Keys({ master: new Uint8Array(32).fill(22), feePayer, store: new FileWotsStore(join(root, "wots-ostra")), folder: new MemoryFolder(), backupExported: async () => true });
+  const creatorKeys = await keys.forCreatorVault(d.chainId, USDG);
+  const local = new LocalSender(client, transport, feePayer);
+  const buyer = new VaultService(client, transport, config, keys, local, "buyer");
+  const creator = new VaultService(client, transport, config, creatorKeys, local, "creator");
+  const lp = new LaunchpadService({ client, transport, config, keys, buyer, buyerSender: local, creator, creatorSender: local });
+  await buyer.open();
+
+  // OSTRA bought on its Pons curve straight into the agent's OSTRA vault (not created yet).
+  const ostraVault = await lp.tokenVault(OSTRA).vaultAddress();
+  const wei = 3n * 10n ** 17n;
+  const buy = await fork.wallet(feePayer).sendTransaction({ account: feePayer, chain: fork.client.chain, to: OSTRA_PONS_CURVE, data: encodeFunctionData({ abi: ponsCurveAbi, functionName: "buy", args: [wei, 0n, ostraVault] }), value: wei });
+  assert.equal((await fork.client.waitForTransactionReceipt({ hash: buy })).status, "success");
+  const held = await tokens(OSTRA, ostraVault);
+  assert.ok(held > 0n);
+
+  // The pairs list names OSTRA third, priced, with the agent's OSTRA vault as its trading vault.
+  const rows = await lp.pairs({ prices: true });
+  assert.deepEqual(rows.slice(0, 3).map((r) => r.symbol), ["USDG", "ETH", "OSTRA"]);
+  const row = rows[2];
+  assert.ok(row !== undefined && row.kind === "ostra" && row.tradingVault === ostraVault && row.priceUsd !== null && Number(row.priceUsd) > 0, JSON.stringify(row));
+
+  // Half of it into the OSTRA creator vault (the OSTRA vault is created first).
+  const half = held / 2n;
+  await lp.fundCreatorVault(formatUnits(half, 18), "OSTRA");
+  const { vault: ostraCreator } = await lp.pairCreator("OSTRA");
+  const ostraCreatorVault = await ostraCreator.vaultAddress();
+  assert.equal(await tokens(OSTRA, ostraCreatorVault), half);
+  assert.equal(await tokens(OSTRA, ostraVault), held - half);
+
+  // A launch paired with OSTRA at $20,000, with a dev buy of 1,000,000 OSTRA.
+  const launched = await lp.launch({ name: "Ostra Pair", symbol: "OPAIR", pair: "OSTRA", marketCap: "20000", devBuy: { amount: "1000000", cliffDays: 7 } });
+  assert.equal(launched.status, "launched");
+  if (launched.status !== "launched") return;
+  assert.equal(launched.pair, "OSTRA");
+  assert.equal(launched.creatorVault, ostraCreatorVault);
+  assert.equal(launched.marketCapUsd, "20000");
+  assert.ok(launched.pairPriceUsd !== null && Number(launched.pairPriceUsd) > 0);
+  // The market cap in OSTRA is the dollars at the price used (to its 8 decimals).
+  assert.ok(Math.abs(Number(launched.marketCapInPair) * Number(launched.pairPriceUsd) - 20_000) / 20_000 < 0.002, `${launched.marketCapInPair} OSTRA at ${launched.pairPriceUsd}`);
+  assert.ok(launched.devBuy !== null && Number(launched.devBuy.paid) > 0 && Number(launched.devBuy.paid) <= 1_000_000);
+  const token = launched.token;
+
+  // A buy paid in OSTRA from the OSTRA vault, into the agent's vault for the token; half of it sold back into the OSTRA vault.
+  const ostraBefore = await tokens(OSTRA, ostraVault);
+  const bought = await lp.buy({ token, amount: "2000000" });
+  assert.ok(bought.status === "sent" && bought.swapped && bought.from === ostraVault && bought.to === launched.tokenVault, JSON.stringify(bought));
+  assert.equal(await tokens(OSTRA, ostraVault), ostraBefore - 2_000_000n * 10n ** 18n);
+  const got = await tokens(token, launched.tokenVault);
+  const sold = await lp.sell({ token, amount: formatUnits(got / 2n, 18) });
+  assert.ok(sold.status === "sent" && sold.swapped && sold.to === ostraVault, JSON.stringify(sold));
+  assert.ok((await tokens(OSTRA, ostraVault)) > ostraBefore - 2_000_000n * 10n ** 18n);
+
+  // The OSTRA creator vault sends OSTRA to the agent's OSTRA vault when no destination is named.
+  const beforeWithdraw = await tokens(OSTRA, ostraVault);
+  const withdrawn = (await lp.creatorWithdraw({ amount: "1000", pair: "OSTRA" })) as { status?: string };
+  assert.equal(withdrawn.status, "sent", JSON.stringify(withdrawn));
+  assert.equal(await tokens(OSTRA, ostraVault), beforeWithdraw + 1_000n * 10n ** 18n);
+
+  // The hook booked the $OSTRA buyback share of these swaps in OSTRA.
+  const lpd = d.launchpad;
+  assert.ok(lpd !== undefined);
+  assert.ok(((await fork.client.readContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "buybackOwed", args: [OSTRA] })) as bigint) > 0n);
+});
 
 test("the launchpad service: launch with a dev buy, buy and sell, settings, shares, an airdrop round, the vesting", { timeout: 900_000 }, async () => {
   const client = fork.client as PublicClient;

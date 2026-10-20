@@ -30,6 +30,22 @@ export const chainlinkAggregatorAbi = parseAbi([
   "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
 ]);
 
+/**
+ * The parts of the Pons bonding curve (OSTRA_PONS_CURVE) Ostra uses, each checked against the deployed curve by
+ * eth_call on chain 4663 on 20 Oct 2026 (selectors in its code, results, reverts). getReserves is the curve's virtual-plus-real ETH reserve and
+ * its token reserve (tokenReserve()), and buy is constant product on them: a buy of x wei gets
+ * y·T / (E + y) tokens, y = x less the curve's fees of 3% in all (exact for amounts in whole hundreds of wei, measured
+ * at 0.0001, 0.1 and 1 ETH; other amounts round the fee up by a few wei). buy takes exactly msg.value == ethIn and
+ * reverts below minTokensOut; the tokens go to `recipient`.
+ */
+export const ponsCurveAbi = parseAbi([
+  "function token() view returns (address)",
+  "function graduated() view returns (bool)",
+  "function graduationThreshold() view returns (uint256)",
+  "function getReserves() view returns (uint256 ethReserve, uint256 tokenReserve)",
+  "function buy(uint256 ethIn, uint256 minTokensOut, address recipient) payable returns (uint256 tokensOut)",
+]);
+
 /** Multicall3 aggregate3. */
 export const multicall3Abi = parseAbi([
   "struct Call3 { address target; bool allowFailure; bytes callData; }",

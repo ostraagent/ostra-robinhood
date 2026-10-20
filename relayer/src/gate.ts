@@ -9,25 +9,26 @@
 //      in its token; spendLeaf, approveBatch, depositWithAuthorization,
 //      cancelDeposit and closeDeposit on the deployment's pool; and on its
 //      launchpad (design v0.4, D2): OstraDevBuy.launchFromVault alone, from a
-//      creator vault in the relayer's token, in WETH or in a listed stock
-//      token (the pairs Ostra offers, sdk pairs.ts; the relayer fronts the
-//      ETH launch fee and charges it), OstraAirdrop claim and close,
-//      OstraDispatcher.claimReferral, OstraCreatorSplit.release, and release
-//      and claimDividends of an OstraVesting OstraDevBuy made
-//      (vestingPool). Vaults in another token (a WETH or listed stock token
-//      vault: a pair's creator vault or the token vault trading its pools; a
+//      creator vault in the relayer's token, in WETH or in a listed pair
+//      token, OSTRA or a stock token (the pairs Ostra offers, sdk pairs.ts;
+//      the relayer fronts the ETH launch fee and charges it), OstraAirdrop
+//      claim and close, OstraDispatcher.claimReferral,
+//      OstraCreatorSplit.release, and release and claimDividends of an
+//      OstraVesting OstraDevBuy made (vestingPool). Vaults in another token
+//      (a WETH or listed pair token vault: a pair's creator vault or the
+//      token vault trading its pools; a
 //      vault holding a token the launchpad launched, launchpad.poolOf) spend
-//      only Transfer, Swap and ClaimDividend (a WETH or stock token vault
+//      only Transfer, Swap and ClaimDividend (a WETH or pair token vault
 //      also ConfigurePool, SetProfile and SetTokenMetadata, what a pair's
 //      creator vault does as its pool's owner), paid by a `payer` vault in
 //      the relayer's token; dividends (a vesting's, a launched-token vault's
 //      ClaimDividend) only of a pool paying them in USDG, WETH, a listed
-//      stock token or a launched token. Nothing else is sent, so the
+//      pair token or a launched token. Nothing else is sent, so the
 //      relayer's account is never the caller of anything that gives a caller
-//      a role, and no code runs but Ostra's, USDG's, WETH's, the listed stock
-//      tokens' and the launchpad's, except the pool, hook and tokens a vault
-//      Swap names and the hook a vault ConfigurePool names (within the gas
-//      cap the request paid for);
+//      a role, and no code runs but Ostra's, USDG's, WETH's, the listed pair
+//      tokens' (OSTRA's and the stock tokens') and the launchpad's, except
+//      the pool, hook and tokens a vault Swap names and the hook a vault
+//      ConfigurePool names (within the gas cap the request paid for);
 //   3. prices the transaction: the gas it uses, simulated from the relayer
 //      (eth_simulateV1), with its L1 data component and the swapGas each
 //      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
@@ -143,8 +144,8 @@ import {
 import { NotSentError, SendUnknownError, type Landed } from "./send.ts";
 import { escrowRecords, wotsClaims, type SignatureEscrow, type SignatureRecord, type WotsClaim } from "./signatures.ts";
 
-/** The stock tokens Ostra offers as pairs (sdk pairs.ts): their vaults are relayed like WETH's. */
-const LISTED_STOCK_TOKENS: ReadonlySet<Address> = new Set(LAUNCH_PAIRS.filter((p) => p.kind === "stock").map((p) => p.address));
+/** The tokens Ostra offers as pairs besides USDG and ETH (sdk pairs.ts: OSTRA and the stock tokens): their vaults are relayed like WETH's. */
+const LISTED_PAIR_TOKENS: ReadonlySet<Address> = new Set(LAUNCH_PAIRS.filter((p) => p.kind === "ostra" || p.kind === "stock").map((p) => p.address));
 
 export type Log = (event: string, fields?: Record<string, unknown>) => void;
 
@@ -548,28 +549,28 @@ export class RelayerGate {
     const d = this.#o.deployment;
     const l = d.launchpad;
     const token = this.#o.merchant.token;
-    const wethOrLaunched = async (t: Address): Promise<"weth" | "stock" | "launched" | null> => {
+    const wethOrLaunched = async (t: Address): Promise<"weth" | "pair" | "launched" | null> => {
       if (t === WETH) return "weth";
-      if (LISTED_STOCK_TOKENS.has(t)) return "stock";
+      if (LISTED_PAIR_TOKENS.has(t)) return "pair";
       if (l === undefined) return null;
       const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [t] })) as Hex;
       return BigInt(id) === 0n ? null : "launched";
     };
-    // Dividends move the pool's dividend token: relayed only when its code is known (USDG, WETH, a listed stock token, a launched token).
+    // Dividends move the pool's dividend token: relayed only when its code is known (USDG, WETH, a listed pair token, a launched token).
     const dividendProblem = async (i: number, id: Hex): Promise<string | null> => {
       if (l === undefined) return null;
       const c = (await this.#o.client.readContract({ address: l.hook, abi: ostraHookAbi, functionName: "poolConfig", args: [id] })) as { dividendToken: Address };
       const t = getAddress(c.dividendToken);
       if (t === token || t === WETH || BigInt(t) === 0n) return null;
       if ((await wethOrLaunched(t)) !== null) return null;
-      return `calls[${i}]: the pool pays dividends in ${t}, not USDG, WETH, a listed stock token or a launched token; its dividends are not relayed`;
+      return `calls[${i}]: the pool pays dividends in ${t}, not USDG, WETH, a listed pair token (OSTRA or a stock token) or a launched token; its dividends are not relayed`;
     };
     for (const [i, c] of tx.parsed.entries()) {
       const name = c.fn ?? c.selector;
       if (c.to === d.vaultFactory) {
         if (c.fn !== "createVault") return `calls[${i}]: ${name} on the vault factory ${c.to} is not relayed`;
         if (c.token !== token) {
-          if ((await wethOrLaunched(c.token)) === null) return `calls[${i}]: vaults are created in ${token}, WETH, a listed stock token or a token the Ostra launchpad launched, not ${c.token}`;
+          if ((await wethOrLaunched(c.token)) === null) return `calls[${i}]: vaults are created in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched, not ${c.token}`;
           if (request.payer === null) return `calls[${i}]: a vault in ${c.token} is paid for by a payer vault in ${token}`;
         }
         continue;
@@ -582,7 +583,7 @@ export class RelayerGate {
         if (tx.parsed.length !== 1) return `calls[${i}]: a launch is relayed alone`;
         const v = await readVault(this.#o.client, d, c.vault);
         if (v === null) return `calls[${i}]: the creator vault ${c.vault} is not an Ostra vault`;
-        if (v.token !== token && v.token !== WETH && !LISTED_STOCK_TOKENS.has(v.token)) return `calls[${i}]: the relayer launches from creator vaults in ${token}, WETH or a listed stock token`;
+        if (v.token !== token && v.token !== WETH && !LISTED_PAIR_TOKENS.has(v.token)) return `calls[${i}]: the relayer launches from creator vaults in ${token}, WETH or a listed pair token (OSTRA or a stock token)`;
         if (v.token !== token && request.payer === null) return `calls[${i}]: a launch from a creator vault in ${v.token} is paid for by a payer vault in ${token}`;
         continue;
       }
@@ -612,12 +613,12 @@ export class RelayerGate {
       if (v === null) return `calls[${i}]: ${c.to} is not an Ostra vault`;
       if (v.token === token) continue;
       // A vault in another token: only what that vault needs, its token's code the launchpad's (or WETH's, or a listed
-      // stock token's), paid by a payer vault. A WETH or stock token vault may be a pair's creator vault: it owns its pools.
+      // pair token's), paid by a payer vault. A WETH or pair token vault may be a pair's creator vault: it owns its pools.
       const kind = await wethOrLaunched(v.token);
-      if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH, a listed stock token or a token the Ostra launchpad launched`;
+      if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched`;
       if (request.payer === null) return `calls[${i}]: a vault in ${v.token} is paid for by a payer vault in ${token}`;
       const allowed: readonly number[] =
-        kind === "weth" || kind === "stock"
+        kind === "weth" || kind === "pair"
           ? [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CONFIGURE_POOL, VAULT_ACTION.CLAIM_DIVIDEND, VAULT_ACTION.SET_PROFILE, VAULT_ACTION.SET_TOKEN_METADATA]
           : [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CLAIM_DIVIDEND];
       if (c.fn !== "spend" || !allowed.includes(c.action)) {

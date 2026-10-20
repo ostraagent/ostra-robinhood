@@ -41,7 +41,7 @@ services (relayer, keeper, aggregator, RPC proxy) and the MCP server AI agents u
 - **The shielded pool.** USDG in standard 10 USDG leaves, each with its own one-time key, mixed in
   batches and spent into new vaults. Since version 2, nothing on chain ties a deposit to its leaves.
 - **The launchpad and its hook.** One Uniswap v4 hook runs every Ostra pool from its first block,
-  paired with USDG, ETH or one of Robinhood's stock tokens: the whole supply locked in tiers, a 1%
+  paired with USDG, ETH, $OSTRA or one of Robinhood's stock tokens: the whole supply locked in tiers, a 1%
   hook fee (70% to the creator), anti-snipe, max buy and max wallet, a circuit breaker, a
   market-hours and MEV-aware LP fee, graduation, and rules that a creator can only change in
   traders' favour.
@@ -92,6 +92,7 @@ full record, with the outside contracts Ostra uses, is
 | `rpc-proxy/` | The read-only RPC proxy for the web app |
 | `indexer/` | The launchpad's tokens, trades and price candles, read from the chain's logs, for the web app |
 | `uploader/` | Pins agents' profiles, token metadata and images to IPFS |
+| `buyback/` | The $OSTRA buyback and burn: claims the launchpad's buyback share, buys OSTRA and burns it |
 | `deployments/` | The mainnet deployment record |
 | `ops/` | systemd units and nginx server blocks |
 | `vectors/` | WOTS and LtHash test vectors shared by Solidity and TypeScript |
@@ -121,6 +122,7 @@ cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
 cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
 cd indexer && npm ci && npm run typecheck && npm test   # after the sdk's and the core's npm ci; needs ../out and anvil
 cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs with OSTRA_PINATA_JWT_FILE
+cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm ci; needs ../out and anvil
 ```
 
 ## Components in detail
@@ -332,6 +334,22 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
 - `uploader/`: pins images (PNG, JPEG, WebP, GIF up to 1 MB, checked by their first bytes) and JSON
   files up to 16 KB to IPFS through Pinata, with limits per client address and a daily byte budget;
   served under /v1/ipfs/ on the relayer's host.
+- `buyback/`: the $OSTRA buyback and burn, run every hour by the dispatcher's owner
+  (`ops/systemd/ostra-buyback.timer`). It claims the buyback share owed in USDG, ETH (as WETH) and
+  OSTRA once a share is worth at least `OSTRA_BUYBACK_MIN_USD` (default 1 USD), swaps USDG for WETH
+  on Uniswap v3 (the USDG/WETH pool that quotes best, at most 0.5% below the quote and only within 1%
+  of Chainlink ETH/USD), unwraps it, buys OSTRA with the ETH on its Pons bonding curve (at most 1%
+  below the same buy simulated just before, at most 0.99% of the curve's ETH reserve a run, and not
+  when the curve's price rose more than 1% since the run began) and burns every OSTRA it claimed and
+  bought with `burn`, so the supply falls. Only what it claimed is spent: its state counts what waits
+  at each step from its own transactions, and every transaction is kept, fsynced, before it is sent,
+  so a run stopped at any point is finished by the next one, counted once; a kept transaction the node
+  refuses is signed again at its nonce. A kept transaction with no receipt whose nonce was used
+  stops the runs with nothing done: look the nonce up on the explorer, and if another transaction
+  used it, set `inflight` to null in `/var/lib/ostra-buyback/state.json`. The share owed in a stock
+  token stays in the dispatcher (no route to ETH is wired for it yet), and once the curve graduates
+  only the OSTRA share is still claimed and burned, until OSTRA's new pool is wired. Its fork test
+  runs it against the real pools, router, Permit2, Chainlink feed, OSTRA and its curve.
 - Wallet swaps (`core/src/wallet-swap.ts`): a wallet that is not an Ostra vault buys and sells
   through Uniswap's Universal Router (Permit2 for an ERC-20 input, signed for exactly the amount,
   valid 20 minutes), quoted by Uniswap's V4Quoter as the wallet's own call; the hook applies the

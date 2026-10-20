@@ -748,8 +748,8 @@ async function main(): Promise<void> {
         const listed = await lp.pairs();
         const row = listed.find((r) => r.symbol === T);
         check(
-          listed.length === 34 && listed[0]?.symbol === "USDG" && listed[1]?.symbol === "ETH" && row?.creatorVault === stockCreatorVault && row.tradingVault === stockVault && listed[1]?.creatorVault === wethCreatorVault,
-          `the pairs list (USDG, ETH, 32 stock tokens) names the agent's ${T} creator vault, ${T} vault and WETH creator vault at the addresses of its keys`,
+          listed.length === 35 && listed[0]?.symbol === "USDG" && listed[1]?.symbol === "ETH" && listed[2]?.symbol === "OSTRA" && row?.creatorVault === stockCreatorVault && row.tradingVault === stockVault && listed[1]?.creatorVault === wethCreatorVault,
+          `the pairs list (USDG, ETH, OSTRA, 32 stock tokens) names the agent's ${T} creator vault, ${T} vault and WETH creator vault at the addresses of its keys`,
           { row, eth: listed[1] },
         );
 

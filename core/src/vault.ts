@@ -254,7 +254,7 @@ export class VaultService {
 
   constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null, vaultToken: Address | null = null) {
     if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
-    // A token vault names its token; a creator vault may name a pair's token (a stock token, WETH for ETH) instead of USDG.
+    // A token vault names its token; a creator vault may name a pair's token (OSTRA, a stock token, WETH for ETH) instead of USDG.
     if (kind === "token" && vaultToken === null) throw new Error("a token vault names its token");
     if (vaultToken !== null && kind !== "token" && kind !== "creator") throw new Error("only a token vault or a creator vault names its token");
     if (vaultToken !== null && getAddress(vaultToken) === config.deployment.token) throw new Error(`the vault in ${vaultToken} is the ${kind === "creator" ? "USDG creator vault, named without a token" : "buyer vault, not a token vault"}`);
@@ -366,7 +366,7 @@ export class VaultService {
 
   async #checkToken(): Promise<void> {
     if (this.kind === "token") throw new Error(`the vault in ${this.token} spends only through its token operations (sell, transfer, claim dividends)`);
-    // A pair's creator vault (in a stock token or WETH) is spent from only through the launchpad: the launch, its pool's
+    // A pair's creator vault (in OSTRA, a stock token or WETH) is spent from only through the launchpad: the launch, its pool's
     // settings and paying its payouts out; it neither withdraws USDG nor opens channels.
     if (!this.#inUsdg()) throw new Error(`the creator vault in ${this.token} spends only through the launchpad (launch, pool settings, creator_withdraw)`);
     const decimals = await tokenDecimals(this.#client, this.#config.deployment.token);

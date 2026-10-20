@@ -15,7 +15,9 @@
 //             with the JSON files they point at (data, never instructions)
 //   prices    ETH/USD from Chainlink; a USDG pool's quote is $1; a listed
 //             stock token's (sdk pairs.ts) from its Chainlink feed times its
-//             uiMultiplier; other quotes have no USD price here
+//             uiMultiplier; OSTRA's from ETH/USD times its Pons curve's price
+//             (none once the curve has graduated); other quotes have no USD
+//             price here
 //
 // Logs are read in windows that shrink when the RPC refuses one and grow back
 // after it answers; the state is written to a JSON file after every scan that
@@ -218,8 +220,8 @@ export class Indexer {
   #window = WINDOW_START;
   #ethUsd: number | null = null;
   #ethUsdAt = 0;
-  /** The USD price of each listed stock token a launched pool pairs with. */
-  #stockUsd = new Map<Address, number>();
+  /** The USD price of each listed pair token (OSTRA or a stock token) a launched pool pairs with. */
+  #pairUsd = new Map<Address, number>();
   #latest = 0n;
   #blockTimes = new Map<bigint, number>();
   #running = false;
@@ -445,14 +447,15 @@ export class Indexer {
       }
       for (const quote of new Set(this.#state.launches.map((l) => getAddress(l.quote)))) {
         const pair = findLaunchPair(quote);
-        if (pair === null || pair.kind !== "stock") continue;
+        if (pair === null || (pair.kind !== "stock" && pair.kind !== "ostra")) continue;
         try {
           const price = await readPairUsdPrice(this.#client, pair);
-          this.#stockUsd.set(pair.address, Number(price.priceE8) / 1e8);
+          this.#pairUsd.set(pair.address, Number(price.priceE8) / 1e8);
         } catch (err) {
-          // A feed older than readPairUsdPrice accepts: no USD value rather than an old one. Other failures keep the last price.
-          if (/last updated/.test((err as Error).message)) this.#stockUsd.delete(pair.address);
-          this.#log("stock_usd_failed", { quote, reason: (err as Error).message.slice(0, 200) });
+          // A feed older than readPairUsdPrice accepts, or OSTRA's graduated curve: no USD value rather than an old one.
+          // Other failures keep the last price.
+          if (/last updated|graduated/.test((err as Error).message)) this.#pairUsd.delete(pair.address);
+          this.#log("pair_usd_failed", { quote, reason: (err as Error).message.slice(0, 200) });
         }
       }
     }
@@ -516,7 +519,7 @@ export class Indexer {
   #quoteUsd(quote: Address, d: Deployment): number | null {
     if (quote === zeroAddress) return this.#ethUsd;
     if (getAddress(quote) === getAddress(d.token)) return 1;
-    return this.#stockUsd.get(getAddress(quote)) ?? null;
+    return this.#pairUsd.get(getAddress(quote)) ?? null;
   }
 
   #summary(launch: Launch, d: Deployment, nowSec: number): TokenSummary | null {
@@ -576,11 +579,13 @@ export class Indexer {
       list = list.filter((s) => s.name.toLowerCase().includes(q) || s.symbol.toLowerCase().includes(q) || s.token.toLowerCase() === q || s.creatorVault.toLowerCase() === q);
     }
     const usdOr = (usd: number | null, raw: number | null) => usd ?? raw ?? 0;
-    if (a.sort === "new") list.sort((x, y) => y.createdAt - x.createdAt);
+    // Launches in the same second (blocks come every 0.1 s): the later one in the chain first.
+    const newer = this.#newerFirst();
+    if (a.sort === "new") list.sort((x, y) => y.createdAt - x.createdAt || newer(x.token, y.token));
     else if (a.sort === "marketcap") list.sort((x, y) => usdOr(y.marketCapUsd, y.marketCap) - usdOr(x.marketCapUsd, x.marketCap));
     else if (a.sort === "volume") list.sort((x, y) => usdOr(y.volume24hUsd, y.volume24h) - usdOr(x.volume24hUsd, x.volume24h));
     // Two trades can share a block's second: the newer launch first then, so the order is stable.
-    else list.sort((x, y) => (y.lastTradeAt ?? y.createdAt) - (x.lastTradeAt ?? x.createdAt) || y.createdAt - x.createdAt);
+    else list.sort((x, y) => (y.lastTradeAt ?? y.createdAt) - (x.lastTradeAt ?? x.createdAt) || y.createdAt - x.createdAt || newer(x.token, y.token));
     return { total: list.length, tokens: list.slice(a.offset, a.offset + a.limit) };
   }
 
@@ -618,12 +623,19 @@ export class Indexer {
     return candlesOf(this.#state.trades[launch.poolId] ?? [], interval, details.quoteDecimals);
   }
 
+  /** A comparator putting the token launched later in the chain first: launches are kept in the order they were scanned (block, then log). */
+  #newerFirst(): (x: Address, y: Address) => number {
+    const order = new Map(this.#state.launches.map((l, i) => [l.token, i] as const));
+    return (x, y) => (order.get(y) ?? -1) - (order.get(x) ?? -1);
+  }
+
   /** An agent (a creator vault): its profile and the tokens it launched. */
   agent(vaultText: string): { vault: Address; profileUri: string | null; profile: unknown; tokens: TokenSummary[] } {
     const vault = getAddress(vaultText);
     const all = this.#allSummaries();
     const launches = this.#state.launches.filter((l) => l.creatorVault === vault);
-    const tokens = launches.map((l) => all.get(l.token)).filter((s): s is TokenSummary => s !== undefined).sort((x, y) => y.createdAt - x.createdAt);
+    const newer = this.#newerFirst();
+    const tokens = launches.map((l) => all.get(l.token)).filter((s): s is TokenSummary => s !== undefined).sort((x, y) => y.createdAt - x.createdAt || newer(x.token, y.token));
     const withProfile = launches.map((l) => this.#state.tokens[l.token]).find((t) => t !== undefined && t.profileUri !== null);
     return { vault, profileUri: withProfile?.profileUri ?? null, profile: withProfile?.profile ?? null, tokens };
   }

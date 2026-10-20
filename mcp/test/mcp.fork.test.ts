@@ -167,13 +167,16 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
     assert.ok(page.ok && pageJson.metadata.uri === "ipfs://bafkreitokenone" && pageJson.creator.profileUri === "ipfs://bafkreiprofileone", page.text);
     assert.equal(getAddress(pageJson.creator.vault), getAddress(launched.json.creatorVault as string));
 
-    // The pairs: USDG, ETH and the 32 stock tokens, each priced; a launch paired with NVDA, without a dev buy.
+    // The pairs: USDG, ETH, OSTRA and the 32 stock tokens, each priced; a launch paired with NVDA, without a dev buy.
     // On a fresh fork the first read of each stock token and feed fetches its code and storage from the forked RPC:
     // that first call took 63.5 s (19 Oct 2026; the same call again 0.65 s, and on mainnet 0.4 s through an archive
     // RPC, 6.6 s through the public RPC), over the client's default 60 s, so it gets 5 minutes.
     const pairs = await call(client, "pairs", {}, 300_000);
     const pairRows = JSON.parse(pairs.text) as { symbol: string; kind: string; creatorVault: string; priceUsd: string | null }[];
-    assert.ok(pairs.ok && pairRows.length === 34 && pairRows[0]?.symbol === "USDG" && pairRows[1]?.symbol === "ETH" && pairRows.filter((r) => r.kind === "stock").length === 32, pairs.text);
+    assert.ok(
+      pairs.ok && pairRows.length === 35 && pairRows[0]?.symbol === "USDG" && pairRows[1]?.symbol === "ETH" && pairRows[2]?.symbol === "OSTRA" && pairRows[2]?.kind === "ostra" && pairRows.filter((r) => r.kind === "stock").length === 32,
+      pairs.text,
+    );
     assert.ok(pairRows.every((r) => r.priceUsd !== null && Number(r.priceUsd) > 0), pairs.text);
     const nvda = pairRows.find((r) => r.symbol === "NVDA");
     assert.ok(nvda !== undefined, pairs.text);

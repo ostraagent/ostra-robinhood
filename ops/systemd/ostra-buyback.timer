@@ -1,0 +1,11 @@
+# Starts ostra-buyback.service every hour (a run missed while the machine was off runs at the next boot).
+[Unit]
+Description=Ostra $OSTRA buyback and burn, every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

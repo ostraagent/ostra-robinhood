@@ -1,0 +1,24 @@
+{
+  "name": "@ostraagent/buyback",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ostra's $OSTRA buyback and burn: claims the launchpad's buyback share, buys OSTRA with it and burns it (one run per start).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ostraagent/sdk": "file:../sdk",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@ostraagent/core": "file:../core",
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

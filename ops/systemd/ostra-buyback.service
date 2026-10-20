@@ -1,0 +1,42 @@
+# Ostra $OSTRA buyback and burn: one run (buyback/src/main.ts), started by ostra-buyback.timer.
+# Installed with @NODE@ replaced by the path of node. The run signs with the key of OstraDispatcher's owner
+# (/etc/ostra/deployer.key, root's, 0600) and keeps its state in /var/lib/ostra-buyback (0700). It runs as root
+# only to read that key, with no capabilities, so it cannot read or write anything root does not own.
+[Unit]
+Description=Ostra OSTRA buyback and burn: claims the launchpad's buyback share, buys OSTRA and burns it
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/apps/ostra-robinhood/buyback
+Environment=OSTRA_DEPLOYMENT=/srv/apps/ostra-robinhood/deployments/robinhood-mainnet.json
+Environment=OSTRA_RPC_URL_FILE=/etc/ostra/robinhood-rpc.url
+Environment=OSTRA_DEPLOYER_KEY_FILE=/etc/ostra/deployer.key
+Environment=OSTRA_BUYBACK_STATE=/var/lib/ostra-buyback/state.json
+Environment=OSTRA_BUYBACK_MIN_USD=1
+ExecStart=@NODE@ src/main.ts
+# At most 9 transactions a run, each waited for up to 3 minutes.
+TimeoutStartSec=1800
+StateDirectory=ostra-buyback
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
