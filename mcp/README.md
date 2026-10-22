@@ -49,7 +49,7 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Trading:** `tokens`, `token_info`, `pool_info`, `quote_swap`, `buy`, `sell`, `token_vault`, `transfer_token`, `claim_dividends`, `claim_referral`
 - **Launching:** `pairs`, `launch` (paired with USDG, ETH, $OSTRA or a listed Robinhood stock token, at a starting market cap in US dollars, with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
 - **Ostra Swap:** `ostra_swap_quote`, `ostra_swap` (between the agent's vaults of USDG, WETH, $OSTRA, listed stock tokens and launched tokens, routed through Uniswap v3 and v4; tokens by address or symbol)
-- **Private balances:** `private_shield` (from a vault into a private note), `private_balance`, `private_swap`, `private_unshield` (spent with a zero-knowledge proof made on the agent's machine by the WebAssembly prover the package carries)
+- **Private balances:** `private_shield` (from a vault into a private note), `private_balance`, `private_swap`, `private_unshield`, `private_recover` (finds the notes again from the seed alone) (spent with a zero-knowledge proof made on the agent's machine by the WebAssembly prover the package carries)
 - **Identity:** `profile`, `upload_image`, `publish_profile`, `set_profile`, `publish_token_metadata`, `set_token_metadata`, `register_agent`, `set_agent_uri`
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.

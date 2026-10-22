@@ -144,9 +144,15 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "private_shield",
-    "Moves `amount` of a token (USDG, WETH, OSTRA or a listed stock token) from the agent's vault of it into a private note in OstraPrivatePool. Notes are kept on this machine, in OSTRA_HOME (a backup of the seed does not bring them back yet: keep OSTRA_HOME). Later spends (private_swap, private_unshield) are sent by the Ostra relayer and do not show which note or vault they spend; their tokens, amounts and times are public.",
+    "Moves `amount` of a token (USDG, WETH, OSTRA or a listed stock token) from the agent's vault of it into a private note in OstraPrivatePool. Notes are kept on this machine and can be found again from the seed alone (private_recover). Later spends (private_swap, private_unshield) are sent by the Ostra relayer and do not show which note or vault they spend; their tokens, amounts and times are public.",
     { token: swapToken, amount: units },
     (a) => notes().shield({ token: tokenAddress(a.token), amount: a.amount }),
+  );
+  tool(
+    "private_recover",
+    "Finds the agent's private notes again from its seed and the pool's events alone (its shields, then each spend's change and swap output), and keeps the unspent ones: for a seed restored on another machine, or notes kept here that look wrong. It runs by itself on first use in a new OSTRA_HOME.",
+    {},
+    () => notes().recover(),
   );
   tool("private_balance", "The agent's private notes in OstraPrivatePool: per token the total, the number of notes and the largest one (a spend uses one note).", {}, () => notes().balance());
   tool(

@@ -12,13 +12,21 @@
 //   * unshield: one note's v goes to an address (default: the agent's vault of that token), with the same fee.
 //
 // Every secret comes from the master seed (keys.ts): the agent's sk, shield n's nonce (n counted up and kept before
-// each use; a missing count is found again from the pool's Shielded events, so a seed restored elsewhere never uses
-// a nonce twice) and a spend's change and output nonces (from the note spent, used once since a note is spent once),
-// so the seed and the chain say whose every note is. The notes, the pool's trees (from its NoteAdded events) and each
-// operation in flight are kept in the PRIVATE_SWAP_DIR folder; refresh() finishes an operation whose answer was
-// lost: a shield escrow paid without its note taken, a spend that landed. A shield's record is kept until its
-// vault's nonce has passed the signed Transfer (it may land later: the vault sends a signed spend again before its
-// next one), and a note with a spend in flight is not spent again.
+// each use) and a spend's change and output nonces (from the note spent, used once since a note is spent once), so the
+// seed and the chain say whose every note is. recover() rebuilds the notes from them alone: the shields of shield
+// nonces 1, 2, ... in the pool's Shielded events (until SHIELD_SCAN_GAP nonces in a row have none), then each note's
+// spend, if its nullifier was spent (Unshielded or PrivateSwapped), to its change note and a swap's output note, until
+// every note found is unspent. It runs by itself on first use in an OSTRA_HOME without the shield count (a new agent,
+// or a seed restored elsewhere), so the shield count starts past every nonce used and no nonce is used twice. It reads
+// all of the pool's events, never ones filtered by the agent's tags or nullifiers, up to the block the trees are
+// checked at, once the logs RPC has reached the agent's own RPC, and refuses events that do not add up to the notes the
+// trees hold; only tokens notes hold count, and notes kept here that the events do not show spent stay. Not found: a
+// shield whose vault Transfer reached its escrow but that the pool never took (no Shielded event), until refresh() on
+// the machine that signed it, or anyone, calls shieldFromEscrow for it. The notes, the
+// pool's trees (from its NoteAdded events) and each operation in flight are kept in the PRIVATE_SWAP_DIR folder;
+// refresh() finishes an operation whose answer was lost: a shield escrow paid without its note taken, a spend that
+// landed. A shield's record is kept until its vault's nonce has passed the signed Transfer (it may land later: the
+// vault sends a signed spend again before its next one), and a note with a spend in flight is not spent again.
 //
 // Spends go through the Ostra relayer, paid from the note: sent by the agent's own fee payer they would all show
 // the account that also sent its vault's transactions, so without a relayer they are refused unless
@@ -39,6 +47,7 @@ import {
   PoolTrees,
   changeNote,
   findRoute,
+  noteKeys,
   ostraPrivatePoolAbi,
   packDigest,
   privateSwapCall,
@@ -85,6 +94,8 @@ export const PRIVATE_FEE_GAS = { unshield: 16_000_000n, swap: 19_000_000n } as c
 export const PRIVATE_FEE_MAX_FACTOR = 3n;
 /** Shield nonces searched past the last one found in the pool's events before a missing count is taken as found. */
 const SHIELD_SCAN_GAP = 20n;
+/** Seconds recover() waits for the logs RPC to reach the block the agent's own RPC is at. */
+const LOGS_CATCH_UP_TRIES = 30;
 /**
  * How long a shield record waits for its Shielded log once its vault's nonce is past the Transfer and the escrow is
  * empty (the logs RPC may be behind), before it is taken as never signed or never sendable and dropped.
@@ -129,7 +140,20 @@ type PendingSpend = {
 };
 type Pending = PendingShield | PendingSpend;
 
+type ShieldedLog = { token: Address; amount: bigint; commitment: Digest };
+type PoolLog =
+  | { eventName: "Shielded"; args: { from: Address; token: Address; amount: bigint; tag: Hex; commitment: Hex } }
+  | { eventName: "Unshielded"; args: { nullifier: Hex; recipient: Address; token: Address; amount: bigint; fee: bigint; relayer: Address } }
+  | {
+      eventName: "PrivateSwapped";
+      args: { nullifier: Hex; tokenIn: Address; tokenOut: Address; amountIn: bigint; amountOut: bigint; fee: bigint; relayer: Address; outTag: Hex; outCommitment: Hex };
+    };
+type SpendLog = { kind: "unshield"; v: bigint; fee: bigint } | { kind: "swap"; v: bigint; fee: bigint; tokenOut: Address; amountOut: bigint; outCommitment: Digest };
+
 export type PrivateBalance = { token: Address; amount: string; notes: number; largestNote: string }[];
+
+/** What recover() found: the shields of the seed, the notes it followed, and the notes unspent now. */
+export type PrivateRecovery = { pool: Address; shields: number; followed: number; tokens: PrivateBalance; notes: number };
 
 export type PrivateSpendResult = {
   status: "sent";
@@ -232,18 +256,10 @@ export class PrivateBalanceService {
     return this.#digest((block) => this.#p.keys.spendNoteSecret(this.#p.config.chainId, this.#pool, purpose, spent, block));
   }
 
-  /**
-   * Keeps a shield count when there is none (a new agent, or a seed restored elsewhere): it starts past the last
-   * shield nonce of this seed in the pool's Shielded events, searched until SHIELD_SCAN_GAP nonces in a row are not
-   * there. Run before a shield's vault operation, which it would otherwise hold up.
-   */
-  async #ensureShieldCount(prover: Prover, sk: Digest): Promise<void> {
+  /** recover() when there is no shield count yet (a new agent, or a seed restored elsewhere) and there is a prover. */
+  async #ensureRecovered(): Promise<void> {
     await this.#p.folder.ensure();
-    if ((await this.#p.folder.read(NEXT_RHO)) !== undefined) return;
-    const tags = await this.#shieldedTags();
-    let last = 0n;
-    for (let i = 1n; i <= last + SHIELD_SCAN_GAP; i++) if (tags.has((await tagOf(prover, sk, this.#shieldRho(i))).toLowerCase())) last = i;
-    await this.#p.folder.write(NEXT_RHO, `${last + 1n}\n`);
+    if (this.#p.prover !== null && (await this.#p.folder.read(NEXT_RHO)) === undefined) await this.#recover();
   }
 
   /** The next shield nonce: its number is kept before it is used, so no nonce is used twice. */
@@ -255,17 +271,162 @@ export class PrivateBalanceService {
     return this.#shieldRho(n);
   }
 
-  /** Every tag the pool's Shielded events name, lower case. */
-  async #shieldedTags(): Promise<Set<string>> {
-    const tags = new Set<string>();
-    const head = await this.#p.logsClient.getBlockNumber();
+  /**
+   * All of the pool's Shielded events, by tag, and its spends (Unshielded and PrivateSwapped), by nullifier, up to
+   * block `head`: read whole, so the RPC learns nothing of which are the agent's. Also how many notes they add (a
+   * shield one, an unshield its change, a private swap its change and its output), to check against the trees.
+   */
+  async #poolEvents(head: bigint): Promise<{ shielded: Map<string, ShieldedLog[]>; spends: Map<string, SpendLog>; notes: number }> {
+    const shielded = new Map<string, ShieldedLog[]>();
+    const spends = new Map<string, SpendLog>();
+    let notes = 0;
     for (let from = BigInt(this.#p.swap.fromBlock); from <= head; from += LOG_WINDOW_BLOCKS) {
       const to = from + LOG_WINDOW_BLOCKS - 1n < head ? from + LOG_WINDOW_BLOCKS - 1n : head;
-      for (const l of await this.#p.logsClient.getLogs({ address: this.#pool, event: shieldedEvent, fromBlock: from, toBlock: to })) {
-        if (l.args.tag !== undefined) tags.add(l.args.tag.toLowerCase());
+      for (const l of await this.#poolLogs(from, to)) {
+        if (l.eventName === "Shielded") {
+          const tag = l.args.tag.toLowerCase();
+          shielded.set(tag, [...(shielded.get(tag) ?? []), { token: getAddress(l.args.token), amount: l.args.amount, commitment: l.args.commitment }]);
+          notes += 1;
+        } else if (l.eventName === "Unshielded") {
+          spends.set(l.args.nullifier.toLowerCase(), { kind: "unshield", v: l.args.amount, fee: l.args.fee });
+          notes += 1;
+        } else {
+          spends.set(l.args.nullifier.toLowerCase(), { kind: "swap", v: l.args.amountIn, fee: l.args.fee, tokenOut: getAddress(l.args.tokenOut), amountOut: l.args.amountOut, outCommitment: l.args.outCommitment });
+          notes += 2;
+        }
       }
     }
-    return tags;
+    return { shielded, spends, notes };
+  }
+
+  /** The pool's Shielded, Unshielded and PrivateSwapped logs in [from, to]; a range the RPC refuses as too many logs is split in halves. */
+  async #poolLogs(from: bigint, to: bigint): Promise<PoolLog[]> {
+    try {
+      return (await this.#p.logsClient.getLogs({ address: this.#pool, events: [shieldedEvent, unshieldedEvent, swappedEvent], fromBlock: from, toBlock: to, strict: true })) as PoolLog[];
+    } catch (err) {
+      if (from >= to || !/exceeds limit|too many|query returned more than/i.test(String((err as Error).message ?? err))) throw err;
+      const mid = from + (to - from) / 2n;
+      return [...(await this.#poolLogs(from, mid)), ...(await this.#poolLogs(mid + 1n, to))];
+    }
+  }
+
+  /** Rebuilds the agent's notes from the seed and the pool's events (see the file comment); the notes kept here become the unspent ones found. */
+  recover(): Promise<PrivateRecovery> {
+    return this.#serial(async () => {
+      await this.#refresh();
+      return this.#recover();
+    });
+  }
+
+  async #recover(): Promise<PrivateRecovery> {
+    const prover = this.#prover();
+    const sk = this.#sk();
+    // The block this agent's own RPC is at: the logs RPC must have it, or a spend that landed would look unspent.
+    const own = await this.#p.client.getBlockNumber({ cacheTime: 0 });
+    // The trees, checked against the pool at their head (PoolTrees.sync), then the events up to that same block: as
+    // many notes as the trees hold, or the logs are incomplete.
+    // A sync that fails (the logs RPC answered a block number ahead of its logs) is tried again too.
+    let trees: PoolTrees | null = null;
+    let failure: unknown = null;
+    for (let i = 0; i <= LOGS_CATCH_UP_TRIES; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 1_000));
+      try {
+        trees = await this.#syncedTrees();
+        failure = null;
+      } catch (err) {
+        failure = err;
+        continue;
+      }
+      if (BigInt(trees.data().searchedTo) >= own) break;
+    }
+    if (trees === null || failure !== null) throw failure ?? new Error("the pool's trees could not be read");
+    const head = BigInt(trees.data().searchedTo);
+    if (head < own) throw new Error(`the logs RPC (OSTRA_LOGS_RPC_URL) is at block ${head}, behind block ${own}: recover again in a minute`);
+    const events = await this.#poolEvents(head);
+    const held = trees.data().trees.reduce((n, t) => n + t.leaves.length, 0);
+    if (events.notes !== held) throw new Error(`the pool's events up to block ${head} add ${events.notes} notes, its trees hold ${held}: the logs RPC answered incompletely, recover again`);
+    const tokens = new Set(privateTokens(this.#p.config));
+    const placed = (commitment: Digest) => {
+      const at = trees.find(commitment);
+      if (at === null) throw new Error(`the note ${commitment} is in the pool's events but not in its trees`);
+      return at;
+    };
+    // The shields of nonces 1, 2, ... (past the count kept here, if there is one): each Shielded event with the
+    // nonce's tag whose commitment is that note's, in a token notes hold (anyone can shield another token to a tag).
+    const kept = await this.#p.folder.read(NEXT_RHO);
+    const counted = kept === undefined ? 0n : BigInt(kept.trim()) - 1n;
+    const queue: PrivateNote[] = [];
+    let last = 0n;
+    for (let i = 1n; i <= (last + SHIELD_SCAN_GAP > counted ? last + SHIELD_SCAN_GAP : counted); i++) {
+      const rho = this.#shieldRho(i);
+      const found = events.shielded.get((await tagOf(prover, sk, rho)).toLowerCase());
+      if (found === undefined) continue;
+      last = i;
+      for (const e of found) {
+        if (!tokens.has(e.token)) continue;
+        const keys = await noteKeys(prover, sk, rho, e.token, e.amount);
+        if (keys.commitment.toLowerCase() !== e.commitment.toLowerCase()) continue;
+        queue.push({ asset: e.token, amount: e.amount, rho, commitment: e.commitment, ...placed(e.commitment) });
+      }
+    }
+    const shields = queue.length;
+    // Each note to its spend, and the spend to the notes it made.
+    const unspent: PrivateNote[] = [];
+    const seen = new Set<string>();
+    let followed = 0;
+    for (let note = queue.pop(); note !== undefined; note = queue.pop()) {
+      if (seen.has(note.commitment.toLowerCase())) continue;
+      seen.add(note.commitment.toLowerCase());
+      followed += 1;
+      const { nullifier } = await noteKeys(prover, sk, note.rho, note.asset, note.amount);
+      const spend = events.spends.get(nullifier.toLowerCase());
+      if (spend === undefined) {
+        unspent.push(note);
+        continue;
+      }
+      // The change note is added in the spend's own transaction: the trees hold it (placed throws otherwise).
+      const change = note.amount - spend.v - spend.fee;
+      if (change > 0n) {
+        const rho = this.#spendRho("change", note.commitment);
+        const keys = await noteKeys(prover, sk, rho, note.asset, change);
+        queue.push({ asset: note.asset, amount: change, rho, commitment: keys.commitment, ...placed(keys.commitment) });
+      }
+      if (spend.kind === "swap" && tokens.has(spend.tokenOut)) {
+        const rho = this.#spendRho("out", note.commitment);
+        const keys = await noteKeys(prover, sk, rho, spend.tokenOut, spend.amountOut);
+        if (keys.commitment.toLowerCase() === spend.outCommitment.toLowerCase()) queue.push({ asset: spend.tokenOut, amount: spend.amountOut, rho, commitment: keys.commitment, ...placed(keys.commitment) });
+      }
+    }
+    // A note kept here that the scan did not reach stays when it is a real note of this seed's (its commitment from its
+    // own rho, token and amount, in the trees, in a token notes hold) that the events do not show spent; a wrong record
+    // goes.
+    const found = new Set(unspent.map((n) => n.commitment.toLowerCase()));
+    const local: NoteRecord[] = [];
+    for (const n of await this.#notes()) {
+      if (found.has(n.commitment.toLowerCase()) || !tokens.has(getAddress(n.asset)) || trees.find(n.commitment) === null) continue;
+      const keys = await noteKeys(prover, sk, n.rho, n.asset, BigInt(n.amount));
+      if (keys.commitment.toLowerCase() === n.commitment.toLowerCase() && !events.spends.has(keys.nullifier.toLowerCase())) local.push(n);
+    }
+    const records = [...unspent.map((n) => ({ asset: n.asset, amount: n.amount.toString(), rho: n.rho, commitment: n.commitment, tree: n.tree, index: n.index })), ...local];
+    await this.#saveNotes(records);
+    // The shield count past every nonce found (never lowered: a nonce counted but not shielded is not used again).
+    const next = counted + 1n > last + 1n ? counted + 1n : last + 1n;
+    await this.#p.folder.write(NEXT_RHO, `${next}\n`);
+    return { pool: this.#pool, shields, followed, notes: records.length, tokens: await this.#summary(records) };
+  }
+
+  /** Per token: what `notes` hold, how many, and the largest. */
+  async #summary(notes: { asset: Address; amount: string }[]): Promise<PrivateBalance> {
+    const by = new Map<Address, bigint[]>();
+    for (const n of notes) by.set(n.asset, [...(by.get(n.asset) ?? []), BigInt(n.amount)]);
+    const tokens: PrivateBalance = [];
+    for (const [token, list] of by) {
+      const decimals = await tokenDecimals(this.#p.client, token);
+      const total = list.reduce((s, x) => s + x, 0n);
+      const largest = list.reduce((m, x) => (x > m ? x : m), 0n);
+      tokens.push({ token, amount: formatUnitsAmount(total, decimals), notes: list.length, largestNote: formatUnitsAmount(largest, decimals) });
+    }
+    return tokens;
   }
 
   /** The notes a spend in flight spends: not spent again until refresh() finishes or drops that spend. */
@@ -345,17 +506,8 @@ export class PrivateBalanceService {
   balance(): Promise<{ pool: Address; tokens: PrivateBalance; inFlight: number }> {
     return this.#serial(async () => {
       const failures = await this.#refresh();
-      const notes = await this.#notes();
-      const by = new Map<Address, NoteRecord[]>();
-      for (const n of notes) by.set(n.asset, [...(by.get(n.asset) ?? []), n]);
-      const tokens: PrivateBalance = [];
-      for (const [token, list] of by) {
-        const decimals = await tokenDecimals(this.#p.client, token);
-        const total = list.reduce((s, n) => s + BigInt(n.amount), 0n);
-        const largest = list.reduce((m, n) => (BigInt(n.amount) > m ? BigInt(n.amount) : m), 0n);
-        tokens.push({ token, amount: formatUnitsAmount(total, decimals), notes: list.length, largestNote: formatUnitsAmount(largest, decimals) });
-      }
-      return { pool: this.#pool, tokens, inFlight: failures.length };
+      await this.#ensureRecovered();
+      return { pool: this.#pool, tokens: await this.#summary(await this.#notes()), inFlight: failures.length };
     });
   }
 
@@ -374,7 +526,7 @@ export class PrivateBalanceService {
       if (s.balance < amount) throw new Error(`the vault in ${token} (${s.vault}) holds ${formatUnitsAmount(s.balance, decimals)}, less than ${a.amount}; nothing was signed`);
       if (!s.exists) await from.open();
       const sk = this.#sk();
-      await this.#ensureShieldCount(prover, sk);
+      await this.#ensureRecovered();
       let pending: PendingShield | null = null;
       const result = await from.operate({
         gas: PRIVATE_SHIELD_GAS,
@@ -536,6 +688,7 @@ export class PrivateBalanceService {
       this.#requireRelayer();
       const prover = this.#prover();
       await this.#refresh();
+      await this.#ensureRecovered();
       const [inDecimals, outDecimals] = await Promise.all([tokenDecimals(this.#p.client, tokenIn), tokenDecimals(this.#p.client, tokenOut)]);
       const v = parseUnitsAmount(a.amount, inDecimals);
       if (v === 0n) throw new RangeError("amount must be greater than zero");
@@ -577,6 +730,7 @@ export class PrivateBalanceService {
       this.#requireRelayer();
       const prover = this.#prover();
       await this.#refresh();
+      await this.#ensureRecovered();
       const decimals = await tokenDecimals(this.#p.client, token);
       const v = parseUnitsAmount(a.amount, decimals);
       if (v === 0n) throw new RangeError("amount must be greater than zero");
