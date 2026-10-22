@@ -31,7 +31,6 @@ import {
   USDG,
   WETH,
   changeNote,
-  cliProver,
   erc20Abi,
   executeEscrowData,
   findRoute,
@@ -55,6 +54,7 @@ import {
   type PrivateNote,
   type Spend,
 } from "@ostraagent/swap";
+import { cliProver } from "@ostraagent/swap/cli-prover";
 import { decodeRelayRequest } from "../src/calls.ts";
 import { createRelayerServer } from "../src/http.ts";
 import { Ledger } from "../src/ledger.ts";

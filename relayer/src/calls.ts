@@ -32,6 +32,9 @@
 //   OstraPrivatePool.privateSwap(spend), unshield(spend)   relayed alone, for
 //                                      the fee their proof pays (private.ts);
 //                                      never shield, which pulls from the caller
+//   OstraPrivatePool.shieldFromEscrow(token, tag)   a vault's shield (its
+//                                      Transfer to the pool's shield escrow in
+//                                      the same request), paid like any other
 //
 // Anything else is read as an unknown call; the relayer's policy (gate.ts)
 // refuses it, as Kora's allowed-program list did.
@@ -86,6 +89,7 @@ export type ParsedCall =
   /** OstraPrivatePool spends: read by private.ts. */
   | { fn: "privateSwap"; to: Address }
   | { fn: "privateUnshield"; to: Address }
+  | { fn: "shieldFromEscrow"; to: Address; token: Address; tag: Hex }
   | { fn: null; to: Address; selector: Hex };
 
 export type RelayTx = {
@@ -110,7 +114,7 @@ for (const [abi, names] of [
   [ostraCreatorSplitAbi, [["release", "splitRelease"]]],
   [ostraVestingAbi, [["release", "vestingRelease"], ["claimDividends", "vestingClaimDividends"]]],
   [ostraRouterAbi, [["executeEscrow", "executeEscrow"], ["announce", "announce"], ["closeEscrow", "closeEscrow"]]],
-  [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"]]],
+  [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"], ["shieldFromEscrow", "shieldFromEscrow"]]],
 ] as const) {
   for (const [name, as] of names) {
     const item = (abi as readonly { type: string; name?: string }[]).find((x) => x.type === "function" && x.name === name);
@@ -170,6 +174,8 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
     case "privateSwap":
     case "privateUnshield":
       return { fn: known.as, to };
+    case "shieldFromEscrow":
+      return { fn: "shieldFromEscrow", to, token: getAddress(a[0] as Address), tag: a[1] as Hex };
     case "createVault":
       return { fn: "createVault", to, token: getAddress(a[0] as Address), initialKeyRoot: a[1] as Hex, initialCrank: getAddress(a[2] as Address) };
     case "spend":

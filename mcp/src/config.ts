@@ -14,6 +14,21 @@
 //                         ETH (without it the fee payer in OSTRA_HOME pays gas)
 //   OSTRA_KEEPER_URL      the Ostra keeper (accept_payments)
 //   OSTRA_AGGREGATOR_URL  the Ostra aggregator (shield)
+//   OSTRA_SWAP_DEPLOYMENT path of Ostra Swap's deployment record (JSON:
+//                         its router, stake and private pool); the npm
+//                         package carries mainnet's once it is deployed.
+//                         Without one the Ostra Swap tools refuse to run
+//   OSTRA_LOGS_RPC_URL    Robinhood Chain RPC for Ostra Swap's event
+//                         searches (Uniswap pools for routes, the private
+//                         pool's trees): default the public RPC, which serves
+//                         wide eth_getLogs windows. Never printed either
+//   OSTRA_PRIVATE_LOCAL_SPENDS  "yes": without a relayer, private spends are
+//                         sent by the fee payer in OSTRA_HOME, which links
+//                         them to the agent (tests and forks); otherwise they
+//                         are refused without a relayer
+//   OSTRA_PROVER          path of the ostra-prove binary (the private
+//                         notes' prover, ostra-swap privacy/); without it the
+//                         private tools refuse to run
 //
 // The npm package sets the three service URLs to Ostra's own when they are
 // not set and it runs on the deployment it carries (never with
@@ -25,11 +40,22 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ROBINHOOD_PUBLIC_RPC, parseDeployment } from "@ostraagent/sdk";
+import { parseSwapDeployment, type SwapDeployment } from "@ostraagent/swap";
 import { X402_NETWORK, type Config } from "@ostraagent/core";
 import { checkPrivate } from "./disk.ts";
 import { packaged } from "./packaged.ts";
 
-export type McpConfig = Config & { home: string };
+export type McpConfig = Config & {
+  home: string;
+  /** Ostra Swap's contracts, or null (its tools then refuse to run). */
+  swap: SwapDeployment | null;
+  /** The RPC Ostra Swap searches events through. */
+  logsRpcUrl: string;
+  /** Private spends sent by the local fee payer without a relayer (OSTRA_PRIVATE_LOCAL_SPENDS=yes). */
+  privateLocalSpends: boolean;
+  /** The ostra-prove binary, or null (the private tools then refuse to run). */
+  prover: string | null;
+};
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
   const value = env[name];
@@ -64,8 +90,19 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     await checkPrivate(rpcFile);
     rpcUrl = (await readFile(rpcFile, "utf8")).trim();
   }
+  let swap: SwapDeployment | null = null;
+  const swapPath = env.OSTRA_SWAP_DEPLOYMENT;
+  if (swapPath !== undefined && swapPath !== "") swap = parseSwapDeployment(JSON.parse(await readFile(swapPath, "utf8")));
+  else if (services !== null && packaged !== null && packaged.swapDeployment !== null && packaged.swapDeployment !== undefined) swap = parseSwapDeployment(packaged.swapDeployment);
+  if (swap !== null && swap.chainId !== deployment.chainId) throw new Error(`Ostra Swap's deployment is of chain ${swap.chainId}, not ${deployment.chainId}`);
+  const logsRpcUrl = env.OSTRA_LOGS_RPC_URL !== undefined && env.OSTRA_LOGS_RPC_URL !== "" ? env.OSTRA_LOGS_RPC_URL : ROBINHOOD_PUBLIC_RPC;
+  const prover = env.OSTRA_PROVER !== undefined && env.OSTRA_PROVER !== "" ? env.OSTRA_PROVER : null;
   return {
     home,
+    swap,
+    logsRpcUrl,
+    privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",
+    prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,
     deployment,

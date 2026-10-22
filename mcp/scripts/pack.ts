@@ -4,16 +4,19 @@
 // server, the core and the SDK bundled by esbuild into dist/ostra-mcp.js, and
 // the third-party packages left as dependencies at the versions the
 // workspace pins. Baked in (packaged.ts): the deployment record of Ostra on
-// Robinhood Chain mainnet (../deployments/robinhood-mainnet.json) and the URLs
-// of Ostra's relayer, keeper and aggregator. The bundle is checked to import
-// nothing of the workspace, and the record to parse.
+// Robinhood Chain mainnet (../deployments/robinhood-mainnet.json), Ostra
+// Swap's (../../ostra-swap/deployments/robinhood-mainnet.json, null while it
+// is not deployed) and the URLs of Ostra's relayer, keeper and aggregator.
+// The bundle is checked to import nothing of the workspace, and the records
+// to parse.
 //
 //   node scripts/pack.ts
 
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { parseDeployment } from "@ostraagent/sdk";
+import { parseSwapDeployment } from "@ostraagent/swap";
 import type { Packaged } from "../src/packaged.ts";
 
 const here = (p: string) => fileURLToPath(new URL(`../${p}`, import.meta.url));
@@ -21,15 +24,15 @@ const OUT = here("release");
 const BUNDLE = "dist/ostra-mcp.js";
 const MAINNET_CHAIN_ID = 4663;
 const SERVICES = { relayerUrl: "https://relayer.ostraagent.xyz", keeperUrl: "https://keeper.ostraagent.xyz", aggregatorUrl: "https://aggregator.ostraagent.xyz" };
-const WORKSPACE = ["@ostraagent/core", "@ostraagent/sdk"];
+const WORKSPACE = ["@ostraagent/core", "@ostraagent/sdk", "@ostraagent/swap"];
 
 type Manifest = { name: string; version: string; dependencies?: Record<string, string> };
 const manifest = async (p: string) => JSON.parse(await readFile(here(p), "utf8")) as Manifest;
 
 const mcp = await manifest("package.json");
-// The third-party dependencies of the MCP server, the core and the SDK, one version each.
+// The third-party dependencies of the MCP server, the core, the SDK and Ostra Swap's SDK, one version each.
 const dependencies: Record<string, string> = {};
-for (const m of [mcp, await manifest("../core/package.json"), await manifest("../sdk/package.json")]) {
+for (const m of [mcp, await manifest("../core/package.json"), await manifest("../sdk/package.json"), await manifest("../../ostra-swap/sdk/package.json")]) {
   for (const [name, version] of Object.entries(m.dependencies ?? {})) {
     if (WORKSPACE.includes(name)) continue;
     if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) throw new Error(`${m.name}: ${name} is not pinned (${version})`);
@@ -43,7 +46,16 @@ const record: unknown = JSON.parse(await readFile(here("../deployments/robinhood
 const deployment = parseDeployment(record);
 if (deployment.chainId !== MAINNET_CHAIN_ID) throw new Error(`the mainnet record is of chain ${deployment.chainId}`);
 if (deployment.launchpad === undefined) throw new Error("the mainnet record has no launchpad");
-const packaged: Packaged = { version: mcp.version, deployment: record, ...SERVICES };
+const SWAP_RECORD = here("../../ostra-swap/deployments/robinhood-mainnet.json");
+const swapRecord: unknown = await access(SWAP_RECORD).then(
+  async () => JSON.parse(await readFile(SWAP_RECORD, "utf8")) as unknown,
+  () => null,
+);
+if (swapRecord !== null) {
+  const swap = parseSwapDeployment(swapRecord);
+  if (swap.chainId !== MAINNET_CHAIN_ID) throw new Error(`Ostra Swap's mainnet record is of chain ${swap.chainId}`);
+}
+const packaged: Packaged = { version: mcp.version, deployment: record, swapDeployment: swapRecord, ...SERVICES };
 
 await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
@@ -102,4 +114,4 @@ await writeFile(
 );
 await copyFile(here("README.md"), `${OUT}/README.md`);
 await copyFile(here("../LICENSE"), `${OUT}/LICENSE`);
-process.stdout.write(`${OUT}: ${mcp.name}@${mcp.version}, ${Math.round(code.length / 1024)} KB, chain ${deployment.chainId}, dependencies ${Object.entries(sorted).map(([n, v]) => `${n}@${v}`).join(" ")}\n`);
+process.stdout.write(`${OUT}: ${mcp.name}@${mcp.version}, ${Math.round(code.length / 1024)} KB, chain ${deployment.chainId}, Ostra Swap ${swapRecord === null ? "not deployed" : "deployed"}, dependencies ${Object.entries(sorted).map(([n, v]) => `${n}@${v}`).join(" ")}\n`);

@@ -29,7 +29,9 @@
 //      or with the vault Transfer that funds it), of an order that does not
 //      name the relayer's account as its executor or canceller (anyone who
 //      pays could then run or cancel it at will), never swap or
-//      swapAtBaseFee, which pull tokens from the caller. A private spend
+//      swapAtBaseFee, which pull tokens from the caller; OstraPrivatePool
+//      shieldFromEscrow (a vault's shield, after its Transfer to the pool's
+//      shield escrow), never shield, which pulls from the caller. A private spend
 //      (OstraPrivatePool privateSwap or unshield) is relayed alone, for the
 //      fee its proof pays the relayer (private.ts), with no x402 payment and
 //      no WOTS signature. Nothing else is sent, so the
@@ -595,6 +597,11 @@ export class RelayerGate {
       }
       if (c.fn === "privateSwap" || c.fn === "privateUnshield") {
         return swap?.private !== undefined && c.to === swap.private.pool ? `calls[${i}]: a private spend is relayed alone` : `calls[${i}]: ${name} on ${c.to} is not relayed`;
+      }
+      // A vault's shield: it takes only what the pool's shield escrow holds (nothing from the caller).
+      if (c.fn === "shieldFromEscrow") {
+        if (swap?.private === undefined || c.to !== swap.private.pool) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
+        continue;
       }
       if (c.to === d.vaultFactory) {
         if (c.fn !== "createVault") return `calls[${i}]: ${name} on the vault factory ${c.to} is not relayed`;

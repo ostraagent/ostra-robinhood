@@ -5,6 +5,10 @@
 //   * the secp256k1 voucher key of every channel (from its salt), the one-time
 //     depositor key and the deposit id of every shield deposit (from its
 //     number), and the seller's merchant and crank keys;
+//   * the secrets of the agent's notes in Ostra Swap's private pool: its sk,
+//     each shield's rho (from the shield's number) and each spend's change
+//     and output rho (from the note spent), so that the seed recovers whose
+//     every note is (private-balance.ts);
 //
 // so the seed alone recovers every vault, channel, deposit and leaf. The fee
 // payer key pays transaction gas when no relayer pays; it holds only ETH,
@@ -46,6 +50,7 @@ const SHIELD_APPROVE_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/SHIELD-APPROVE/EVM/v1");
 const SHIELD_LEAF_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/SHIELD-LEAF/EVM/v1");
 const PRIVATE_VAULT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/PRIVATE-VAULT/EVM/v1");
 const CREATOR_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/CREATOR-VAULT/EVM/v1");
+const NOTE_SECRET_DOMAIN = utf8("OSTRA/MCP/SWAP-NOTE/EVM/v1");
 
 /** secp256k1 group order: a private key must be in 1..n-1. */
 const SECP256K1_N = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141n;
@@ -277,6 +282,25 @@ export class Keys<S extends WotsStore = WotsStore> {
   /** Approval keys of shield deposit `index` (one per approveBatch; the key rotates every time). */
   shieldApprovalKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
     return this.#keychain(shieldApprovalKeychainId(chainId, token, index));
+  }
+
+  /**
+   * A 32-byte secret of the agent's notes in Ostra Swap's private pool `pool` on chain `chainId`: `purpose` "sk"
+   * (index 0: the agent's note key) or "rho" (index n: shield n's nonce), or a further block (`block` > 0) of the same
+   * secret when a field element must be drawn again (private-balance.ts #digest).
+   */
+  noteSecret(chainId: number, pool: Address, purpose: "sk" | "rho", index: bigint, block = 0n): Uint8Array {
+    return sha256([NOTE_SECRET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(pool), utf8(purpose), u64Be(index), u64Be(block)]);
+  }
+
+  /**
+   * A 32-byte secret of a spend of the note `spent` (its 32-byte commitment) in the private pool `pool`: `purpose`
+   * "change" (the nonce of its change note) or "out" (the nonce of a private swap's output note), or a further block.
+   * A note is spent once, so each is used once; the chain's events and the seed say them again.
+   */
+  spendNoteSecret(chainId: number, pool: Address, purpose: "change" | "out", spent: Hex, block = 0n): Uint8Array {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(spent)) throw new RangeError("the note spent is a 32-byte commitment");
+    return sha256([NOTE_SECRET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(pool), utf8(purpose), hexToBytes(spent), u64Be(block)]);
   }
 
   /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */

@@ -8,18 +8,24 @@
 //   * without it the fee payer in OSTRA_HOME sends and pays gas in ETH.
 // The sweep (every SWEEP_SECONDS) carries on with what takes time: channel
 // closes asked for, channels `pay` opened past their life, relayer channels
-// past theirs, shield deposits and scheduled unshields.
+// past theirs, shield deposits and scheduled unshields, and Ostra Swap's
+// orders and private operations whose answer was lost.
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createPublicClient, getAddress, isAddress, type Address, type PublicClient, type Transport } from "viem";
+import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
 import { assertRobinhoodChain, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
+import { cliProver } from "@ostraagent/swap/cli-prover";
 import {
   ChannelService,
   LaunchpadService,
   LocalSender,
+  PRIVATE_SWAP_DIR,
   PayService,
+  PrivateBalanceService,
   RelayerClient,
+  SWAP_DIR,
+  SwapService,
   ShieldService,
   SignatureEscrowClient,
   UnshieldService,
@@ -62,6 +68,10 @@ export class Agent {
   readonly shield: ShieldService;
   readonly creatorShield: ShieldService;
   readonly unshield: UnshieldService;
+  /** Ostra Swap from the agent's vaults, and its private notes (null without OSTRA_SWAP_DEPLOYMENT). */
+  readonly swap: SwapService | null;
+  readonly privateBalance: PrivateBalanceService | null;
+  readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
   #sweeping = false;
@@ -100,6 +110,40 @@ export class Agent {
     this.shield = new ShieldService(client, config, keys, this.buyer, this.sender);
     this.creatorShield = new ShieldService(client, config, keys, this.creator, creatorSender);
     this.unshield = new UnshieldService(client, config, keys, this.shield, (index) => this.privateVault(index));
+    if (config.swap === null) {
+      this.swap = null;
+      this.privateBalance = null;
+    } else {
+      // OSTRA_LOGS_RPC_URL (default Robinhood Chain's public RPC) serves eth_getLogs over the windows the pool index and the private pool's trees search.
+      const logsClient = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
+      const vaultFor = (token: Address) => this.vaultFor(token);
+      this.swap = new SwapService({ client, logsClient, config, swap: config.swap, vaultFor, sender: this.sender, folder: keys.folder.folder(SWAP_DIR) });
+      this.privateBalance = new PrivateBalanceService({
+        client,
+        logsClient,
+        config,
+        swap: config.swap,
+        keys,
+        prover: config.prover === null ? null : cliProver(config.prover),
+        vaultFor,
+        sender: this.sender,
+        folder: keys.folder.folder(PRIVATE_SWAP_DIR),
+        localSpends: config.privateLocalSpends,
+      });
+    }
+  }
+
+  /** The agent's vault for `token`: the buyer vault for USDG, else its token vault (the launchpad's, when there is one). */
+  vaultFor(token: Address): VaultService {
+    const t = getAddress(token);
+    if (t === this.config.deployment.token) return this.buyer;
+    if (this.launchpad !== null) return this.launchpad.tokenVault(t);
+    let v = this.#tokenVaults.get(t);
+    if (v === undefined) {
+      v = new VaultService(this.client, this.transport, this.config, this.keys, this.sender, "token", null, t);
+      this.#tokenVaults.set(t, v);
+    }
+    return v;
   }
 
   static async open(config: McpConfig, log: Log): Promise<Agent> {
@@ -226,6 +270,8 @@ export class Agent {
         await step("creator shield", () => this.creatorShield.sweep());
       }
       await step("unshield", () => this.unshield.sweep());
+      if (this.swap !== null) await step("ostra swap orders", () => this.swap!.finishPending());
+      if (this.privateBalance !== null && this.config.prover !== null) await step("private notes", () => this.privateBalance!.refresh());
     } finally {
       this.#sweeping = false;
     }

@@ -62,13 +62,19 @@ test("Ostra Swap: an escrow order naming the relayer's account as executor or ca
     // The policy decides before anything is read from the chain or paid: nothing else of the gate is reached.
     const gate = new RelayerGate({ deployment, ledger, merchant: { token: deployment.token }, sender: { address: relayer }, swap: { router } } as never);
     const order = { tokenIn: deployment.token, tokenOut: at(0xa1), amountIn: 1n, minOut: 1n, recipient: at(0xa2), refundTo: at(0xa2), notBefore: 0n, deadline: 2_000_000_000n, tranches: 0, interval: 0, executor: zeroAddress, canceller: zeroAddress, route: `0x${"11".repeat(32)}` as const, salt: `0x${"22".repeat(32)}` as const };
-    const body = (data: string) => JSON.stringify({ calls: [{ to: router, data }] });
-    const ask = async (data: string) => (await gate.relay({ body: body(data), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
+    const body = (data: string, to: string) => JSON.stringify({ calls: [{ to, data }] });
+    const ask = async (data: string, to: string = router) => (await gate.relay({ body: body(data, to), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
     for (const o of [{ ...order, executor: relayer }, { ...order, canceller: relayer }]) {
       const a = await ask(encodeFunctionData({ abi: ostraRouterAbi, functionName: "announce", args: [o] }));
       assert.equal(a.status, 422);
       assert.match(a.body.message, /executor or canceller/);
     }
+    // A vault's shield is relayed only on the configured private pool (none here).
+    const { ostraPrivatePoolAbi } = await import("@ostraagent/swap");
+    const pool = at(0xc4);
+    const shield = await ask(encodeFunctionData({ abi: ostraPrivatePoolAbi, functionName: "shieldFromEscrow", args: [deployment.token, `0x${"07".repeat(32)}`] }), pool);
+    assert.equal(shield.status, 422);
+    assert.equal(shield.body.message, `calls[0]: shieldFromEscrow on ${pool} is not relayed`);
     const swap = await ask(encodeFunctionData({ abi: ostraRouterAbi, functionName: "swap", args: [order.tokenIn, order.tokenOut, 1n, 1n, at(0xa2), order.tokenIn, { commands: "0x", inputs: [] }, { commands: "0x", inputs: [] }] }));
     assert.equal(swap.status, 422);
     assert.match(swap.body.message, /not relayed/);

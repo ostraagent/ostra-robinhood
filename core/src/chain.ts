@@ -6,7 +6,7 @@
 // token accounts and an EVM chain no rent, so those are gone.
 
 import { createWalletClient, type Address, type Hash, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
-import { assertRobinhoodChain, readVault, relayTransaction, retryingHttp, robinhoodChain, robinhoodClient, usdgAbi, type Deployment, type RelayCall, type VaultState } from "@ostraagent/sdk";
+import { assertRobinhoodChain, escrowCalls, estimateRelay, readVault, relayGasCap, relayTransaction, retryingHttp, robinhoodChain, robinhoodClient, usdgAbi, type Deployment, type RelayCall, type VaultState } from "@ostraagent/sdk";
 import type { Config } from "./config.ts";
 
 /** Gas limit of a transaction the fee payer sends = estimate + 20% (as the relayer, decided 17 Oct 2026). */
@@ -81,7 +81,10 @@ export function revertReason(err: unknown): string {
  * Sends `calls` from `account` (one call as it is, several through Multicall3
  * aggregate3, none allowed to fail) and waits for a successful receipt. The
  * transaction is simulated first (eth_estimateGas): one that reverts now is
- * not sent (SimulationError). Returns the transaction hash.
+ * not sent (SimulationError). A transaction with an OstraRouter escrow
+ * execution gets the gas limit its swap needs as the relayer prices it
+ * (estimateRelay): eth_estimateGas finds the least gas that does not revert,
+ * at which an escrow refunds instead of swapping. Returns the transaction hash.
  */
 export async function sendCalls(client: PublicClient, transport: Transport, account: PrivateKeyAccount, calls: readonly RelayCall[], value = 0n): Promise<Hash> {
   const tx = relayTransaction(calls);
@@ -91,8 +94,13 @@ export async function sendCalls(client: PublicClient, transport: Transport, acco
   } catch (err) {
     throw new SimulationError(`the transaction reverts now, so it was not sent: ${revertReason(err)}`);
   }
+  let limit = gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
+  if (escrowCalls(tx) > 0) {
+    const swapLimit = relayGasCap((await estimateRelay(client, { relayer: account.address, to: tx.to, data: tx.data, value })).gas);
+    if (swapLimit > limit) limit = swapLimit;
+  }
   const wallet = createWalletClient({ account, chain: robinhoodChain, transport });
-  const hash = await wallet.sendTransaction({ account, chain: robinhoodChain, to: tx.to, data: tx.data, value, gas: gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n });
+  const hash = await wallet.sendTransaction({ account, chain: robinhoodChain, to: tx.to, data: tx.data, value, gas: limit });
   const receipt = await client.waitForTransactionReceipt({ hash, timeout: RECEIPT_TIMEOUT_MS });
   if (receipt.status !== "success") throw new Error(`transaction ${hash} reverted on-chain`);
   return hash;

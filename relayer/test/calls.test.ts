@@ -208,6 +208,9 @@ test("Ostra Swap: the router's escrow-order functions and the private pool's spe
     if (as === null) assert.equal(parseCall({ to: pool, data: concat([selector, `0x${"00".repeat(96)}`]) }).fn, null);
     else assert.throws(() => parseCall({ to: pool, data: concat([selector, "0x00"]) }), /malformed/);
   }
+  // A vault's shield takes what the pool's escrow holds: read with its token and tag.
+  const tag = `0x${"07".repeat(32)}` as Hex;
+  assert.deepEqual(parseCall({ to: pool, data: encodeFunctionData({ abi: ostraPrivatePoolAbi, functionName: "shieldFromEscrow", args: [order.tokenIn, tag] }) }), { fn: "shieldFromEscrow", to: pool, token: order.tokenIn, tag });
 });
 
 test("the SDK's executeEscrow selector and EscrowExecuted topic are OstraRouter's", () => {

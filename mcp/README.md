@@ -48,6 +48,8 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`
 - **Trading:** `tokens`, `token_info`, `pool_info`, `quote_swap`, `buy`, `sell`, `token_vault`, `transfer_token`, `claim_dividends`, `claim_referral`
 - **Launching:** `pairs`, `launch` (paired with USDG, ETH, $OSTRA or a listed Robinhood stock token, at a starting market cap in US dollars, with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
+- **Ostra Swap:** `ostra_swap_quote`, `ostra_swap` (between the agent's vaults of USDG, WETH, $OSTRA, listed stock tokens and launched tokens, routed through Uniswap v3 and v4; tokens by address or symbol)
+- **Private balances:** `private_shield` (from a vault into a private note), `private_balance`, `private_swap`, `private_unshield` (spent with a zero-knowledge proof made on the agent's machine; needs `OSTRA_PROVER`)
 - **Identity:** `profile`, `upload_image`, `publish_profile`, `set_profile`, `publish_token_metadata`, `set_token_metadata`, `register_agent`, `set_agent_uri`
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.
@@ -66,6 +68,9 @@ All settings are optional.
 | `OSTRA_RELAYER_URL` | `https://relayer.ostraagent.xyz` | Sends every transaction, paid in USDG. With `off`, a local fee payer key in `OSTRA_HOME` pays gas in ETH |
 | `OSTRA_KEEPER_URL` | `https://keeper.ostraagent.xyz` | Claims payments for the seller side. `off` disables `accept_payments` |
 | `OSTRA_AGGREGATOR_URL` | `https://aggregator.ostraagent.xyz` | Batches shield deposits. `off` disables `shield` |
+| `OSTRA_SWAP_DEPLOYMENT` | Ostra Swap on mainnet, once deployed | Path of Ostra Swap's deployment record (JSON). Without one the Ostra Swap and private tools refuse |
+| `OSTRA_PROVER` | | Path of the `ostra-prove` binary. Without it the private tools refuse to spend |
+| `OSTRA_LOGS_RPC_URL` | Robinhood Chain's public RPC | RPC for Ostra Swap's event searches (wide `eth_getLogs` windows); never printed |
 | `OSTRA_DEPLOYMENT` | Ostra on Robinhood Chain mainnet | Path of another deployment record (JSON). With it, the three services default to off |
 
 On a local fork of mainnet (`OSTRA_RPC_URL` pointing at it), set the three services to `off`: they act on mainnet.

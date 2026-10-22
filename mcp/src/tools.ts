@@ -4,14 +4,15 @@
 // unless its message says otherwise. Amounts are decimal strings: USDG with
 // at most 6 decimals, launched tokens, OSTRA, stock tokens and ETH with at
 // most 18. A launch pairs with USDG, ETH, OSTRA or a listed stock token (the
-// `pairs` tool); its market cap is in US dollars.
+// `pairs` tool); its market cap is in US dollars. Ostra Swap's tools take a
+// token as an address or the symbol of a pair (ETH: WETH, which a vault holds).
 
 import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
-import { LAUNCH_PAIRS, QuoteError, redact } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, QuoteError, WETH, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
@@ -23,6 +24,16 @@ const units = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/, "an amount: 
 const pair = z.enum(LAUNCH_PAIRS.map((p) => p.symbol) as [string, ...string[]]);
 const slippage = z.number().int().min(0).max(1_000).optional().describe("slippage in bps (default 100 = 1%, at most 1000)");
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "32 bytes of 0x hex");
+/** A token of Ostra Swap: an address, or a pair's symbol (ETH and WETH: WETH). */
+const swapToken = z.string().regex(/^(0x[0-9a-fA-F]{40}|[A-Za-z0-9]{1,11})$/, "a token address or a pair's symbol (USDG, ETH, OSTRA, a listed stock token's ticker)");
+const tokenAddress = (text: string): string => {
+  if (text.startsWith("0x")) return text;
+  const u = text.toUpperCase();
+  if (u === "ETH" || u === "WETH") return WETH;
+  const p = LAUNCH_PAIRS.find((q) => q.symbol === u);
+  if (p === undefined) throw new RangeError(`${text} is not a symbol Ostra knows; give the token's address, or one of WETH, ${LAUNCH_PAIRS.filter((q) => q.kind !== "eth").map((q) => q.symbol).join(", ")}`);
+  return p.address;
+};
 const uri = z.string().max(256).regex(/^(ipfs|https):\/\/[^\s]+$/, "an ipfs:// or https:// URI of at most 256 bytes");
 /** What a profile or a token's metadata tells: texts and https links; image an ipfs:// or https:// URI (upload_image makes one). */
 const publicFields = {
@@ -34,7 +45,7 @@ const publicFields = {
 };
 
 /** A tool's answer: its result as JSON, or the error, with what kind of error it is. */
-async function run(fn: () => Promise<unknown>, rpcUrl: string): Promise<CallToolResult> {
+async function run(fn: () => Promise<unknown>, rpcUrls: readonly string[]): Promise<CallToolResult> {
   try {
     return { content: [{ type: "text", text: toJson(await fn()) }] };
   } catch (err) {
@@ -43,8 +54,8 @@ async function run(fn: () => Promise<unknown>, rpcUrl: string): Promise<CallTool
     else if (err instanceof RelayerError) kind = `relayer_refused ${err.status} ${err.code}`;
     else if (err instanceof QuoteError) kind = `refused_before_signing ${err.code}`;
     else if (err instanceof RangeError) kind = "invalid_input";
-    // The RPC URL may carry an API key (viem's errors print it): never passed on.
-    const message = redact(err instanceof Error ? err.message : String(err), rpcUrl);
+    // The RPC URLs may carry an API key (viem's errors print them): never passed on.
+    const message = rpcUrls.reduce((text, url) => redact(text, url), err instanceof Error ? err.message : String(err));
     return { isError: true, content: [{ type: "text", text: `${kind}: ${message}` }] };
   }
 }
@@ -54,8 +65,17 @@ export function registerTools(server: McpServer, agent: Agent): void {
     if (agent.launchpad === null) throw new Error("this deployment has no launchpad");
     return agent.launchpad;
   };
+  const ostraSwap = () => {
+    if (agent.swap === null) throw new Error("Ostra Swap is not configured here (OSTRA_SWAP_DEPLOYMENT)");
+    return agent.swap;
+  };
+  const notes = () => {
+    if (agent.privateBalance === null) throw new Error("Ostra Swap is not configured here (OSTRA_SWAP_DEPLOYMENT)");
+    return agent.privateBalance;
+  };
+  const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
-    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), agent.config.rpcUrl)) as never);
+    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), [agent.config.rpcUrl, agent.config.logsRpcUrl])) as never);
 
   // --- the vault ---------------------------------------------------------------------------------
   tool("open_vault", "Creates the agent's vault (USDG on Robinhood Chain, post-quantum WOTS keys) or finds it. With the Ostra relayer, its creation is paid later from the vault.", {}, () => agent.buyer.open());
@@ -108,6 +128,39 @@ export function registerTools(server: McpServer, agent: Agent): void {
     const ctx = await agent.privateVault(await agent.unshield.indexOf(a.vault));
     return ctx.vault.withdraw(a.destination, a.amount);
   });
+
+  // --- Ostra Swap: swaps between the agent's vaults, and private balances in OstraPrivatePool -----------------
+  tool(
+    "ostra_swap_quote",
+    "Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault). Nothing is signed.",
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage },
+    (a) => ostraSwap().quote({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps) }),
+  );
+  tool(
+    "ostra_swap",
+    "Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address.",
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage },
+    (a) => ostraSwap().swap({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps) }),
+  );
+  tool(
+    "private_shield",
+    "Moves `amount` of a token (USDG, WETH, OSTRA or a listed stock token) from the agent's vault of it into a private note in OstraPrivatePool. Notes are kept on this machine, in OSTRA_HOME (a backup of the seed does not bring them back yet: keep OSTRA_HOME). Later spends (private_swap, private_unshield) are sent by the Ostra relayer and do not show which note or vault they spend; their tokens, amounts and times are public.",
+    { token: swapToken, amount: units },
+    (a) => notes().shield({ token: tokenAddress(a.token), amount: a.amount }),
+  );
+  tool("private_balance", "The agent's private notes in OstraPrivatePool: per token the total, the number of notes and the largest one (a spend uses one note).", {}, () => notes().balance());
+  tool(
+    "private_swap",
+    "Swaps `amount` of tokenIn held in a private note into a new private note of tokenOut, through Ostra Swap, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note (a fee in tokenIn); the change stays private.",
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage },
+    (a) => notes().swap({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps) }),
+  );
+  tool(
+    "private_unshield",
+    "Pays `amount` of a token out of a private note to an address, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note; the change stays private. The default destination is the agent's vault of that token, which an observer can link to the vault that shielded: pay a fresh address for privacy.",
+    { token: swapToken, amount: units, destination: address.optional() },
+    (a) => notes().unshield({ token: tokenAddress(a.token), amount: a.amount, ...opt("destination", a.destination) }),
+  );
 
   // --- recovery ----------------------------------------------------------------------------------------
   tool("recovery_status", "The vault's guardians, recovery policy and any recovery waiting.", {}, () => agent.buyer.recovery());
