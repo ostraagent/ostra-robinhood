@@ -272,10 +272,12 @@ cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm c
   kind, a spend whose fee is worth less than it costs is refused with the fee that would do.
   Private spends move only USDG, WETH, OSTRA and the listed stock tokens, along legs the swap SDK
   builds on the pools it routes through, so all the code they run is known. A spend that reverts
-  costs the relayer its gas and pays nothing, so reverts are bounded: a note or an IP address with
-  two reverted spends in 24 hours gets nothing more relayed in that time, four reverted spends
-  within half an hour pause private relaying, and one IP address gets 30 requests an hour. Every hour the relayer sells the fees it took for
-  ETH through the router.
+  costs the relayer its gas and pays nothing, so reverts are bounded: a note or a client with
+  two reverted spends in 24 hours gets nothing more relayed in that time, and four reverted spends
+  within half an hour pause private relaying; the relayer's ledger keeps these counts, so a restart
+  does not reset them. One client gets 30 private spends relayed an hour, and 30 fresh quotes and
+  120 requests on a live quote a minute (429 with Retry-After); a client is an IPv4 address or an
+  IPv6 /64. Every hour the relayer sells the fees it took for ETH through the router.
   `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
   ETH; its fork test runs it on a mainnet fork.
 - `core/`: Ostra Agent's logic shared by the MCP package and the web app (`@ostraagent/core`),
@@ -313,9 +315,14 @@ cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm c
   the vault (open_vault, balance, withdraw), channels and pay, the seller side (accept_payments),
   shield and unshield, recovery, and the launchpad (pool_info, quote_swap, buy, sell, token_vault,
   transfer_token, claim_dividends, launch, set_pool_setting, set_creator_share, airdrop_fund,
-  airdrop_start, airdrop_claim, airdrop_close, vesting_release, claim_referral and more). A refused
-  tool says whether it was refused before anything was signed. With OSTRA_RELAYER_URL the agent needs
-  no ETH. `test/mcp.fork.test.ts` drives the server over stdio on a fork.
+  airdrop_start, airdrop_claim, airdrop_close, vesting_release, claim_referral and more), and Ostra
+  Swap (ostra_swap_quote, ostra_swap, private_shield, private_balance, private_swap,
+  private_unshield, private_recover). A refused tool says whether it was refused before anything
+  was signed. With OSTRA_RELAYER_URL the agent needs no ETH. `test/mcp.fork.test.ts` drives the
+  server over stdio on a fork. `scripts/swap-check.ts` runs Ostra Swap end to end through the
+  server and the relayer (vault swaps, a shield, a private swap, unshields, the notes found again
+  from the seed), every step a real transaction; its fork test runs it against the relayer and
+  keeper set up as on mainnet.
 - `aggregator/`: the aggregator service (`@ostraagent/aggregator`). It builds the shielded pool's
   batches: a depositor posts a leaf set of its pending deposit, signed (EIP-191) by its depositor
   key and checked against the deposit's amount after the pool fee, with that key and its deposit
