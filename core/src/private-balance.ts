@@ -299,14 +299,25 @@ export class PrivateBalanceService {
     return { shielded, spends, notes };
   }
 
-  /** The pool's Shielded, Unshielded and PrivateSwapped logs in [from, to]; a range the RPC refuses as too many logs is split in halves. */
+  /**
+   * The pool's Shielded, Unshielded and PrivateSwapped logs in [from, to], one event per request: Robinhood Chain's
+   * public RPC serves LOG_WINDOW_BLOCKS only for one value per topic position, and a request naming the three events
+   * at once over at most 100,000 blocks (measured 23 Oct 2026, error -32602).
+   */
   async #poolLogs(from: bigint, to: bigint): Promise<PoolLog[]> {
+    const out: PoolLog[] = [];
+    for (const event of [shieldedEvent, unshieldedEvent, swappedEvent]) out.push(...(await this.#eventLogs(event, from, to)));
+    return out;
+  }
+
+  /** The pool's logs of `event` in [from, to]; a range the RPC refuses as too many logs is split in halves. */
+  async #eventLogs(event: typeof shieldedEvent | typeof unshieldedEvent | typeof swappedEvent, from: bigint, to: bigint): Promise<PoolLog[]> {
     try {
-      return (await this.#p.logsClient.getLogs({ address: this.#pool, events: [shieldedEvent, unshieldedEvent, swappedEvent], fromBlock: from, toBlock: to, strict: true })) as PoolLog[];
+      return (await this.#p.logsClient.getLogs({ address: this.#pool, event, fromBlock: from, toBlock: to, strict: true })) as unknown as PoolLog[];
     } catch (err) {
       if (from >= to || !/exceeds limit|too many|query returned more than/i.test(String((err as Error).message ?? err))) throw err;
       const mid = from + (to - from) / 2n;
-      return [...(await this.#poolLogs(from, mid)), ...(await this.#poolLogs(mid + 1n, to))];
+      return [...(await this.#eventLogs(event, from, mid)), ...(await this.#eventLogs(event, mid + 1n, to))];
     }
   }
 
