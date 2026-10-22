@@ -18,18 +18,20 @@
 // when the market is closed (no heartbeat then), so a price is accepted up to
 // STOCK_PRICE_MAX_AGE old: a long weekend, not a stale feed.
 //
-// OSTRA's price in USD is Chainlink ETH/USD times its Pons curve's spot price
-// in ETH (the curve's ETH reserve over its token reserve, ponsCurveAbi), read on
-// chain at the time of use. Once the curve has graduated and OSTRA has migrated
-// to its own pool, the price is refused until that pool is wired here. The
-// price has 8 decimals like the others: at $0.00002 that is 2,000 units, so
+// OSTRA's price in USD is Chainlink ETH/USD times its spot price in ETH, read
+// on chain at the time of use: on its Pons curve (the curve's ETH reserve over
+// its token reserve, ponsCurveAbi) until the curve graduates, then in the pool
+// Pons graduated it to (constants.ts PONS_HOOK: native ETH / OSTRA on Uniswap
+// v4, its slot0 price read from the PoolManager's storage; a pool with no
+// liquidity is refused). OSTRA graduated on 22 Oct 2026. The price has 8
+// decimals like the others: at $0.00002 that is 2,000 units, so
 // a market cap set in OSTRA is within 0.05% of the dollars asked; under 100
 // units (a price under $0.000001) it is refused rather than set more than 1%
 // off.
 
-import { getAddress, parseAbi, zeroAddress, type Address, type PublicClient } from "viem";
-import { CHAINLINK_ETH_USD, OSTRA, OSTRA_DECIMALS, OSTRA_PONS_CURVE, USDG } from "./constants.ts";
-import { chainlinkAggregatorAbi, ponsCurveAbi } from "./external-abi.ts";
+import { encodeAbiParameters, getAddress, hexToBigInt, keccak256, parseAbi, toHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
+import { CHAINLINK_ETH_USD, OSTRA, OSTRA_DECIMALS, OSTRA_PONS_CURVE, OSTRA_POOL_FEE, OSTRA_POOL_TICK_SPACING, PONS_HOOK, UNISWAP_V4_POOL_MANAGER, USDG } from "./constants.ts";
+import { chainlinkAggregatorAbi, poolManagerExtsloadAbi, ponsCurveAbi } from "./external-abi.ts";
 
 export type LaunchPairKind = "usdg" | "eth" | "ostra" | "stock";
 
@@ -41,7 +43,7 @@ export type LaunchPair = {
   /** The pool's quote currency: address(0) for ETH. */
   address: Address;
   decimals: number;
-  /** The Chainlink feed of its USD price (null: USDG, one dollar; OSTRA: ETH/USD, times its Pons curve's price in ETH). */
+  /** The Chainlink feed of its USD price (null: USDG, one dollar; OSTRA: ETH/USD, times its price in ETH in its pool). */
   feed: Address | null;
 };
 
@@ -126,9 +128,32 @@ export type PairUsdPrice = {
   updatedAt: number;
 };
 
+/** The v4 pool id of the pool Pons graduates OSTRA to: keccak256(abi.encode(PoolKey)). */
+export const OSTRA_POOL_ID: Hex = keccak256(
+  encodeAbiParameters(
+    [{ type: "address" }, { type: "address" }, { type: "uint24" }, { type: "int24" }, { type: "address" }],
+    [zeroAddress, OSTRA, OSTRA_POOL_FEE, OSTRA_POOL_TICK_SPACING, PONS_HOOK],
+  ),
+);
+
+/** v4-core StateLibrary: the PoolManager's pools mapping is at slot 6; a pool's liquidity is 3 slots after its slot0. */
+const POOLS_SLOT = 6n;
+const LIQUIDITY_OFFSET = 3n;
+
+/** The spot price (slot0's sqrtPriceX96) and in-range liquidity of the pool Pons graduated OSTRA to. */
+export async function readOstraPool(client: PublicClient): Promise<{ sqrtPriceX96: bigint; liquidity: bigint }> {
+  const slot0 = keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [OSTRA_POOL_ID, POOLS_SLOT]));
+  const [word, liq] = await Promise.all([
+    client.readContract({ address: UNISWAP_V4_POOL_MANAGER, abi: poolManagerExtsloadAbi, functionName: "extsload", args: [slot0] }),
+    client.readContract({ address: UNISWAP_V4_POOL_MANAGER, abi: poolManagerExtsloadAbi, functionName: "extsload", args: [toHex(hexToBigInt(slot0) + LIQUIDITY_OFFSET, { size: 32 })] }),
+  ]);
+  return { sqrtPriceX96: hexToBigInt(word) & ((1n << 160n) - 1n), liquidity: hexToBigInt(liq) & ((1n << 128n) - 1n) };
+}
+
 /**
  * The price of `quote` in USD now: USDG is one dollar; ETH and the stock tokens from Chainlink (a stock times its
- * uiMultiplier); OSTRA is ETH/USD times its Pons curve's spot price in ETH, refused once the curve has graduated.
+ * uiMultiplier); OSTRA is ETH/USD times its spot price in ETH, on its Pons curve until the curve graduates, then in
+ * the pool Pons graduated it to.
  */
 export async function readPairUsdPrice(client: PublicClient, quote: LaunchPair): Promise<PairUsdPrice> {
   const block = await client.getBlock();
@@ -152,11 +177,18 @@ export async function readPairUsdPrice(client: PublicClient, quote: LaunchPair):
       client.readContract({ address: OSTRA_PONS_CURVE, abi: ponsCurveAbi, functionName: "graduated" }),
       client.readContract({ address: OSTRA_PONS_CURVE, abi: ponsCurveAbi, functionName: "getReserves" }),
     ]);
-    if (graduated) throw new Error("OSTRA has graduated from its Pons curve and migrated; its price is not read from its new pool yet");
-    const [ethReserve, tokenReserve] = reserves;
-    if (ethReserve <= 0n || tokenReserve <= 0n) throw new Error(`the OSTRA Pons curve reports reserves of ${ethReserve} wei and ${tokenReserve} tokens`);
-    // Both have 18 decimals: USD per whole OSTRA = USD per ETH x ETH per OSTRA.
-    priceE8 = (answer * ethReserve) / tokenReserve;
+    if (graduated) {
+      const { sqrtPriceX96, liquidity } = await readOstraPool(client);
+      if (sqrtPriceX96 === 0n || liquidity === 0n) throw new Error(`OSTRA's pool ${OSTRA_POOL_ID} has no price or no liquidity in range`);
+      // ETH is currency0 and OSTRA currency1, both 18 decimals: OSTRA per ETH = sqrtPriceX96^2 / 2^192, so USD per
+      // whole OSTRA = USD per ETH x 2^192 / sqrtPriceX96^2.
+      priceE8 = (answer << 192n) / (sqrtPriceX96 * sqrtPriceX96);
+    } else {
+      const [ethReserve, tokenReserve] = reserves;
+      if (ethReserve <= 0n || tokenReserve <= 0n) throw new Error(`the OSTRA Pons curve reports reserves of ${ethReserve} wei and ${tokenReserve} tokens`);
+      // Both have 18 decimals: USD per whole OSTRA = USD per ETH x ETH per OSTRA.
+      priceE8 = (answer * ethReserve) / tokenReserve;
+    }
     // With 8 decimals the price is exact to 1/priceE8: under 100 units (0.000001 USD) a market cap set in OSTRA could
     // be more than 1% off, so it is refused rather than set wrong.
     if (priceE8 < 100n) throw new Error(`OSTRA's price (${priceE8} x 0.00000001 USD) is too small to set a market cap in within 1%`);

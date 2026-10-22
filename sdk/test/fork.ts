@@ -42,6 +42,8 @@ export type Fork = {
   wallet: (account: PrivateKeyAccount) => WalletClient;
   /** Sets `holder`'s USDG balance (anvil_dealERC20, the fork equivalent of forge's deal). */
   dealUsdg: (holder: Address, amount: bigint) => Promise<void>;
+  /** Sets `holder`'s balance of the ERC-20 `token` (anvil_dealERC20). */
+  dealToken: (holder: Address, token: Address, amount: bigint) => Promise<void>;
   /** Sets `holder`'s ETH balance in wei (anvil_setBalance). */
   setBalance: (holder: Address, wei: bigint) => Promise<void>;
   /** Moves the fork's clock forward and mines a block. */
@@ -108,6 +110,9 @@ export async function startFork(): Promise<Fork> {
     wallet: (account) => createWalletClient({ account, chain: robinhoodChain, transport: http(url) }),
     dealUsdg: async (holder, amount) => {
       await rpc(url, "anvil_dealERC20", [holder, USDG, numberToHex(amount)]);
+    },
+    dealToken: async (holder, token, amount) => {
+      await rpc(url, "anvil_dealERC20", [holder, token, numberToHex(amount)]);
     },
     setBalance: async (holder, wei) => {
       await rpc(url, "anvil_setBalance", [holder, numberToHex(wei)]);

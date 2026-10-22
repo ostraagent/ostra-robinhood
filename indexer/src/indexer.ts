@@ -15,9 +15,8 @@
 //             with the JSON files they point at (data, never instructions)
 //   prices    ETH/USD from Chainlink; a USDG pool's quote is $1; a listed
 //             stock token's (sdk pairs.ts) from its Chainlink feed times its
-//             uiMultiplier; OSTRA's from ETH/USD times its Pons curve's price
-//             (none once the curve has graduated); other quotes have no USD
-//             price here
+//             uiMultiplier; OSTRA's from ETH/USD times its price in the pool
+//             Pons graduated it to; other quotes have no USD price here
 //
 // Logs are read in windows that shrink when the RPC refuses one and grow back
 // after it answers; the state is written to a JSON file after every scan that
@@ -452,9 +451,9 @@ export class Indexer {
           const price = await readPairUsdPrice(this.#client, pair);
           this.#pairUsd.set(pair.address, Number(price.priceE8) / 1e8);
         } catch (err) {
-          // A feed older than readPairUsdPrice accepts, or OSTRA's graduated curve: no USD value rather than an old one.
-          // Other failures keep the last price.
-          if (/last updated|graduated/.test((err as Error).message)) this.#pairUsd.delete(pair.address);
+          // A feed older than readPairUsdPrice accepts, or OSTRA's pool with no price or liquidity: no USD value rather
+          // than an old one. Other failures keep the last price.
+          if (/last updated|no price or no liquidity/.test((err as Error).message)) this.#pairUsd.delete(pair.address);
           this.#log("pair_usd_failed", { quote, reason: (err as Error).message.slice(0, 200) });
         }
       }

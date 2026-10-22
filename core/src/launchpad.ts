@@ -31,7 +31,8 @@
 // traded from a vault (a vault holds one ERC-20; an ETH pool takes native ETH),
 // only from a wallet (wallet-swap.ts). A launch's market cap is given in US
 // dollars and set in the pair's token at its price now (pairs.ts: USDG one
-// dollar, ETH and stocks from Chainlink, OSTRA from ETH/USD and its Pons curve).
+// dollar, ETH and stocks from Chainlink, OSTRA from ETH/USD and its spot price
+// in the pool Pons graduated it to on 22 Oct 2026).
 //
 // Public calls (airdrop claim and close, vesting release and dividends,
 // referral claims, split releases) are sent for the buyer vault as payer.

@@ -14,28 +14,28 @@
 //   * an airdrop round: bought into OstraAirdrop, started with its tree,
 //     claimed for an account, closed after the claim period;
 //   * the vesting released after its cliff;
-//   * an OSTRA pair: OSTRA bought on its Pons curve into the agent's OSTRA
-//     vault, the OSTRA creator vault funded from it, a launch at a market cap
-//     in US dollars (ETH/USD times the curve's price) with a dev buy in OSTRA,
+//   * an OSTRA pair: OSTRA in the agent's OSTRA vault (dealt: OSTRA graduated
+//     from its Pons curve on 22 Oct 2026, so the curve sells no more), the
+//     OSTRA creator vault funded from it, a launch at a market cap in US
+//     dollars (ETH/USD times OSTRA's price in its pool) with a dev buy in OSTRA,
 //     a buy paid in OSTRA from the OSTRA vault and a sale back into it, the
 //     creator vault's OSTRA withdrawn to the OSTRA vault by default, and the
-//     dispatcher owing the $OSTRA buyback share in OSTRA.
+//     dispatcher owing the $OSTRA buyback share in OSTRA, which its owner
+//     claims straight to the burn address (as ostra-swap's buyback does).
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { encodeFunctionData, formatUnits, keccak256, stringToHex, type Address, type Hash, type PublicClient } from "viem";
+import { createWalletClient, formatUnits, http, keccak256, stringToHex, type Address, type Hash, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   FileWotsStore,
   OSTRA,
-  OSTRA_PONS_CURVE,
   USDG,
   ostraDispatcherAbi,
   ostraTokenAbi,
-  ponsCurveAbi,
   readVault,
   retryingHttp,
   usdgAbi,
@@ -107,11 +107,9 @@ test("an OSTRA pair: fund, launch at a market cap in US dollars with a dev buy, 
   const lp = new LaunchpadService({ client, transport, config, keys, buyer, buyerSender: local, creator, creatorSender: local });
   await buyer.open();
 
-  // OSTRA bought on its Pons curve straight into the agent's OSTRA vault (not created yet).
+  // OSTRA straight into the agent's OSTRA vault (not created yet): about what 0.3 ETH buys in its pool.
   const ostraVault = await lp.tokenVault(OSTRA).vaultAddress();
-  const wei = 3n * 10n ** 17n;
-  const buy = await fork.wallet(feePayer).sendTransaction({ account: feePayer, chain: fork.client.chain, to: OSTRA_PONS_CURVE, data: encodeFunctionData({ abi: ponsCurveAbi, functionName: "buy", args: [wei, 0n, ostraVault] }), value: wei });
-  assert.equal((await fork.client.waitForTransactionReceipt({ hash: buy })).status, "success");
+  await fork.dealToken(ostraVault, OSTRA, 7_000_000n * 10n ** 18n);
   const held = await tokens(OSTRA, ostraVault);
   assert.ok(held > 0n);
 
@@ -161,7 +159,18 @@ test("an OSTRA pair: fund, launch at a market cap in US dollars with a dev buy, 
   // The hook booked the $OSTRA buyback share of these swaps in OSTRA.
   const lpd = d.launchpad;
   assert.ok(lpd !== undefined);
-  assert.ok(((await fork.client.readContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "buybackOwed", args: [OSTRA] })) as bigint) > 0n);
+  const owed = (await fork.client.readContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "buybackOwed", args: [OSTRA] })) as bigint;
+  assert.ok(owed > 0n);
+  // The buyback (ostra-swap sdk/scripts/buyback.ts) claims the part owed in OSTRA straight to the burn address.
+  const owner = (await fork.client.readContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "owner" })) as Address;
+  await fork.client.request({ method: "anvil_impersonateAccount" as never, params: [owner] as never });
+  await fork.setBalance(owner, 10n ** 18n);
+  const dead: Address = "0x000000000000000000000000000000000000dEaD";
+  const deadBefore = await tokens(OSTRA, dead);
+  const claim = await createWalletClient({ account: owner, chain: fork.client.chain, transport: http(fork.url) }).writeContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "claimBuyback", args: [OSTRA, dead], account: owner, chain: fork.client.chain });
+  assert.equal((await fork.client.waitForTransactionReceipt({ hash: claim })).status, "success");
+  assert.equal(await tokens(OSTRA, dead), deadBefore + owed, "the OSTRA owed went to the burn address");
+  assert.equal(await fork.client.readContract({ address: lpd.dispatcher, abi: ostraDispatcherAbi, functionName: "buybackOwed", args: [OSTRA] }), 0n);
 });
 
 test("the launchpad service: launch with a dev buy, buy and sell, settings, shares, an airdrop round, the vesting", { timeout: 900_000 }, async () => {

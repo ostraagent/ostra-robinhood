@@ -46,6 +46,9 @@ export const ponsCurveAbi = parseAbi([
   "function buy(uint256 ethIn, uint256 minTokensOut, address recipient) payable returns (uint256 tokensOut)",
 ]);
 
+/** Uniswap v4 PoolManager's extsload: its pools are read from storage (v4-core StateLibrary: pools at slot 6). */
+export const poolManagerExtsloadAbi = parseAbi(["function extsload(bytes32 slot) view returns (bytes32)"]);
+
 /** Multicall3 aggregate3. */
 export const multicall3Abi = parseAbi([
   "struct Call3 { address target; bool allowFailure; bytes callData; }",

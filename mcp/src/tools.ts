@@ -227,7 +227,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "launch",
-    "Launches a token on the Ostra launchpad (1 billion supply) paired with USDG (default), ETH, OSTRA or a listed stock token (pairs), from the agent's creator vault of that pair, optionally with a dev buy in the pair's token paid by that creator vault in the same transaction and vesting to the agent's token vault. The market cap is in US dollars, set in the pair's token at its price now (Chainlink for ETH and stocks; OSTRA at Chainlink ETH/USD times its bonding curve's price). The relayer fronts the 0.0002 ETH launch fee and charges it in USDG. The launch is simulated first; nothing is signed if it would fail. `options` sets LaunchParams fields (taxes, buckets, anti-snipe, limits, graduation, circuit breaker) beyond Ostra's defaults.",
+    "Launches a token on the Ostra launchpad (1 billion supply) paired with USDG (default), ETH, OSTRA or a listed stock token (pairs), from the agent's creator vault of that pair, optionally with a dev buy in the pair's token paid by that creator vault in the same transaction and vesting to the agent's token vault. The market cap is in US dollars, set in the pair's token at its price now (Chainlink for ETH and stocks; OSTRA at Chainlink ETH/USD times its price in the pool it graduated to). The relayer fronts the 0.0002 ETH launch fee and charges it in USDG. The launch is simulated first; nothing is signed if it would fail. `options` sets LaunchParams fields (taxes, buckets, anti-snipe, limits, graduation, circuit breaker) beyond Ostra's defaults.",
     {
       name: z.string().min(1).max(64),
       symbol: z.string().regex(/^[A-Za-z0-9]{1,11}$/),

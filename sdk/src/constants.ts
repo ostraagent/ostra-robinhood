@@ -63,6 +63,16 @@ export const OSTRA_DECIMALS = 18;
 export const OSTRA_CODE_HASH = "0x55e96d3bbff72f192ba79b21f7735c50dd0db6ced9f185de166ee9d871c92351";
 export const OSTRA_PONS_CURVE: Address = "0xef89C3a9832Ae6f8Dc5F785484b1B5cb1120F372";
 export const OSTRA_PONS_CURVE_CODE_HASH = "0xd71963ef1e2c4c13de134e298ce13bda63e8fb453b0fa9db1bea9296433ea6a0";
+/**
+ * The pool Pons graduates OSTRA to: native ETH (currency0) / OSTRA (currency1) on Uniswap v4
+ * (UNISWAP_V4_POOL_MANAGER), fee 0, tick spacing 200, the Pons V2 meme hook PONS_HOOK; the same key as ostra-swap's
+ * OstraBuyback.ostraPoolKey. Checked on chain 4663 on 22 Oct 2026, after the curve graduated (graduated() true, the
+ * curve holding no OSTRA and no ETH): the pool is initialized with liquidity 29,277,002,188,455,997,495,745 at about
+ * 23.4 million OSTRA per ETH, and the V4Quoter quotes 0.001 ETH in for 22,737 OSTRA out.
+ */
+export const PONS_HOOK: Address = "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044";
+export const OSTRA_POOL_FEE = 0;
+export const OSTRA_POOL_TICK_SPACING = 200;
 /** The deterministic CREATE2 deployer (github.com/Arachnid/deterministic-deployment-proxy): OstraHook is mined with it. */
 export const CREATE2_DEPLOYER: Address = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 

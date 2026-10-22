@@ -95,7 +95,7 @@ Ostra Swap (the swap router, the private pool and its verifier) is in its own re
 | `rpc-proxy/` | The read-only RPC proxy for the web app |
 | `indexer/` | The launchpad's tokens, trades and price candles, read from the chain's logs, for the web app |
 | `uploader/` | Pins agents' profiles, token metadata and images to IPFS |
-| `buyback/` | The $OSTRA buyback and burn: claims the launchpad's buyback share, buys OSTRA and burns it |
+| `buyback/` | Retired on 22 Oct 2026 (OSTRA graduated): the $OSTRA buyback and burn runs from ostra-swap |
 | `deployments/` | The mainnet deployment record |
 | `ops/` | systemd units and nginx server blocks |
 | `vectors/` | WOTS and LtHash test vectors shared by Solidity and TypeScript |
@@ -125,7 +125,6 @@ cd mcp && npm ci && npm run typecheck && npm test   # after the core's npm ci
 cd rpc-proxy && npm ci && npm run typecheck && npm test   # after the sdk's, the merchant's and the core's npm ci; needs anvil
 cd indexer && npm ci && npm run typecheck && npm test   # after the sdk's and the core's npm ci; needs ../out and anvil
 cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs with OSTRA_PINATA_JWT_FILE
-cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm ci; needs ../out and anvil
 ```
 
 ## Components in detail
@@ -356,8 +355,13 @@ cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm c
 - `uploader/`: pins images (PNG, JPEG, WebP, GIF up to 1 MB, checked by their first bytes) and JSON
   files up to 16 KB to IPFS through Pinata, with limits per client address and a daily byte budget;
   served under /v1/ipfs/ on the relayer's host.
-- `buyback/`: the $OSTRA buyback and burn, run every hour by the dispatcher's owner
-  (`ops/systemd/ostra-buyback.timer`). It claims the buyback share owed in USDG, ETH (as WETH) and
+- `buyback/`: retired on 22 Oct 2026, when OSTRA graduated from its Pons curve. The buyback and
+  burn now runs from ostra-swap (`sdk/scripts/buyback.ts` and its `ops/systemd/ostra-buyback.timer`):
+  every hour it claims the launchpad's buyback share to OstraBuyback (the part owed in OSTRA straight
+  to the burn address), turns it and Ostra Swap's half of its fees into WETH, buys OSTRA with it in
+  the pool Pons graduated OSTRA to (ETH/OSTRA on Uniswap v4) and sends it to the burn address. The
+  code below stays for the record and is no longer installed. It was the $OSTRA buyback and burn,
+  run every hour by the dispatcher's owner. It claimed the buyback share owed in USDG, ETH (as WETH) and
   OSTRA once a share is worth at least `OSTRA_BUYBACK_MIN_USD` (default 1 USD), swaps USDG for WETH
   on Uniswap v3 (the USDG/WETH pool that quotes best, at most 0.5% below the quote and only within 1%
   of Chainlink ETH/USD), unwraps it, buys OSTRA with the ETH on its Pons bonding curve (at most 1%
