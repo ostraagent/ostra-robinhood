@@ -4,7 +4,7 @@
   "fromBlock": "91991509",
   "token": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
   "batchSettlement": "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
-  "vaultImplementation": "0xa455cbf5Aa10cE858f3b250dc791FCD900e950BC",
+  "vaultImplementation": "0xD20c6744Cfa46d9ec564b119cC923bAb2f9f9331",
   "vaultBeacon": "0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0",
   "vaultFactory": "0x043a15c514CFE2c797d33520bFF91a5DCdbf2979",
   "poolImplementation": "0xC04d4a222dC1C966640B977608bE29949b0648ec",
@@ -23,5 +23,6 @@
     "vesting": "0xadD9C1995910457312c156E7D8120D1b447E179a",
     "airdrop": "0xBC798D956aF4c2B104FFC6106d5322294Bc103bb",
     "owner": "0x6569E27A95a6A3E92A311B4Cc6600fed56aA50A2"
-  }
+  },
+  "registry": "0xcE6Cc1f93744f4090DA1444Bb8590d9206157506"
 }

@@ -70,12 +70,15 @@ full record, with the outside contracts Ostra uses, is
 | OstraCreatorSplit | Creator payouts shared with up to 100 recipients | [`0x987994dE6A1d5303B9e3F50977cB0321BA4D033B`](https://repo.sourcify.dev/4663/0x987994dE6A1d5303B9e3F50977cB0321BA4D033B) |
 | OstraVaultFactory | Creates every vault at its predicted address | [`0x043a15c514CFE2c797d33520bFF91a5DCdbf2979`](https://repo.sourcify.dev/4663/0x043a15c514CFE2c797d33520bFF91a5DCdbf2979) |
 | Vault beacon | Points every vault at its code | [`0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0`](https://repo.sourcify.dev/4663/0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0) |
-| OstraVault | The vaults’ code | [`0xa455cbf5Aa10cE858f3b250dc791FCD900e950BC`](https://repo.sourcify.dev/4663/0xa455cbf5Aa10cE858f3b250dc791FCD900e950BC) |
+| OstraVault version 2 | The vaults’ code since 22 October 2026: profiles, token metadata and agent identity | [`0xd20c6744cfa46d9ec564b119cc923bab2f9f9331`](https://repo.sourcify.dev/4663/0xD20c6744Cfa46d9ec564b119cC923bAb2f9f9331) |
+| OstraRegistry | Agent profiles and token metadata, written by creator vaults only | [`0xcE6Cc1f93744f4090DA1444Bb8590d9206157506`](https://repo.sourcify.dev/4663/0xcE6Cc1f93744f4090DA1444Bb8590d9206157506) |
 | OstraPool | The shielded pool (beacon proxy) | [`0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6`](https://repo.sourcify.dev/4663/0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6) |
 | Pool beacon | Points the pool at its code | [`0x30669Ca534921038a531BBE27116d85bB7406fFF`](https://repo.sourcify.dev/4663/0x30669Ca534921038a531BBE27116d85bB7406fFF) |
 | OstraPool version 2 | The pool’s code | [`0xC04d4a222dC1C966640B977608bE29949b0648ec`](https://repo.sourcify.dev/4663/0xC04d4a222dC1C966640B977608bE29949b0648ec) |
 | OstraSplit factory | Revenue splits of seller channels | [`0xAAf54A483B2c7c2c5ecFc1eDED5ed1619C1bA882`](https://repo.sourcify.dev/4663/0xAAf54A483B2c7c2c5ecFc1eDED5ed1619C1bA882) |
 | OstraUpgradeOwner | Owns both beacons: WOTS key, 72-hour public delay | [`0x55533a51d9bd9b06F2D179d919BB31995EF96E5e`](https://repo.sourcify.dev/4663/0x55533a51d9bd9b06F2D179d919BB31995EF96E5e) |
+
+Ostra Swap (the swap router, the private pool and its verifier) is in its own repository, [ostraagent/ostra-swap](https://github.com/ostraagent/ostra-swap), with its addresses.
 
 ## Repository layout
 

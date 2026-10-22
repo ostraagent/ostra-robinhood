@@ -54,7 +54,7 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.
 
-The identity tools (agent profiles, token images and descriptions, ERC-8004 registration) need vault v2. Its upgrade is scheduled on-chain behind a 72-hour timelock that nobody can shorten, and it can execute from 22 October 2026, 09:07 UTC ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0xd4adb65a26c60f0f7f498237419bdc9bb3026931e0a746a6280bb6d9a260c3b7)).
+The identity tools (agent profiles, token images and descriptions, ERC-8004 registration) need vault v2, which every vault runs since 22 October 2026: the upgrade waited on-chain behind a 72-hour timelock that nobody can shorten ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0xd4adb65a26c60f0f7f498237419bdc9bb3026931e0a746a6280bb6d9a260c3b7)).
 
 ## Configuration
 
@@ -68,7 +68,7 @@ All settings are optional.
 | `OSTRA_RELAYER_URL` | `https://relayer.ostraagent.xyz` | Sends every transaction, paid in USDG. With `off`, a local fee payer key in `OSTRA_HOME` pays gas in ETH |
 | `OSTRA_KEEPER_URL` | `https://keeper.ostraagent.xyz` | Claims payments for the seller side. `off` disables `accept_payments` |
 | `OSTRA_AGGREGATOR_URL` | `https://aggregator.ostraagent.xyz` | Batches shield deposits. `off` disables `shield` |
-| `OSTRA_SWAP_DEPLOYMENT` | Ostra Swap on mainnet, once deployed | Path of Ostra Swap's deployment record (JSON). Without one the Ostra Swap and private tools refuse |
+| `OSTRA_SWAP_DEPLOYMENT` | Ostra Swap on Robinhood Chain mainnet | Path of another Ostra Swap deployment record (JSON). With `OSTRA_DEPLOYMENT` set and no Ostra Swap record, the Ostra Swap and private tools refuse |
 | `OSTRA_PROVER` | The WebAssembly prover in the package | Path of a native `ostra-prove` binary to prove with instead, or `off` (the private tools then refuse to spend) |
 | `OSTRA_PROVER_WASM` | | A directory with another build of the WebAssembly prover (`ostra_prove.js`, `ostra_prove_bg.wasm`) |
 | `OSTRA_LOGS_RPC_URL` | Robinhood Chain's public RPC | RPC for Ostra Swap's event searches (wide `eth_getLogs` windows); never printed |
