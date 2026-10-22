@@ -186,8 +186,11 @@ export class RelaySender {
       sendError = err;
     }
     if (sendError !== undefined && isNodeRefusal(sendError)) {
-      const e = sendError as { shortMessage?: string; message?: string };
-      throw new NotSentError(`the node refused transaction ${hash}: ${e.shortMessage ?? e.message ?? String(sendError)}`, hash);
+      // viem's shortMessage names the error code ("Transaction creation failed."); details is the node's own reason
+      // (an RPC error's message, never its URL), such as insufficient funds for gas * price + value.
+      const e = sendError as { shortMessage?: string; message?: string; details?: string };
+      const reason = e.shortMessage ?? e.message ?? String(sendError);
+      throw new NotSentError(`the node refused transaction ${hash}: ${reason}${e.details !== undefined && e.details !== "" && e.details !== reason ? ` (${e.details})` : ""}`, hash);
     }
     if (sendError === undefined) {
       const deadline = Date.now() + this.#receiptTimeoutMs;
