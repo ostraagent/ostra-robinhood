@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { getAddress } from "viem";
-import { loadRelayerConfig, parseListen } from "../src/config.ts";
+import { loadRelayerConfig, parseListen, parseSwapContracts } from "../src/config.ts";
 
 const deployment = {
   version: 1,
@@ -67,4 +67,22 @@ test("listen addresses", () => {
   assert.throws(() => parseListen("4300"), /host:port/);
   assert.throws(() => parseListen("h:0"), /1..65535/);
   assert.throws(() => parseListen("h:65536"), /1..65535/);
+});
+
+test("OSTRA_SWAP_DEPLOYMENT: optional; its chain must be the deployment's, privatePool optional", async () => {
+  assert.equal(loadRelayerConfig(base).swap, null);
+  const record = { chainId: 4663, fromBlock: "1", router: "0x00000000000000000000000000000000000000c1", stake: "0x00000000000000000000000000000000000000c2", buyback: "0x00000000000000000000000000000000000000c3", privatePool: "0x00000000000000000000000000000000000000c4" };
+  await writeFile(join(root, "swap.json"), JSON.stringify(record));
+  assert.deepEqual(loadRelayerConfig({ ...base, OSTRA_SWAP_DEPLOYMENT: join(root, "swap.json") }).swap, {
+    chainId: 4663,
+    router: getAddress(record.router),
+    stake: getAddress(record.stake),
+    privatePool: getAddress(record.privatePool),
+  });
+  const { privatePool: _, ...withoutPool } = record;
+  assert.equal(parseSwapContracts(withoutPool, 4663).privatePool, null);
+  assert.throws(() => parseSwapContracts({ ...record, chainId: 1 }, 4663), /for chain 1, not 4663/);
+  assert.throws(() => parseSwapContracts({ ...record, router: "nope" }, 4663), /router is not an address/);
+  assert.throws(() => parseSwapContracts({ ...record, stake: undefined }, 4663), /has no stake/);
+  assert.throws(() => loadRelayerConfig({ ...base, OSTRA_SWAP_DEPLOYMENT: join(root, "missing.json") }), /OSTRA_SWAP_DEPLOYMENT .* could not be read/);
 });

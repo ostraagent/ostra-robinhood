@@ -2,17 +2,20 @@
 
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { getAddress, isAddress } from "viem";
+import type { PrivateRelay } from "./private.ts";
 import { applyCors } from "../../merchant/src/cors.ts";
 import type { BackupStore } from "./backups.ts";
 import type { Log, RelayerGate } from "./gate.ts";
 import type { SignatureEscrow } from "./signatures.ts";
 
 /**
- * Largest request body (decided 17 Oct 2026): MAX_RELAY_CALLS calls of a
- * WOTS spend (about 2,300 bytes of calldata, 4,600 hex characters each) with
- * room to spare. On Solana it was 16 KiB, for a 4,096-byte transaction.
+ * Largest request body (decided 17 Oct 2026; raised 21 Oct 2026): a private
+ * spend's calldata (OstraPrivatePool privateSwap or unshield, about 75.5 KB
+ * with its STARK proof: 151,000 hex characters) with room to spare. Before,
+ * 64 KiB: MAX_RELAY_CALLS calls of a WOTS spend (about 2,300 bytes of
+ * calldata each). On Solana it was 16 KiB, for a 4,096-byte transaction.
  */
-export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_BODY_BYTES = 256 * 1024;
 
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -31,6 +34,8 @@ export function createRelayerServer(o: {
   gate: Pick<RelayerGate, "relay" | "vaultState" | "escrow">;
   escrow: Pick<SignatureEscrow, "get">;
   backups: Pick<BackupStore, "get" | "lastWrite" | "write">;
+  /** Serves GET /v1/private/price when the relayer relays private spends. */
+  privateRelay?: Pick<PrivateRelay, "price">;
   facts: Record<string, unknown>;
   clientIp: "socket" | "cf-connecting-ip";
   log: Log;
@@ -45,6 +50,20 @@ export function createRelayerServer(o: {
         if (path === "/v1/relayer" && req.method === "GET") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(toJson(o.facts));
+          return;
+        }
+        if (path === "/v1/private/price" && req.method === "GET" && o.privateRelay !== undefined) {
+          const q = new URL(req.url ?? "/", "http://relayer").searchParams;
+          const token = q.get("token") ?? "";
+          const kind = q.get("kind") ?? "";
+          if (!isAddress(token, { strict: false }) || (kind !== "swap" && kind !== "unshield")) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "bad_request", message: "token=<address>&kind=swap|unshield" }));
+            return;
+          }
+          const answer = await o.privateRelay.price(getAddress(token), kind);
+          res.writeHead(answer.status, answer.headers);
+          res.end(toJson(answer.body));
           return;
         }
         if (path.startsWith("/v1/vaults/") && req.method === "GET") {

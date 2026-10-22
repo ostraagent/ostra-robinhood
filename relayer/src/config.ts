@@ -19,6 +19,12 @@
 //   OSTRA_RELAYER_LISTEN     host:port of this server, e.g. 127.0.0.1:4300
 //   OSTRA_RELAYER_CLIENT_IP  "socket" (default: the connection's address) or
 //                            "cf-connecting-ip" (behind Cloudflare and a local proxy only)
+//   OSTRA_SWAP_DEPLOYMENT    optional: path of the Ostra Swap deployment record
+//                            (ostra-swap script/Deploy.s.sol): {chainId, router,
+//                            stake, privatePool?}. With it the relayer relays
+//                            the router's escrow orders and, with privatePool,
+//                            private spends for their fee, and sells those fees
+//                            for ETH (private.ts, sweep.ts)
 //
 // On Solana the relayer also read OSTRA_CLUSTER, OSTRA_MINT and OSTRA_KORA_URL:
 // the chain is checked by its id, the token comes from the deployment, and
@@ -27,6 +33,9 @@
 import { readFileSync } from "node:fs";
 import { getAddress, isAddress, type Address } from "viem";
 import { parseDeployment, type Deployment } from "@ostraagent/sdk";
+
+/** The Ostra Swap contracts the relayer serves (OSTRA_SWAP_DEPLOYMENT). */
+export type SwapContracts = { chainId: number; router: Address; stake: Address; privatePool: Address | null };
 
 export type RelayerConfig = {
   rpcUrl: string;
@@ -37,6 +46,7 @@ export type RelayerConfig = {
   dataDir: string;
   listen: { host: string; port: number };
   clientIp: "socket" | "cf-connecting-ip";
+  swap: SwapContracts | null;
 };
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -80,17 +90,42 @@ function readDeployment(path: string): Deployment {
   return parseDeployment(json);
 }
 
+/** Reads an Ostra Swap deployment record; throws with the reason. */
+export function parseSwapContracts(json: unknown, chainId: number): SwapContracts {
+  const r = json as { chainId?: unknown; router?: unknown; stake?: unknown; privatePool?: unknown } | null;
+  if (r === null || typeof r !== "object") throw new Error("OSTRA_SWAP_DEPLOYMENT must be a JSON object");
+  if (r.chainId !== chainId) throw new Error(`OSTRA_SWAP_DEPLOYMENT is for chain ${String(r.chainId)}, not ${chainId}`);
+  const addr = (v: unknown, name: string) => {
+    if (typeof v !== "string") throw new Error(`OSTRA_SWAP_DEPLOYMENT has no ${name}`);
+    return evmAddress(v, `OSTRA_SWAP_DEPLOYMENT ${name}`);
+  };
+  return { chainId, router: addr(r.router, "router"), stake: addr(r.stake, "stake"), privatePool: r.privatePool === undefined || r.privatePool === null ? null : addr(r.privatePool, "privatePool") };
+}
+
+function readSwapContracts(path: string | undefined, chainId: number): SwapContracts | null {
+  if (path === undefined || path === "") return null;
+  let json: unknown;
+  try {
+    json = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(`OSTRA_SWAP_DEPLOYMENT ${path} could not be read: ${(err as Error).message}`);
+  }
+  return parseSwapContracts(json, chainId);
+}
+
 export function loadRelayerConfig(env: NodeJS.ProcessEnv = process.env): RelayerConfig {
   const clientIp = env.OSTRA_RELAYER_CLIENT_IP === undefined || env.OSTRA_RELAYER_CLIENT_IP === "" ? "socket" : env.OSTRA_RELAYER_CLIENT_IP;
   if (clientIp !== "socket" && clientIp !== "cf-connecting-ip") throw new Error("OSTRA_RELAYER_CLIENT_IP must be socket or cf-connecting-ip");
+  const deployment = readDeployment(required(env, "OSTRA_DEPLOYMENT"));
   return {
     rpcUrl: httpUrl(required(env, "OSTRA_RPC_URL"), "OSTRA_RPC_URL"),
-    deployment: readDeployment(required(env, "OSTRA_DEPLOYMENT")),
+    deployment,
     keeperUrl: httpUrl(required(env, "OSTRA_KEEPER_URL"), "OSTRA_KEEPER_URL"),
     vault: evmAddress(required(env, "OSTRA_RELAYER_VAULT"), "OSTRA_RELAYER_VAULT"),
     secretsDir: required(env, "OSTRA_RELAYER_SECRETS"),
     dataDir: required(env, "OSTRA_RELAYER_DATA"),
     listen: parseListen(required(env, "OSTRA_RELAYER_LISTEN")),
     clientIp,
+    swap: readSwapContracts(env.OSTRA_SWAP_DEPLOYMENT, deployment.chainId),
   };
 }

@@ -26,6 +26,20 @@
 //             RELAYER_MARGIN_BPS (relayGasCap): code that uses more when sent
 //             than it did simulated cannot make the relayer pay more gas than
 //             it was paid for.
+//             An Ostra Swap OstraRouter.executeEscrow (decided 21 Oct 2026)
+//             gives its swap all the gas left but REFUND_GAS_RESERVE and
+//             refunds the order when the swap runs out, without reverting:
+//             neither the gas it used simulated nor eth_estimateGas is enough
+//             to swap (measured on a fork, 21 Oct 2026: 378,846 used
+//             simulated, 227,338 estimated, refunded at a 548,732 limit). A
+//             transaction with one is priced at least at the least gas limit
+//             with which every escrow swap that swaps simulated still swaps
+//             (escrowGasLimit: simulated at given limits, to within
+//             ESCROW_GAS_PRECISION_BPS, counting only the router's own
+//             EscrowExecuted logs; one that needs more than
+//             ESCROW_GAS_MAX_FACTOR times its gas used plus
+//             ESCROW_GAS_MAX_EXTRA is refused), and the relayer sends it with
+//             its whole cap.
 //             Not eth_estimateGas otherwise: that is a gas limit, above what
 //             the transaction uses. There is no rent and nothing comes back
 //             to the relayer, so nothing is refunded.
@@ -311,7 +325,7 @@ export type RelayTxInput = { relayer: Address; to: Address; data: Hex; value?: b
 export async function simulateRelay(
   client: PublicClient,
   a: RelayTxInput,
-  o: { stateOverrides?: { address: Address; stateDiff?: { slot: Hex; value: Hex }[] }[] } = {},
+  o: { stateOverrides?: { address: Address; stateDiff?: { slot: Hex; value: Hex }[] }[]; gas?: bigint } = {},
 ): Promise<{ gasUsed: bigint; logs: readonly Log[]; time: bigint }> {
   try {
     const head = await client.getBlock({ blockTag: "latest" });
@@ -322,7 +336,7 @@ export async function simulateRelay(
         {
           blockOverrides: { time },
           ...(o.stateOverrides !== undefined ? { stateOverrides: o.stateOverrides } : {}),
-          calls: [{ account: a.relayer, to: a.to, data: a.data, ...(a.value !== undefined && a.value !== 0n ? { value: a.value } : {}) }],
+          calls: [{ account: a.relayer, to: a.to, data: a.data, ...(a.value !== undefined && a.value !== 0n ? { value: a.value } : {}), ...(o.gas !== undefined ? { gas: o.gas } : {}) }],
         },
       ],
     });
@@ -387,6 +401,88 @@ export function reservedSwapGas(tx: { to: Address; data: Hex }): bigint {
   return swapGasOf(tx).reduce((a, g) => a + g + g / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE), 0n);
 }
 
+/** The selector of OstraRouter.executeEscrow(Order, address, Leg, Leg) (ostra-swap src/OstraRouter.sol; checked against its ABI by the relayer's tests). */
+export const EXECUTE_ESCROW_SELECTOR: Hex = "0x3d9887bd";
+/** OstraRouter's EscrowExecuted(bytes32 indexed orderHash, address indexed escrow, uint256 received, bool swapped). */
+export const ESCROW_EXECUTED_TOPIC: Hex = toEventSelector("EscrowExecuted(bytes32,address,uint256,bool)");
+/** How close escrowGasLimit gets to the least gas limit that swaps (it never returns one below it). */
+export const ESCROW_GAS_PRECISION_BPS = 50n;
+/**
+ * The most gas an escrow transaction's swaps may need, as a multiple of what it used simulated plus a fixed part
+ * (measured: 1.5 times), within MAX_RELAY_GAS: one that needs more is refused, so a quote costs a bounded number of
+ * bounded simulations.
+ */
+export const ESCROW_GAS_MAX_FACTOR = 4n;
+export const ESCROW_GAS_MAX_EXTRA = 500_000n;
+/** The highest gas limit escrowGasLimit tries (Robinhood Chain's per-transaction limit). */
+export const MAX_RELAY_GAS = 32_000_000n;
+
+/** The calls of a relay transaction: the call itself, or each call of a Multicall3 aggregate3 (none when that does not decode). */
+function relayedCalls(tx: { to: Address; data: Hex }): readonly { to: Address; data: Hex }[] {
+  if (getAddress(tx.to) !== MULTICALL3) return [{ to: getAddress(tx.to), data: tx.data }];
+  try {
+    const d = decodeFunctionData({ abi: multicall3Abi, data: tx.data });
+    return d.functionName === "aggregate3" ? (d.args[0] as readonly { target: Address; callData: Hex }[]).map((c) => ({ to: getAddress(c.target), data: c.callData })) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The contracts the relay transaction `tx` calls OstraRouter.executeEscrow on (by selector), once each. */
+function escrowRouters(tx: { to: Address; data: Hex }): Address[] {
+  return [...new Set(relayedCalls(tx).filter((c) => c.data.slice(0, 10).toLowerCase() === EXECUTE_ESCROW_SELECTOR).map((c) => c.to))];
+}
+
+/** How many OstraRouter.executeEscrow calls the relay transaction `tx` makes (by selector). */
+export function escrowCalls(tx: { to: Address; data: Hex }): number {
+  return relayedCalls(tx).filter((c) => c.data.slice(0, 10).toLowerCase() === EXECUTE_ESCROW_SELECTOR).length;
+}
+
+/** How many escrow executions among `logs` swapped (EscrowExecuted with swapped true), counting only logs of `routers`. */
+export function escrowSwaps(logs: readonly Log[], routers: readonly Address[]): number {
+  const from = new Set(routers.map((r) => r.toLowerCase()));
+  let n = 0;
+  for (const l of logs) {
+    if (!from.has(l.address.toLowerCase())) continue;
+    if (l.topics[0]?.toLowerCase() !== ESCROW_EXECUTED_TOPIC.toLowerCase() || l.data.length !== 2 + 128) continue;
+    if (BigInt(`0x${l.data.slice(66, 130)}`) === 1n) n++;
+  }
+  return n;
+}
+
+/**
+ * The least gas limit, to within ESCROW_GAS_PRECISION_BPS and never below it, with which `a` still makes as many
+ * escrow swaps as `swaps` (what it made simulated without a limit): simulated at a limit doubled from `gasUsed`, then
+ * halved down. 0 when it makes none (an order that only refunds needs nothing beyond its gas). Throws
+ * RelaySimulationError when no limit up to MAX_RELAY_GAS swaps.
+ */
+export async function escrowGasLimit(client: PublicClient, a: RelayTxInput, gasUsed: bigint, swaps: number): Promise<bigint> {
+  if (swaps === 0) return 0n;
+  const routers = escrowRouters(a);
+  const swapsAt = async (gas: bigint): Promise<boolean> => {
+    try {
+      return escrowSwaps((await simulateRelay(client, a, { gas })).logs, routers) >= swaps;
+    } catch (err) {
+      if (err instanceof RelaySimulationError && err.code === "simulation_unavailable") throw err;
+      return false;
+    }
+  };
+  const max = gasUsed * ESCROW_GAS_MAX_FACTOR + ESCROW_GAS_MAX_EXTRA < MAX_RELAY_GAS ? gasUsed * ESCROW_GAS_MAX_FACTOR + ESCROW_GAS_MAX_EXTRA : MAX_RELAY_GAS;
+  let lo = gasUsed;
+  let hi = gasUsed + gasUsed / 2n < max ? gasUsed + gasUsed / 2n : max;
+  while (!(await swapsAt(hi))) {
+    lo = hi;
+    if (hi >= max) throw new RelaySimulationError(`its escrow swap does not swap with any gas limit up to ${max} (${ESCROW_GAS_MAX_FACTOR} times what it used simulated, plus ${ESCROW_GAS_MAX_EXTRA})`);
+    hi = hi * 2n > max ? max : hi * 2n;
+  }
+  while (hi - lo > (hi * ESCROW_GAS_PRECISION_BPS) / 10_000n) {
+    const mid = (lo + hi) / 2n;
+    if (await swapsAt(mid)) hi = mid;
+    else lo = mid;
+  }
+  return hi;
+}
+
 /**
  * The most gas the relayer sends a transaction with when it was priced at
  * `gas` (estimateRelay): `gas` plus RELAYER_MARGIN_BPS, which leaves room
@@ -403,7 +499,9 @@ const SPEND_SELECTOR = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "
 
 /**
  * The gas `tx` is priced at sent from `relayer`: what it uses (simulateRelay),
- * its L1 data component and the swapGas its Swaps reserve (reservedSwapGas);
+ * its L1 data component and the swapGas its Swaps reserve (reservedSwapGas),
+ * or for escrow executions at least the gas limit their swaps need
+ * (escrowGasLimit);
  * the current gas price, their product (what the relayer pays for it at
  * most), and the logs it emits. The relayer gate prices with it; an agent
  * checks a quote with it.
@@ -411,7 +509,11 @@ const SPEND_SELECTOR = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "
 export async function estimateRelay(client: PublicClient, a: RelayTxInput): Promise<RelayMeasure> {
   const { gasUsed, logs } = await simulateRelay(client, a);
   const [l1, gasPrice] = await Promise.all([l1DataGas(client, a.to, a.data), client.getGasPrice()]);
-  const gas = gasUsed + l1 + reservedSwapGas(a);
+  let gas = gasUsed + l1 + reservedSwapGas(a);
+  if (escrowCalls(a) > 0) {
+    const floor = (await escrowGasLimit(client, a, gasUsed, escrowSwaps(logs, escrowRouters(a)))) + l1;
+    if (floor > gas) gas = floor;
+  }
   return { gas, gasPrice, wei: gas * gasPrice, value: a.value ?? 0n, logs };
 }
 

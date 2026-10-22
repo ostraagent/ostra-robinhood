@@ -17,6 +17,10 @@
 //            credited too; on Robinhood Chain nothing comes back to the
 //            relayer, so there are no refunds.
 //   createVaults  per IP address: times of CreateVault relayed before payment
+//   feeTokens     tokens private spends paid their fee in (private.ts), sold
+//                 to ETH by sweep.ts
+//   privateReverts  per nullifier: the private spends of that note that
+//                 reverted on-chain when relayed, in the last 24 hours
 
 import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -57,7 +61,8 @@ export type Quote = {
   createdAt: number;
 };
 
-export type Paid = { txHash: string; amount: string; at: number };
+/** `token`: a private spend's fee token (private.ts); absent: the vault's channel token. */
+export type Paid = { txHash: string; amount: string; at: number; token?: string };
 export type Debt = { amount: string; txs: string[] };
 /** `calls`: the relayed open's request, sent again with the first voucher to pay it. */
 export type PendingOpen = { hash: string; txHash: string; channel: string; amount: string; at: number; calls: { to: string; data: string }[] };
@@ -70,6 +75,10 @@ type LedgerData = {
   opens: Record<string, PendingOpen>;
   credits: Record<string, string>;
   createVaults: Record<string, number[]>;
+  /** Tokens private spends paid fees in, which sweep.ts sells to ETH (absent in ledgers from before 21 Oct 2026). */
+  feeTokens?: string[];
+  /** Per nullifier (lowercase hex): the private spends of that note that reverted when relayed in the last 24 hours (private.ts). */
+  privateReverts?: Record<string, { txHash: string; at: number }[]>;
 };
 
 const empty = (): LedgerData => ({ version: 1, quotes: {}, paid: {}, debts: {}, opens: {}, credits: {}, createVaults: {} });

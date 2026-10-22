@@ -28,6 +28,10 @@
 //                      (put), "at", "signature"}: writes it, signed by the
 //                      seed's backup key: 200, 400, 403 bad_signature, 404,
 //                      409 owner_mismatch or replayed, 429 backup_limit
+//   GET  /v1/private/price?token=<address>&kind=swap|unshield  with
+//                      OSTRA_SWAP_DEPLOYMENT's privatePool: the fee in that
+//                      token a private spend is relayed for now (private.ts):
+//                      200 {fee, relayer, ...}, 422 fee_unpriced, 400
 // The web app's origin gets CORS on every route, and its preflights (OPTIONS)
 // are answered with 204 (merchant/src/cors.ts).
 //
@@ -35,10 +39,13 @@
 // seller server's (merchant/src/merchant.ts), paid to OSTRA_RELAYER_VAULT's
 // split and guarded by the keeper. It sends from its own account (send.ts;
 // Kora signed on Solana) and drops escrowed WOTS signatures once their keys
-// are used (signatures.ts). Configuration: config.ts. Stops cleanly on SIGINT
+// are used (signatures.ts). With Ostra Swap configured it also relays its
+// router's escrow orders and private spends, and sells the fees private spends
+// pay it for ETH every hour (sweep.ts). Configuration: config.ts. Stops cleanly on SIGINT
 // and SIGTERM.
 
-import { createPublicClient, type PublicClient } from "viem";
+import { createPublicClient, http, type PublicClient } from "viem";
+import { PoolIndex, ROBINHOOD_PUBLIC_RPC } from "@ostraagent/swap";
 import { CHAINLINK_ETH_USD, assertRobinhoodChain, chainlinkEthUsd, redact, retryingHttp, robinhoodChain } from "@ostraagent/sdk";
 import { MerchantKeys, ensurePrivateDir } from "../../merchant/src/keys.ts";
 import { createOstraMerchant } from "../../merchant/src/merchant.ts";
@@ -49,6 +56,8 @@ import { BackupStore } from "./backups.ts";
 import { createRelayerServer } from "./http.ts";
 import { openRelayerAccount } from "./keys.ts";
 import { Ledger } from "./ledger.ts";
+import { PrivateRelay } from "./private.ts";
+import { FeeSweeper } from "./sweep.ts";
 import { RelaySender } from "./send.ts";
 import { SignatureEscrow, SignaturePruner } from "./signatures.ts";
 
@@ -84,6 +93,17 @@ async function main(): Promise<void> {
     log,
   });
   const sender = new RelaySender(client, transport, account);
+  const ethUsd = chainlinkEthUsd(client, CHAINLINK_ETH_USD);
+  const sc = config.swap;
+  let privateRelay: PrivateRelay | undefined;
+  let sweeper: FeeSweeper | undefined;
+  if (sc !== null && sc.privatePool !== null) {
+    // Robinhood Chain's public RPC serves eth_getLogs over the windows the pool index searches.
+    const logsClient = createPublicClient({ chain: robinhoodChain, transport: http(ROBINHOOD_PUBLIC_RPC) }) as PublicClient;
+    const index = new PoolIndex();
+    privateRelay = new PrivateRelay({ client, logsClient, index, pool: sc.privatePool, ledger, sender, ethUsd, log });
+    sweeper = new FeeSweeper({ client, logsClient, index, router: sc.router, stake: sc.stake, ledger, sender, log });
+  }
   const gate = new RelayerGate({
     client,
     deployment: d,
@@ -93,18 +113,20 @@ async function main(): Promise<void> {
     sender,
     vault: config.vault,
     priceFeed: CHAINLINK_ETH_USD,
-    ethUsd: chainlinkEthUsd(client, CHAINLINK_ETH_USD),
+    ethUsd,
+    ...(sc === null ? {} : { swap: { router: sc.router, ...(privateRelay === undefined ? {} : { private: privateRelay }) } }),
     log,
   });
   const facts = { ...gate.facts(), merchant: keys.merchant, crank: merchant.crank, facilitator: keys.facilitator.address };
 
-  const server = createRelayerServer({ gate, escrow, backups, facts, clientIp: config.clientIp, log, scrub });
+  const server = createRelayerServer({ gate, escrow, backups, ...(privateRelay === undefined ? {} : { privateRelay }), facts, clientIp: config.clientIp, log, scrub });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(config.listen.port, config.listen.host, () => resolve());
   });
   const pruner = new SignaturePruner({ client, deployment: d, escrow, log });
   pruner.start();
+  sweeper?.start();
   log("started", { ...facts, listen: `${config.listen.host}:${config.listen.port}` });
 
   let stopping = false;
@@ -113,6 +135,7 @@ async function main(): Promise<void> {
     stopping = true;
     log("stopping", { signal, unforwarded: merchant.forwarder.pending });
     pruner.stop();
+    sweeper?.stop();
     merchant.stop();
     server.close(() => process.exit(0));
   };

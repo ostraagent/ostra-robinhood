@@ -264,6 +264,18 @@ cd buyback && npm ci && npm run typecheck && npm test   # after the core's npm c
   Passkey backups (GET and POST /v1/backups/<name>) keep a seed encrypted under a passkey's PRF
   output, which the relayer cannot open, named by the hash of the credential id; the seed's backup
   key binds the name with its first write and alone replaces or deletes it.
+  With Ostra Swap configured (`OSTRA_SWAP_DEPLOYMENT`), it also relays the Ostra Swap router's
+  escrow orders (`executeEscrow`, `announce`, `closeEscrow`, never a wallet swap, and never an order
+  naming the relayer as its executor or canceller), each `executeEscrow` priced at the least gas
+  limit its swap still swaps with (found by simulating) and sent with its whole cap; and private spends of the private pool (`privateSwap`, `unshield`), alone, for the
+  fee their proof pays it in the note's token: GET /v1/private/price gives that fee per token and
+  kind, a spend whose fee is worth less than it costs is refused with the fee that would do.
+  Private spends move only USDG, WETH, OSTRA and the listed stock tokens, along legs the swap SDK
+  builds on the pools it routes through, so all the code they run is known. A spend that reverts
+  costs the relayer its gas and pays nothing, so reverts are bounded: a note or an IP address with
+  two reverted spends in 24 hours gets nothing more relayed in that time, four reverted spends
+  within half an hour pause private relaying, and one IP address gets 30 requests an hour. Every hour the relayer sells the fees it took for
+  ETH through the router.
   `scripts/chain-check.ts` runs the keeper and the relayer end to end with an agent that holds no
   ETH; its fork test runs it on a mainnet fork.
 - `core/`: Ostra Agent's logic shared by the MCP package and the web app (`@ostraagent/core`),

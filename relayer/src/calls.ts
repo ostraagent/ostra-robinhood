@@ -22,10 +22,22 @@
 //   OstraCreatorSplit.release(poolId, account)
 //   OstraVesting.release(), claimDividends()
 //
+// and of Ostra Swap (ostra-swap src/*.sol, decided 21 Oct 2026):
+//
+//   OstraRouter.executeEscrow(order, hub, legIn, legOut), announce(order),
+//   closeEscrow(order)                 a vault's escrow order (none pulls from
+//                                      the caller); never swap or
+//                                      swapAtBaseFee, which pull tokenIn from
+//                                      the caller: the relayer's account
+//   OstraPrivatePool.privateSwap(spend), unshield(spend)   relayed alone, for
+//                                      the fee their proof pays (private.ts);
+//                                      never shield, which pulls from the caller
+//
 // Anything else is read as an unknown call; the relayer's policy (gate.ts)
 // refuses it, as Kora's allowed-program list did.
 
 import { decodeFunctionData, getAddress, toFunctionSelector, type AbiFunction, type Address, type Hex } from "viem";
+import { ostraPrivatePoolAbi, ostraRouterAbi, type Order } from "@ostraagent/swap";
 import {
   VAULT_ACTION,
   decodeOpenChannelParams,
@@ -68,6 +80,12 @@ export type ParsedCall =
   | { fn: "splitRelease"; to: Address; poolId: Hex; account: Address }
   | { fn: "vestingRelease"; to: Address }
   | { fn: "vestingClaimDividends"; to: Address }
+  | { fn: "executeEscrow"; to: Address; order: Order }
+  | { fn: "announce"; to: Address; order: Order }
+  | { fn: "closeEscrow"; to: Address; order: Order }
+  /** OstraPrivatePool spends: read by private.ts. */
+  | { fn: "privateSwap"; to: Address }
+  | { fn: "privateUnshield"; to: Address }
   | { fn: null; to: Address; selector: Hex };
 
 export type RelayTx = {
@@ -91,6 +109,8 @@ for (const [abi, names] of [
   [ostraDispatcherAbi, [["claimReferral", "claimReferral"]]],
   [ostraCreatorSplitAbi, [["release", "splitRelease"]]],
   [ostraVestingAbi, [["release", "vestingRelease"], ["claimDividends", "vestingClaimDividends"]]],
+  [ostraRouterAbi, [["executeEscrow", "executeEscrow"], ["announce", "announce"], ["closeEscrow", "closeEscrow"]]],
+  [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"]]],
 ] as const) {
   for (const [name, as] of names) {
     const item = (abi as readonly { type: string; name?: string }[]).find((x) => x.type === "function" && x.name === name);
@@ -143,6 +163,13 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
       return { fn: "vestingRelease", to };
     case "vestingClaimDividends":
       return { fn: "vestingClaimDividends", to };
+    case "executeEscrow":
+    case "announce":
+    case "closeEscrow":
+      return { fn: known.as, to, order: a[0] as Order };
+    case "privateSwap":
+    case "privateUnshield":
+      return { fn: known.as, to };
     case "createVault":
       return { fn: "createVault", to, token: getAddress(a[0] as Address), initialKeyRoot: a[1] as Hex, initialCrank: getAddress(a[2] as Address) };
     case "spend":

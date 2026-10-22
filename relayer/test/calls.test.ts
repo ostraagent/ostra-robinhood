@@ -4,7 +4,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { concat, encodeFunctionData, getAddress, hexToBytes, keccak256, type Address, type Hex } from "viem";
+import { concat, encodeFunctionData, getAddress, hexToBytes, keccak256, toEventSelector, toFunctionSelector, type AbiEvent, type AbiFunction, type Address, type Hex } from "viem";
+import { ostraPrivatePoolAbi, ostraRouterAbi } from "@ostraagent/swap";
+import { ESCROW_EXECUTED_TOPIC, EXECUTE_ESCROW_SELECTOR } from "@ostraagent/sdk";
 import {
   LAUNCHPAD,
   MULTICALL3,
@@ -167,4 +169,52 @@ test("the launchpad's calls: a vault-funded launch acts for its creator vault an
   assert.equal(parseCall({ to: at(0xd1), data: encodeFunctionData({ abi: ostraVestingAbi, functionName: "claimDividends" }) }).fn, "vestingClaimDividends");
   // A launch call cut short is malformed, not unknown.
   assert.throws(() => parseCall({ to: l.devBuy, data: launch.data.slice(0, 200) as Hex }, 1), /calls\[1\]: malformed launchFromVault calldata/);
+});
+
+test("Ostra Swap: the router's escrow-order functions and the private pool's spends are read; swap, swapAtBaseFee and shield are unknown", () => {
+  const router = getAddress("0x00000000000000000000000000000000000c0001");
+  const pool = getAddress("0x00000000000000000000000000000000000c0002");
+  const order = {
+    tokenIn: getAddress("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
+    tokenOut: getAddress("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"),
+    amountIn: 1_000_000n,
+    minOut: 1n,
+    recipient: getAddress("0x00000000000000000000000000000000000c0003"),
+    refundTo: getAddress("0x00000000000000000000000000000000000c0003"),
+    notBefore: 0n,
+    deadline: 2_000_000_000n,
+    tranches: 0,
+    interval: 0,
+    executor: getAddress("0x0000000000000000000000000000000000000000"),
+    canceller: getAddress("0x0000000000000000000000000000000000000000"),
+    route: `0x${"11".repeat(32)}` as Hex,
+    salt: `0x${"22".repeat(32)}` as Hex,
+  };
+  const noLeg = { commands: "0x" as Hex, inputs: [] as Hex[] };
+  const exec = parseCall({ to: router, data: encodeFunctionData({ abi: ostraRouterAbi, functionName: "executeEscrow", args: [order, order.tokenIn, noLeg, noLeg] }) });
+  assert.equal(exec.fn, "executeEscrow");
+  assert.deepEqual((exec as { order: unknown }).order, order);
+  assert.equal(parseCall({ to: router, data: encodeFunctionData({ abi: ostraRouterAbi, functionName: "announce", args: [order] }) }).fn, "announce");
+  assert.equal(parseCall({ to: router, data: encodeFunctionData({ abi: ostraRouterAbi, functionName: "closeEscrow", args: [order] }) }).fn, "closeEscrow");
+  for (const name of ["swap", "swapAtBaseFee"] as const) {
+    const item = ostraRouterAbi.find((x) => x.type === "function" && x.name === name);
+    assert.ok(item);
+    assert.equal(parseCall({ to: router, data: concat([toFunctionSelector(item as AbiFunction), `0x${"00".repeat(64)}`]) }).fn, null);
+  }
+  for (const [name, as] of [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"], ["shield", null]] as const) {
+    const item = ostraPrivatePoolAbi.find((x) => x.type === "function" && x.name === name);
+    assert.ok(item);
+    const selector = toFunctionSelector(item as AbiFunction);
+    if (as === null) assert.equal(parseCall({ to: pool, data: concat([selector, `0x${"00".repeat(96)}`]) }).fn, null);
+    else assert.throws(() => parseCall({ to: pool, data: concat([selector, "0x00"]) }), /malformed/);
+  }
+});
+
+test("the SDK's executeEscrow selector and EscrowExecuted topic are OstraRouter's", () => {
+  const item = ostraRouterAbi.find((x) => x.type === "function" && x.name === "executeEscrow");
+  assert.ok(item);
+  assert.equal(toFunctionSelector(item as AbiFunction), EXECUTE_ESCROW_SELECTOR);
+  const event = ostraRouterAbi.find((x) => x.type === "event" && x.name === "EscrowExecuted");
+  assert.ok(event);
+  assert.equal(toEventSelector(event as AbiEvent), ESCROW_EXECUTED_TOPIC);
 });

@@ -23,6 +23,10 @@ import {
   relayRequestHash,
   relayGasCap,
   relayTransaction,
+  ESCROW_EXECUTED_TOPIC,
+  EXECUTE_ESCROW_SELECTOR,
+  escrowCalls,
+  escrowSwaps,
   reservedSwapGas,
   swapGasOf,
   weiToTokenUnits,
@@ -137,4 +141,18 @@ test("the gas the vault Swaps of a relay transaction reserve is added up (swapGa
   // The gas limit cap: the priced gas + the margin.
   assert.equal(relayGasCap(100_000n), 110_000n);
   assert.equal(relayGasCap(100_001n), withMargin(100_001n));
+});
+
+test("escrow executions: counted by selector in a relay transaction, and their swaps read from EscrowExecuted", () => {
+  const exec = { to: at(7), data: concat([EXECUTE_ESCROW_SELECTOR, "0x00"]) };
+  const other = { to: at(8), data: "0xabcdef01" as Hex };
+  assert.equal(escrowCalls(relayTransaction([exec])), 1);
+  assert.equal(escrowCalls(relayTransaction([other, exec, exec])), 2);
+  assert.equal(escrowCalls(relayTransaction([other])), 0);
+  assert.equal(ESCROW_EXECUTED_TOPIC, encodeEventTopics({ abi: [{ type: "event", name: "EscrowExecuted", inputs: [{ name: "orderHash", type: "bytes32", indexed: true }, { name: "escrow", type: "address", indexed: true }, { name: "received", type: "uint256", indexed: false }, { name: "swapped", type: "bool", indexed: false }] }] as const, eventName: "EscrowExecuted" })[0]);
+  const executed = (swapped: boolean, address = at(7)) => ({ address, topics: [ESCROW_EXECUTED_TOPIC, `0x${"11".repeat(32)}`, `0x${"00".repeat(12)}${"22".repeat(20)}`], data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }], [10n, swapped]) }) as unknown as Log;
+  assert.equal(escrowSwaps([executed(true), executed(false), executed(true)], [at(7)]), 2);
+  assert.equal(escrowSwaps([{ ...executed(true), topics: [`0x${"33".repeat(32)}`] } as unknown as Log], [at(7)]), 0);
+  // Only the router's own logs count: another contract in the swap cannot claim one.
+  assert.equal(escrowSwaps([executed(true, at(9))], [at(7)]), 0);
 });

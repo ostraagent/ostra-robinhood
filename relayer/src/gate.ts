@@ -23,7 +23,16 @@
 //      creator vault does as its pool's owner), paid by a `payer` vault in
 //      the relayer's token; dividends (a vesting's, a launched-token vault's
 //      ClaimDividend) only of a pool paying them in USDG, WETH, a listed
-//      pair token or a launched token. Nothing else is sent, so the
+//      pair token or a launched token; and of Ostra Swap (decided 21 Oct
+//      2026), when the relayer is configured with it: OstraRouter
+//      executeEscrow, announce and closeEscrow (a vault's escrow order, alone
+//      or with the vault Transfer that funds it), of an order that does not
+//      name the relayer's account as its executor or canceller (anyone who
+//      pays could then run or cancel it at will), never swap or
+//      swapAtBaseFee, which pull tokens from the caller. A private spend
+//      (OstraPrivatePool privateSwap or unshield) is relayed alone, for the
+//      fee its proof pays the relayer (private.ts), with no x402 payment and
+//      no WOTS signature. Nothing else is sent, so the
 //      relayer's account is never the caller of anything that gives a caller
 //      a role, and no code runs but Ostra's, USDG's, WETH's, the listed pair
 //      tokens' (OSTRA's and the stock tokens') and the launchpad's, except
@@ -114,6 +123,7 @@ import {
   readVault,
   relayGasCap,
   relayPriceWei,
+  escrowCalls,
   relayValue,
   relayTransactionHash,
   simulateRelay,
@@ -141,7 +151,8 @@ import {
   type LedgerData,
   type Quote,
 } from "./ledger.ts";
-import { NotSentError, SendUnknownError, type Landed } from "./send.ts";
+import type { PrivateRelay } from "./private.ts";
+import { NotSentError, SendUnknownError, type Landed, type SendOptions } from "./send.ts";
 import { escrowRecords, wotsClaims, type SignatureEscrow, type SignatureRecord, type WotsClaim } from "./signatures.ts";
 
 /** The tokens Ostra offers as pairs besides USDG and ETH (sdk pairs.ts: OSTRA and the stock tokens): their vaults are relayed like WETH's. */
@@ -163,13 +174,15 @@ export type GateOptions = {
   escrow: SignatureEscrow;
   merchant: GateMerchant;
   /** Sends the relayed transactions (send.ts): the relayer's account. */
-  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }, o?: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint }): Promise<Landed> };
+  sender: { readonly address: Address; send(tx: { to: Address; data: `0x${string}` }, o?: SendOptions): Promise<Landed> };
   /** The relayer's Ostra vault: the receiverAuthorizer of its channels. */
   vault: Address;
   /** The Chainlink feed ETH/USD is read from (shown in the relayer's terms). */
   priceFeed: Address;
   /** ETH/USD, checked and fresh (the SDK's chainlinkEthUsd on priceFeed). */
   ethUsd: EthUsdSource;
+  /** Ostra Swap (OSTRA_SWAP_DEPLOYMENT): its router's escrow orders are relayed; `private` relays private spends. */
+  swap?: { router: Address; private?: PrivateRelay };
   log: Log;
 };
 
@@ -263,6 +276,9 @@ export class RelayerGate {
       split: this.#o.merchant.split,
       priceFeed: this.#o.priceFeed,
       maxCalls: MAX_RELAY_CALLS,
+      ...(this.#o.swap === undefined
+        ? {}
+        : { swap: { router: this.#o.swap.router, privatePool: this.#o.swap.private?.pool ?? null, privatePrice: this.#o.swap.private === undefined ? null : "/v1/private/price?token=<address>&kind=swap|unshield" } }),
     };
   }
 
@@ -288,6 +304,9 @@ export class RelayerGate {
     } catch (err) {
       return json(400, { error: "bad_transaction", message: (err as Error).message });
     }
+    // A private spend pays the relayer from its proof: no voucher, no WOTS signature (private.ts).
+    const privateRelay = this.#o.swap?.private;
+    if (privateRelay !== undefined && privateRelay.kindOf(tx) !== null) return privateRelay.relay(tx, input.ip);
     // The WOTS signatures in it have left the client: escrowed before anything else.
     const escrowed = await this.#escrow(tx);
     if (escrowed.answer !== null) return escrowed.answer;
@@ -565,8 +584,18 @@ export class RelayerGate {
       if ((await wethOrLaunched(t)) !== null) return null;
       return `calls[${i}]: the pool pays dividends in ${t}, not USDG, WETH, a listed pair token (OSTRA or a stock token) or a launched token; its dividends are not relayed`;
     };
+    const swap = this.#o.swap;
     for (const [i, c] of tx.parsed.entries()) {
       const name = c.fn ?? c.selector;
+      if (swap !== undefined && c.to === swap.router) {
+        if (c.fn !== "executeEscrow" && c.fn !== "announce" && c.fn !== "closeEscrow") return `calls[${i}]: ${name} on the Ostra Swap router ${c.to} is not relayed (only executeEscrow, announce and closeEscrow)`;
+        const me = this.#o.sender.address;
+        if (getAddress(c.order.executor) === me || getAddress(c.order.canceller) === me) return `calls[${i}]: an order naming the relayer's account ${me} as its executor or canceller is not relayed: anyone could run or cancel it through the relayer`;
+        continue;
+      }
+      if (c.fn === "privateSwap" || c.fn === "privateUnshield") {
+        return swap?.private !== undefined && c.to === swap.private.pool ? `calls[${i}]: a private spend is relayed alone` : `calls[${i}]: ${name} on ${c.to} is not relayed`;
+      }
       if (c.to === d.vaultFactory) {
         if (c.fn !== "createVault") return `calls[${i}]: ${name} on the vault factory ${c.to} is not relayed`;
         if (c.token !== token) {
@@ -717,7 +746,9 @@ export class RelayerGate {
   async #send(quote: Quote, swaps: readonly Address[] = []): Promise<Landed> {
     const tx = { to: getAddress(quote.to), data: quote.data as `0x${string}` };
     try {
-      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)), value: BigInt(quote.value ?? "0") });
+      // An escrow execution keeps gas back for its refund, beyond what eth_estimateGas finds: sent at the cap it was priced for.
+      const gasAtCap = escrowCalls(tx) > 0;
+      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)), value: BigInt(quote.value ?? "0"), gasAtCap });
     } catch (err) {
       // Its quote no longer holds: the request sent again is priced anew.
       if (err instanceof NotSentError && err.overCap) {

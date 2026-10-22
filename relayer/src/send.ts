@@ -35,6 +35,8 @@ export const RECEIPT_TIMEOUT_MS = 60_000;
 export const SETTLE_TIMEOUT_MS = 600_000;
 /** Gas limit = estimate + 20% (decided 17 Oct 2026): the L1 component of an estimate moves with the L1 price; unused gas is not paid. */
 export const GAS_LIMIT_MARGIN_PERCENT = 20n;
+/** A send with a deadline (`notAfter`) is signed only while the chain's latest block is at least this many seconds before it. */
+export const DEADLINE_SPARE_SECONDS = 30n;
 const POLL_MS = 1_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -82,6 +84,8 @@ export function isNodeRefusal(err: unknown): boolean {
 /** A landed transaction: its gas, its gas price and the ETH it sent (value). */
 export type Landed = { txHash: Hash; gasUsed: bigint; effectiveGasPrice: bigint; block: bigint; value: bigint };
 
+export type SendOptions = { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint; gasAtCap?: boolean; notAfter?: bigint };
+
 export class RelaySender {
   readonly #client: PublicClient;
   readonly #transport: Transport;
@@ -107,10 +111,15 @@ export class RelaySender {
    * Sends `tx` after every earlier send has finished; resolves when it landed,
    * throws NotSentError or SendUnknownError. `refuseFailedSwaps`: vaults whose
    * Swap in `tx` is not sent if it fails now (SwapFailed). `maxGas`: the
-   * highest gas limit it is sent with.
+   * highest gas limit it is sent with; `gasAtCap`: sent with exactly that
+   * limit (code that keeps gas back for a fallback, such as
+   * OstraRouter.executeEscrow's refund, needs more than eth_estimateGas finds,
+   * as the fallback does not revert). `notAfter`: a deadline (unix seconds)
+   * the transaction reverts after; it is not signed once the latest block is
+   * within DEADLINE_SPARE_SECONDS of it.
    */
-  send(tx: { to: Address; data: Hex }, o: { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint } = {}): Promise<Landed> {
-    const run = () => this.#send({ ...tx, value: o.value ?? 0n }, o.refuseFailedSwaps ?? [], o.maxGas);
+  send(tx: { to: Address; data: Hex }, o: SendOptions = {}): Promise<Landed> {
+    const run = () => this.#send({ ...tx, value: o.value ?? 0n }, o.refuseFailedSwaps ?? [], o.maxGas, o);
     const p = this.#tail.then(run, run);
     this.#tail = p.catch(() => undefined);
     return p;
@@ -126,7 +135,7 @@ export class RelaySender {
     }
   }
 
-  async #send(tx: { to: Address; data: Hex; value: bigint }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined): Promise<Landed> {
+  async #send(tx: { to: Address; data: Hex; value: bigint }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined, o: SendOptions): Promise<Landed> {
     const account = this.#account;
     let gas: bigint;
     try {
@@ -138,7 +147,7 @@ export class RelaySender {
     let limit = gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
     if (maxGas !== undefined) {
       if (gas > maxGas) throw new NotSentError(`the transaction needs ${gas} gas now, more than the ${maxGas} it was priced for, so it was not sent; sent again, it is priced anew`, null, true);
-      if (limit > maxGas) limit = maxGas;
+      if (limit > maxGas || o.gasAtCap === true) limit = maxGas;
     }
     if (refuseFailedSwaps.length !== 0) {
       let failed: ReturnType<typeof failedSwaps>;
@@ -150,6 +159,10 @@ export class RelaySender {
       if (failed.length !== 0) {
         throw new NotSentError(`the Swap of ${failed.map((f) => `vault ${f.vault} (${f.reason})`).join(", ")} fails now, so it was not sent`);
       }
+    }
+    if (o.notAfter !== undefined) {
+      const now = (await this.#client.getBlock({ blockTag: "latest" })).timestamp;
+      if (now + DEADLINE_SPARE_SECONDS > o.notAfter) throw new NotSentError(`its deadline ${o.notAfter} is less than ${DEADLINE_SPARE_SECONDS} s away, so it was not sent`);
     }
     const nonce = await this.#client.getTransactionCount({ address: account.address, blockTag: "pending" });
     const { maxFeePerGas, maxPriorityFeePerGas } = await this.#client.estimateFeesPerGas();
