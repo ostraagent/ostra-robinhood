@@ -110,6 +110,8 @@ export const SWAP_DEADLINE_SECONDS = 600n;
 export const PERMIT2_ALLOWANCE_SECONDS = 3_600n;
 /** How long a run waits for a transaction it sent to land (ms). */
 export const RECEIPT_TIMEOUT_MS = 180_000;
+/** Gas limit = estimate + 20% (decided 17 Oct 2026, as relayer/src/send.ts and core/src/chain.ts): the L1 component of an estimate moves with the L1 price; unused gas is not paid. */
+export const GAS_LIMIT_MARGIN_PERCENT = 20n;
 /** How long a kept transaction's receipt is looked for once its nonce is used (a node that lags behind; ms). */
 export const LAGGING_NODE_MS = 30_000;
 const RECEIPT_POLL_MS = 1_000;
@@ -458,6 +460,7 @@ export async function runBuyback(o: BuybackOptions): Promise<BuybackSummary> {
     /** Signs `call` at `nonce` (or the next one) with fees now; one that would revert fails its gas estimate and is never signed. */
     const sign = async (step: Step, to: Address, data: Hex, value: bigint, amount: bigint, prior: Hex[], nonce?: number): Promise<Inflight> => {
       const req = await wallet.prepareTransactionRequest({ account, chain: robinhoodChain, to, data, value, ...(nonce === undefined ? {} : { nonce }) });
+      req.gas = req.gas + (req.gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
       const raw = await wallet.signTransaction(req as never);
       return { step, hash: keccak256(raw), raw, nonce: Number(req.nonce), value: value.toString(), to, data, amount: amount.toString(), prior, at: new Date().toISOString() };
     };

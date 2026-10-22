@@ -21,6 +21,10 @@ import { BatchSettlementEvmScheme as BatchSettlementFacilitatorScheme } from "@x
 /** CAIP-2 id of Robinhood Chain. */
 export const X402_NETWORK = `eip155:${robinhoodChain.id}` as const;
 
+/** Gas limit = estimate + 20% (decided 17 Oct 2026, as relayer/src/send.ts and core/src/chain.ts): the L1 component of an estimate moves with the L1 price; unused gas is not paid. */
+export const GAS_LIMIT_MARGIN_PERCENT = 20n;
+const withMargin = (gas: bigint): bigint => gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
+
 /** An x402 facilitator client served in-process by the stock batch-settlement facilitator. */
 export function createFacilitator(client: PublicClient, transport: Transport, account: PrivateKeyAccount): FacilitatorClient & { address: Address } {
   const wallet = createWalletClient({ account, chain: robinhoodChain, transport });
@@ -28,8 +32,16 @@ export function createFacilitator(client: PublicClient, transport: Transport, ac
     address: account.address,
     readContract: (args) => client.readContract(args as Parameters<PublicClient["readContract"]>[0]),
     verifyTypedData: (args) => client.verifyTypedData(args as Parameters<PublicClient["verifyTypedData"]>[0]),
-    writeContract: (args) => wallet.writeContract({ ...(args as Parameters<typeof wallet.writeContract>[0]), account, chain: robinhoodChain }),
-    sendTransaction: (args) => wallet.sendTransaction({ ...args, account, chain: robinhoodChain }),
+    // The gas limit x402 gives is kept; otherwise it is the estimate plus GAS_LIMIT_MARGIN_PERCENT.
+    writeContract: async (args) => {
+      const gas = args.gas ?? withMargin(await client.estimateContractGas({ ...args, account: account.address } as Parameters<PublicClient["estimateContractGas"]>[0]));
+      return wallet.writeContract({ ...(args as Parameters<typeof wallet.writeContract>[0]), gas, account, chain: robinhoodChain });
+    },
+    sendTransaction: async (args) => {
+      const given = (args as { gas?: bigint }).gas;
+      const gas = given ?? withMargin(await client.estimateGas({ account: account.address, to: args.to, data: args.data }));
+      return wallet.sendTransaction({ ...args, gas, account, chain: robinhoodChain });
+    },
     waitForTransactionReceipt: (args) => client.waitForTransactionReceipt(args),
     getCode: (args) => client.getCode(args),
   });

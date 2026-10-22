@@ -9,6 +9,10 @@ import { DEPOSIT_STATUS, ostraPoolAbi, robinhoodChain, type DepositState } from 
 /** A contract call: what the aggregator sends. */
 export type Call = { address: Address; abi: Abi; functionName: string; args: readonly unknown[] };
 
+/** Gas limit = estimate + 20% (decided 17 Oct 2026, as relayer/src/send.ts and core/src/chain.ts): the L1 component of an estimate moves with the L1 price; unused gas is not paid. */
+export const GAS_LIMIT_MARGIN_PERCENT = 20n;
+const withMargin = (gas: bigint): bigint => gas + (gas * GAS_LIMIT_MARGIN_PERCENT) / 100n;
+
 export class Sender {
   readonly #client: PublicClient;
   readonly #transport: Transport;
@@ -29,8 +33,9 @@ export class Sender {
   send(call: Call): Promise<TransactionReceipt> {
     const run = async () => {
       const { request } = await this.#client.simulateContract({ ...call, account: this.#account } as Parameters<PublicClient["simulateContract"]>[0]);
+      const gas = withMargin(await this.#client.estimateContractGas({ ...call, account: this.#account.address } as Parameters<PublicClient["estimateContractGas"]>[0]));
       const wallet = createWalletClient({ account: this.#account, chain: robinhoodChain, transport: this.#transport });
-      const hash = await wallet.writeContract(request as Parameters<typeof wallet.writeContract>[0]);
+      const hash = await wallet.writeContract({ ...(request as Parameters<typeof wallet.writeContract>[0]), gas });
       const receipt = await this.#client.waitForTransactionReceipt({ hash });
       if (receipt.status !== "success") throw new Error(`${call.functionName} transaction ${hash} reverted`);
       return receipt;
