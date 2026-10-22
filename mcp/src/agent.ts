@@ -16,6 +16,8 @@ import { join } from "node:path";
 import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
 import { assertRobinhoodChain, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
 import { cliProver } from "@ostraagent/swap/cli-prover";
+import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
+import type { Prover } from "@ostraagent/swap";
 import {
   ChannelService,
   LaunchpadService,
@@ -46,6 +48,36 @@ const SELLER_RECORD = "seller.json";
 export const MERCHANT_DIR = "merchant";
 
 export type Log = (event: string, fields?: Record<string, unknown>) => void;
+
+/**
+ * The private notes' prover: the native binary, or the WebAssembly build loaded on its first use. Its glue and bytes
+ * are checked against the SHA-256 the npm package records, the glue is imported from the very bytes checked (a data:
+ * URL), and the bytes are instantiated once. After a trap it refuses to prove until the server is restarted
+ * (wasm-prover.ts).
+ */
+function proverOf(c: McpConfig["prover"]): Prover | null {
+  if (c === null) return null;
+  if (c.kind === "native") return cliProver(c.path);
+  const { dir, sha256 } = c;
+  let loaded: Promise<Prover> | null = null;
+  const load = async (): Promise<Prover> => {
+    const glueBytes = new Uint8Array(await readFile(join(dir, "ostra_prove.js")));
+    const wasmBytes = new Uint8Array(await readFile(join(dir, "ostra_prove_bg.wasm")));
+    if (sha256 !== null) {
+      const got = await sha256Hex(glueBytes);
+      if (got !== sha256.glue) throw new Error(`the WebAssembly prover's glue has SHA-256 ${got}, not ${sha256.glue}: reinstall @ostraagent/mcp`);
+    }
+    const glue = (await import(`data:text/javascript;base64,${Buffer.from(glueBytes).toString("base64")}`)) as ProverWasmGlue;
+    return wasmProver(glue, wasmBytes, sha256 === null ? null : (sha256.wasm as `0x${string}`));
+  };
+  return async (command, request) => {
+    loaded ??= load().catch((err: unknown) => {
+      loaded = null;
+      throw err;
+    });
+    return (await loaded)(command, request);
+  };
+}
 
 export class Agent {
   readonly config: McpConfig;
@@ -124,7 +156,7 @@ export class Agent {
         config,
         swap: config.swap,
         keys,
-        prover: config.prover === null ? null : cliProver(config.prover),
+        prover: proverOf(config.prover),
         vaultFor,
         sender: this.sender,
         folder: keys.folder.folder(PRIVATE_SWAP_DIR),

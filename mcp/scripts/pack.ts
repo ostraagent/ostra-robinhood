@@ -6,12 +6,15 @@
 // workspace pins. Baked in (packaged.ts): the deployment record of Ostra on
 // Robinhood Chain mainnet (../deployments/robinhood-mainnet.json), Ostra
 // Swap's (../../ostra-swap/deployments/robinhood-mainnet.json, null while it
-// is not deployed) and the URLs of Ostra's relayer, keeper and aggregator.
+// is not deployed), the SHA-256 of the WebAssembly prover and the URLs of
+// Ostra's relayer, keeper and aggregator. The prover (ostra-swap
+// privacy/wasm/pkg, built by privacy/wasm/build.sh) goes into dist/prover.
 // The bundle is checked to import nothing of the workspace, and the records
 // to parse.
 //
 //   node scripts/pack.ts
 
+import { createHash } from "node:crypto";
 import { access, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -55,7 +58,16 @@ if (swapRecord !== null) {
   const swap = parseSwapDeployment(swapRecord);
   if (swap.chainId !== MAINNET_CHAIN_ID) throw new Error(`Ostra Swap's mainnet record is of chain ${swap.chainId}`);
 }
-const packaged: Packaged = { version: mcp.version, deployment: record, swapDeployment: swapRecord, ...SERVICES };
+const PROVER_DIR = here("../../ostra-swap/privacy/wasm/pkg");
+const PROVER_FILES = ["ostra_prove.js", "ostra_prove_bg.wasm"];
+for (const f of PROVER_FILES) {
+  await access(`${PROVER_DIR}/${f}`).catch(() => {
+    throw new Error(`${PROVER_DIR}/${f} is missing: build the prover first (ostra-swap privacy/wasm/build.sh)`);
+  });
+}
+const sha256Of = async (f: string) => `0x${createHash("sha256").update(await readFile(`${PROVER_DIR}/${f}`)).digest("hex")}`;
+const prover = { wasm: await sha256Of("ostra_prove_bg.wasm"), glue: await sha256Of("ostra_prove.js") };
+const packaged: Packaged = { version: mcp.version, deployment: record, swapDeployment: swapRecord, prover, ...SERVICES };
 
 await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
@@ -112,6 +124,8 @@ await writeFile(
     2,
   )}\n`,
 );
+await mkdir(`${OUT}/dist/prover`, { recursive: true });
+for (const f of PROVER_FILES) await copyFile(`${PROVER_DIR}/${f}`, `${OUT}/dist/prover/${f}`);
 await copyFile(here("README.md"), `${OUT}/README.md`);
 await copyFile(here("../LICENSE"), `${OUT}/LICENSE`);
-process.stdout.write(`${OUT}: ${mcp.name}@${mcp.version}, ${Math.round(code.length / 1024)} KB, chain ${deployment.chainId}, Ostra Swap ${swapRecord === null ? "not deployed" : "deployed"}, dependencies ${Object.entries(sorted).map(([n, v]) => `${n}@${v}`).join(" ")}\n`);
+process.stdout.write(`${OUT}: ${mcp.name}@${mcp.version}, ${Math.round(code.length / 1024)} KB, chain ${deployment.chainId}, Ostra Swap ${swapRecord === null ? "not deployed" : "deployed"}, prover ${prover.wasm} (glue ${prover.glue}), dependencies ${Object.entries(sorted).map(([n, v]) => `${n}@${v}`).join(" ")}\n`);

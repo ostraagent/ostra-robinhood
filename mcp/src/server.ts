@@ -33,7 +33,7 @@ async function main(): Promise<void> {
   const server = new McpServer({ name: "ostra-agent", version: packaged?.version ?? "0.1.0" }, { instructions: INSTRUCTIONS });
   registerTools(server, agent);
   await server.connect(new StdioServerTransport());
-  log("started", { chainId: config.chainId, relayer: config.relayerUrl !== null, launchpad: config.deployment.launchpad !== undefined, ostraSwap: config.swap !== null, prover: config.prover !== null, feePayer: agent.keys.feePayer.address });
+  log("started", { chainId: config.chainId, relayer: config.relayerUrl !== null, launchpad: config.deployment.launchpad !== undefined, ostraSwap: config.swap !== null, prover: config.prover?.kind ?? null, feePayer: agent.keys.feePayer.address });
   const timer = setInterval(() => void agent.sweep(), SWEEP_SECONDS * 1000);
   timer.unref();
 }

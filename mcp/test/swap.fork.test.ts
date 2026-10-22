@@ -1,16 +1,16 @@
 // Ostra Swap through the MCP server as an agent runs it: spawned over stdio, on a fork of Robinhood Chain mainnet
 // with Ostra and the launchpad deployed and Ostra Swap's contracts (OstraStake, OstraBuyback, OstraRouter,
 // SpendVerifier, OstraPrivatePool) deployed from the ostra-swap Foundry build, without a relayer (the fee payer in
-// OSTRA_HOME pays gas; private spends then carry no fee). Swaps between the agent's vaults as escrow orders (USDG to
+// OSTRA_HOME pays gas; private spends then carry no fee), proving with the WebAssembly prover the server loads by
+// default (ostra-swap privacy/wasm/pkg). Swaps between the agent's vaults as escrow orders (USDG to
 // WETH and back, tokens named by symbol), a private note shielded from the vault, a private swap into a WETH note,
 // an unshield of that note to a fresh address, refusals, and the notes found again by a second server on the same
-// OSTRA_HOME, one without the prover refusing to spend, and one without OSTRA_PRIVATE_LOCAL_SPENDS refusing to spend
+// OSTRA_HOME, one with OSTRA_PROVER=off refusing to spend, and one without OSTRA_PRIVATE_LOCAL_SPENDS refusing to spend
 // without a relayer. The seed in a new OSTRA_HOME (as a restored backup) shields again the amount it first shielded:
 // it finds its last shield nonce in the pool's events, so the note is new (a nonce used again would be refused as the
-// same commitment). The pool index (Uniswap pools per pair) is searched once
-// from Robinhood Chain's public RPC, as an agent's first swap does, and kept in OSTRA_HOME; the server searches the
-// private pool's events on the fork (OSTRA_LOGS_RPC_URL). Needs ../../ostra-swap built (forge build; cd privacy &&
-// cargo build --release --locked --bin ostra-prove) and anvil on PATH.
+// same commitment). The pool index (Uniswap pools per pair) is searched once from Robinhood Chain's public RPC, as
+// an agent's first swap does, and kept in OSTRA_HOME; the server searches the private pool's events on the fork
+// (OSTRA_LOGS_RPC_URL). Needs ../../ostra-swap built (forge build; privacy/wasm/build.sh) and anvil on PATH.
 
 import assert from "node:assert/strict";
 import { copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
@@ -27,7 +27,6 @@ import { deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostr
 import { OSTRA, OSTRA_PONS_CURVE, PONS_HOOK, PoolIndex, ROBINHOOD_PUBLIC_RPC, TREASURY, UNIVERSAL_ROUTER, USDG, WETH, erc20Abi, findRoute } from "@ostraagent/swap";
 
 const SWAP_DIR = new URL("../../../ostra-swap/", import.meta.url);
-const PROVER = fileURLToPath(new URL("privacy/target/release/ostra-prove", SWAP_DIR));
 const RECIPIENT = getAddress("0x00000000000000000000000000000000000D0D1A");
 
 let fork: Fork;
@@ -88,7 +87,7 @@ async function connect(home: string, o: { prover?: boolean; localSpends?: boolea
       OSTRA_AGGREGATOR_URL: "off",
       // No relayer here: the fee payer sends the private spends too (which links them to the agent).
       ...(o.localSpends !== false ? { OSTRA_PRIVATE_LOCAL_SPENDS: "yes" } : {}),
-      ...(prover ? { OSTRA_PROVER: PROVER } : {}),
+      ...(prover ? {} : { OSTRA_PROVER: "off" }),
     },
     stderr: "pipe",
   });
@@ -206,7 +205,7 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     await client.close();
   }
 
-  // The same OSTRA_HOME without the prover: the notes are there; a spend is refused before anything is signed.
+  // The same OSTRA_HOME with OSTRA_PROVER=off: the notes are there; a spend is refused before anything is signed.
   const again = await connect(home, { prover: false });
   try {
     const b = await call(again, "private_balance");

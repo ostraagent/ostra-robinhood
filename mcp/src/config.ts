@@ -26,9 +26,14 @@
 //                         sent by the fee payer in OSTRA_HOME, which links
 //                         them to the agent (tests and forks); otherwise they
 //                         are refused without a relayer
-//   OSTRA_PROVER          path of the ostra-prove binary (the private
-//                         notes' prover, ostra-swap privacy/); without it the
-//                         private tools refuse to run
+//   OSTRA_PROVER          the private notes' prover: unset, the WebAssembly
+//                         build of ostra-prove (the npm package carries it in
+//                         dist/prover and checks the SHA-256 of its files;
+//                         from source,
+//                         ostra-swap privacy/wasm/pkg, or the directory
+//                         OSTRA_PROVER_WASM names); a path, that native
+//                         ostra-prove binary instead; "off", none. Without a
+//                         prover the private tools refuse to spend
 //
 // The npm package sets the three service URLs to Ostra's own when they are
 // not set and it runs on the deployment it carries (never with
@@ -36,14 +41,45 @@
 // in OSTRA_HOME pays gas in ETH). On a fork of mainnet through OSTRA_RPC_URL
 // they must be turned off: the services are mainnet's.
 
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ROBINHOOD_PUBLIC_RPC, parseDeployment } from "@ostraagent/sdk";
 import { parseSwapDeployment, type SwapDeployment } from "@ostraagent/swap";
 import { X402_NETWORK, type Config } from "@ostraagent/core";
 import { checkPrivate } from "./disk.ts";
-import { packaged } from "./packaged.ts";
+import { packaged, type ProverHashes } from "./packaged.ts";
+
+/** ostra-prove as a native binary, or its WebAssembly build: a directory with ostra_prove.js and ostra_prove_bg.wasm. */
+export type ProverConfig = { kind: "native"; path: string } | { kind: "wasm"; dir: string; sha256: ProverHashes | null };
+
+/** The WebAssembly prover's files in a directory. */
+export const PROVER_WASM_FILES = ["ostra_prove.js", "ostra_prove_bg.wasm"] as const;
+
+/**
+ * The prover OSTRA_PROVER chooses (see the file comment). A WebAssembly build whose files are missing is none, except
+ * the npm package's own: a package without it is broken, and the server does not start.
+ */
+async function proverConfig(env: NodeJS.ProcessEnv): Promise<ProverConfig | null> {
+  const v = env.OSTRA_PROVER;
+  if (v === "off") return null;
+  if (v !== undefined && v !== "") return { kind: "native", path: v };
+  let dir: string;
+  let sha256: ProverHashes | null = null;
+  if (env.OSTRA_PROVER_WASM !== undefined && env.OSTRA_PROVER_WASM !== "") dir = env.OSTRA_PROVER_WASM;
+  else if (packaged !== null) {
+    dir = join(dirname(fileURLToPath(import.meta.url)), "prover");
+    sha256 = packaged.prover;
+  } else dir = fileURLToPath(new URL("../../../ostra-swap/privacy/wasm/pkg/", import.meta.url));
+  try {
+    for (const f of PROVER_WASM_FILES) await access(join(dir, f));
+  } catch {
+    if (sha256 !== null) throw new Error(`the package's prover is missing from ${dir}: reinstall @ostraagent/mcp`);
+    return null;
+  }
+  return { kind: "wasm", dir, sha256 };
+}
 
 export type McpConfig = Config & {
   home: string;
@@ -53,8 +89,8 @@ export type McpConfig = Config & {
   logsRpcUrl: string;
   /** Private spends sent by the local fee payer without a relayer (OSTRA_PRIVATE_LOCAL_SPENDS=yes). */
   privateLocalSpends: boolean;
-  /** The ostra-prove binary, or null (the private tools then refuse to run). */
-  prover: string | null;
+  /** The private notes' prover, or null (the private tools then refuse to spend). */
+  prover: ProverConfig | null;
 };
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
@@ -96,7 +132,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
   else if (services !== null && packaged !== null && packaged.swapDeployment !== null && packaged.swapDeployment !== undefined) swap = parseSwapDeployment(packaged.swapDeployment);
   if (swap !== null && swap.chainId !== deployment.chainId) throw new Error(`Ostra Swap's deployment is of chain ${swap.chainId}, not ${deployment.chainId}`);
   const logsRpcUrl = env.OSTRA_LOGS_RPC_URL !== undefined && env.OSTRA_LOGS_RPC_URL !== "" ? env.OSTRA_LOGS_RPC_URL : ROBINHOOD_PUBLIC_RPC;
-  const prover = env.OSTRA_PROVER !== undefined && env.OSTRA_PROVER !== "" ? env.OSTRA_PROVER : null;
+  const prover = await proverConfig(env);
   return {
     home,
     swap,
