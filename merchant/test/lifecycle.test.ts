@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { Channel } from "@x402/evm/batch-settlement/server";
-import { IDLE_TIMEOUT_SECONDS, closeRequestedSince, createLifecycle } from "../src/lifecycle.ts";
+import { IDLE_TIMEOUT_SECONDS, closeRequestedSince, closedSinceRequest, createLifecycle } from "../src/lifecycle.ts";
 import { FileChannelStorage } from "../src/store.ts";
 import { channelRecord } from "./fixtures.ts";
 
@@ -30,7 +30,15 @@ test("an idle channel is closed once, activity postpones it, and new activity af
     const busy = channelRecord("busy", { lastRequestTimestamp: now });
     await store.updateChannel(idle.channelId, () => idle);
     await store.updateChannel(busy.channelId, () => busy);
-    const lc = createLifecycle(store, async (c: Channel) => void closed.push(c.channelId), 600);
+    // A close that happens marks the channel closed, as the server's closeThroughKeeper does.
+    const lc = createLifecycle(
+      store,
+      async (c: Channel) => {
+        closed.push(c.channelId);
+        await store.updateMeta(c.channelId, (_c, meta) => ({ meta: { ...meta, closedAt: Date.now() } }));
+      },
+      600,
+    );
     lifecycle.shutdown = () => lc.shutdown();
     store.onChange((_p, next) => {
       if (next !== undefined) lc.touch(next.channelId);
@@ -53,6 +61,51 @@ test("an idle channel is closed once, activity postpones it, and new activity af
     assert.deepEqual(closed, [idle.channelId, busy.channelId, idle.channelId]);
   } finally {
     lifecycle.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a close that did not happen is requested again a timeout later, also after a restart, until it is closed", async () => {
+  assert.equal(closedSinceRequest({}), false);
+  assert.equal(closedSinceRequest({ closeRequestedAt: 100 }), false);
+  assert.equal(closedSinceRequest({ closeRequestedAt: 100, closedAt: 99 }), false);
+  assert.equal(closedSinceRequest({ closeRequestedAt: 100, closedAt: 100 }), true);
+  const root = await mkdtemp(join(tmpdir(), "ostra-merchant-retry-"));
+  const running: { shutdown: () => void }[] = [];
+  try {
+    let store = await FileChannelStorage.open(root);
+    const tries: number[] = [];
+    let works = false;
+    // The keeper cannot close it (closeThroughKeeper's failures are logged and swallowed by the server) until `works`;
+    // a close marks the channel closed in the store the running server uses.
+    const closeOnIdle = async (c: Channel) => {
+      tries.push(Date.now());
+      if (!works) return;
+      await store.updateMeta(c.channelId, (_c, meta) => ({ meta: { ...meta, closedAt: Date.now() } }));
+    };
+    const ch = channelRecord("stuck", { lastRequestTimestamp: Date.now() - 10_000 });
+    await store.updateChannel(ch.channelId, () => ch);
+    const first = createLifecycle(store, closeOnIdle, 400);
+    running.push(first);
+    await sleep(150);
+    assert.equal(tries.length, 1, "closed once at start");
+    await sleep(500);
+    assert.equal(tries.length, 2, "requested again a timeout later");
+    // A restart: the close requested and not done is requested again from the store.
+    first.shutdown();
+    store = await FileChannelStorage.open(root);
+    const second = createLifecycle(store, closeOnIdle, 400);
+    running.push(second);
+    await sleep(600);
+    assert.ok(tries.length >= 3, `requested again after a restart (${tries.length})`);
+    works = true;
+    await sleep(500);
+    const n = tries.length;
+    assert.ok(closedSinceRequest(store.meta(ch.channelId)), "closed at last");
+    await sleep(1_000);
+    assert.equal(tries.length, n, "not requested again once closed");
+  } finally {
+    for (const l of running) l.shutdown();
     await rm(root, { recursive: true, force: true });
   }
 });
