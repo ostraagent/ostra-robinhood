@@ -19,6 +19,7 @@ import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
 import type { Prover } from "@ostraagent/swap";
 import {
+  AiService,
   ChannelService,
   LaunchpadService,
   LocalSender,
@@ -100,6 +101,8 @@ export class Agent {
   readonly shield: ShieldService;
   readonly creatorShield: ShieldService;
   readonly unshield: UnshieldService;
+  /** Ostra AI's tasks paid from the vault (null without OSTRA_AI_URL). */
+  readonly ai: AiService | null;
   /** Ostra Swap from the agent's vaults, and its private notes (null without OSTRA_SWAP_DEPLOYMENT). */
   readonly swap: SwapService | null;
   readonly privateBalance: PrivateBalanceService | null;
@@ -131,6 +134,7 @@ export class Agent {
     this.relayer?.attachBuyerVault(this.buyer);
     this.channels = new ChannelService(client, config, keys, this.buyer, this.sender);
     this.payments = new PayService(client, config, this.buyer, this.channels);
+    this.ai = config.aiUrl === null ? null : new AiService(config, this.payments, this.buyer);
     this.seller = new VaultService(client, transport, config, keys, this.sender, "seller");
     this.creatorRelayer = config.relayerUrl === null ? null : new RelayerClient(client, config, p.creatorKeys, config.relayerUrl);
     const creatorSender = this.creatorRelayer ?? this.local;

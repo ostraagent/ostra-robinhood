@@ -1,0 +1,33 @@
+: keep-alive
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"The"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" user asks for"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" a one"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"-word answer about"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" the color of"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" a clear daytime sky"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":". The"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" answer is blue"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"."}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"Blue"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":"","reasoning":null}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165297,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":33,"completion_tokens":25,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"completion_tokens_details":{"reasoning_tokens":24,"image_tokens":0,"audio_tokens":0}}}
+
+: keep-alive
+
+event: ostra
+data: {"object":"ostra.task","task":"4863bea77ef9bb8d434f377c","model":"inclusionai/ling-3.0-flash","finish_reason":"stop","usage":{"prompt_tokens":33,"completion_tokens":25,"reasoning_tokens":24},"quality_source":"Text quality: Artificial Analysis Intelligence Index (artificialanalysis.ai)","paid":{"charged":"40","from_voucher":"40","channel":"0x7077e33ce22cce9365cc32c91e13660a56f94d62f519f8105eb624a5524edd7e","from_credit":"0","cost":"8","credited":"32","credit":"95","unit":"base units (0.000001 per unit)"}}
+
+data: [DONE]
+

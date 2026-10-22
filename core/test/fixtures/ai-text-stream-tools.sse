@@ -1,0 +1,41 @@
+: keep-alive
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"The"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" user wants to"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" know the current weather"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" in Jakarta. I"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" should use the get"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"_weather tool"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" with the city parameter"}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" set to \""}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":"Jakarta\"."}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_642d4d295f6f4630b70bc03c","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"\"city\": \"Jak"}}]}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"arta\""}}]}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":"","reasoning":null}}]}
+
+data: {"id":"4863bea77ef9bb8d434f377c","object":"chat.completion.chunk","created":1792165298,"model":"inclusionai/ling-3.0-flash","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":250,"completion_tokens":46,"total_tokens":296,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"completion_tokens_details":{"reasoning_tokens":33,"image_tokens":0,"audio_tokens":0}}}
+
+: keep-alive
+
+event: ostra
+data: {"object":"ostra.task","task":"4863bea77ef9bb8d434f377c","model":"inclusionai/ling-3.0-flash","finish_reason":"tool_calls","usage":{"prompt_tokens":250,"completion_tokens":46,"reasoning_tokens":33},"quality_source":"Text quality: Artificial Analysis Intelligence Index (artificialanalysis.ai)","paid":{"charged":"40","from_voucher":"40","channel":"0x7077e33ce22cce9365cc32c91e13660a56f94d62f519f8105eb624a5524edd7e","from_credit":"0","cost":"8","credited":"32","credit":"95","unit":"base units (0.000001 per unit)"}}
+
+data: [DONE]
+

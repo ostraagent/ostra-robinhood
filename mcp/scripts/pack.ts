@@ -26,7 +26,7 @@ const here = (p: string) => fileURLToPath(new URL(`../${p}`, import.meta.url));
 const OUT = here("release");
 const BUNDLE = "dist/ostra-mcp.js";
 const MAINNET_CHAIN_ID = 4663;
-const SERVICES = { relayerUrl: "https://relayer.ostraagent.xyz", keeperUrl: "https://keeper.ostraagent.xyz", aggregatorUrl: "https://aggregator.ostraagent.xyz" };
+const SERVICES = { relayerUrl: "https://relayer.ostraagent.xyz", keeperUrl: "https://keeper.ostraagent.xyz", aggregatorUrl: "https://aggregator.ostraagent.xyz", aiUrl: "https://ai.ostraagent.xyz" };
 const WORKSPACE = ["@ostraagent/core", "@ostraagent/sdk", "@ostraagent/swap"];
 
 type Manifest = { name: string; version: string; dependencies?: Record<string, string> };

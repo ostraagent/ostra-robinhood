@@ -7,13 +7,15 @@
 // `pairs` tool); its market cap is in US dollars. Ostra Swap's tools take a
 // token as an address or the symbol of a pair (ETH: WETH, which a vault holds).
 
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
+import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
 import { LAUNCH_PAIRS, QuoteError, WETH, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
+import { ensurePrivateDir } from "./disk.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
 
@@ -43,6 +45,27 @@ const publicFields = {
   x: z.string().url().max(200).optional().describe("the X (Twitter) profile link"),
   telegram: z.string().url().max(200).optional(),
 };
+
+/** Where ostra_ai keeps the images and videos it gets, in OSTRA_HOME. */
+export const AI_DIR = "ai";
+/** A saved image's extension, from its first bytes (an answer's media_type may be missing): "bin" when none of these. */
+function imageExt(b: Buffer): string {
+  if (b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpg";
+  if (b.subarray(0, 4).toString("latin1") === "RIFF" && b.subarray(8, 12).toString("latin1") === "WEBP") return "webp";
+  if (b.subarray(0, 4).toString("latin1") === "GIF8") return "gif";
+  return "bin";
+}
+/** A saved video's extension, from its first bytes: an MP4 (or QuickTime) carries "ftyp" at byte 4, WebM starts with EBML. */
+function videoExt(b: Buffer): string {
+  if (b.subarray(4, 8).toString("latin1") === "ftyp") return "mp4";
+  if (b.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) return "webm";
+  return "bin";
+}
+/** The largest video ostra_ai_job saves. */
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+/** A finished video job's status (the gateway's). */
+const FINAL_JOB = ["completed", "failed", "cancelled", "expired"];
 
 /** A tool's answer: its result as JSON, or the error, with what kind of error it is. */
 async function run(fn: () => Promise<unknown>, rpcUrls: readonly string[]): Promise<CallToolResult> {
@@ -102,6 +125,63 @@ export function registerTools(server: McpServer, agent: Agent): void {
     { url: z.string().url(), method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"), headers: z.record(z.string(), z.string()).optional(), body: z.string().max(1_000_000).optional(), maxPrice: usdg, deposit: usdg.optional() },
     (a) => agent.payments.pay({ url: a.url, method: a.method, maxPrice: a.maxPrice, ...(a.headers === undefined ? {} : { headers: a.headers }), ...(a.body === undefined ? {} : { body: a.body }), ...(a.deposit === undefined ? {} : { deposit: a.deposit }) }),
   );
+
+  // --- Ostra AI ---------------------------------------------------------------------------------------
+  const ai = () => {
+    if (agent.ai === null) throw new Error("Ostra AI is not configured here (OSTRA_AI_URL)");
+    return agent.ai;
+  };
+  const aiDir = join(agent.config.home, AI_DIR);
+  tool(
+    "ostra_ai",
+    "Runs an AI task on Ostra AI. text: request { messages, max_tokens, and optionally quality (best, balanced or cheapest; default best), privacy (no_training, zdr or standard; default no_training), temperature, top_p, seed, stop, tools, tool_choice, response_format, reasoning }. image: { prompt, and optionally n, quality, aspect_ratio, resolution, seed, background, output_format, image_quality, references }. video: { prompt, duration in seconds, and optionally quality, resolution (such as 480p; models priced per token need one), aspect_ratio, size, frame_images, references, generate_audio, seed }. A text task is read as a stream and answered whole, however long the model takes. No model is named: Ostra chooses one by its quality rating within maxPrice, and a task no model can do within it is refused with the reasons, nothing paid. Paid in USDG from the vault through an x402 channel to Ostra AI, opened when needed with `deposit` (default 1 USDG; its unused deposit comes back to the vault when the channel closes). maxPrice is the most the task may cost; what it did not cost stays as the vault's credit with Ostra AI and pays part of the next task (ostra_ai_credit). Images are saved as files in the agent's directory; a video task answers a job, followed with ostra_ai_job.",
+    { task: z.enum(AI_TASK_KINDS), request: z.record(z.string(), z.unknown()), maxPrice: usdg, deposit: usdg.optional() },
+    async (a) => {
+      const r = await ai().task(a.task, a.request, a.maxPrice, a.deposit);
+      const answer = r.answer as { task?: unknown; images?: unknown } | null;
+      if (a.task !== "image" || answer === null || typeof answer !== "object" || !Array.isArray(answer.images)) return r;
+      // The images, base64 in the answer, as files.
+      await ensurePrivateDir(aiDir);
+      const id = typeof answer.task === "string" && /^[0-9a-f]{1,64}$/.test(answer.task) ? answer.task : String(Date.now());
+      const images = [];
+      for (const [i, img] of (answer.images as { media_type?: unknown; b64_json?: unknown }[]).entries()) {
+        if (typeof img.b64_json !== "string") {
+          images.push({ media_type: img.media_type ?? null, file: null, note: "the answer carried no image data" });
+          continue;
+        }
+        const bytes = Buffer.from(img.b64_json, "base64");
+        const file = join(aiDir, `${id}-${i}.${imageExt(bytes)}`);
+        await writeFile(file, bytes, { mode: 0o600 });
+        images.push({ media_type: img.media_type, file, bytes: bytes.length });
+      }
+      return { ...r, answer: { ...answer, images } };
+    },
+  );
+  tool(
+    "ostra_ai_job",
+    "A video job of ostra_ai: its status until it is final (completed, failed, cancelled or expired; the first final read settles its cost and credits the rest to the vault). With download (default true), a completed job's video is saved as a file in the agent's directory. Free: no payment.",
+    { job: z.string().regex(/^[0-9a-f]{32}$/, "the job ostra_ai answered: 32 hex characters"), download: z.boolean().default(true) },
+    async (a) => {
+      const s = await ai().job(a.job);
+      const answer = s.answer as { status?: unknown } | null;
+      if (s.status !== 200 || answer === null || typeof answer !== "object") return s;
+      const final = typeof answer.status === "string" && FINAL_JOB.includes(answer.status);
+      if (!a.download || answer.status !== "completed") return { ...answer, final };
+      const res = await fetch(ai().contentUrl(a.job), { signal: AbortSignal.timeout(600_000) });
+      const size = Number(res.headers.get("content-length") ?? "0");
+      if (!res.ok || size > MAX_VIDEO_BYTES) return { ...answer, final, file: null, note: `the video could not be read (${res.status}${size > MAX_VIDEO_BYTES ? `, ${size} bytes` : ""}); ask again` };
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (bytes.length > MAX_VIDEO_BYTES) return { ...answer, final, file: null, note: `the video is larger than ${MAX_VIDEO_BYTES} bytes` };
+      await ensurePrivateDir(aiDir);
+      const file = join(aiDir, `${a.job}.${videoExt(bytes)}`);
+      await writeFile(file, bytes, { mode: 0o600 });
+      return { ...answer, final, file, bytes: bytes.length };
+    },
+  );
+  tool("ostra_ai_credit", "The vault's credit with Ostra AI: what earlier tasks were paid and did not cost, used first by the next task (USDG).", {}, async () => {
+    const c = (await ai().credit()) as { payer?: unknown; credit?: unknown };
+    return { payer: c.payer, credit: typeof c.credit === "string" && /^[0-9]+$/.test(c.credit) ? formatTokenAmount(BigInt(c.credit)) : c.credit };
+  });
 
   // --- the seller vault -------------------------------------------------------------------------------
   tool("accept_payments", "Sets up the seller side: the seller vault with the Ostra keeper's crank (it claims vouchers), and the merchant key for the seller server (merchant/).", {}, () => agent.acceptPayments());

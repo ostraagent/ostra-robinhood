@@ -14,6 +14,7 @@
 //                         ETH (without it the fee payer in OSTRA_HOME pays gas)
 //   OSTRA_KEEPER_URL      the Ostra keeper (accept_payments)
 //   OSTRA_AGGREGATOR_URL  the Ostra aggregator (shield)
+//   OSTRA_AI_URL          Ostra AI, the gateway of the ostra_ai tools
 //   OSTRA_SWAP_DEPLOYMENT path of Ostra Swap's deployment record (JSON:
 //                         its router, stake and private pool); the npm
 //                         package carries mainnet's once it is deployed.
@@ -35,7 +36,7 @@
 //                         ostra-prove binary instead; "off", none. Without a
 //                         prover the private tools refuse to spend
 //
-// The npm package sets the three service URLs to Ostra's own when they are
+// The npm package sets the four service URLs to Ostra's own when they are
 // not set and it runs on the deployment it carries (never with
 // OSTRA_DEPLOYMENT); "off" turns one off (without the relayer the fee payer
 // in OSTRA_HOME pays gas in ETH). On a fork of mainnet through OSTRA_RPC_URL
@@ -112,7 +113,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
   const deploymentPath = env.OSTRA_DEPLOYMENT;
   let record: unknown;
   // Ostra's services are the defaults on the packaged mainnet deployment only.
-  let services: { relayerUrl: string; keeperUrl: string; aggregatorUrl: string } | null = null;
+  let services: { relayerUrl: string; keeperUrl: string; aggregatorUrl: string; aiUrl?: string } | null = null;
   if (deploymentPath !== undefined && deploymentPath !== "") record = JSON.parse(await readFile(deploymentPath, "utf8"));
   else if (packaged !== null) {
     record = packaged.deployment;
@@ -146,6 +147,6 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     keeperUrl: serviceUrl(env, "OSTRA_KEEPER_URL", services?.keeperUrl ?? null),
     relayerUrl: serviceUrl(env, "OSTRA_RELAYER_URL", services?.relayerUrl ?? null),
     aggregatorUrl: serviceUrl(env, "OSTRA_AGGREGATOR_URL", services?.aggregatorUrl ?? null),
-    aiUrl: null,
+    aiUrl: serviceUrl(env, "OSTRA_AI_URL", services?.aiUrl ?? null),
   };
 }

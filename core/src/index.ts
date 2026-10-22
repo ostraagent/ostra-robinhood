@@ -2,6 +2,7 @@
 // app (in the browser). Nothing here depends on Node: records go through the
 // Folder interface (storage.ts) and the keys through Keys (keys.ts).
 
+export * from "./ai.ts";
 export * from "./amount.ts";
 export * from "./chain.ts";
 export * from "./channels.ts";

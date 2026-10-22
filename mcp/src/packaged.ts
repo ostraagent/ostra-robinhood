@@ -2,7 +2,7 @@
 // (esbuild's define): its version, the deployment record of Ostra on
 // Robinhood Chain mainnet, Ostra Swap's (null until it is deployed), the
 // SHA-256 of the WebAssembly prover's files in dist/prover and the URLs of Ostra's
-// relayer, keeper and aggregator, so that
+// relayer, keeper, aggregator and AI gateway, so that
 // `npx -y @ostraagent/mcp` runs with no configuration.
 // Null when the server runs from source, where OSTRA_DEPLOYMENT and the
 // service URLs are set by hand.
@@ -19,6 +19,8 @@ export type Packaged = {
   relayerUrl: string;
   keeperUrl: string;
   aggregatorUrl: string;
+  /** Ostra AI (from 0.1.4). */
+  aiUrl?: string;
 };
 
 declare const OSTRA_PACKAGED: Packaged | undefined;

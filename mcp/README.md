@@ -1,12 +1,12 @@
 # @ostraagent/mcp
 
-Ostra Agent's MCP server. It gives an AI agent its own vault of USDG on Robinhood Chain (chain 4663), guarded by post-quantum one-time keys (WOTS), and the tools to pay for services, keep funds private and trade or launch tokens on the Ostra launchpad. Every transaction goes through the Ostra relayer and is paid in USDG from the vault, so the agent never needs ETH.
+Ostra Agent's MCP server. It gives an AI agent its own vault of USDG on Robinhood Chain (chain 4663), guarded by post-quantum one-time keys (WOTS), and the tools to pay for services, run AI tasks on Ostra AI, keep funds private and trade or launch tokens on the Ostra launchpad. Every transaction goes through the Ostra relayer and is paid in USDG from the vault, so the agent never needs ETH.
 
 Website: [ostraagent.xyz](https://ostraagent.xyz) · Docs: [docs.ostraagent.xyz](https://docs.ostraagent.xyz) · Source: [github.com/ostraagent/ostra-robinhood](https://github.com/ostraagent/ostra-robinhood/tree/main/mcp)
 
 ## Install
 
-Requires Node.js 22 or later. No configuration is needed: the package carries the mainnet deployment of Ostra and the addresses of its relayer, keeper and aggregator.
+Requires Node.js 22 or later. No configuration is needed: the package carries the mainnet deployment of Ostra and the addresses of its relayer, keeper, aggregator and AI gateway.
 
 Claude Code:
 
@@ -43,6 +43,7 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 
 - **Vault:** `open_vault`, `balance`, `withdraw`, `fund_creator_vault`, `creator_withdraw`
 - **Payments:** `pay` (calls a paid HTTP service and pays it from a channel of the vault, refused before signing above `maxPrice`), `open_channel`, `list_channels`, `close_channel`
+- **Ostra AI:** `ostra_ai` (a text, image or video task; Ostra chooses the model by its quality rating within `maxPrice`, paid in USDG from a channel of the vault, and what a task did not cost stays as the vault's credit), `ostra_ai_job` (a video job, saved as a file once completed), `ostra_ai_credit`
 - **Selling services:** `accept_payments`, `seller_balance`, `seller_withdraw`
 - **Privacy:** `shield`, `shield_status`, `auto_shield`, `unshield`, `private_withdraw`
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`
@@ -68,13 +69,14 @@ All settings are optional.
 | `OSTRA_RELAYER_URL` | `https://relayer.ostraagent.xyz` | Sends every transaction, paid in USDG. With `off`, a local fee payer key in `OSTRA_HOME` pays gas in ETH |
 | `OSTRA_KEEPER_URL` | `https://keeper.ostraagent.xyz` | Claims payments for the seller side. `off` disables `accept_payments` |
 | `OSTRA_AGGREGATOR_URL` | `https://aggregator.ostraagent.xyz` | Batches shield deposits. `off` disables `shield` |
+| `OSTRA_AI_URL` | `https://ai.ostraagent.xyz` | Ostra AI, the gateway of the `ostra_ai` tools. `off` disables them |
 | `OSTRA_SWAP_DEPLOYMENT` | Ostra Swap on Robinhood Chain mainnet | Path of another Ostra Swap deployment record (JSON). With `OSTRA_DEPLOYMENT` set and no Ostra Swap record, the Ostra Swap and private tools refuse |
 | `OSTRA_PROVER` | The WebAssembly prover in the package | Path of a native `ostra-prove` binary to prove with instead, or `off` (the private tools then refuse to spend) |
 | `OSTRA_PROVER_WASM` | | A directory with another build of the WebAssembly prover (`ostra_prove.js`, `ostra_prove_bg.wasm`) |
 | `OSTRA_LOGS_RPC_URL` | Robinhood Chain's public RPC | RPC for Ostra Swap's event searches (wide `eth_getLogs` windows); never printed |
-| `OSTRA_DEPLOYMENT` | Ostra on Robinhood Chain mainnet | Path of another deployment record (JSON). With it, the three services default to off |
+| `OSTRA_DEPLOYMENT` | Ostra on Robinhood Chain mainnet | Path of another deployment record (JSON). With it, the four services default to off |
 
-On a local fork of mainnet (`OSTRA_RPC_URL` pointing at it), set the three services to `off`: they act on mainnet.
+On a local fork of mainnet (`OSTRA_RPC_URL` pointing at it), set the four services to `off`: they act on mainnet.
 
 Logs go to stderr as JSON lines. Stdout carries only the MCP protocol.
 

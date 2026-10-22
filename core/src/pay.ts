@@ -47,6 +47,10 @@ export type PayInput = {
   maxPrice: string;
   /** Deposit of a new channel to the seller, when one is opened (USDG; default 1, at least the price). */
   deposit?: string;
+  /** At most this much of the answer is returned (default PAY_MAX_BODY_CHARS). */
+  maxBodyChars?: number;
+  /** How long one request may take, its answer read to the end (ms; default 120,000). */
+  timeoutMs?: number;
 };
 
 export type PayResult = {
@@ -98,7 +102,7 @@ export class PayService {
         method: input.method ?? "GET",
         headers: { ...(input.headers ?? {}), ...headers },
         ...(input.body === undefined ? {} : { body: input.body }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(input.timeoutMs ?? REQUEST_TIMEOUT_MS),
         redirect: "manual",
       });
     } catch (err) {
@@ -106,16 +110,16 @@ export class PayService {
     }
   }
 
-  async #answer(res: Response, paid: bigint | null, record: ChannelRecord | null, note?: string): Promise<PayResult> {
+  async #answer(res: Response, paid: bigint | null, record: ChannelRecord | null, note?: string, maxBodyChars = PAY_MAX_BODY_CHARS): Promise<PayResult> {
     const text = await res.text();
-    const truncated = text.length > PAY_MAX_BODY_CHARS;
+    const truncated = text.length > maxBodyChars;
     return {
       status: res.status,
       paid: paid === null ? null : formatTokenAmount(paid),
       channel: record === null ? null : record.channel,
       channelLeft: record === null ? null : formatTokenAmount(payCapacity(record)),
       contentType: res.headers.get("content-type"),
-      body: truncated ? text.slice(0, PAY_MAX_BODY_CHARS) : text,
+      body: truncated ? text.slice(0, maxBodyChars) : text,
       truncated,
       ...(note === undefined ? {} : { note }),
     };
@@ -186,7 +190,7 @@ export class PayService {
       if (url.protocol !== "https:" && url.protocol !== "http:") throw new RangeError("pay sends http(s) requests only");
       const maxPrice = parseTokenAmount(input.maxPrice);
       const first = await this.#fetch(input);
-      if (first.status !== 402) return this.#answer(first, null, null);
+      if (first.status !== 402) return this.#answer(first, null, null, undefined, input.maxBodyChars);
 
       let firstBody: unknown = null;
       try {
@@ -279,12 +283,12 @@ export class PayService {
         break;
       }
       if (answer.status === 402) {
-        return this.#answer(answer, null, r, "the seller did not take the voucher; what the voucher signed stays recorded against the channel");
+        return this.#answer(answer, null, r, "the seller did not take the voucher; what the voucher signed stays recorded against the channel", input.maxBodyChars);
       }
       const done = await this.#channels.updatePayRecord(r.salt, (rec) => {
         rec.pay.payments.push({ url: input.url, amount: paid.toString(), transaction: answer.headers.get("payment-response") ?? "", at: now() });
       });
-      return this.#answer(answer, paid, done, opened ? `a channel to the seller was opened with a deposit of ${formatTokenAmount(BigInt(done.deposit))}; later payments to the seller use it` : undefined);
+      return this.#answer(answer, paid, done, opened ? `a channel to the seller was opened with a deposit of ${formatTokenAmount(BigInt(done.deposit))}; later payments to the seller use it` : undefined, input.maxBodyChars);
     });
   }
 }

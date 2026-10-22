@@ -1,7 +1,7 @@
 // Runs the npm package as an MCP client does, through npx, in a fresh
 // OSTRA_HOME and npm cache: the tools are listed, `tokens` reads the
-// launchpad from the chain, `balance` answers, and `backup` without arguments
-// prints its usage. Run on the packed tarball before publishing and on the
+// launchpad from the chain, `balance` answers, `ostra_ai_credit` reaches Ostra
+// AI (no payment), and `backup` without arguments prints its usage. Run on the packed tarball before publishing and on the
 // published version after:
 //
 //   node scripts/smoke.ts ./release/ostraagent-mcp-0.1.0.tgz
@@ -59,11 +59,14 @@ try {
   assert.ok(tokens.ok, tokens.text);
   const balance = await call("balance", {});
   assert.ok(balance.ok, balance.text);
+  const credit = await call("ostra_ai_credit", {});
+  assert.ok(credit.ok, credit.text);
+  assert.match(credit.text, /"credit": "[0-9.]+"/, credit.text);
   await client.close();
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");
   process.stdout.write(
-    `${info?.name}@${info?.version}: ${names.size} tools; tokens: ${tokens.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nSMOKE_OK\n`,
+    `${info?.name}@${info?.version}: ${names.size} tools; tokens: ${tokens.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nSMOKE_OK\n`,
   );
 } catch (err) {
   process.stderr.write(`${stderr.slice(-3000)}\n`);
