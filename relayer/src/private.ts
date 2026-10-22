@@ -21,9 +21,10 @@
 // without a bond cannot rule out: it is bounded instead. A note (its nullifier, the ledger's privateReverts) whose
 // spends reverted NOTE_REVERTS times in REVERT_WINDOW_MS is not relayed again in that window, nor anything from an IP
 // address with IP_REVERTS reverted spends in it; GLOBAL_REVERTS reverted spends within GLOBAL_PAUSE_MS pause private
-// relaying until they are older; one IP address gets PRIVATE_RELAYS_PER_IP_HOUR requests an hour. The deadline is
-// checked when the request comes and again just before the transaction is signed (send.ts notAfter), so a spend is
-// not sent to revert Expired.
+// relaying until they are older. All three are kept in the ledger, so a restart does not reset them
+// (privateRevertRefusal, recordPrivateRevert). One IP address gets PRIVATE_RELAYS_PER_IP_HOUR requests an hour. The
+// deadline is checked when the request comes and again just before the transaction is signed (send.ts notAfter), so a
+// spend is not sent to revert Expired.
 //
 // The price an agent proves with (GET /v1/private/price, kept PRICE_CACHE_MS per token and kind): the gas a spend of
 // that kind uses with headroom (PRIVATE_GAS), at the gas price now, with the relayer margin and PRICE_HEADROOM_BPS for
@@ -35,7 +36,8 @@ import { decodeFunctionData, encodeFunctionData, getAddress, toFunctionSelector,
 import { LAUNCH_PAIRS, RelaySimulationError, USDG_DECIMALS, estimateRelay, relayGasCap, relayPriceWei, weiToTokenUnits, withMargin, type EthUsd, type EthUsdSource } from "@ostraagent/sdk";
 import { HUBS, NO_LEG, NoRouteError, PRIVATE_SWAP_FEE_BPS, USDG, WETH, findRoute, hubPools, legFor, ostraPrivatePoolAbi, type Leg, type PoolIndex } from "@ostraagent/swap";
 import type { Answer, Log } from "./gate.ts";
-import type { Ledger } from "./ledger.ts";
+import type { Ledger, LedgerData } from "./ledger.ts";
+import { RateWindow } from "./rate.ts";
 import { NotSentError, SendUnknownError, type Landed } from "./send.ts";
 import type { RelayTx } from "./calls.ts";
 
@@ -91,8 +93,8 @@ type SwapTerms = { tokenOut: Address; minOut: bigint; outTag: Hex; hub: Address;
 
 const sameLeg = (a: Leg, b: Leg) => a.commands.toLowerCase() === b.commands.toLowerCase() && a.inputs.length === b.inputs.length && a.inputs.every((x, i) => x.toLowerCase() === (b.inputs[i] as Hex).toLowerCase());
 
-function json(status: number, body: unknown): Answer {
-  return { status, headers: { "content-type": "application/json", "cache-control": "no-store" }, body };
+function json(status: number, body: unknown, headers: Record<string, string> = {}): Answer {
+  return { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers }, body };
 }
 
 export type PrivateRelayOptions = {
@@ -108,14 +110,49 @@ export type PrivateRelayOptions = {
   log: Log;
 };
 
+/**
+ * Whether a private spend of the note `nullifier` from `ip` is refused at `now` for what reverted before (see the file
+ * comment): the note's own reverts, its IP address's, and everyone's in the last GLOBAL_PAUSE_MS.
+ */
+export function privateRevertRefusal(data: LedgerData, ip: string, nullifier: string, now: number): Answer | null {
+  const noteReverts = (data.privateReverts?.[nullifier.toLowerCase()] ?? []).filter((r) => now - r.at < REVERT_WINDOW_MS);
+  if (noteReverts.length >= NOTE_REVERTS) {
+    return json(409, { error: "reverted_before", message: `spends of this note reverted ${noteReverts.length} times when relayed; it is not relayed again for 24 hours after the last`, txHashes: noteReverts.map((r) => r.txHash) });
+  }
+  if ((data.privateIpReverts?.[ip] ?? []).filter((t) => now - t < REVERT_WINDOW_MS).length >= IP_REVERTS) {
+    return json(403, { error: "reverts_limit", message: `${IP_REVERTS} private spends from this IP address reverted when relayed in 24 hours; none is relayed for it until then` });
+  }
+  if ((data.privateRecentReverts ?? []).filter((t) => now - t < GLOBAL_PAUSE_MS).length >= GLOBAL_REVERTS) {
+    return json(503, { error: "private_paused", message: "private spends are not relayed for now; try again within half an hour" });
+  }
+  return null;
+}
+
+/**
+ * Records in the ledger's `data` a private spend of the note `nullifier` from `ip` that reverted at `at`, dropping what
+ * is older than its window. Recording the same revert (note, txHash, at) again changes nothing.
+ */
+export function recordPrivateRevert(data: LedgerData, ip: string, nullifier: string, txHash: string, at: number): void {
+  const notes = data.privateReverts ?? {};
+  if ((notes[nullifier.toLowerCase()] ?? []).some((r) => r.txHash === txHash && r.at === at)) return;
+  for (const [n, list] of Object.entries(notes)) if (list.every((r) => at - r.at >= REVERT_WINDOW_MS)) delete notes[n];
+  const key = nullifier.toLowerCase();
+  notes[key] = [...(notes[key] ?? []).filter((r) => at - r.at < REVERT_WINDOW_MS), { txHash, at }];
+  data.privateReverts = notes;
+  const ips = data.privateIpReverts ?? {};
+  for (const [i, list] of Object.entries(ips)) if (list.every((t) => at - t >= REVERT_WINDOW_MS)) delete ips[i];
+  ips[ip] = [...(ips[ip] ?? []).filter((t) => at - t < REVERT_WINDOW_MS), at];
+  data.privateIpReverts = ips;
+  data.privateRecentReverts = [...(data.privateRecentReverts ?? []).filter((t) => at - t < GLOBAL_PAUSE_MS), at];
+}
+
 export class PrivateRelay {
   readonly #o: PrivateRelayOptions;
   readonly #locks = new Map<string, Promise<unknown>>();
   readonly #prices = new Map<string, { at: number; answer: Answer }>();
-  readonly #perIp = new Map<string, number[]>();
-  /** Times of reverted private spends, of everyone and per IP address. */
-  #reverts: number[] = [];
-  readonly #ipReverts = new Map<string, number[]>();
+  readonly #perIp = new RateWindow(PRIVATE_RELAYS_PER_IP_HOUR, HOUR_MS);
+  /** Reverts the ledger could not record (a failed write): counted from memory until a later write records them. */
+  #unrecorded: { ip: string; nullifier: string; txHash: string; at: number }[] = [];
 
   constructor(o: PrivateRelayOptions) {
     this.#o = o;
@@ -211,11 +248,7 @@ export class PrivateRelay {
 
   /** POST /v1/relay with a private spend (kindOf not null) from `ip`. */
   relay(tx: RelayTx, ip: string): Promise<Answer> {
-    const now = Date.now();
-    const recent = (this.#perIp.get(ip) ?? []).filter((t) => now - t < HOUR_MS);
-    if (recent.length >= PRIVATE_RELAYS_PER_IP_HOUR) return Promise.resolve(json(429, { error: "private_relay_limit", message: `at most ${PRIVATE_RELAYS_PER_IP_HOUR} private spends are relayed per IP address an hour` }));
-    this.#perIp.set(ip, [...recent, now]);
-    if (this.#perIp.size > 10_000) for (const [k, v] of this.#perIp) if (v.every((t) => now - t >= HOUR_MS)) this.#perIp.delete(k);
+    if (!this.#perIp.take(ip, Date.now())) return Promise.resolve(json(429, { error: "private_relay_limit", message: `at most ${PRIVATE_RELAYS_PER_IP_HOUR} private spends are relayed per IP address an hour` }, { "retry-after": "600" }));
     const prev = this.#locks.get(tx.hash) ?? Promise.resolve();
     const next = prev.then(
       () => this.#relay(tx, ip),
@@ -243,15 +276,11 @@ export class PrivateRelay {
       return json(400, { error: "bad_transaction", message: "malformed private spend calldata" });
     }
     const now = Date.now();
-    const noteReverts = (this.#o.ledger.view().privateReverts?.[s.nullifier.toLowerCase()] ?? []).filter((r) => now - r.at < REVERT_WINDOW_MS);
-    if (noteReverts.length >= NOTE_REVERTS) {
-      return json(409, { error: "reverted_before", message: `spends of this note reverted ${noteReverts.length} times when relayed; it is not relayed again for 24 hours after the last`, txHashes: noteReverts.map((r) => r.txHash) });
-    }
-    if ((this.#ipReverts.get(ip) ?? []).filter((t) => now - t < REVERT_WINDOW_MS).length >= IP_REVERTS) {
-      return json(403, { error: "reverts_limit", message: `${IP_REVERTS} private spends from this IP address reverted when relayed in 24 hours; none is relayed for it until then` });
-    }
-    this.#reverts = this.#reverts.filter((t) => now - t < GLOBAL_PAUSE_MS);
-    if (this.#reverts.length >= GLOBAL_REVERTS) return json(503, { error: "private_paused", message: "private spends are not relayed for now; try again within half an hour" });
+    this.#unrecorded = this.#unrecorded.filter((u) => now - u.at < REVERT_WINDOW_MS);
+    const view = this.#o.ledger.view();
+    for (const u of this.#unrecorded) recordPrivateRevert(view, u.ip, u.nullifier, u.txHash, u.at);
+    const refusal = privateRevertRefusal(view, ip, s.nullifier, now);
+    if (refusal !== null) return refusal;
     const relayer = this.#o.sender.address;
     if (getAddress(s.relayer) !== relayer) return json(422, { error: "not_relayer_fee", message: `the spend pays its fee to ${getAddress(s.relayer)}, not this relayer's account ${relayer}: prove it with relayer ${relayer}` });
     if (s.fee <= 0n) return json(422, { error: "fee_too_low", message: "the spend pays the relayer no fee" });
@@ -312,16 +341,16 @@ export class PrivateRelay {
         this.#o.log("private_not_sent", { request: tx.hash, spentWei: err.spentWei, txHash: err.txHash, error: err.message });
         if (err.spentWei > 0n) {
           // It reverted on-chain, and the relayer paid its gas: it counts against the note, the IP address and everyone.
+          // Counted from memory at once, and in the ledger with any earlier one a failed write left in memory.
           const at = Date.now();
-          this.#reverts.push(at);
-          this.#ipReverts.set(ip, [...(this.#ipReverts.get(ip) ?? []).filter((t) => at - t < REVERT_WINDOW_MS), at]);
-          const key = s.nullifier.toLowerCase();
+          this.#unrecorded.push({ ip, nullifier: s.nullifier, txHash: err.txHash ?? "", at });
+          const pending = [...this.#unrecorded];
           await this.#o.ledger
             .update((data) => {
-              const all = data.privateReverts ?? {};
-              for (const [n, list] of Object.entries(all)) if (list.every((r) => at - r.at >= REVERT_WINDOW_MS)) delete all[n];
-              all[key] = [...(all[key] ?? []).filter((r) => at - r.at < REVERT_WINDOW_MS), { txHash: err.txHash ?? "", at }];
-              data.privateReverts = all;
+              for (const u of pending) recordPrivateRevert(data, u.ip, u.nullifier, u.txHash, u.at);
+            })
+            .then(() => {
+              this.#unrecorded = this.#unrecorded.filter((u) => !pending.includes(u));
             })
             .catch((e: unknown) => this.#o.log("ledger_write_failed", { request: tx.hash, error: (e as Error).message }));
         }

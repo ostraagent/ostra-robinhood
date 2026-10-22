@@ -7,6 +7,7 @@ import { applyCors } from "../../merchant/src/cors.ts";
 import type { BackupStore } from "./backups.ts";
 import type { Log, RelayerGate } from "./gate.ts";
 import type { SignatureEscrow } from "./signatures.ts";
+import { clientKey } from "./rate.ts";
 
 /**
  * Largest request body (decided 17 Oct 2026; raised 21 Oct 2026): a private
@@ -41,7 +42,8 @@ export function createRelayerServer(o: {
   log: Log;
   scrub: (text: string) => string;
 }): Server {
-  const ipOf = (req: IncomingMessage) => (o.clientIp === "cf-connecting-ip" ? String(req.headers["cf-connecting-ip"] ?? "") : (req.socket.remoteAddress ?? ""));
+  // The client a request counts against (rate.ts clientKey: an IPv6 address by its /64).
+  const ipOf = (req: IncomingMessage) => clientKey(o.clientIp === "cf-connecting-ip" ? String(req.headers["cf-connecting-ip"] ?? "") : (req.socket.remoteAddress ?? ""));
   return createServer((req, res) => {
     void (async () => {
       try {

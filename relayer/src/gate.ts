@@ -143,6 +143,7 @@ import { classify, decodeRelayRequest, type Classified, type CreateVaultCall, ty
 import {
   Ledger,
   LedgerRefusal,
+  QUOTE_RETENTION_MS,
   createVaultLimitReached,
   creditOf,
   creditPlan,
@@ -154,6 +155,7 @@ import {
   type Quote,
 } from "./ledger.ts";
 import type { PrivateRelay } from "./private.ts";
+import { RateWindow } from "./rate.ts";
 import { NotSentError, SendUnknownError, type Landed, type SendOptions } from "./send.ts";
 import { escrowRecords, wotsClaims, type SignatureEscrow, type SignatureRecord, type WotsClaim } from "./signatures.ts";
 
@@ -254,12 +256,28 @@ export class PolicyRefusal extends Error {
   }
 }
 
+/**
+ * Requests one IP address may have priced in a minute (decided 22 Oct 2026): a new quote simulates the transaction,
+ * an escrow execution up to a few dozen times (escrowGasLimit), so unpaid quotes are bounded per IP address. A request
+ * quoted before (its quote is in the ledger) is not counted.
+ */
+export const FRESH_QUOTES_PER_IP_MINUTE = 30;
+/** Requests one IP address may have checked against a quote it has (a policy check, and a simulation when it swaps) in a minute. */
+export const QUOTED_REQUESTS_PER_IP_MINUTE = 120;
+
+/** A quote still within QUOTE_RETENTION_MS (an older one is priced again; ledger.ts prunes them only when it writes one). */
+function liveQuote(q: Quote | undefined, now: number): Quote | undefined {
+  return q !== undefined && now - q.createdAt <= QUOTE_RETENTION_MS ? q : undefined;
+}
+
 const POOL_FNS = new Set(["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]);
 const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw"]);
 
 export class RelayerGate {
   readonly #o: GateOptions;
   readonly #locks = new Map<string, Promise<unknown>>();
+  readonly #freshQuotes = new RateWindow(FRESH_QUOTES_PER_IP_MINUTE, 60_000);
+  readonly #quotedRequests = new RateWindow(QUOTED_REQUESTS_PER_IP_MINUTE, 60_000);
 
   constructor(o: GateOptions) {
     this.#o = o;
@@ -449,6 +467,16 @@ export class RelayerGate {
 
     const early = this.#refusedUpfront(classified, input.ip, leafVault, openProblem);
     if (early !== null) return early;
+
+    // A request counts in one window: a new quote in the fresh one, one already quoted in the other.
+    const now = Date.now();
+    if (liveQuote(this.#o.ledger.view().quotes[tx.hash], now) === undefined) {
+      if (!this.#freshQuotes.take(input.ip, now)) {
+        return json(429, { error: "quote_limit", message: `at most ${FRESH_QUOTES_PER_IP_MINUTE} requests are priced per IP address a minute; try again shortly` }, { "retry-after": "60" });
+      }
+    } else if (!this.#quotedRequests.take(input.ip, now)) {
+      return json(429, { error: "quote_limit", message: `at most ${QUOTED_REQUESTS_PER_IP_MINUTE} quoted requests are checked per IP address a minute; try again shortly` }, { "retry-after": "60" });
+    }
 
     // The vaults whose Swap in this request must not fail (SwapFailed); none with allowFailedSwaps.
     const swaps = request.allowFailedSwaps ? [] : swapVaults(tx);
@@ -674,7 +702,7 @@ export class RelayerGate {
   // -------------------------------------------------------------------------
 
   async #quote(tx: RelayTx, classified: Classified, leafVault: Address | null, swaps: readonly Address[], request: RelayRequest, unescrowed: number): Promise<Quote> {
-    const known = this.#o.ledger.view().quotes[tx.hash];
+    const known = liveQuote(this.#o.ledger.view().quotes[tx.hash], Date.now());
     if (known !== undefined) {
       // The quote is kept by the calls alone: what the policy decides from the request (its payer) is decided again.
       const again = await this.#policyProblem(tx, request);

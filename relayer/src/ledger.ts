@@ -21,6 +21,10 @@
 //                 to ETH by sweep.ts
 //   privateReverts  per nullifier: the private spends of that note that
 //                 reverted on-chain when relayed, in the last 24 hours
+//   privateIpReverts  per IP address: times of its private spends that
+//                 reverted, in the last 24 hours
+//   privateRecentReverts  times of everyone's reverted private spends, in the
+//                 last 30 minutes (private.ts pauses private relaying on them)
 
 import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -79,6 +83,10 @@ type LedgerData = {
   feeTokens?: string[];
   /** Per nullifier (lowercase hex): the private spends of that note that reverted when relayed in the last 24 hours (private.ts). */
   privateReverts?: Record<string, { txHash: string; at: number }[]>;
+  /** Per IP address: times of its private spends that reverted when relayed in the last 24 hours (absent before 22 Oct 2026). */
+  privateIpReverts?: Record<string, number[]>;
+  /** Times of everyone's private spends that reverted when relayed in the last GLOBAL_PAUSE_MS (absent before 22 Oct 2026). */
+  privateRecentReverts?: number[];
 };
 
 const empty = (): LedgerData => ({ version: 1, quotes: {}, paid: {}, debts: {}, opens: {}, credits: {}, createVaults: {} });
