@@ -43,6 +43,7 @@ import {
   type PoolKey,
 } from "@ostraagent/sdk";
 import { IpfsReader, imageCid, type ImageStore, type StoredImage } from "./ipfs.ts";
+import type { Sourcify } from "./sourcify.ts";
 
 const launchedEvent = parseAbiItem("event Launched(bytes32 indexed poolId, address indexed token, address indexed creatorVault, address quote)");
 const swapEvent = parseAbiItem("event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)");
@@ -121,6 +122,8 @@ export type IndexerState = {
   launches: Launch[];
   trades: Record<Hex, Trade[]>;
   tokens: Record<Address, TokenDetails>;
+  /** Tokens whose source Sourcify verified (sourcify.ts); absent in a state written before it. */
+  sourceVerified?: Address[];
 };
 
 export type TokenSummary = {
@@ -217,6 +220,8 @@ export type IndexerOptions = {
   readFile?: (uri: string | null) => Promise<unknown>;
   /** Where the images those files name are kept and served from; none: no images are kept. */
   images?: ImageStore | null;
+  /** Verifies each launched token's source on Sourcify; none: not done. */
+  sourcify?: Sourcify | null;
   now?: () => number;
 };
 
@@ -228,6 +233,10 @@ export class Indexer {
   readonly #log: IndexerOptions["log"];
   readonly #readFile: (uri: string | null) => Promise<unknown>;
   readonly #images: ImageStore | null;
+  readonly #sourcify: Sourcify | null;
+  /** Tokens whose verification runs now (one at a time, apart from the file reads), and those verified. */
+  readonly #verifying = new Set<Address>();
+  readonly #sourceVerified = new Set<Address>();
   readonly #now: () => number;
   /** Files being read now, by "metadata:<uri>" or "profile:<uri>". */
   readonly #loading = new Set<string>();
@@ -264,6 +273,7 @@ export class Indexer {
       this.#readFile = (uri) => reader.json(uri);
     }
     this.#images = o.images ?? null;
+    this.#sourcify = o.sourcify ?? null;
     this.#now = o.now ?? Date.now;
     const d = this.#deployment();
     const lp = this.#launchpadOf(d);
@@ -275,6 +285,7 @@ export class Indexer {
       this.#state = fresh;
     }
     for (const l of this.#state.launches) this.#tokenIndex.set(getAddress(l.token), l);
+    for (const t of this.#state.sourceVerified ?? []) this.#sourceVerified.add(t);
   }
 
   #launchpadOf(d: Deployment): Address {
@@ -530,9 +541,51 @@ export class Indexer {
     });
   }
 
-  /** Runs `run` in the background, at most BACKGROUND_AT_ONCE at a time (the gateways rate-limit). */
-  #track(run: () => Promise<unknown>): void {
+  /**
+   * Verifies `launch`'s token on Sourcify unless it is verified already (here or there) or its last attempt's wait
+   * is not over: the source is submitted with the launch transaction, and the job is followed for up to two minutes.
+   */
+  #verifyDue(launch: Launch, now: number): void {
+    const sourcify = this.#sourcify;
+    const token = launch.token;
+    const key = `sourcify:${token}`;
+    // One verification at a time, outside the slots of the file reads: a job is followed for minutes.
+    if (sourcify === null || this.#verifying.size > 0 || this.#sourceVerified.has(token) || !this.#mayTry(key, now)) return;
+    this.#verifying.add(token);
+    const done = () => {
+      this.#retry.delete(key);
+      this.#sourceVerified.add(token);
+      this.#state.sourceVerified = [...this.#sourceVerified];
+      this.#save();
+      this.#log("source_verified", { token });
+    };
+    this.#track(async () => {
+      try {
+        if ((await sourcify.status(token)) === "verified") return done();
+        const id = await sourcify.submit(token, launch.txHash);
+        for (let i = 0; i < 24; i++) {
+          await new Promise((r) => setTimeout(r, 5_000));
+          const job = await sourcify.job(id);
+          if (!job.done) continue;
+          if (job.verified) return done();
+          this.#failed(key);
+          return this.#log("source_unverified", { token, error: job.error });
+        }
+        this.#failed(key);
+        this.#log("source_unverified", { token, error: "the job did not finish in two minutes" });
+      } catch (err) {
+        this.#failed(key);
+        this.#log("source_unverified", { token, error: (err as Error).message.slice(0, 200) });
+      } finally {
+        this.#verifying.delete(token);
+      }
+    }, false);
+  }
+
+  /** Runs `run` in the background; `limited`: at most BACKGROUND_AT_ONCE of those at a time (the gateways rate-limit). */
+  #track(run: () => Promise<unknown>, limited = true): void {
     const p = (async () => {
+      if (!limited) return run();
       while (this.#backgroundRunning >= BACKGROUND_AT_ONCE) await new Promise<void>((r) => this.#waiting.push(r));
       this.#backgroundRunning++;
       try {
@@ -605,6 +658,7 @@ export class Indexer {
       const details = this.#state.tokens[launch.token];
       // Files and images that could not be read are tried again on their own time, between details reads.
       if (details !== undefined) this.#loadFilesDue(launch.token, now);
+      this.#verifyDue(launch, now);
       if (details !== undefined && now - details.readAt < DETAILS_EVERY_MS) continue;
       try {
         changed = (await this.#readDetails(d, launch, details === undefined)) || changed;

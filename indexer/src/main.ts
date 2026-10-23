@@ -11,6 +11,8 @@
 //                             /var/lib/ostra-indexer/images)
 //   OSTRA_INDEXER_IPFS_GATEWAYS  the IPFS gateways, comma-separated, in the order they are tried (default
 //                             Pinata's, then ipfs.io; ipfs.ts)
+//   OSTRA_INDEXER_SOURCIFY    the Sourcify API each launched token's source is verified on (default
+//                             https://sourcify.dev/server; "off": none; sourcify.ts)
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
@@ -19,6 +21,7 @@ import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, ro
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
+import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
 function privateFile(path: string, what: string): string {
   const mode = statSync(path).mode & 0o777;
@@ -72,7 +75,10 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   const gateways = gatewaysText === undefined || gatewaysText === "" ? IPFS_GATEWAYS : gatewaysText.split(",").map((g) => g.trim());
   const reader = new IpfsReader({ gateways });
   const images = new ImageStore(process.env.OSTRA_INDEXER_IMAGES || "/var/lib/ostra-indexer/images", reader);
-  const indexer = new Indexer({ client, logsClient, deployment, statePath, log, readFile: (uri) => reader.json(uri), images });
+  const sourcifyApi = process.env.OSTRA_INDEXER_SOURCIFY || SOURCIFY_API;
+  const sourcify = sourcifyApi === "off" ? null : new Sourcify({ api: sourcifyApi, chainId: record.chainId });
+  const indexer = new Indexer({ client, logsClient, deployment, statePath, log, readFile: (uri) => reader.json(uri), images, sourcify });
+  log("sourcify", { api: sourcify === null ? "off" : new URL(sourcifyApi).host });
   log("ipfs", { gateways: gateways.map((g) => new URL(g).host) });
   log("logs_rpc", { host: new URL(logsUrl).host === new URL(rpcUrl).host ? "<rpc>" : new URL(logsUrl).host });
   const server = createIndexerServer(indexer, log);
