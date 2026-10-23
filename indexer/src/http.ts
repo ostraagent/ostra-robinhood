@@ -8,6 +8,8 @@
 //   GET /api/v1/tokens/<token>/trades?limit=&before=<block>:<logIndex>
 //   GET /api/v1/tokens/<token>/candles?interval=60|300|900|3600|14400|86400
 //   GET /api/v1/agents/<creator vault>
+//   GET /api/v1/images/<cid>   an image a token's metadata or a creator's profile names (ipfs://<cid>), as the
+//                              indexer keeps it (ipfs.ts): PNG, JPEG, WebP or GIF, by its first bytes
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
@@ -32,6 +34,18 @@ function intParam(url: URL, name: string, fallback: number, max: number): number
   if (!/^[0-9]{1,9}$/.test(v)) return null;
   const n = Number(v);
   return n > max ? null : n;
+}
+
+/** An image's bytes: named by its CID, so it never changes; the type from its first bytes; nothing in it runs. */
+function sendImage(res: ServerResponse, image: { bytes: Uint8Array; type: string }): void {
+  res.writeHead(200, {
+    "content-type": image.type,
+    "content-length": String(image.bytes.length),
+    "cache-control": "public, max-age=31536000, immutable",
+    "x-content-type-options": "nosniff",
+    "content-security-policy": "default-src 'none'; sandbox",
+  });
+  res.end(image.bytes);
 }
 
 export function handle(indexer: Indexer, req: IncomingMessage, res: ServerResponse): void {
@@ -78,6 +92,11 @@ export function handle(indexer: Indexer, req: IncomingMessage, res: ServerRespon
       return candles === null ? send(res, 404, { error: "unknown_token" }) : send(res, 200, { interval, candles });
     }
     return send(res, 404, { error: "not_found" });
+  }
+  if (resource === "images" && id !== undefined && sub === undefined) {
+    if (!/^[A-Za-z0-9]{1,100}$/.test(id)) return send(res, 400, { error: "bad_cid" });
+    const image = indexer.image(id);
+    return image === null ? send(res, 404, { error: "unknown_image" }) : sendImage(res, image);
   }
   if (resource === "agents" && id !== undefined && sub === undefined) {
     if (!isAddress(id, { strict: false })) return send(res, 400, { error: "bad_address" });

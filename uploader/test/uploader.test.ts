@@ -46,6 +46,22 @@ test("refusals: not an image, a mislabelled image, too large, not JSON, not an o
   }
 });
 
+test("the web app's origin gets CORS and its preflight 204; other sites none", async () => {
+  const app = "https://app.ostraagent.xyz";
+  const pre = await fetch(`${base}/v1/ipfs/image`, { method: "OPTIONS", headers: { origin: app, "access-control-request-method": "POST", "access-control-request-headers": "content-type" } });
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers.get("access-control-allow-origin"), app);
+  assert.match(pre.headers.get("access-control-allow-headers") ?? "", /Content-Type/);
+  // A refusal (not an image) still carries the header, so the page can read why.
+  const refused = await fetch(`${base}/v1/ipfs/image`, { method: "POST", headers: { origin: app, "content-type": "image/png", "x-forwarded-for": "203.0.113.9" }, body: "not an image" });
+  assert.equal(refused.status, 415);
+  assert.equal(refused.headers.get("access-control-allow-origin"), app);
+  await refused.arrayBuffer();
+  const other = await fetch(`${base}/v1/ipfs/health`, { headers: { origin: "https://evil.example" } });
+  assert.equal(other.headers.get("access-control-allow-origin"), null);
+  await other.arrayBuffer();
+});
+
 test("one address may upload UPLOADS_PER_HOUR times an hour", () => {
   const u = new Uploader({ jwt: "y".repeat(40), dailyBytes: 1_000_000 });
   for (let i = 0; i < UPLOADS_PER_HOUR; i++) u.admit("198.51.100.1", 10);

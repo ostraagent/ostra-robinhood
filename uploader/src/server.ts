@@ -8,11 +8,15 @@
 //                         or a token's metadata)
 //   GET  /v1/ipfs/health  how much of today's budget is used
 //
+// The web app (https://app.ostraagent.xyz) uploads from the browser: its origin gets CORS and its preflight is
+// answered 204 (merchant/src/cors.ts); the limits below are the same for it.
+//
 // Answers are { cid, uri } or { error: <code>, message }. Nothing is stored here: what an address uploads is
 // counted (UPLOADS_PER_HOUR per address) and the bytes of a day are capped (the daily budget), so the
 // operator's pinning quota cannot be drained. The Pinata key only adds pins (pinFileToIPFS, pinJSONToIPFS).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { applyCors } from "../../merchant/src/cors.ts";
 
 export const MAX_IMAGE_BYTES = 1_048_576;
 export const MAX_JSON_BYTES = 16_384;
@@ -153,6 +157,7 @@ export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"]):
   return createServer((req, res) => {
     void (async () => {
       try {
+        if (applyCors(req, res)) return;
         const path = new URL(req.url ?? "/", "http://uploader").pathname;
         if (req.method === "GET" && path === "/v1/ipfs/health") return reply(res, 200, u.health());
         if (req.method !== "POST" || (path !== "/v1/ipfs/image" && path !== "/v1/ipfs/json")) throw new UploadError(404, "not_found", "POST /v1/ipfs/image or /v1/ipfs/json");

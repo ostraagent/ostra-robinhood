@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -33,6 +34,7 @@ import {
 import { MemoryFolder } from "../../core/test/memory-folder.ts";
 import { createIndexerServer } from "../src/http.ts";
 import { Indexer, type Trade } from "../src/indexer.ts";
+import { ImageStore, IpfsReader, rawCidOf } from "../src/ipfs.ts";
 
 let fork: Fork;
 let d: Deployment;
@@ -50,7 +52,10 @@ after(async () => {
 });
 
 const METADATA_URI = "ipfs://bafkreih5aznjvttude6c3wbvqeebb6rlx5wkbzyppv7garjiubll2ceym4";
-const METADATA = { name: "Indexed", description: "A token the indexer test launched.", image: "ipfs://bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", website: "https://example.org", x: "https://x.com/example" };
+/** A 1x1 PNG (fixture), served by a local gateway under its raw CID: the image the metadata names. */
+const PNG = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==", "base64"));
+const PNG_CID = rawCidOf(PNG);
+const METADATA = { name: "Indexed", description: "A token the indexer test launched.", image: `ipfs://${PNG_CID}`, website: "https://example.org", x: "https://x.com/example" };
 
 async function send(account: PrivateKeyAccount, call: { to: Address; data: Hex; value?: bigint }) {
   // The gas limit the web app sends with (walletSwapGasLimit): the bare estimate ran out of gas in a swap's inner call.
@@ -121,6 +126,17 @@ test("the indexer: launches, metadata, trades with side and trader, candles, the
   const statePath = join(dir, "state.json");
   const logs: string[] = [];
   const readFiles: string[] = [];
+  // A local gateway serving the PNG by its CID, as Pinata's serves /ipfs/<cid>.
+  const gatewayServer = createServer((req, res) => {
+    if (req.url === `/ipfs/${PNG_CID}`) {
+      res.writeHead(200, { "content-type": "image/png" });
+      return void res.end(PNG);
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((r) => gatewayServer.listen(0, "127.0.0.1", r));
+  const images = new ImageStore(join(dir, "images"), new IpfsReader({ gateways: [`http://127.0.0.1:${(gatewayServer.address() as { port: number }).port}/ipfs/`] }));
   const make = () =>
     new Indexer({
       client,
@@ -131,10 +147,13 @@ test("the indexer: launches, metadata, trades with side and trader, candles, the
         if (uri !== null) readFiles.push(uri);
         return uri === METADATA_URI ? METADATA : null;
       },
+      images,
     });
   const indexer = make();
   assert.equal(await indexer.sync(), true);
   assert.equal(indexer.scannedTo, indexer.latest);
+  // Metadata files are read in the background: a slow gateway never holds a scan.
+  await indexer.settled();
 
   const list = indexer.tokens({ sort: "new", q: null, offset: 0, limit: 10 });
   assert.equal(list.total, 2);
@@ -200,6 +219,14 @@ test("the indexer: launches, metadata, trades with side and trader, candles, the
     assert.equal((await get("/api/v1/tokens/0x123")).status, 400);
     assert.equal((await get(`/api/v1/tokens/${zeroAddress}`)).status, 404);
     assert.equal((await get("/api/v2/tokens")).status, 404);
+    // The image the metadata names, kept and served from this host; no other CID.
+    const img = await fetch(`http://127.0.0.1:${port}/api/v1/images/${PNG_CID}`);
+    assert.equal(img.status, 200);
+    assert.equal(img.headers.get("content-type"), "image/png");
+    assert.equal(img.headers.get("x-content-type-options"), "nosniff");
+    assert.deepEqual(new Uint8Array(await img.arrayBuffer()), PNG);
+    assert.equal((await get(`/api/v1/images/${rawCidOf(new Uint8Array([1]))}`)).status, 404);
+    assert.equal((await get("/api/v1/images/..%2Fstate.json")).status, 400);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }
@@ -215,4 +242,6 @@ test("the indexer: launches, metadata, trades with side and trader, candles, the
   assert.deepEqual((again.trades(second.token, { limit: 50, before: null }) ?? []).map((t) => [t.side, t.trader]), [["buy", trader.address]]);
   assert.equal(again.tokens({ sort: "active", q: null, offset: 0, limit: 10 }).tokens[0]?.symbol, "IDX2");
   assert.ok(!logs.includes("sync_failed"));
+  assert.ok(logs.includes("image_kept"));
+  await new Promise<void>((r) => gatewayServer.close(() => r()));
 });

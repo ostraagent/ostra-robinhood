@@ -7,6 +7,10 @@
 //   OSTRA_INDEXER_LISTEN      host:port of the HTTP API (default 127.0.0.1:4900)
 //   OSTRA_INDEXER_STATE       the state file (default /var/lib/ostra-indexer/state.json)
 //   OSTRA_INDEXER_EVERY_MS    time between scans (default 3000)
+//   OSTRA_INDEXER_IMAGES      the directory the images of metadata and profiles are kept in (default
+//                             /var/lib/ostra-indexer/images)
+//   OSTRA_INDEXER_IPFS_GATEWAYS  the IPFS gateways, comma-separated, in the order they are tried (default
+//                             Pinata's, then ipfs.io; ipfs.ts)
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
@@ -14,6 +18,7 @@ import { readFileSync, statSync } from "node:fs";
 import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
+import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 
 function privateFile(path: string, what: string): string {
   const mode = statSync(path).mode & 0o777;
@@ -63,7 +68,12 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   const logsClient = robinhoodClient(logsUrl);
   await assertRobinhoodChain(logsClient);
   if (record.chainId !== (await client.getChainId())) throw new Error(`${recordPath} is a deployment on chain ${record.chainId}`);
-  const indexer = new Indexer({ client, logsClient, deployment, statePath, log });
+  const gatewaysText = process.env.OSTRA_INDEXER_IPFS_GATEWAYS;
+  const gateways = gatewaysText === undefined || gatewaysText === "" ? IPFS_GATEWAYS : gatewaysText.split(",").map((g) => g.trim());
+  const reader = new IpfsReader({ gateways });
+  const images = new ImageStore(process.env.OSTRA_INDEXER_IMAGES || "/var/lib/ostra-indexer/images", reader);
+  const indexer = new Indexer({ client, logsClient, deployment, statePath, log, readFile: (uri) => reader.json(uri), images });
+  log("ipfs", { gateways: gateways.map((g) => new URL(g).host) });
   log("logs_rpc", { host: new URL(logsUrl).host === new URL(rpcUrl).host ? "<rpc>" : new URL(logsUrl).host });
   const server = createIndexerServer(indexer, log);
   server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString() }));

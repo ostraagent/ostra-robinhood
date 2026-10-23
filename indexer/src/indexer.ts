@@ -12,7 +12,10 @@
 //             through a router (Uniswap's Universal Router)
 //   tokens    name, symbol and total supply, the pool's graduation, the
 //             metadata URI in OstraRegistry and the creator's profile URI,
-//             with the JSON files they point at (data, never instructions)
+//             with the JSON files they point at (data, never instructions),
+//             read in the background so a slow gateway never holds a scan
+//             (ipfs.ts), and the ipfs:// images those files name, kept on
+//             disk and served on the web app's host
 //   prices    ETH/USD from Chainlink; a USDG pool's quote is $1; a listed
 //             stock token's (sdk pairs.ts) from its Chainlink feed times its
 //             uiMultiplier; OSTRA's from ETH/USD times its price in the pool
@@ -39,7 +42,7 @@ import {
   type Deployment,
   type PoolKey,
 } from "@ostraagent/sdk";
-import { readIpfsJson } from "../../core/src/launchpad.ts";
+import { IpfsReader, imageCid, type ImageStore, type StoredImage } from "./ipfs.ts";
 
 const launchedEvent = parseAbiItem("event Launched(bytes32 indexed poolId, address indexed token, address indexed creatorVault, address quote)");
 const swapEvent = parseAbiItem("event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)");
@@ -55,8 +58,11 @@ const WINDOW_MAX = 2_000_000n;
 const POOLS_PER_QUERY = 100;
 /** How often the token details (supply, graduation, metadata URIs) and the ETH price are read again. */
 const DETAILS_EVERY_MS = 60_000;
-/** A metadata or profile file is fetched again when its URI changes, or after this long. */
-const FILE_REFRESH_MS = 30 * 60_000;
+/** A file or image that could not be read is tried again after this long, doubled after each failure up to FILE_RETRY_MAX_MS. */
+const FILE_RETRY_MS = 2 * 60_000;
+const FILE_RETRY_MAX_MS = 60 * 60_000;
+/** File and image reads running at once. */
+const BACKGROUND_AT_ONCE = 4;
 /** Most trades kept per pool (the oldest go first); candles over a longer history come from what is kept. */
 const MAX_TRADES_PER_POOL = 50_000;
 
@@ -175,6 +181,11 @@ function textField(file: unknown, key: string, max: number): string | null {
   return t === "" ? null : t.slice(0, max);
 }
 
+/** The image field of a metadata or profile file, as written. */
+function fileImage(file: unknown): unknown {
+  return file !== null && typeof file === "object" ? (file as Record<string, unknown>).image : undefined;
+}
+
 /** A link of a metadata file: the field itself, or the same name inside its "links" object. */
 function linkField(file: unknown, key: string): string | null {
   const direct = textField(file, key, 200);
@@ -202,8 +213,10 @@ export type IndexerOptions = {
   deployment: () => Deployment;
   statePath: string;
   log: (event: string, fields?: Record<string, unknown>) => void;
-  /** Reads a metadata or profile file (core's readIpfsJson by default). */
+  /** Reads a metadata or profile file (an IpfsReader's json by default). */
   readFile?: (uri: string | null) => Promise<unknown>;
+  /** Where the images those files name are kept and served from; none: no images are kept. */
+  images?: ImageStore | null;
   now?: () => number;
 };
 
@@ -214,7 +227,17 @@ export class Indexer {
   readonly #statePath: string;
   readonly #log: IndexerOptions["log"];
   readonly #readFile: (uri: string | null) => Promise<unknown>;
+  readonly #images: ImageStore | null;
   readonly #now: () => number;
+  /** Files being read now, by "metadata:<uri>" or "profile:<uri>". */
+  readonly #loading = new Set<string>();
+  /** Files (by URI) and images (by CID) that could not be fetched: how often, and when they may be tried again. */
+  readonly #retry = new Map<string, { failures: number; next: number }>();
+  readonly #imageLoading = new Set<string>();
+  #backgroundRunning = 0;
+  readonly #waiting: (() => void)[] = [];
+  /** The background reads running now (settled() waits for them). */
+  readonly #background = new Set<Promise<unknown>>();
   #state: IndexerState;
   #window = WINDOW_START;
   #ethUsd: number | null = null;
@@ -235,7 +258,12 @@ export class Indexer {
     this.#deployment = o.deployment;
     this.#statePath = o.statePath;
     this.#log = o.log;
-    this.#readFile = o.readFile ?? readIpfsJson;
+    if (o.readFile !== undefined) this.#readFile = o.readFile;
+    else {
+      const reader = new IpfsReader();
+      this.#readFile = (uri) => reader.json(uri);
+    }
+    this.#images = o.images ?? null;
     this.#now = o.now ?? Date.now;
     const d = this.#deployment();
     const lp = this.#launchpadOf(d);
@@ -267,7 +295,8 @@ export class Indexer {
     const d = this.#deployment();
     const lp = d.launchpad;
     if (lp === undefined) throw new Error("the deployment has no launchpad");
-    this.#latest = await this.#client.getBlockNumber();
+    // Not viem's cached block number (cacheTime): a block number seconds old would leave the newest swaps to the next scan.
+    this.#latest = await this.#client.getBlockNumber({ cacheTime: 0 });
     let changed = false;
     let from = BigInt(this.#state.scannedTo) + 1n;
     while (from <= this.#latest) {
@@ -415,22 +444,136 @@ export class Indexer {
     ]);
     const mUri = metadataUri === "" ? null : metadataUri;
     const pUri = profileUri === "" ? null : profileUri;
-    let metadata: unknown = old?.metadata ?? null;
-    let metadataAt = old?.metadataAt ?? 0;
-    if (mUri !== (old?.metadataUri ?? null) || (mUri !== null && now - metadataAt > FILE_REFRESH_MS)) {
-      metadata = mUri === null ? null : await this.#readFile(mUri);
-      metadataAt = now;
-    }
-    let profile: unknown = old?.profile ?? null;
-    let profileAt = old?.profileAt ?? 0;
-    if (pUri !== (old?.profileUri ?? null) || (pUri !== null && now - profileAt > FILE_REFRESH_MS)) {
-      profile = pUri === null ? null : await this.#readFile(pUri);
-      profileAt = now;
-    }
-    const next: TokenDetails = { ...base, totalSupply: totalSupply.toString(), graduated: state.graduated, metadataUri: mUri, metadata, metadataAt, profileUri: pUri, profile, profileAt, readAt: now };
-    const changed = old === undefined || JSON.stringify({ ...old, readAt: 0 }) !== JSON.stringify({ ...next, readAt: 0 });
+    // The details as they are now: a background read may have finished during the reads above.
+    const cur = this.#state.tokens[launch.token] ?? old;
+    // A URI that changed drops the file read for the old one; the new one is read in the background (#loadFile).
+    const mSame = mUri === (cur?.metadataUri ?? null);
+    const pSame = pUri === (cur?.profileUri ?? null);
+    const next: TokenDetails = {
+      ...base,
+      totalSupply: totalSupply.toString(),
+      graduated: state.graduated,
+      metadataUri: mUri,
+      metadata: mSame ? (cur?.metadata ?? null) : null,
+      metadataAt: mSame ? (cur?.metadataAt ?? 0) : 0,
+      profileUri: pUri,
+      profile: pSame ? (cur?.profile ?? null) : null,
+      profileAt: pSame ? (cur?.profileAt ?? 0) : 0,
+      readAt: now,
+    };
+    const changed = cur === undefined || JSON.stringify({ ...cur, readAt: 0 }) !== JSON.stringify({ ...next, readAt: 0 });
     this.#state.tokens[launch.token] = next;
+    this.#loadFilesDue(launch.token, now);
     return changed;
+  }
+
+  /**
+   * True when `key` (a file's URI, or an image's CID) may be fetched now: never tried, or its last failure's wait is
+   * over. A file read once is never read again (an ipfs:// URI names fixed bytes; a new file is a new URI).
+   */
+  #mayTry(key: string, now: number): boolean {
+    return now >= (this.#retry.get(key)?.next ?? 0);
+  }
+
+  /** Records a failed fetch of `key`: tried again after FILE_RETRY_MS, doubled per failure up to FILE_RETRY_MAX_MS, spread by a quarter either way. */
+  #failed(key: string): void {
+    const failures = (this.#retry.get(key)?.failures ?? 0) + 1;
+    const wait = Math.min(FILE_RETRY_MS * 2 ** (failures - 1), FILE_RETRY_MAX_MS) * (0.75 + Math.random() / 2);
+    this.#retry.set(key, { failures, next: this.#now() + wait });
+    if (this.#retry.size > 10_000) this.#retry.clear();
+  }
+
+  /** Starts reading a token's metadata and profile files not read yet, and the images they name. */
+  #loadFilesDue(token: Address, now: number): void {
+    const t = this.#state.tokens[token];
+    if (t === undefined) return;
+    if (t.metadataUri !== null && t.metadata === null && this.#mayTry(t.metadataUri, now)) this.#loadFile("metadata", t.metadataUri);
+    if (t.profileUri !== null && t.profile === null && this.#mayTry(t.profileUri, now)) this.#loadFile("profile", t.profileUri);
+    for (const file of [t.metadata, t.profile]) this.#loadImageDue(file, now);
+  }
+
+  /** Reads a metadata or profile file in the background, once for every token that points at `uri` (a profile is one creator's). */
+  #loadFile(kind: "metadata" | "profile", uri: string): void {
+    const key = `${kind}:${uri}`;
+    if (this.#loading.has(key)) return;
+    this.#loading.add(key);
+    this.#track(async () => {
+      try {
+        let content: unknown = null;
+        try {
+          content = await this.#readFile(uri);
+        } catch (err) {
+          this.#log("file_failed", { kind, uri, reason: (err as Error).message.slice(0, 200) });
+        }
+        if (content === null) {
+          // What was read before stays: a gateway that fails now changes nothing that is shown.
+          this.#failed(uri);
+          this.#log("file_unread", { kind, uri });
+          return;
+        }
+        this.#retry.delete(uri);
+        const at = this.#now();
+        let kept = false;
+        for (const [token, t] of Object.entries(this.#state.tokens) as [Address, TokenDetails][]) {
+          if (kind === "metadata" && t.metadataUri === uri) this.#state.tokens[token] = { ...t, metadata: content, metadataAt: at };
+          else if (kind === "profile" && t.profileUri === uri) this.#state.tokens[token] = { ...t, profile: content, profileAt: at };
+          else continue;
+          kept = true;
+        }
+        if (!kept) return;
+        this.#summaries = null;
+        this.#save();
+        this.#loadImageDue(content, at);
+      } finally {
+        this.#loading.delete(key);
+      }
+    });
+  }
+
+  /** Runs `run` in the background, at most BACKGROUND_AT_ONCE at a time (the gateways rate-limit). */
+  #track(run: () => Promise<unknown>): void {
+    const p = (async () => {
+      while (this.#backgroundRunning >= BACKGROUND_AT_ONCE) await new Promise<void>((r) => this.#waiting.push(r));
+      this.#backgroundRunning++;
+      try {
+        await run();
+      } finally {
+        this.#backgroundRunning--;
+        this.#waiting.shift()?.();
+      }
+    })().catch((err: unknown) => this.#log("background_failed", { reason: (err as Error).message.slice(0, 200) }));
+    this.#background.add(p);
+    void p.finally(() => this.#background.delete(p));
+  }
+
+  /** Waits until the file and image reads running now (and those they start) are done. */
+  async settled(): Promise<void> {
+    while (this.#background.size > 0) await Promise.all([...this.#background]);
+  }
+
+  /** Starts fetching the ipfs:// image a metadata or profile file names, unless it is kept or its last failure's wait is not over. */
+  #loadImageDue(file: unknown, now: number): void {
+    if (this.#images === null || file === null || typeof file !== "object") return;
+    const cid = imageCid((file as Record<string, unknown>).image);
+    if (cid === null || this.#imageLoading.has(cid) || this.#images.has(cid) || !this.#mayTry(cid, now)) return;
+    const images = this.#images;
+    this.#imageLoading.add(cid);
+    this.#track(async () => {
+      try {
+        if (await images.ensure(cid)) {
+          this.#retry.delete(cid);
+          this.#log("image_kept", { cid });
+        } else {
+          this.#failed(cid);
+          this.#log("image_unread", { cid });
+        }
+      } catch (err) {
+        this.#failed(cid);
+        this.#log("image_failed", { cid, reason: (err as Error).message.slice(0, 200) });
+      } finally {
+        this.#imageLoading.delete(cid);
+      }
+    });
   }
 
   async #refreshDetails(d: Deployment): Promise<boolean> {
@@ -460,6 +603,8 @@ export class Indexer {
     }
     for (const launch of this.#state.launches) {
       const details = this.#state.tokens[launch.token];
+      // Files and images that could not be read are tried again on their own time, between details reads.
+      if (details !== undefined) this.#loadFilesDue(launch.token, now);
       if (details !== undefined && now - details.readAt < DETAILS_EVERY_MS) continue;
       try {
         changed = (await this.#readDetails(d, launch, details === undefined)) || changed;
@@ -637,6 +782,16 @@ export class Indexer {
     const tokens = launches.map((l) => all.get(l.token)).filter((s): s is TokenSummary => s !== undefined).sort((x, y) => y.createdAt - x.createdAt || newer(x.token, y.token));
     const withProfile = launches.map((l) => this.#state.tokens[l.token]).find((t) => t !== undefined && t.profileUri !== null);
     return { vault, profileUri: withProfile?.profileUri ?? null, profile: withProfile?.profile ?? null, tokens };
+  }
+
+  /**
+   * An image a token's metadata or its creator's profile names, as kept: only those, so the API serves no other
+   * IPFS content. null when no current file names it or it is not kept (yet).
+   */
+  image(cid: string): StoredImage | null {
+    if (this.#images === null) return null;
+    const named = Object.values(this.#state.tokens).some((t) => imageCid(fileImage(t.metadata)) === cid || imageCid(fileImage(t.profile)) === cid);
+    return named ? this.#images.get(cid) : null;
   }
 
   /** The index's progress and the launchpad's totals over the last 24 hours (USD where the quote has a USD price). */

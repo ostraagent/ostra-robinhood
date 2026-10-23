@@ -360,9 +360,14 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   pool's quote is $1). A swap through Uniswap's Universal Router is the transaction sender's; a
   vault's swap is the vault's. Its state is a JSON file, so a restart resumes where it stopped; its
   read-only JSON API (tokens, trades, candles, agents) is served under /api/v1 on the web app's host.
+  Metadata and profile files are read in the background through Pinata's gateway, then ipfs.io (both
+  public gateways of Protocol Labs answer 429 to a server), a raw CID checked against the bytes, and
+  tried again two minutes after a failure; the ipfs:// images they name are kept on disk and served
+  at /api/v1/images/<cid>, so a browser needs no IPFS gateway.
 - `uploader/`: pins images (PNG, JPEG, WebP, GIF up to 1 MB, checked by their first bytes) and JSON
   files up to 16 KB to IPFS through Pinata, with limits per client address and a daily byte budget;
-  served under /v1/ipfs/ on the relayer's host.
+  served under /v1/ipfs/ on the relayer's host, with CORS for the web app, whose launch form and token
+  pages publish a token's image, description and links from the browser.
 - `buyback/`: retired on 22 Oct 2026, when OSTRA graduated from its Pons curve. The buyback and
   burn now runs from ostra-swap (`sdk/scripts/buyback.ts` and its `ops/systemd/ostra-buyback.timer`):
   every hour it claims the launchpad's buyback share to OstraBuyback (the part owed in OSTRA straight
