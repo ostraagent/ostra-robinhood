@@ -54,10 +54,10 @@ export type ForwardedRequest = { jsonrpc: "2.0"; id: RpcId; method: string; para
 
 export type Checked = { ok: true; request: ForwardedRequest } | { ok: false; id: RpcId; status: number; code: number; message: string };
 
-const refuse = (id: RpcId, status: number, code: number, message: string): Checked => ({ ok: false, id, status, code, message });
+export const refuse = (id: RpcId, status: number, code: number, message: string): Checked => ({ ok: false, id, status, code, message });
 
-const QUANTITY = /^0x(0|[1-9a-f][0-9a-f]*)$/;
-const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
+export const QUANTITY = /^0x(0|[1-9a-f][0-9a-f]*)$/;
+export const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
 
 /** True when `params` ask eth_getLogs as core's recoverChannelConfig does (core/src/channels.ts). */
 function channelOpenedQuery(params: unknown[] | undefined): boolean {
@@ -77,8 +77,11 @@ function channelOpenedQuery(params: unknown[] | undefined): boolean {
   return to >= from && to - from + 1n <= MAX_LOG_BLOCKS;
 }
 
-/** Checks a parsed request body; the request to forward, or the JSON-RPC error that refuses it. */
-export function checkRequest(body: unknown): Checked {
+/**
+ * The JSON-RPC 2.0 envelope of a parsed body, checked: one request object, with its method and params as the
+ * request to forward (nothing else of the body), or the error that refuses it. The method is not checked here.
+ */
+export function checkEnvelope(body: unknown): Checked {
   if (Array.isArray(body)) return refuse(null, 400, -32600, "batch requests are not served; send one request at a time");
   if (body === null || typeof body !== "object") return refuse(null, 400, -32600, "the body must be a JSON-RPC 2.0 request object");
   const r = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
@@ -88,11 +91,19 @@ export function checkRequest(body: unknown): Checked {
   if (typeof r.method !== "string") return refuse(id, 400, -32600, "method must be a string");
   if (r.params !== undefined && !Array.isArray(r.params)) return refuse(id, 400, -32602, "params must be an array");
   const params = r.params as unknown[] | undefined;
-  if (!READ_METHODS.has(r.method)) return refuse(id, 403, -32601, `${r.method} is not served: this proxy only reads and simulates; send transactions through the relayer`);
-  if (r.method === "eth_getLogs" && !channelOpenedQuery(params)) {
+  return { ok: true, request: { jsonrpc: "2.0", id, method: r.method, ...(params === undefined ? {} : { params }) } };
+}
+
+/** Checks a parsed request body; the request to forward, or the JSON-RPC error that refuses it. */
+export function checkRequest(body: unknown): Checked {
+  const checked = checkEnvelope(body);
+  if (!checked.ok) return checked;
+  const { id, method, params } = checked.request;
+  if (!READ_METHODS.has(method)) return refuse(id, 403, -32601, `${method} is not served: this proxy only reads and simulates; send transactions through the relayer`);
+  if (method === "eth_getLogs" && !channelOpenedQuery(params)) {
     return refuse(id, 403, -32602, `eth_getLogs is served only for the ChannelOpened logs of one channel of one vault over at most ${MAX_LOG_BLOCKS} blocks (core channel recovery)`);
   }
-  return { ok: true, request: { jsonrpc: "2.0", id, method: r.method, ...(params === undefined ? {} : { params }) } };
+  return checked;
 }
 
 /**

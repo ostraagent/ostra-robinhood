@@ -53,7 +53,13 @@ async function closedPort(): Promise<number> {
 
 async function proxy(perIp: number, total: number, upstream: string = fork.url) {
   const events: { event: string; fields: Record<string, unknown> }[] = [];
-  const server: Server = createRpcProxyServer({ rpcUrl: upstream, limiter: new RateLimiter(perIp, total), clientIp: "socket", log: (event, fields = {}) => events.push({ event, fields }) });
+  const server: Server = createRpcProxyServer({
+    rpcUrl: upstream,
+    limiter: new RateLimiter(perIp, total),
+    clientIp: "socket",
+    log: (event, fields = {}) => events.push({ event, fields }),
+    logs: { rpcUrl: upstream, limiter: new RateLimiter(perIp, total), policy: { privatePool: someone, fromBlock: 0n } },
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const at = server.address();
   if (at === null || typeof at === "string") throw new Error("no port");
@@ -226,7 +232,8 @@ test("over HTTP on the fork: viem's reads and simulations are answered by the ch
     assert.equal((await c.getTransaction({ hash })).to?.toLowerCase(), someone);
     // Channel recovery's logs, as core asks them (core/src/channels.ts), over the fork's own blocks: an upstream such
     // as Alchemy Free (10 blocks a request) is not asked for the logs of the blocks the fork was made from.
-    const latest = await c.getBlockNumber();
+    // Not viem's cached block number: the one read above, before the transaction's block, may still be cached.
+    const latest = await c.getBlockNumber({ cacheTime: 0 });
     assert.deepEqual(await c.getLogs({ address: someone, event: channelOpened, args: { channelId: channel }, fromBlock: receipt.blockNumber, toBlock: latest }), []);
     // Refused here, before the fork.
     const wallet = createWalletClient({ account: sender, chain: robinhoodChain, transport: http(p.url, { retryCount: 0 }) });

@@ -11,9 +11,25 @@
 //   OSTRA_RPC_PROXY_CLIENT_IP    "socket" (default: the connection's address) or
 //                                "cf-connecting-ip" (behind Cloudflare and a local proxy only)
 //
+// The /logs route (logs-policy.ts) has defaults, so a configuration written
+// before it needs no change:
+//   OSTRA_RPC_PROXY_LOGS_URL     the RPC its log scans go to: one serving eth_getLogs
+//                                over LOG_WINDOW_BLOCKS blocks (default Robinhood
+//                                Chain's public RPC)
+//   OSTRA_RPC_PROXY_LOGS_PER_IP  requests a second per client IP address (default 20)
+//   OSTRA_RPC_PROXY_LOGS_TOTAL   requests a second in all (default 60)
+//   OSTRA_SWAP_DEPLOYMENT        the ostra-swap deployment record naming
+//                                OstraPrivatePool (default the ostra-swap checkout
+//                                next to this one, deployments/robinhood-mainnet.json)
+//
 // The two rates have no default: they are set from the measured use of the
 // web app (design: RPC proxy). On Solana the proxy also read OSTRA_CLUSTER;
 // the chain is now checked by its id at start (main.ts).
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { ROBINHOOD_CHAIN_ID, ROBINHOOD_PUBLIC_RPC } from "@ostraagent/sdk";
+import { getAddress, isAddress, type Address } from "viem";
 
 export type ProxyConfig = {
   rpcUrl: string;
@@ -21,7 +37,17 @@ export type ProxyConfig = {
   perIp: number;
   total: number;
   clientIp: "socket" | "cf-connecting-ip";
+  logs: { rpcUrl: string; perIp: number; total: number; swapDeployment: string };
 };
+
+/**
+ * One Swap quote of the web app sends up to some 16 log searches at once (its route's pairs searched in parallel,
+ * measured 23 Oct 2026 through this route); 20 a second per address lets one through without a 429.
+ */
+export const DEFAULT_LOGS = { perIp: 20, total: 60 } as const;
+export const DEFAULT_SWAP_DEPLOYMENT = fileURLToPath(new URL("../../../ostra-swap/deployments/robinhood-mainnet.json", import.meta.url));
+
+const orDefault = (env: NodeJS.ProcessEnv, name: string, fallback: string): string => (env[name] === undefined || env[name] === "" ? fallback : (env[name] as string));
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name];
@@ -63,11 +89,29 @@ export function loadProxyConfig(env: NodeJS.ProcessEnv = process.env): ProxyConf
   const perIp = rate(required(env, "OSTRA_RPC_PROXY_PER_IP"), "OSTRA_RPC_PROXY_PER_IP");
   const total = rate(required(env, "OSTRA_RPC_PROXY_TOTAL"), "OSTRA_RPC_PROXY_TOTAL");
   if (perIp > total) throw new Error("OSTRA_RPC_PROXY_PER_IP must not exceed OSTRA_RPC_PROXY_TOTAL");
+  const logsPerIp = rate(orDefault(env, "OSTRA_RPC_PROXY_LOGS_PER_IP", String(DEFAULT_LOGS.perIp)), "OSTRA_RPC_PROXY_LOGS_PER_IP");
+  const logsTotal = rate(orDefault(env, "OSTRA_RPC_PROXY_LOGS_TOTAL", String(DEFAULT_LOGS.total)), "OSTRA_RPC_PROXY_LOGS_TOTAL");
+  if (logsPerIp > logsTotal) throw new Error("OSTRA_RPC_PROXY_LOGS_PER_IP must not exceed OSTRA_RPC_PROXY_LOGS_TOTAL");
   return {
     rpcUrl: httpUrl(required(env, "OSTRA_RPC_URL"), "OSTRA_RPC_URL"),
     listen: parseListen(required(env, "OSTRA_RPC_PROXY_LISTEN")),
     perIp,
     total,
     clientIp,
+    logs: {
+      rpcUrl: httpUrl(orDefault(env, "OSTRA_RPC_PROXY_LOGS_URL", ROBINHOOD_PUBLIC_RPC), "OSTRA_RPC_PROXY_LOGS_URL"),
+      perIp: logsPerIp,
+      total: logsTotal,
+      swapDeployment: orDefault(env, "OSTRA_SWAP_DEPLOYMENT", DEFAULT_SWAP_DEPLOYMENT),
+    },
   };
+}
+
+/** OstraPrivatePool's address and the block its search starts at (core and the SDK start there) from the ostra-swap deployment record (Robinhood Chain's). */
+export function privatePoolOf(recordPath: string): { privatePool: Address; fromBlock: bigint } {
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as { chainId?: unknown; privatePool?: unknown; fromBlock?: unknown };
+  if (record.chainId !== ROBINHOOD_CHAIN_ID) throw new Error(`the ostra-swap deployment record ${recordPath} is not Robinhood Chain's`);
+  if (typeof record.privatePool !== "string" || !isAddress(record.privatePool, { strict: false })) throw new Error(`the ostra-swap deployment record ${recordPath} names no privatePool`);
+  if (typeof record.fromBlock !== "string" || !/^[0-9]+$/.test(record.fromBlock)) throw new Error(`the ostra-swap deployment record ${recordPath} has no fromBlock`);
+  return { privatePool: getAddress(record.privatePool), fromBlock: BigInt(record.fromBlock) };
 }

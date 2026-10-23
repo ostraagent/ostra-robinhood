@@ -344,7 +344,15 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   sends is refused (403), since the web app's transactions go through the relayer or the visitor's own wallet. Rates per
   client IP and in total (OSTRA_RPC_PROXY_PER_IP, OSTRA_RPC_PROXY_TOTAL) have no default; over a
   rate it answers 429 with Retry-After. The chain is checked by eth_chainId at start. Its tests run
-  viem's calls through it against a mainnet fork.
+  viem's calls through it against a mainnet fork. POST `/logs` serves the web app's log scans to a
+  browser that cannot reach Robinhood Chain's public RPC itself: only OstraPrivatePool's Shielded,
+  Unshielded, PrivateSwapped and NoteAdded logs, the PoolManager's Initialize logs (one event a
+  request, at most 10,000,000 blocks), the pool's currentTree, treeSize and currentRoot, and
+  eth_blockNumber, from OSTRA_RPC_PROXY_LOGS_URL (default the public RPC), at
+  OSTRA_RPC_PROXY_LOGS_PER_IP and OSTRA_RPC_PROXY_LOGS_TOTAL a second (default 20 and 60) and at
+  most 8 upstream at once. The pool comes from ostra-swap's deployment record
+  (OSTRA_SWAP_DEPLOYMENT, default the checkout next to this one). Its tests run the swap SDK's
+  and core's searches through it on mainnet.
 - `indexer/`: the web app's market data (`@ostraagent/indexer`). It reads OstraLaunchpad's Launched
   events and the PoolManager's Swap events of those pools from the deployment's first block, in log
   windows that shrink when the RPC refuses one, with each token's name, supply, graduation and the
