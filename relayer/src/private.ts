@@ -43,12 +43,15 @@ import type { RelayTx } from "./calls.ts";
 
 /**
  * Gas a private spend is priced at for GET /v1/private/price, per kind (receipt gas measured on a mainnet fork on 21 Oct
- * 2026: an unshield about 13.9M with its ~75 KB proof's calldata, a USDG to NVDA private swap 15.5-15.6M), with room
- * for swap legs through pools that cost more. The relay itself is priced by simulating the transaction.
+ * 2026: an unshield about 13.9M with its ~75 KB proof's calldata, a USDG to NVDA private swap 15.5-15.6M), 10-12%
+ * above (decided 23 Oct 2026, from 16M and 19M). This is only the fee an agent proves with: the relay itself is priced
+ * by simulating the transaction, and a spend whose fee does not cover its simulated gas with the relayer margin is
+ * refused with the fee that would (fee_too_low, required), so a route that uses more gas costs the agent one more
+ * proof, not the relayer.
  */
-export const PRIVATE_GAS = { unshield: 16_000_000n, swap: 19_000_000n } as const;
-/** The gas price may move between the price and the relay: the price an agent proves with is this much above. */
-export const PRICE_HEADROOM_BPS = 2_500n;
+export const PRIVATE_GAS = { unshield: 15_500_000n, swap: 17_000_000n } as const;
+/** The gas price may move between the price and the relay: the price an agent proves with is this much above (from 25%, 23 Oct 2026). */
+export const PRICE_HEADROOM_BPS = 1_000n;
 /** A fee in a token other than WETH and USDG counts this much below its sale quote now (it is sold later). */
 export const FEE_HAIRCUT_BPS = 300n;
 /** The least time a spend's deadline leaves when it is relayed, in seconds (checked again before signing: send.ts DEADLINE_SPARE_SECONDS). */
