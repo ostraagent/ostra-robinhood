@@ -12,8 +12,9 @@
 //     payments to the seller land in it. It does not open channels;
 //   * private vault `index`: keychain privateVaultKeychainId(chain, token,
 //     index), no crank, created by unshield together with the leaf spent
-//     into it (unshield.ts); it pays like the buyer vault, with its own
-//     relayer channels and records (keys.forPrivateVault).
+//     into it (unshield.ts), or by open once a private note's unshield paid
+//     its address (private-balance.ts); it pays like the buyer vault, with
+//     its own relayer channels and records (keys.forPrivateVault).
 // Every vault spend is signed only after the checks that could make it fail
 // on-chain have passed, because a signed message that never lands blocks the
 // vault until it is sent (see pending.ts). With the relayer paying (relay.ts),
@@ -291,7 +292,7 @@ export class VaultService {
   }
 
   #missing(): string {
-    if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; unshield creates it`;
+    if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; it is created on its first use`;
     if (this.kind === "creator") return `this agent has no creator vault${this.#inUsdg() ? "" : ` in ${this.token}`} yet; open it before a launch names it`;
     if (this.kind === "token") return `this agent has no vault in ${this.token} yet; buying the token creates it`;
     return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
@@ -438,7 +439,6 @@ export class VaultService {
 
   open(): Promise<OpenVaultResult> {
     return this.#serial(async () => {
-      if (this.kind === "private") throw new Error("a private vault is created by unshield, together with the leaf spent into it");
       if (this.kind !== "token" && this.#inUsdg()) await this.#checkToken();
       const vault = await this.vaultAddress();
       const token = this.token;
@@ -454,7 +454,7 @@ export class VaultService {
       // pair's creator vault (in another token than USDG) are paid up front by the buyer vault.
       const txHash = await this.#sender.send([await this.createCall()], this.#options({ prepay: this.kind === "seller" || !this.#paysRelayer() }));
       const result: OpenVaultResult = { vault, token, nonce: "0", created: true, txHash, softLimit };
-      if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator") && this.#paysRelayer()) {
+      if (this.#sender.relayed && (this.kind === "buyer" || this.kind === "creator" || this.kind === "private") && this.#paysRelayer()) {
         result.note =
           "the Ostra relayer paid the vault's creation; the vault owes that price, paid with the first voucher of its channel to the relayer, " +
           "which this server opens from the vault once it holds tokens (nothing else is relayed for the vault until then)";

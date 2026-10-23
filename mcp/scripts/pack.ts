@@ -107,7 +107,7 @@ await writeFile(
     {
       name: mcp.name,
       version: mcp.version,
-      description: "Ostra Agent's MCP server: an AI agent's own post-quantum USDG vault on Robinhood Chain, with payments, a shielded pool and the Ostra launchpad. The agent needs no ETH.",
+      description: "Ostra Agent's MCP server: an AI agent's own post-quantum USDG vault on Robinhood Chain, with payments, private balances and the Ostra launchpad. The agent needs no ETH.",
       keywords: ["mcp", "model-context-protocol", "ai-agent", "robinhood-chain", "post-quantum", "wots", "usdg", "launchpad"],
       homepage: "https://ostraagent.xyz",
       repository: { type: "git", url: "git+https://github.com/ostraagent/ostra-robinhood.git", directory: "mcp" },

@@ -35,9 +35,23 @@
 //
 // What stays public: the token, the amounts in and out, the pair, the time, the relayer and its fee, and for a
 // shield the vault it came from. A spend is relayed alone; a note's v and fee cannot exceed it (one note per spend).
+//
+// Private vaults (decided 23 Oct 2026, when the OstraPool leaves of shield.ts and unshield.ts left the MCP tools): an
+// unshield of USDG may pay a new private vault of the agent instead of an address, private vault n with keychain
+// privateVaultKeychainId(chain, USDG, n), the number counted up and kept (PRIVATE_VAULTS) before the proof names it,
+// never one unshield.ts took, nor one whose address has code or USDG already (an OSTRA_HOME restored from an older
+// copy). Its tokens wait at its address until it is used: withdrawPrivate creates it then and sends from it, through
+// the relayer (sent by the agent's own fee payer it would show the account that sends its vaults' transactions). recover() finds them again: every unshield of the agent's notes pays a recipient, and the recipients
+// that are private vaults of this seed (numbers 0 up to past the last one found, PRIVATE_VAULT_SCAN_GAP on) are
+// kept. An unshield names the amount it pays, so a private vault's first balance matches an unshield in the pool's
+// events: that link is public, what is not is which note and whose.
+//
+// Auto-shield of the creator vault (decided 23 Oct 2026, the launch's creator share, design v0.4): when it is on, each
+// sweep shields what the creator vault holds beyond `keep` (default RELAYER_CHANNEL_DEPOSIT, which pays the relayer
+// for the creator vault's own transactions) into a note, once that is at least AUTO_SHIELD_MIN.
 
-import { getAddress, parseAbiItem, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt } from "viem";
-import { LAUNCH_PAIRS, WETH, chainlinkEthUsd, signVaultTransfer } from "@ostraagent/sdk";
+import { bytesToHex, getAddress, parseAbiItem, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt } from "viem";
+import { LAUNCH_PAIRS, WETH, chainlinkEthUsd, signVaultTransfer, vaultAddress as computeVaultAddress } from "@ostraagent/sdk";
 import {
   FIELD_P,
   LOG_WINDOW_BLOCKS,
@@ -68,13 +82,13 @@ import {
   type Spend,
   type SwapDeployment,
 } from "@ostraagent/swap";
-import { formatUnitsAmount, parseUnitsAmount } from "./amount.ts";
+import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmount } from "./amount.ts";
 import { chainTime, tokenBalance, tokenDecimals } from "./chain.ts";
-import type { Config } from "./config.ts";
+import { RELAYER_CHANNEL_DEPOSIT, type Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { RelayerError, RelayerUnavailableError, VAULT_SPEND_GAS, type Sender } from "./relay.ts";
 import type { Folder } from "./storage.ts";
-import { spendCall, type VaultOperationResult, type VaultService } from "./vault.ts";
+import { spendCall, type VaultOperationResult, type VaultService, type WithdrawResult } from "./vault.ts";
 
 export const PRIVATE_SWAP_DIR = "ostra-swap-private";
 /** Gas a shield from a vault is reserved for: the vault's Transfer and shieldFromEscrow (measured on a fork 22 Oct 2026: 3.15M with the escrow's creation and the tree's insertion). */
@@ -83,13 +97,14 @@ export const PRIVATE_SHIELD_GAS = VAULT_SPEND_GAS + 3_600_000n;
 export const PRIVATE_SPEND_DEADLINE_SECONDS = 3_600n;
 const MAX_SLIPPAGE_BPS = 1_000;
 /**
- * The gas the relayer prices a private spend at (relayer src/private.ts PRIVATE_GAS: measured 13.9M for an unshield
- * and 15.5M for a swap with their proofs' calldata).
+ * The gas a private spend's fee is checked against (measured 13.9M for an unshield and 15.5M for a swap with their
+ * proofs' calldata; the relayer prices them at 15.5M and 17M since 23 Oct 2026, relayer src/private.ts PRIVATE_GAS).
  */
 export const PRIVATE_FEE_GAS = { unshield: 16_000_000n, swap: 19_000_000n } as const;
 /**
  * The most a relayer's fee may be worth, as a multiple of PRIVATE_FEE_GAS at the gas price now: the relayer adds its
- * margin (10%), headroom for the gas price (25%) and, for a token it sells later, a haircut (3%), about 1.42 times.
+ * margin (10%), headroom for the gas price (10%) and, for a token it sells later, a haircut (3%), about 1.25 times its
+ * own gas (since 23 Oct 2026; 1.42 before).
  */
 export const PRIVATE_FEE_MAX_FACTOR = 3n;
 /** Shield nonces searched past the last one found in the pool's events before a missing count is taken as found. */
@@ -102,11 +117,22 @@ const LOGS_CATCH_UP_TRIES = 30;
  */
 const SHIELD_LOG_WAIT_MS = 60 * 60 * 1000;
 
+/**
+ * Private vault numbers searched past the last one found among the agent's unshields' recipients (see the file comment):
+ * a number is taken before its proof, so an unshield refused (a fee, the relayer) leaves one unused; checking one costs a
+ * single WOTS key, no request.
+ */
+const PRIVATE_VAULT_SCAN_GAP = 200n;
+/** The least auto-shield moves into a note at once. */
+export const AUTO_SHIELD_MIN = parseTokenAmount("1");
+
 const NOTES = "notes.json";
 const TREES = "trees.json";
 const NEXT_RHO = "next-rho";
 const POOL_INDEX = "pool-index.json";
 const PENDING_PREFIX = "pending-";
+const PRIVATE_VAULTS = "private-vaults.json";
+const AUTO_SHIELD = "auto-shield-creator.json";
 
 type NoteRecord = { asset: Address; amount: string; rho: Digest; commitment: Digest; tree: number; index: number };
 
@@ -118,6 +144,8 @@ type PendingShield = {
   rho: Digest;
   tag: Digest;
   escrow: Address;
+  /** The vault it is shielded from: the agent's vault of the token, or the creator vault (auto-shield). */
+  source?: "creator";
   vaultNonce: string;
   block: string;
   at: number;
@@ -148,12 +176,21 @@ type PoolLog =
       eventName: "PrivateSwapped";
       args: { nullifier: Hex; tokenIn: Address; tokenOut: Address; amountIn: bigint; amountOut: bigint; fee: bigint; relayer: Address; outTag: Hex; outCommitment: Hex };
     };
-type SpendLog = { kind: "unshield"; v: bigint; fee: bigint } | { kind: "swap"; v: bigint; fee: bigint; tokenOut: Address; amountOut: bigint; outCommitment: Digest };
+type SpendLog = { kind: "unshield"; v: bigint; fee: bigint; recipient: Address } | { kind: "swap"; v: bigint; fee: bigint; tokenOut: Address; amountOut: bigint; outCommitment: Digest };
 
 export type PrivateBalance = { token: Address; amount: string; notes: number; largestNote: string }[];
 
-/** What recover() found: the shields of the seed, the notes it followed, and the notes unspent now. */
-export type PrivateRecovery = { pool: Address; shields: number; followed: number; tokens: PrivateBalance; notes: number };
+/** What recover() found: the shields of the seed, the notes it followed, the notes unspent now, and the private vaults. */
+export type PrivateRecovery = { pool: Address; shields: number; followed: number; tokens: PrivateBalance; notes: number; privateVaults: PrivateVaultView[] };
+
+/** A private vault an unshield paid (see the file comment): its number and address, kept before the proof names it. */
+type PrivateVaultRecord = { index: string; vault: Address; at: number };
+
+/** A private vault of the agent, as read now: whether it was created yet and what it holds (USDG). */
+export type PrivateVaultView = { index: string; vault: Address; exists: boolean; balance: string };
+
+/** Auto-shield of the creator vault (see the file comment). */
+export type PrivateAutoShield = { vault: Address; enabled: boolean; keep: string };
 
 export type PrivateSpendResult = {
   status: "sent";
@@ -184,6 +221,12 @@ export type PrivateBalanceParts = {
   folder: Folder;
   /** Without a relayer, spends are sent by `sender`, which links them to the agent: for tests and forks only. */
   localSpends?: boolean;
+  /** Private vault `index` of the agent (USDG), with its own records and sender: an unshield to a private vault pays it. */
+  privateVault?: (index: bigint) => Promise<VaultService>;
+  /** The private vault numbers unshield.ts took (OstraPool leaves): never given to a note's unshield. */
+  takenPrivateIndexes?: () => Promise<bigint[]>;
+  /** The creator vault (USDG), which auto-shield shields from. */
+  creator?: VaultService;
 };
 
 const shieldedEvent = parseAbiItem("event Shielded(address indexed from, address indexed token, uint256 amount, bytes32 tag, bytes32 commitment)");
@@ -288,7 +331,7 @@ export class PrivateBalanceService {
           shielded.set(tag, [...(shielded.get(tag) ?? []), { token: getAddress(l.args.token), amount: l.args.amount, commitment: l.args.commitment }]);
           notes += 1;
         } else if (l.eventName === "Unshielded") {
-          spends.set(l.args.nullifier.toLowerCase(), { kind: "unshield", v: l.args.amount, fee: l.args.fee });
+          spends.set(l.args.nullifier.toLowerCase(), { kind: "unshield", v: l.args.amount, fee: l.args.fee, recipient: getAddress(l.args.recipient) });
           notes += 1;
         } else {
           spends.set(l.args.nullifier.toLowerCase(), { kind: "swap", v: l.args.amountIn, fee: l.args.fee, tokenOut: getAddress(l.args.tokenOut), amountOut: l.args.amountOut, outCommitment: l.args.outCommitment });
@@ -384,6 +427,8 @@ export class PrivateBalanceService {
     // Each note to its spend, and the spend to the notes it made.
     const unspent: PrivateNote[] = [];
     const seen = new Set<string>();
+    // Who the agent's unshields paid: its private vaults among them are found below.
+    const recipients = new Set<Address>();
     let followed = 0;
     for (let note = queue.pop(); note !== undefined; note = queue.pop()) {
       if (seen.has(note.commitment.toLowerCase())) continue;
@@ -395,6 +440,7 @@ export class PrivateBalanceService {
         unspent.push(note);
         continue;
       }
+      if (spend.kind === "unshield") recipients.add(spend.recipient);
       // The change note is added in the spend's own transaction: the trees hold it (placed throws otherwise).
       const change = note.amount - spend.v - spend.fee;
       if (change > 0n) {
@@ -423,7 +469,28 @@ export class PrivateBalanceService {
     // The shield count past every nonce found (never lowered: a nonce counted but not shielded is not used again).
     const next = counted + 1n > last + 1n ? counted + 1n : last + 1n;
     await this.#p.folder.write(NEXT_RHO, `${next}\n`);
-    return { pool: this.#pool, shields, followed, notes: records.length, tokens: await this.#summary(records) };
+    await this.#recoverPrivateVaults(recipients);
+    return { pool: this.#pool, shields, followed, notes: records.length, tokens: await this.#summary(records), privateVaults: await this.#privateVaultViews() };
+  }
+
+  /**
+   * The private vaults among `recipients` (the agent's unshields' recipients): numbers 0, 1, ... until
+   * PRIVATE_VAULT_SCAN_GAP numbers in a row past the last one found, and past every number kept here or taken by
+   * unshield.ts, are none of them. Kept with the ones recorded here (a record whose address is not its number's goes).
+   */
+  async #recoverPrivateVaults(recipients: Set<Address>): Promise<void> {
+    const kept = (await this.#privateVaults()).filter((r) => this.#privateVaultAddress(BigInt(r.index)) === getAddress(r.vault));
+    const byIndex = new Map(kept.map((r) => [r.index, r]));
+    const known = [...kept.map((r) => BigInt(r.index)), ...(await this.#takenPrivateIndexes())];
+    const floor = known.reduce((m, i) => (i + 1n > m ? i + 1n : m), 0n);
+    let last = -1n;
+    for (let i = 0n; recipients.size > 0 && (i <= last + PRIVATE_VAULT_SCAN_GAP || i < floor); i++) {
+      const vault = this.#privateVaultAddress(i);
+      if (!recipients.has(vault)) continue;
+      last = i;
+      if (!byIndex.has(i.toString())) byIndex.set(i.toString(), { index: i.toString(), vault, at: Date.now() });
+    }
+    await this.#savePrivateVaults([...byIndex.values()].sort((a, b) => (BigInt(a.index) < BigInt(b.index) ? -1 : 1)));
   }
 
   /** Per token: what `notes` hold, how many, and the largest. */
@@ -470,6 +537,58 @@ export class PrivateBalanceService {
     await this.#p.folder.write(NOTES, `${JSON.stringify({ version: 1, notes })}\n`);
   }
 
+  /** The address of private vault `index` (VaultService.vaultAddress of kind "private"; no crank). */
+  #privateVaultAddress(index: bigint): Address {
+    const { chainId, deployment: d } = this.#p.config;
+    const initialKeyRoot = bytesToHex(this.#p.keys.privateVaultKeychain(chainId, d.token, index).keyRoot(0n));
+    return computeVaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: d.token, initialKeyRoot, initialCrank: zeroAddress });
+  }
+
+  async #privateVaults(): Promise<PrivateVaultRecord[]> {
+    const text = await this.#p.folder.read(PRIVATE_VAULTS);
+    return text === undefined ? [] : (JSON.parse(text) as { version: 1; vaults: PrivateVaultRecord[] }).vaults;
+  }
+
+  async #savePrivateVaults(vaults: PrivateVaultRecord[]): Promise<void> {
+    await this.#p.folder.ensure();
+    await this.#p.folder.write(PRIVATE_VAULTS, `${JSON.stringify({ version: 1, vaults })}\n`);
+  }
+
+  async #takenPrivateIndexes(): Promise<bigint[]> {
+    return this.#p.takenPrivateIndexes === undefined ? [] : this.#p.takenPrivateIndexes();
+  }
+
+  /**
+   * A new private vault, kept before it is used: the first number past every one kept here or taken by unshield.ts
+   * whose address has no code and no USDG yet. A number used from another copy of this OSTRA_HOME is passed over and
+   * kept too (it is this seed's private vault), so private_balance and private_withdraw see it.
+   */
+  async #newPrivateVault(): Promise<PrivateVaultRecord> {
+    const vaults = await this.#privateVaults();
+    let index = [...vaults.map((r) => BigInt(r.index)), ...(await this.#takenPrivateIndexes())].reduce((m, i) => (i + 1n > m ? i + 1n : m), 0n);
+    for (;; index++) {
+      const vault = this.#privateVaultAddress(index);
+      const record: PrivateVaultRecord = { index: index.toString(), vault, at: Date.now() };
+      vaults.push(record);
+      const used = (await this.#p.client.getCode({ address: vault })) !== undefined || (await tokenBalance(this.#p.client, this.#p.config.deployment.token, vault)) > 0n;
+      if (used) continue;
+      await this.#savePrivateVaults(vaults);
+      return record;
+    }
+  }
+
+  /** The private vaults kept here, read now: the ones created or holding USDG (a number whose unshield never landed stays kept, unused). */
+  async #privateVaultViews(): Promise<PrivateVaultView[]> {
+    const out: PrivateVaultView[] = [];
+    for (const r of await this.#privateVaults()) {
+      const vault = getAddress(r.vault);
+      const exists = (await this.#p.client.getCode({ address: vault })) !== undefined;
+      const balance = await tokenBalance(this.#p.client, this.#p.config.deployment.token, vault);
+      if (exists || balance > 0n) out.push({ index: r.index, vault, exists, balance: formatTokenAmount(balance) });
+    }
+    return out;
+  }
+
   async #addNotes(add: PrivateNote[], remove: Digest[] = []): Promise<void> {
     const drop = new Set(remove.map((c) => c.toLowerCase()));
     const notes = (await this.#notes()).filter((n) => !drop.has(n.commitment.toLowerCase()));
@@ -513,12 +632,12 @@ export class PrivateBalanceService {
     await this.#p.folder.remove(`${PENDING_PREFIX}${id}.json`);
   }
 
-  /** The agent's notes now (operations in flight finished first), and per token what they hold. */
-  balance(): Promise<{ pool: Address; tokens: PrivateBalance; inFlight: number }> {
+  /** The agent's notes now (operations in flight finished first), per token what they hold, and its private vaults. */
+  balance(): Promise<{ pool: Address; tokens: PrivateBalance; inFlight: number; privateVaults: PrivateVaultView[] }> {
     return this.#serial(async () => {
       const failures = await this.#refresh();
       await this.#ensureRecovered();
-      return { pool: this.#pool, tokens: await this.#summary(await this.#notes()), inFlight: failures.length };
+      return { pool: this.#pool, tokens: await this.#summary(await this.#notes()), inFlight: failures.length, privateVaults: await this.#privateVaultViews() };
     });
   }
 
@@ -527,42 +646,58 @@ export class PrivateBalanceService {
     return this.#serial(async () => {
       const token = address(a.token, "token");
       this.#checkToken(token);
-      const prover = this.#prover();
       const decimals = await tokenDecimals(this.#p.client, token);
       const amount = parseUnitsAmount(a.amount, decimals);
       if (amount === 0n) throw new RangeError("amount must be greater than zero");
-      const from = this.#p.vaultFor(token);
-      const s = await from.state();
-      if (!s.exists && from.kind === "buyer") throw new Error("this agent has no vault yet; call open_vault first");
-      if (s.balance < amount) throw new Error(`the vault in ${token} (${s.vault}) holds ${formatUnitsAmount(s.balance, decimals)}, less than ${a.amount}; nothing was signed`);
-      if (!s.exists) await from.open();
-      const sk = this.#sk();
-      await this.#ensureRecovered();
-      let pending: PendingShield | null = null;
-      const result = await from.operate({
-        gas: PRIVATE_SHIELD_GAS,
-        moves: amount,
-        what: "shield",
-        build: async ({ v, vault, keychain, chainId }) => {
-          const balance = await tokenBalance(this.#p.client, token, vault);
-          if (balance < amount) throw new Error(`the vault holds ${formatUnitsAmount(balance, decimals)} now, less than ${a.amount}; nothing was signed`);
-          const rho = await this.#nextShieldRho();
-          const tag = await tagOf(prover, sk, rho);
-          const escrow = shieldEscrowAddress(this.#pool, token, tag);
-          pending = { kind: "shield", id: tag.slice(2, 18), token, rho, tag, escrow, vaultNonce: v.nonce.toString(), block: (await this.#p.client.getBlockNumber({ cacheTime: 0 })).toString(), at: Date.now() };
-          await this.#keep(pending);
-          const signed = await signVaultTransfer(keychain, v, { chainId, to: escrow, amount });
-          return [spendCall(vault, signed), shieldFromEscrowCall(this.#pool, token, tag)];
-        },
-      });
-      if (result.status !== "sent") return result;
-      const kept = pending as PendingShield | null;
-      if (kept === null) throw new Error("the shield was sent without its record");
-      const note = await shieldedNote(prover, sk, kept.rho, await this.#p.client.getTransactionReceipt({ hash: result.txHash }), this.#pool);
-      await this.#addNotes([note]);
-      await this.#done(kept.id);
-      return { status: "sent", txHash: result.txHash, token, amount: formatUnitsAmount(note.amount, decimals), note: note.commitment };
+      return this.#shieldFrom(this.#p.vaultFor(token), undefined, token, amount, decimals);
     });
+  }
+
+  /** Shields `amount` of `token` from the vault `from` (`source` "creator": the creator vault) into a new note. */
+  async #shieldFrom(from: VaultService, source: PendingShield["source"], token: Address, amount: bigint, decimals: number): Promise<VaultOperationResult | { status: "sent"; txHash: Hash; token: Address; amount: string; note: Digest }> {
+    const prover = this.#prover();
+    const text = formatUnitsAmount(amount, decimals);
+    const s = await from.state();
+    if (!s.exists && from.kind === "buyer") throw new Error("this agent has no vault yet; call open_vault first");
+    if (s.balance < amount) throw new Error(`the vault in ${token} (${s.vault}) holds ${formatUnitsAmount(s.balance, decimals)}, less than ${text}; nothing was signed`);
+    if (!s.exists) await from.open();
+    const sk = this.#sk();
+    await this.#ensureRecovered();
+    let pending: PendingShield | null = null;
+    const result = await from.operate({
+      gas: PRIVATE_SHIELD_GAS,
+      moves: amount,
+      what: "shield",
+      build: async ({ v, vault, keychain, chainId }) => {
+        const balance = await tokenBalance(this.#p.client, token, vault);
+        if (balance < amount) throw new Error(`the vault holds ${formatUnitsAmount(balance, decimals)} now, less than ${text}; nothing was signed`);
+        const rho = await this.#nextShieldRho();
+        const tag = await tagOf(prover, sk, rho);
+        const escrow = shieldEscrowAddress(this.#pool, token, tag);
+        pending = {
+          kind: "shield",
+          id: tag.slice(2, 18),
+          token,
+          rho,
+          tag,
+          escrow,
+          ...(source === undefined ? {} : { source }),
+          vaultNonce: v.nonce.toString(),
+          block: (await this.#p.client.getBlockNumber({ cacheTime: 0 })).toString(),
+          at: Date.now(),
+        };
+        await this.#keep(pending);
+        const signed = await signVaultTransfer(keychain, v, { chainId, to: escrow, amount });
+        return [spendCall(vault, signed), shieldFromEscrowCall(this.#pool, token, tag)];
+      },
+    });
+    if (result.status !== "sent") return result;
+    const kept = pending as PendingShield | null;
+    if (kept === null) throw new Error("the shield was sent without its record");
+    const note = await shieldedNote(prover, sk, kept.rho, await this.#p.client.getTransactionReceipt({ hash: result.txHash }), this.#pool);
+    await this.#addNotes([note]);
+    await this.#done(kept.id);
+    return { status: "sent", txHash: result.txHash, token, amount: formatUnitsAmount(note.amount, decimals), note: note.commitment };
   }
 
   /** The smallest note of `token` holding at least `need`, or an error naming the largest. */
@@ -733,11 +868,19 @@ export class PrivateBalanceService {
     });
   }
 
-  /** Sends `amount` of `token` out of one private note to `destination` (default: the agent's vault of that token). */
-  unshield(a: { token: string; amount: string; destination?: string }): Promise<PrivateSpendResult> {
+  /**
+   * Sends `amount` of `token` out of one private note to `destination` (default: the agent's vault of that token), or,
+   * with `toPrivateVault`, to a new private vault of the agent (USDG only; see the file comment).
+   */
+  unshield(a: { token: string; amount: string; destination?: string; toPrivateVault?: boolean }): Promise<PrivateSpendResult & { privateVault?: { index: string; vault: Address } }> {
     return this.#serial(async () => {
       const token = address(a.token, "token");
       this.#checkToken(token);
+      if (a.toPrivateVault === true) {
+        if (a.destination !== undefined) throw new RangeError("name a destination or toPrivateVault, not both");
+        if (token !== this.#p.config.deployment.token) throw new RangeError("a private vault holds USDG: unshield another token to an address");
+        if (this.#p.privateVault === undefined) throw new Error("private vaults are not set up here");
+      }
       this.#requireRelayer();
       const prover = this.#prover();
       await this.#refresh();
@@ -745,10 +888,12 @@ export class PrivateBalanceService {
       const decimals = await tokenDecimals(this.#p.client, token);
       const v = parseUnitsAmount(a.amount, decimals);
       if (v === 0n) throw new RangeError("amount must be greater than zero");
-      const recipient = a.destination === undefined ? await this.#p.vaultFor(token).vaultAddress() : address(a.destination, "destination");
-      if (recipient === "0x0000000000000000000000000000000000000000") throw new RangeError("the destination must not be the zero address");
       const { fee: priced } = await this.#price(token, "unshield");
       const note = await this.#pick(token, v + priced, decimals, `${a.amount} and the relayer's fee`);
+      // A new private vault's number is kept before the proof names its address: it is never given to another unshield.
+      const privateVault = a.toPrivateVault === true ? await this.#newPrivateVault() : null;
+      const recipient = privateVault !== null ? privateVault.vault : a.destination === undefined ? await this.#p.vaultFor(token).vaultAddress() : address(a.destination, "destination");
+      if (recipient === zeroAddress) throw new RangeError("the destination must not be the zero address");
       const sk = this.#sk();
       const changeRho = this.#spendRho("change", note.commitment);
       const r = await this.#spend(note, (fee) => v + fee, "unshield", async (fee, relayer, deadline, trees) => {
@@ -759,7 +904,112 @@ export class PrivateBalanceService {
       const change = changeNote(spend, r.receipt, this.#pool);
       await this.#addNotes(change === null ? [] : [change], [note.commitment]);
       await this.#done(spend.terms.nullifier.slice(2, 18));
-      return { status: "sent", txHash: r.txHash, amountIn: formatUnitsAmount(v, decimals), fee: formatUnitsAmount(r.fee, decimals), recipient, change: formatUnitsAmount(spend.change.amount, decimals) };
+      return {
+        status: "sent",
+        txHash: r.txHash,
+        amountIn: formatUnitsAmount(v, decimals),
+        fee: formatUnitsAmount(r.fee, decimals),
+        recipient,
+        change: formatUnitsAmount(spend.change.amount, decimals),
+        ...(privateVault === null ? {} : { privateVault: { index: privateVault.index, vault: privateVault.vault } }),
+      };
+    });
+  }
+
+  /** The private vaults an unshield paid, read now. */
+  privateVaults(): Promise<PrivateVaultView[]> {
+    return this.#serial(() => this.#privateVaultViews());
+  }
+
+  /** The number of the private vault at `vault` kept here (found again from the seed first in a new OSTRA_HOME), or null. */
+  async privateVaultIndex(vault: string): Promise<bigint | null> {
+    const found = (
+      await this.#serial(async () => {
+        await this.#ensureRecovered();
+        return this.#privateVaults();
+      })
+    ).find((r) => r.vault.toLowerCase() === vault.toLowerCase());
+    return found === undefined ? null : BigInt(found.index);
+  }
+
+  /** Sends USDG from the private vault at `vault` (one an unshield paid), creating the vault first when it does not exist yet. */
+  async withdrawPrivate(a: { vault: string; destination: string; amount: string }): Promise<WithdrawResult & { created?: boolean }> {
+    const index = await this.privateVaultIndex(address(a.vault, "vault"));
+    if (index === null) throw new Error(`${a.vault} is not a private vault an unshield of this agent paid (private_balance lists them)`);
+    if (this.#p.privateVault === undefined) throw new Error("private vaults are not set up here");
+    this.#requireRelayer();
+    const pv = await this.#p.privateVault(index);
+    if ((await pv.vaultAddress()) !== getAddress(a.vault)) throw new Error(`private vault ${index} is ${await pv.vaultAddress()}, not ${a.vault}`);
+    const s = await pv.state();
+    const created = !s.exists;
+    if (created && this.#p.config.relayerUrl !== null) {
+      // The relayer creates the vault as its debt, paid with the first voucher of the vault's own relayer channel: the
+      // channel's deposit stays in the vault, so a withdrawal that leaves less is refused before the vault is created.
+      const amount = parseTokenAmount(a.amount);
+      if (s.balance < amount + RELAYER_CHANNEL_DEPOSIT) {
+        throw new Error(`private vault ${index} holds ${formatTokenAmount(s.balance)}; its first withdrawal leaves ${formatTokenAmount(RELAYER_CHANNEL_DEPOSIT)} for its relayer channel, so at most ${formatTokenAmount(s.balance > RELAYER_CHANNEL_DEPOSIT ? s.balance - RELAYER_CHANNEL_DEPOSIT : 0n)} now; nothing was signed`);
+      }
+    }
+    if (created) await pv.open();
+    return { ...(await pv.withdraw(a.destination, a.amount)), ...(created ? { created } : {}) };
+  }
+
+  /** Auto-shield of the creator vault (off unless set). */
+  autoShield(): Promise<PrivateAutoShield> {
+    return this.#serial(() => this.#autoShieldSetting());
+  }
+
+  #creator(): VaultService {
+    if (this.#p.creator === undefined) throw new Error("the creator vault is not set up here");
+    return this.#p.creator;
+  }
+
+  async #autoShieldSetting(): Promise<PrivateAutoShield> {
+    const vault = await this.#creator().vaultAddress();
+    const text = await this.#p.folder.read(AUTO_SHIELD);
+    if (text === undefined) return { vault, enabled: false, keep: formatTokenAmount(RELAYER_CHANNEL_DEPOSIT) };
+    const r = JSON.parse(text) as { enabled?: unknown; keep?: unknown };
+    if (typeof r.enabled !== "boolean" || typeof r.keep !== "string") throw new Error(`${AUTO_SHIELD} is not an auto-shield setting`);
+    return { vault, enabled: r.enabled, keep: formatTokenAmount(parseTokenAmount(r.keep)) };
+  }
+
+  /** Turns auto-shield of the creator vault on or off; `keep` (USDG, default RELAYER_CHANNEL_DEPOSIT) stays in the vault. */
+  setAutoShield(enabled: boolean, keep?: string): Promise<PrivateAutoShield> {
+    return this.#serial(async () => {
+      this.#creator();
+      if (enabled) this.#prover();
+      const kept = keep === undefined ? RELAYER_CHANNEL_DEPOSIT : parseTokenAmount(keep);
+      await this.#p.folder.ensure();
+      await this.#p.folder.write(AUTO_SHIELD, `${JSON.stringify({ enabled, keep: formatTokenAmount(kept) })}\n`);
+      return this.#autoShieldSetting();
+    });
+  }
+
+  /**
+   * One auto-shield step (the sweep): what the creator vault holds beyond `keep`, once at least AUTO_SHIELD_MIN, into
+   * a note. Null when it is off, the creator vault does not exist yet (a launch creates it), it is below that, or a
+   * shield from the creator vault is in flight that the vault no longer holds signed (refresh finishes it); one the
+   * vault holds signed and not landed is sent again first (VaultService.operate), so a lost send does not stop it.
+   */
+  autoShieldStep(): Promise<Awaited<ReturnType<PrivateBalanceService["shield"]>> | null> {
+    return this.#serial(async () => {
+      if (this.#p.creator === undefined || this.#p.prover === null) return null;
+      const setting = await this.#autoShieldSetting();
+      if (!setting.enabled) return null;
+      let inFlight = false;
+      for (const name of await this.#p.folder.list()) {
+        if (!name.startsWith(PENDING_PREFIX)) continue;
+        const text = await this.#p.folder.read(name);
+        const p = text === undefined ? null : (JSON.parse(text) as Pending);
+        if (p !== null && p.kind === "shield" && p.source === "creator") inFlight = true;
+      }
+      const token = this.#p.config.deployment.token;
+      const s = await this.#creator().state();
+      if (!s.exists) return null;
+      if (inFlight && s.pendingAction === null) return null;
+      const amount = s.balance - parseTokenAmount(setting.keep);
+      if (amount < AUTO_SHIELD_MIN) return null;
+      return this.#shieldFrom(this.#creator(), "creator", token, amount, await tokenDecimals(this.#p.client, token));
     });
   }
 
@@ -803,7 +1053,7 @@ export class PrivateBalanceService {
       found = true;
     }
     // Until the vault's nonce passes the signed Transfer, it may still land (sent again before the vault's next spend).
-    const s = await this.#p.vaultFor(p.token).state();
+    const s = await (p.source === "creator" ? this.#creator() : this.#p.vaultFor(p.token)).state();
     if (s.nonce === null || s.nonce <= BigInt(p.vaultNonce)) return false;
     // Paid and not taken: the pool takes it now.
     if ((await tokenBalance(this.#p.client, p.token, p.escrow)) > 0n) {

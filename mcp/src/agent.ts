@@ -8,8 +8,15 @@
 //   * without it the fee payer in OSTRA_HOME sends and pays gas in ETH.
 // The sweep (every SWEEP_SECONDS) carries on with what takes time: channel
 // closes asked for, channels `pay` opened past their life, relayer channels
-// past theirs, shield deposits and scheduled unshields, and Ostra Swap's
-// orders and private operations whose answer was lost.
+// past theirs, shield deposits and scheduled unshields kept from before 0.1.6,
+// Ostra Swap's orders and private operations whose answer was lost, and the
+// creator vault's auto-shield into private notes.
+//
+// Privacy is OstraPrivatePool's private notes since 0.1.6 (decided 23 Oct
+// 2026): the shielded pool of standard leaves (shield.ts, unshield.ts, the
+// aggregator's batches) left the tools, as no batch ever formed on mainnet;
+// its services stay so that records kept from before still finish, and an
+// auto-shield set on it moves to the private notes (#moveAutoShield).
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -165,6 +172,9 @@ export class Agent {
         sender: this.sender,
         folder: keys.folder.folder(PRIVATE_SWAP_DIR),
         localSpends: config.privateLocalSpends,
+        privateVault: async (index) => (await this.privateVault(index)).vault,
+        takenPrivateIndexes: async () => (await this.unshield.list()).map((r) => BigInt(r.index)),
+        creator: this.creator,
       });
     }
   }
@@ -191,7 +201,29 @@ export class Agent {
     const creatorKeys = await keys.forCreatorVault(config.chainId, config.deployment.token);
     const agent = new Agent({ config, client, transport, keys, creatorKeys, escrow, log });
     await agent.#loadSeller();
+    await agent.#moveAutoShield();
     return agent;
+  }
+
+  /**
+   * An auto-shield of the creator vault set on the shielded pool's leaves (before 0.1.6) is turned on for the private
+   * notes with the same `keep`, then off there; without Ostra Swap or a prover it is left as it is (and logged) for a
+   * start that has them. It never stops the server from starting.
+   */
+  async #moveAutoShield(): Promise<void> {
+    try {
+      const old = await this.creatorShield.autoShield();
+      if (!old.enabled) return;
+      if (this.privateBalance === null || this.config.prover === null) {
+        this.#log("auto_shield_not_moved", { vault: old.vault, reason: "private notes need Ostra Swap and a prover" });
+        return;
+      }
+      await this.privateBalance.setAutoShield(true, old.keep);
+      await this.creatorShield.setAutoShield(false);
+      this.#log("auto_shield_moved", { vault: old.vault, keep: old.keep });
+    } catch (err) {
+      this.#log("auto_shield_not_moved", { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   /** Private vault `index` (unshield made it), with its own records and relayer client. */
@@ -307,7 +339,10 @@ export class Agent {
       }
       await step("unshield", () => this.unshield.sweep());
       if (this.swap !== null) await step("ostra swap orders", () => this.swap!.finishPending());
-      if (this.privateBalance !== null && this.config.prover !== null) await step("private notes", () => this.privateBalance!.refresh());
+      if (this.privateBalance !== null && this.config.prover !== null) {
+        await step("private notes", () => this.privateBalance!.refresh());
+        await step("private auto-shield", () => this.privateBalance!.autoShieldStep());
+      }
     } finally {
       this.#sweeping = false;
     }

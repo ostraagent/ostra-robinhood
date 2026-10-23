@@ -84,9 +84,10 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "shield", "unshield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata", "upload_image", "publish_profile", "publish_token_metadata", "pairs", "fund_creator_vault", "creator_withdraw"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "launch", "buy", "sell", "quote_swap", "pool_info", "airdrop_start", "vesting_release", "claim_referral", "tokens", "token_info", "profile", "set_profile", "register_agent", "set_agent_uri", "set_token_metadata", "upload_image", "publish_profile", "publish_token_metadata", "pairs", "fund_creator_vault", "creator_withdraw"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
+    for (const name of ["shield", "unshield", "shield_status"]) assert.ok(!tools.includes(name), `no tool ${name}`);
     assert.equal(((await stat(home)).mode & 0o777).toString(8), "700");
     assert.equal(((await stat(join(home, "master.key"))).mode & 0o777).toString(8), "600");
 

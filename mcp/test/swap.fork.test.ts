@@ -4,12 +4,16 @@
 // OSTRA_HOME pays gas; private spends then carry no fee), proving with the WebAssembly prover the server loads by
 // default (ostra-swap privacy/wasm/pkg). Swaps between the agent's vaults as escrow orders (USDG to
 // WETH and back, tokens named by symbol), a private note shielded from the vault, a private swap into a WETH note,
-// an unshield of that note to a fresh address, refusals, and the notes found again by a second server on the same
+// an unshield of that note to a fresh address, an unshield of USDG to a new private vault and a private_withdraw that
+// creates it, refusals, and the notes found again by a second server on the same
 // OSTRA_HOME, one with OSTRA_PROVER=off refusing to spend, and one without OSTRA_PRIVATE_LOCAL_SPENDS refusing to spend
 // without a relayer, where private_recover finds the same notes from the seed and the pool's events. The seed alone
 // in a new OSTRA_HOME (as a restored backup) finds its notes again (the shield, its swap's change; the swap's output
 // was unshielded) and shields again the amount it first shielded: the shield count is past its last shield nonce, so
-// the note is new (a nonce used again would be refused as the same commitment). The pool index (Uniswap pools per pair) is searched once from Robinhood Chain's public RPC, as
+// the note is new (a nonce used again would be refused as the same commitment); it finds the private vault again from
+// the unshields' recipients and withdraws from it, gives its next unshield a new private vault, and moves an
+// auto-shield of the creator vault kept from before 0.1.6 (the shielded pool's leaves) to the private notes, which the
+// sweep then shields the creator vault's payout into. The pool index (Uniswap pools per pair) is searched once from Robinhood Chain's public RPC, as
 // an agent's first swap does, and kept in OSTRA_HOME; the server searches the private pool's events on the fork
 // (OSTRA_LOGS_RPC_URL). Needs ../../ostra-swap built (forge build; privacy/wasm/build.sh) and anvil on PATH.
 
@@ -29,6 +33,7 @@ import { OSTRA, OSTRA_PONS_CURVE, PONS_HOOK, PoolIndex, ROBINHOOD_PUBLIC_RPC, TR
 
 const SWAP_DIR = new URL("../../../ostra-swap/", import.meta.url);
 const RECIPIENT = getAddress("0x00000000000000000000000000000000000D0D1A");
+const RECIPIENT2 = getAddress("0x00000000000000000000000000000000000D0D1B");
 
 let fork: Fork;
 let d: Deployment;
@@ -125,15 +130,21 @@ async function keepPoolIndex(home: string): Promise<void> {
   }
 }
 
-test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded, swapped and unshielded, refusals", { timeout: 1_800_000 }, async () => {
+test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded, swapped and unshielded, refusals", { timeout: 2_400_000 }, async () => {
   const home = join(root, "home");
   const client = await connect(home);
   let usdgNote: string;
+  let privateVault: Address;
+  let creatorVault: Address;
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["ostra_swap_quote", "ostra_swap", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover"]) assert.ok(tools.includes(name), `tool ${name}`);
+    for (const name of ["ostra_swap_quote", "ostra_swap", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover", "private_withdraw", "auto_shield"]) assert.ok(tools.includes(name), `tool ${name}`);
+    // The shielded pool's leaves left the tools in 0.1.6.
+    for (const name of ["shield", "unshield", "shield_status"]) assert.ok(!tools.includes(name), `no tool ${name}`);
 
-    const status = (await call(client, "balance")).json.vault as { feePayer: Address };
+    const balance = (await call(client, "balance")).json;
+    const status = balance.vault as { feePayer: Address };
+    creatorVault = getAddress((balance.creatorVault as { vault: string }).vault);
     await fork.setBalance(status.feePayer, 10n ** 19n);
     const opened = await call(client, "open_vault");
     assert.ok(opened.ok, opened.text);
@@ -201,7 +212,31 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     assert.equal(await balanceOf(WETH, pool), 0n);
     const b3 = (await call(client, "private_balance")).json.tokens as unknown[];
     assert.deepEqual(b3, [{ token: getAddress(USDG), amount: "150", notes: 1, largestNote: "150" }]);
-    usdgNote = "150";
+
+    // 40 USDG to a new private vault: number 0, at its address before it exists.
+    const notUsdg = await call(client, "private_unshield", { token: "ETH", amount: "1", toPrivateVault: true });
+    assert.ok(!notUsdg.ok && /a private vault holds USDG/.test(notUsdg.text), notUsdg.text);
+    const both = await call(client, "private_unshield", { token: "USDG", amount: "1", toPrivateVault: true, destination: RECIPIENT });
+    assert.ok(!both.ok && /not both/.test(both.text), both.text);
+    const toVault = await call(client, "private_unshield", { token: "USDG", amount: "40", toPrivateVault: true });
+    assert.ok(toVault.ok && toVault.json.status === "sent" && toVault.json.change === "110", toVault.text);
+    const pv = toVault.json.privateVault as { index: string; vault: string };
+    assert.equal(pv.index, "0");
+    privateVault = getAddress(pv.vault);
+    assert.equal(getAddress(toVault.json.recipient as string), privateVault);
+    assert.equal(await balanceOf(USDG, privateVault), parseUnits("40", 6));
+    assert.equal(await fork.client.getCode({ address: privateVault }), undefined, "not created yet");
+    const b4 = (await call(client, "private_balance")).json;
+    assert.deepEqual(b4.tokens, [{ token: getAddress(USDG), amount: "110", notes: 1, largestNote: "110" }]);
+    assert.deepEqual(b4.privateVaults, [{ index: "0", vault: privateVault, exists: false, balance: "40" }]);
+    // The first withdraw creates it (the local fee payer pays here) and sends from it.
+    const notMine = await call(client, "private_withdraw", { vault: RECIPIENT, destination: RECIPIENT2, amount: "1" });
+    assert.ok(!notMine.ok && /not a private vault/.test(notMine.text), notMine.text);
+    const w = await call(client, "private_withdraw", { vault: privateVault, destination: RECIPIENT2, amount: "10" });
+    assert.ok(w.ok && w.json.status === "sent" && w.json.created === true, w.text);
+    assert.equal(await balanceOf(USDG, RECIPIENT2), parseUnits("10", 6));
+    assert.deepEqual((await call(client, "private_balance")).json.privateVaults, [{ index: "0", vault: privateVault, exists: true, balance: "30" }]);
+    usdgNote = "110";
   } finally {
     await client.close();
   }
@@ -223,12 +258,14 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
   try {
     const refused = await call(linked, "private_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
     assert.ok(!refused.ok && /goes through the Ostra relayer/.test(refused.text), refused.text);
-    // From the seed and the pool's events: the shield, the swap's output and change; the output was unshielded whole.
+    // From the seed and the pool's events: the shield, the swap's output and change (the output was unshielded whole),
+    // the change's unshield to the private vault and its change; and the private vault from that unshield's recipient.
     const recovered = await call(linked, "private_recover");
     assert.ok(recovered.ok, recovered.text);
     assert.equal(recovered.json.shields, 1);
-    assert.equal(recovered.json.followed, 3);
+    assert.equal(recovered.json.followed, 4);
     assert.deepEqual(recovered.json.tokens, [{ token: getAddress(USDG), amount: usdgNote, notes: 1, largestNote: usdgNote }]);
+    assert.deepEqual(recovered.json.privateVaults, [{ index: "0", vault: privateVault, exists: true, balance: "30" }]);
     const same = await call(linked, "private_balance");
     assert.deepEqual(same.json.tokens, recovered.json.tokens);
   } finally {
@@ -239,6 +276,10 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
   const restored = join(root, "restored");
   await mkdir(restored, { mode: 0o700 });
   for (const f of ["master.key", "fee-payer.key"]) await copyFile(join(home, f), join(restored, f));
+  // An auto-shield of the creator vault set on the shielded pool's leaves before 0.1.6 (shield.ts's setting file).
+  await mkdir(join(restored, "shield"), { mode: 0o700 });
+  const oldSetting = join(restored, "shield", `auto-shield-${d.chainId}-${getAddress(d.token)}-${creatorVault}.json`);
+  await writeFile(oldSetting, `${JSON.stringify({ enabled: true, keep: "1" })}\n`, { mode: 0o600 });
   const fresh = await connect(restored);
   try {
     const opened = await call(fresh, "open_vault");
@@ -247,16 +288,45 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     const found = await call(fresh, "private_balance");
     assert.ok(found.ok, found.text);
     assert.deepEqual(found.json.tokens, [{ token: getAddress(USDG), amount: usdgNote, notes: 1, largestNote: usdgNote }]);
+    assert.deepEqual(found.json.privateVaults, [{ index: "0", vault: privateVault, exists: true, balance: "30" }]);
+    // The old auto-shield is off there and on for the private notes.
+    assert.deepEqual(JSON.parse(readFileSync(oldSetting, "utf8")), { enabled: false, keep: "1" });
+    // The private vault found again spends with the seed alone.
+    const w = await call(fresh, "private_withdraw", { vault: privateVault, destination: RECIPIENT2, amount: "5" });
+    assert.ok(w.ok && w.json.status === "sent" && w.json.created === undefined, w.text);
+    assert.equal(await balanceOf(USDG, RECIPIENT2), parseUnits("15", 6));
     const poolBefore = await balanceOf(USDG, pool);
     const shielded = await call(fresh, "private_shield", { token: "USDG", amount: "200" });
     assert.ok(shielded.ok && shielded.json.status === "sent" && shielded.json.amount === "200", shielded.text);
     assert.equal(await balanceOf(USDG, pool), poolBefore + parseUnits("200", 6));
     const after = await call(fresh, "private_balance");
-    assert.deepEqual(after.json.tokens, [{ token: getAddress(USDG), amount: "350", notes: 2, largestNote: "200" }]);
-    // The recovered change note spends: 100 of its 150 back to the vault (local spends: no fee).
+    assert.deepEqual(after.json.tokens, [{ token: getAddress(USDG), amount: "310", notes: 2, largestNote: "200" }]);
+    // The recovered change note spends: 100 of its 110 to an address (local spends: no fee).
     const out = await call(fresh, "private_unshield", { token: "USDG", amount: "100", destination: RECIPIENT });
-    assert.ok(out.ok && out.json.status === "sent" && out.json.change === "50", out.text);
+    assert.ok(out.ok && out.json.status === "sent" && out.json.change === "10", out.text);
     assert.equal(await balanceOf(USDG, RECIPIENT), parseUnits("100", 6));
+    // The next private vault is number 1: number 0, found again, is never paid twice.
+    const next = await call(fresh, "private_unshield", { token: "USDG", amount: "5", toPrivateVault: true });
+    assert.ok(next.ok && next.json.change === "5", next.text);
+    const pv1 = next.json.privateVault as { index: string; vault: string };
+    assert.equal(pv1.index, "1");
+    assert.notEqual(getAddress(pv1.vault), privateVault);
+    assert.equal(await balanceOf(USDG, getAddress(pv1.vault)), parseUnits("5", 6));
+
+    // Auto-shield (moved from the old setting) acts on an existing creator vault: created here by funding it with 1
+    // USDG, which it keeps. Then a payout to 21 USDG; the sweep (every minute) shields what it holds beyond the 1.
+    const funded = await call(fresh, "fund_creator_vault", { amount: "1" });
+    assert.ok(funded.ok, funded.text);
+    assert.notEqual(await fork.client.getCode({ address: creatorVault }), undefined, "the creator vault exists");
+    await fork.dealUsdg(creatorVault, parseUnits("21", 6));
+    let shieldedPayout = false;
+    for (let i = 0; i < 40 && !shieldedPayout; i++) {
+      await new Promise((r) => setTimeout(r, 6_000));
+      shieldedPayout = (await balanceOf(USDG, creatorVault)) === parseUnits("1", 6);
+    }
+    assert.ok(shieldedPayout, "the creator vault's payout was shielded");
+    const withPayout = await call(fresh, "private_balance");
+    assert.deepEqual(withPayout.json.tokens, [{ token: getAddress(USDG), amount: "225", notes: 3, largestNote: "200" }]);
   } finally {
     await fresh.close();
   }

@@ -45,12 +45,11 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Payments:** `pay` (calls a paid HTTP service and pays it from a channel of the vault, refused before signing above `maxPrice`), `open_channel`, `list_channels`, `close_channel`
 - **Ostra AI:** `ostra_ai` (a text, image or video task; Ostra chooses the model by its quality rating within `maxPrice`, paid in USDG from a channel of the vault, and what a task did not cost stays as the vault's credit), `ostra_ai_job` (a video job, saved as a file once completed), `ostra_ai_credit`
 - **Selling services:** `accept_payments`, `seller_balance`, `seller_withdraw`
-- **Privacy:** `shield`, `shield_status`, `auto_shield`, `unshield`, `private_withdraw`
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`
 - **Trading:** `tokens`, `token_info`, `pool_info`, `quote_swap`, `buy`, `sell`, `token_vault`, `transfer_token`, `claim_dividends`, `claim_referral`
 - **Launching:** `pairs`, `launch` (paired with USDG, ETH, $OSTRA or a listed Robinhood stock token, at a starting market cap in US dollars, with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
 - **Ostra Swap:** `ostra_swap_quote`, `ostra_swap` (between the agent's vaults of USDG, WETH, $OSTRA, listed stock tokens and launched tokens, routed through Uniswap v3 and v4; tokens by address or symbol)
-- **Private balances:** `private_shield` (from a vault into a private note), `private_balance`, `private_swap`, `private_unshield`, `private_recover` (finds the notes again from the seed alone) (spent with a zero-knowledge proof made on the agent's machine by the WebAssembly prover the package carries)
+- **Privacy:** `private_shield` (from a vault into a private note), `private_balance`, `private_swap`, `private_unshield` (to an address, or with `toPrivateVault` to a new private vault of the agent), `private_withdraw` (from a private vault), `private_recover` (finds the notes and private vaults again from the seed alone), `auto_shield` (everything the creator vault holds beyond what it keeps, into private notes). Notes are spent with a zero-knowledge proof made on the agent's machine by the WebAssembly prover the package carries. A spend does not show which note it spends; the token, the amounts, the times, the vault a shield comes from and an unshield's recipient are public, so a private vault's first balance matches the unshield that paid it
 - **Identity:** `profile`, `upload_image`, `publish_profile`, `set_profile`, `publish_token_metadata`, `set_token_metadata`, `register_agent`, `set_agent_uri`
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.
@@ -68,7 +67,7 @@ All settings are optional.
 | `OSTRA_RPC_URL_FILE` | | A private file (mode 0600) holding the RPC URL, when it carries an API key |
 | `OSTRA_RELAYER_URL` | `https://relayer.ostraagent.xyz` | Sends every transaction, paid in USDG. With `off`, a local fee payer key in `OSTRA_HOME` pays gas in ETH |
 | `OSTRA_KEEPER_URL` | `https://keeper.ostraagent.xyz` | Claims payments for the seller side. `off` disables `accept_payments` |
-| `OSTRA_AGGREGATOR_URL` | `https://aggregator.ostraagent.xyz` | Batches shield deposits. `off` disables `shield` |
+| `OSTRA_AGGREGATOR_URL` | `https://aggregator.ostraagent.xyz` | The shielded pool's batches, for shield deposits kept from before 0.1.6 only. `off` stops them |
 | `OSTRA_AI_URL` | `https://ai.ostraagent.xyz` | Ostra AI, the gateway of the `ostra_ai` tools. `off` disables them |
 | `OSTRA_SWAP_DEPLOYMENT` | Ostra Swap on Robinhood Chain mainnet | Path of another Ostra Swap deployment record (JSON). With `OSTRA_DEPLOYMENT` set and no Ostra Swap record, the Ostra Swap and private tools refuse |
 | `OSTRA_PROVER` | The WebAssembly prover in the package | Path of a native `ostra-prove` binary to prove with instead, or `off` (the private tools then refuse to spend) |

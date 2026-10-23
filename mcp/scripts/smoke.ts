@@ -66,8 +66,9 @@ try {
   assert.match(credit.text, /"credit": "[0-9.]+"/, credit.text);
   const recovered = await call("private_recover", {});
   assert.ok(recovered.ok, recovered.text);
-  const found = JSON.parse(recovered.text) as { pool?: string; notes?: number; tokens?: unknown[] };
+  const found = JSON.parse(recovered.text) as { pool?: string; notes?: number; tokens?: unknown[]; privateVaults?: unknown[] };
   assert.ok(typeof found.pool === "string" && found.notes === 0 && Array.isArray(found.tokens) && found.tokens.length === 0, recovered.text);
+  assert.ok(Array.isArray(found.privateVaults) && found.privateVaults.length === 0, recovered.text);
   await client.close();
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");

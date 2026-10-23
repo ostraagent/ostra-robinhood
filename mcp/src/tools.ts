@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, UNSHIELD_DEFAULT_WINDOW_HOURS, UNSHIELD_MAX_WINDOW_HOURS, formatTokenAmount, uploadImage } from "@ostraagent/core";
+import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, formatTokenAmount, uploadImage } from "@ostraagent/core";
 import { LAUNCH_PAIRS, QuoteError, WETH, redact } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { ensurePrivateDir } from "./disk.ts";
@@ -194,21 +194,6 @@ export function registerTools(server: McpServer, agent: Agent): void {
     return agent.seller.withdraw(a.destination ?? (await agent.buyer.vaultAddress()), a.amount);
   });
 
-  // --- the shielded pool --------------------------------------------------------------------------------
-  tool("shield", "Deposits `leaves` standard leaves from the vault into the shielded pool (through the Ostra aggregator's batches).", { leaves: z.number().int().min(1).max(64) }, (a) => agent.shield.shield(a.leaves));
-  tool(
-    "unshield",
-    `Spends \`leaves\` shielded leaves, each into a new private vault at a random time within windowHours (default ${UNSHIELD_DEFAULT_WINDOW_HOURS}, at most ${UNSHIELD_MAX_WINDOW_HOURS}; 0: now, which lets the spends be timed together).`,
-    { leaves: z.number().int().min(1).max(64), windowHours: z.number().min(0).max(UNSHIELD_MAX_WINDOW_HOURS).default(UNSHIELD_DEFAULT_WINDOW_HOURS) },
-    (a) => agent.unshield.unshield(a.leaves, a.windowHours),
-  );
-  tool("shield_status", "Shield deposits, scheduled unshields and the private vaults.", {}, async () => ({ deposits: await agent.shield.list(), unshields: await agent.unshield.list(), privateVaults: await agent.unshield.vaults() }));
-  tool("auto_shield", "Turns the creator vault's auto-shield on or off (it shields what the vault holds beyond `keep` USDG).", { enabled: z.boolean(), keep: usdg.optional() }, (a) => agent.creatorShield.setAutoShield(a.enabled, a.keep));
-  tool("private_withdraw", "Sends USDG from one of the agent's private vaults.", { vault: address, destination: address, amount: usdg }, async (a) => {
-    const ctx = await agent.privateVault(await agent.unshield.indexOf(a.vault));
-    return ctx.vault.withdraw(a.destination, a.amount);
-  });
-
   // --- Ostra Swap: swaps between the agent's vaults, and private balances in OstraPrivatePool -----------------
   tool(
     "ostra_swap_quote",
@@ -230,11 +215,11 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "private_recover",
-    "Finds the agent's private notes again from its seed and the pool's events alone (its shields, then each spend's change and swap output), and keeps the unspent ones: for a seed restored on another machine, or notes kept here that look wrong. It runs by itself on first use in a new OSTRA_HOME.",
+    "Finds the agent's private notes again from its seed and the pool's events alone (its shields, then each spend's change and swap output), and keeps the unspent ones, with the private vaults its unshields paid: for a seed restored on another machine, or notes kept here that look wrong. It runs by itself on first use in a new OSTRA_HOME.",
     {},
     () => notes().recover(),
   );
-  tool("private_balance", "The agent's private notes in OstraPrivatePool: per token the total, the number of notes and the largest one (a spend uses one note).", {}, () => notes().balance());
+  tool("private_balance", "The agent's private notes in OstraPrivatePool: per token the total, the number of notes and the largest one (a spend uses one note); and its private vaults with what they hold.", {}, () => notes().balance());
   tool(
     "private_swap",
     "Swaps `amount` of tokenIn held in a private note into a new private note of tokenOut, through Ostra Swap, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note (a fee in tokenIn); the change stays private.",
@@ -243,9 +228,31 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "private_unshield",
-    "Pays `amount` of a token out of a private note to an address, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note; the change stays private. The default destination is the agent's vault of that token, which an observer can link to the vault that shielded: pay a fresh address for privacy.",
-    { token: swapToken, amount: units, destination: address.optional() },
-    (a) => notes().unshield({ token: tokenAddress(a.token), amount: a.amount, ...opt("destination", a.destination) }),
+    "Pays `amount` of a token out of a private note to an address, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note; the change stays private. The default destination is the agent's vault of that token, which an observer can link to the vault that shielded. With toPrivateVault (USDG only), it pays a new private vault of the agent instead, its own post-quantum vault found again from the seed (private_recover), which private_withdraw spends from. The amount is public, so a round amount, or a note split over several unshields, is harder to match to its shield.",
+    { token: swapToken, amount: units, destination: address.optional(), toPrivateVault: z.boolean().optional() },
+    (a) => notes().unshield({ token: tokenAddress(a.token), amount: a.amount, ...opt("destination", a.destination), ...opt("toPrivateVault", a.toPrivateVault) }),
+  );
+  tool(
+    "private_withdraw",
+    "Sends USDG from one of the agent's private vaults (private_balance lists them) to an address; a private vault an unshield paid is created on this first use.",
+    { vault: address, destination: address, amount: usdg },
+    async (a) => {
+      // A private vault of the shielded pool's leaves (unshield.ts, before 0.1.6), else one a private note's unshield paid.
+      const old = (await agent.unshield.vaults()).find((v) => v.vault.toLowerCase() === a.vault.toLowerCase());
+      if (old !== undefined) return (await agent.privateVault(old.index)).vault.withdraw(a.destination, a.amount);
+      if (agent.privateBalance !== null && (await agent.privateBalance.privateVaultIndex(a.vault)) !== null) return agent.privateBalance.withdrawPrivate(a);
+      throw new Error(`${a.vault} is not a private vault of this agent (private_balance lists them)`);
+    },
+  );
+  tool(
+    "auto_shield",
+    "Turns the creator vault's auto-shield on or off: every minute, everything the creator vault holds beyond `keep` USDG (default 1, which pays the relayer for its own transactions), once that is at least 1 USDG, is shielded into a private note (private_balance): launch payouts, and USDG put there for a launch too, so turn it off before funding a launch. The shield shows the creator vault it came from.",
+    { enabled: z.boolean(), keep: usdg.optional() },
+    async (a) => {
+      // An auto-shield set on the shielded pool's leaves before 0.1.6 is turned off with it.
+      await agent.creatorShield.setAutoShield(false);
+      return notes().setAutoShield(a.enabled, a.keep);
+    },
   );
 
   // --- recovery ----------------------------------------------------------------------------------------
@@ -277,7 +284,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
     (a) => lp().sell({ token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
   tool("token_vault", "The agent's vault for a launched token: address, balance, dividends to claim.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
-  tool("transfer_token", "Sends a launched token from the agent's token vault to an address.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
+  tool("transfer_token", "Sends a token other than USDG (a launched token, WETH, OSTRA or a stock token) from the agent's vault of it to an address; USDG goes with withdraw.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
   tool("claim_dividends", "Claims the dividends the agent's token vault earned, into the agent's vault of the dividend token.", { token: address }, (a) => lp().claimDividends(a.token));
   tool(
     "claim_referral",
