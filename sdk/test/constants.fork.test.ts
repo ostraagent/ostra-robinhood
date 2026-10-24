@@ -102,3 +102,28 @@ test("Multicall3 aggregate3 runs calls in one transaction", async () => {
   assert.equal(result[0]?.success, true);
   assert.equal(BigInt(result[0]!.returnData), 6n);
 });
+
+test("Morpho and Borro: every Borro stock's vault and USDG market, as BORRO_STOCKS names them", async () => {
+  const { BORRO_BUILDERS, BORRO_CODE, BORRO_ROUTER, BORRO_USDG_VAULT, MORPHO_BLUE, MORPHO_VAULT_V2_FACTORY } = await import("../src/constants.ts");
+  const { borroBuildersAbi, borroRouterAbi, borroStocks, morphoBlueAbi, vaultV2Abi } = await import("../src/borro.ts");
+  const { parseAbi, getAddress } = await import("viem");
+  const factoryAbi = parseAbi(["function isVaultV2(address) view returns (bool)"]);
+  const read = fork.client.readContract.bind(fork.client);
+  // The builder code is registered.
+  assert.notEqual(await read({ address: BORRO_BUILDERS, abi: borroBuildersAbi, functionName: "builders", args: [BORRO_CODE] }), "0x0000000000000000000000000000000000000000");
+  assert.equal(await read({ address: MORPHO_VAULT_V2_FACTORY, abi: factoryAbi, functionName: "isVaultV2", args: [BORRO_USDG_VAULT] }), true);
+  assert.equal(await read({ address: BORRO_BUILDERS, abi: borroBuildersAbi, functionName: "vaults", args: [BORRO_USDG_VAULT] }), true);
+  assert.equal(getAddress(await read({ address: BORRO_USDG_VAULT, abi: vaultV2Abi, functionName: "asset" })), USDG);
+  for (const s of borroStocks()) {
+    assert.equal(await read({ address: MORPHO_VAULT_V2_FACTORY, abi: factoryAbi, functionName: "isVaultV2", args: [s.vault] }), true, s.symbol);
+    assert.equal(await read({ address: BORRO_BUILDERS, abi: borroBuildersAbi, functionName: "vaults", args: [s.vault] }), s.builders, `${s.symbol} in BorroBuilders`);
+    assert.equal(getAddress(await read({ address: s.vault, abi: vaultV2Abi, functionName: "asset" })), s.token, s.symbol);
+    assert.equal(await read({ address: BORRO_ROUTER, abi: borroRouterAbi, functionName: "listed", args: [s.marketId] }), true, `${s.symbol} market listed`);
+    const p = await read({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: "idToMarketParams", args: [s.marketId] });
+    assert.deepEqual(
+      [getAddress(p[0]), getAddress(p[1]), getAddress(p[2]), getAddress(p[3]), p[4]],
+      [s.market.loanToken, s.market.collateralToken, getAddress(s.market.oracle), getAddress(s.market.irm), s.market.lltv],
+      s.symbol,
+    );
+  }
+});

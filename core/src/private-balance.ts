@@ -51,7 +51,7 @@
 // for the creator vault's own transactions) into a note, once that is at least AUTO_SHIELD_MIN.
 
 import { bytesToHex, getAddress, parseAbiItem, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt } from "viem";
-import { LAUNCH_PAIRS, WETH, chainlinkEthUsd, signVaultTransfer, vaultAddress as computeVaultAddress } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, VAULT_ACTION, WETH, chainlinkEthUsd, signVaultTransfer, transferParams, vaultAddress as computeVaultAddress } from "@ostraagent/sdk";
 import {
   FIELD_P,
   LOG_WINDOW_BLOCKS,
@@ -674,6 +674,7 @@ export class PrivateBalanceService {
         const rho = await this.#nextShieldRho();
         const tag = await tagOf(prover, sk, rho);
         const escrow = shieldEscrowAddress(this.#pool, token, tag);
+        await from.checkSpend(VAULT_ACTION.TRANSFER, transferParams({ to: escrow, amount }), "the shield's transfer to its escrow", this.#p.sender);
         pending = {
           kind: "shield",
           id: tag.slice(2, 18),

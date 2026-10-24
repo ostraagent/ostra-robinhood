@@ -46,6 +46,8 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Ostra AI:** `ostra_ai` (a text, image or video task; Ostra chooses the model by its quality rating within `maxPrice`, paid in USDG from a channel of the vault, and what a task did not cost stays as the vault's credit), `ostra_ai_job` (a video job, saved as a file once completed), `ostra_ai_credit`
 - **Selling services:** `accept_payments`, `seller_balance`, `seller_withdraw`
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`
+- **Withdrawal lock:** `vault_lock` (status; set a withdrawal address on another device, a delay of 36 hours to 14 days and a daily limit: anything else the vault sends counts against the limit, and every loosening waits the delay; off; cancel what waits), `vault_link` (the linked vault a Borro loan is paid to), `vault_approve_hash` (EIP-1271 approvals; under the lock they wait the delay), `guard_vault` (as a guardian of another locked vault: cancel its waiting changes, revoke an approval, sweep it to its withdrawal address, bring its Borro shares or collateral back)
+- **Borro:** `borro_markets`, `borro_position`, `borro_lend` (USDG, or a stock from the agent's vault of it, into Borro's Morpho vault of it), `borro_withdraw`, `borro_collateral`, `borro_borrow` (USDG against the stock vault's collateral, into the vault; the vault caps a loan at half of what the market's LLTV allows), `borro_repay`
 - **Trading:** `tokens`, `token_info`, `pool_info`, `quote_swap`, `buy`, `sell`, `token_vault`, `transfer_token`, `claim_dividends`, `claim_referral`
 - **Launching:** `pairs`, `launch` (paired with USDG, ETH, $OSTRA or a listed Robinhood stock token, at a starting market cap in US dollars, with an optional dev buy and vesting), `launches`, `set_pool_setting`, `set_creator_share`, `release_creator_payout`, `airdrop_fund`, `airdrop_start`, `airdrop_claim`, `airdrop_close`, `vesting_info`, `vesting_release`, `vesting_claim_dividends`
 - **Ostra Swap:** `ostra_swap_quote`, `ostra_swap` (between the agent's vaults of USDG, WETH, $OSTRA, listed stock tokens and launched tokens, routed through Uniswap v3 and v4; tokens by address or symbol)
@@ -53,6 +55,8 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 - **Identity:** `profile`, `upload_image`, `publish_profile`, `set_profile`, `publish_token_metadata`, `set_token_metadata`, `register_agent`, `set_agent_uri`
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.
+
+The withdrawal lock and Borro tools need vault v3, which waits behind the same 72-hour timelock as every vault upgrade; until the vaults run it they refuse before anything is signed. Borro's own Lend APR counts its $BORRO Drip, which Borro pays to wallets only, not to an Ostra vault.
 
 The identity tools (agent profiles, token images and descriptions, ERC-8004 registration) need vault v2, which every vault runs since 22 October 2026: the upgrade waited on-chain behind a 72-hour timelock that nobody can shorten ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0xd4adb65a26c60f0f7f498237419bdc9bb3026931e0a746a6280bb6d9a260c3b7)).
 

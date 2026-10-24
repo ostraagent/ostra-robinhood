@@ -18,6 +18,9 @@ import {OstraSplit, OstraSplitFactory} from "../src/OstraSplit.sol";
 import {Wots} from "../src/Wots.sol";
 import {IX402BatchSettlement} from "../src/interfaces/IX402BatchSettlement.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
+import {VaultStack} from "./utils/VaultStack.sol";
+import {OstraVaultV3} from "../src/OstraVaultV3.sol";
+import {OstraVaultModule} from "../src/OstraVaultModule.sol";
 
 /// @notice Vaults on a fork of Robinhood Chain mainnet, against the deployed USDG, x402BatchSettlement and
 ///         Uniswap v4 PoolManager.
@@ -84,11 +87,10 @@ contract VaultForkTest is Test {
         assertEq(batch.MIN_WITHDRAW_DELAY(), GRACE);
         assertGt(IDENTITY_REGISTRY.code.length, 0);
         registry = new OstraRegistry();
-        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER, address(registry), IDENTITY_REGISTRY);
+        (factory,) = VaultStack.deploy(address(registry));
+        OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
         assertEq(address(implementation.POOL_MANAGER()), POOL_MANAGER);
-        assertEq(implementation.VERSION(), 2);
-        UpgradeableBeacon beacon = new UpgradeableBeacon(address(implementation), address(this));
-        factory = new OstraVaultFactory(address(beacon));
+        assertEq(implementation.VERSION(), 3);
         splitFactory = new OstraSplitFactory();
     }
 
@@ -247,7 +249,7 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(14, bytes32(0), "", signature);
+        vault.spend(25, bytes32(0), "", signature);
         // DevBuy: abi.encode(devBuy, launchHash, amount), 96 bytes.
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(9, bytes32(0), new bytes(64), signature);
@@ -679,6 +681,48 @@ contract VaultForkTest is Test {
         assertEq(to.balance, 0);
     }
 
+    /// @dev Signs and submits a spend that must revert with `err`; the key stays.
+    function _spendReverts(OstraVault vault, bytes32 keychain, uint8 action, bytes memory params, bytes memory err)
+        internal
+    {
+        (bytes32 next, bytes memory signature) = _sign(vault, keychain, action, params);
+        uint64 n = vault.nonce();
+        vm.expectRevert(err);
+        vault.spend(action, next, params, signature);
+        assertEq(vault.nonce(), n);
+    }
+
+    function test_theWithdrawalLockCountsSwapsAndChannelsButNotAFailedSwap() public {
+        OstraVault vault = _vault(BUYER, address(0));
+        _fund(address(vault), 100e6);
+        address withdrawal = makeAddr("withdrawal");
+        _spend(vault, BUYER, 14, abi.encode(withdrawal, uint32(36 hours), uint128(15e6)));
+        address to = makeAddr("eth recipient");
+
+        // A swap counts what it took, whatever the recipient.
+        _spend(vault, BUYER, 3, _swapParams(_ethUsdg(), false, 10e6, 1, to));
+        assertEq(vault.outflowAvailable(), 5e6);
+        _spendReverts(
+            vault, BUYER, 3, _swapParams(_ethUsdg(), false, 10e6, 1, to),
+            abi.encodeWithSelector(OstraVaultV3.OverDailyLimit.selector, 5e6)
+        );
+        // A swap that fails moves nothing and counts nothing.
+        _spend(vault, BUYER, 3, _swapParams(_ethUsdg(), false, 5e6, type(uint128).max, to));
+        assertEq(vault.outflowAvailable(), 5e6);
+
+        // A channel deposit counts.
+        IX402BatchSettlement.ChannelConfig memory c = _config(vault, makeAddr("seller"), makeAddr("seller authorizer"), keccak256("locked"));
+        _spendReverts(vault, BUYER, 1, _openParams(c, 6e6), abi.encodeWithSelector(OstraVaultV3.OverDailyLimit.selector, 5e6));
+        _spend(vault, BUYER, 1, _openParams(c, 5e6));
+        assertEq(vault.outflowAvailable(), 0);
+
+        // The withdrawal address takes the rest at once.
+        uint256 rest = usdg.balanceOf(address(vault));
+        _spend(vault, BUYER, 0, abi.encode(withdrawal, rest));
+        assertEq(usdg.balanceOf(withdrawal), rest);
+        assertEq(usdg.balanceOf(address(vault)), 0);
+    }
+
     function test_aSwapSentFromInsideAnotherUnlockReverts() public {
         OstraVault vault = _vault(BUYER, address(0));
         _fund(address(vault), 100e6);
@@ -802,10 +846,13 @@ contract VaultForkTest is Test {
         assertEq(owner.recoverySupport(keccak256(abi.encode(round, newRoot))), 1);
         (, uint64 executableAt,) = owner.pendingRecovery();
         assertEq(executableAt, 0, "one support is below the threshold");
-        // A guardian supports a root once.
+        // A guardian supports a root once: the second support is refused, and (version 3) the guardian's spend lands.
         (bytes32 next, bytes memory signature) = _sign(g[0], G1, 8, abi.encode(address(owner), newRoot));
-        vm.expectRevert(OstraVault.AlreadySupported.selector);
+        vm.expectEmit(address(g[0]));
+        emit OstraVaultModule.Guarded(address(owner), 255, false, OstraVault.AlreadySupported.selector);
+        vm.prank(makeAddr("relayer"), makeAddr("relayer"));
         g[0].spend(8, next, abi.encode(address(owner), newRoot), signature);
+        assertEq(owner.recoverySupport(keccak256(abi.encode(round, newRoot))), 1);
 
         (next, signature) = _sign(g[1], G2, 8, abi.encode(address(owner), newRoot));
         uint256 gas = gasleft();
@@ -993,8 +1040,8 @@ contract VaultForkTest is Test {
         }
         // The longest URI passes; an action past the last one is refused.
         _spend(vault, BUYER, setProfile, abi.encode(string(new bytes(256))));
-        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 14, abi.encode("ipfs://x"));
+        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 25, abi.encode("ipfs://x"));
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(14, n2, abi.encode("ipfs://x"), s2);
+        vault.spend(25, n2, abi.encode("ipfs://x"), s2);
     }
 }

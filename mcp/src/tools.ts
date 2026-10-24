@@ -13,7 +13,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, formatTokenAmount, uploadImage } from "@ostraagent/core";
-import { LAUNCH_PAIRS, QuoteError, WETH, redact } from "@ostraagent/sdk";
+import { GUARD_OP, LAUNCH_PAIRS, QuoteError, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { ensurePrivateDir } from "./disk.ts";
 
@@ -262,6 +262,106 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("cancel_recovery", "Cancels a recovery of the vault that waits (the owner still holds the key).", {}, () => agent.buyer.cancelRecovery());
   tool("support_recovery", "As a guardian, supports moving another vault to the key root its owner's new device gave.", { vault: address, newKeyRoot: bytes32 }, (a) => agent.buyer.supportRecovery(a.vault, a.newKeyRoot));
   tool("request_recovery", "On a new device that lost the old seed: adopts a vault and says what its recovery still needs.", { vault: address }, (a) => agent.buyer.requestRecovery(a.vault));
+
+  // --- Borro (vault version 3) ---------------------------------------------------------------------------
+  const borroAsset = z.string().regex(/^[A-Za-z]{1,8}$/, "USDG or a Borro stock's ticker (borro_markets lists them)");
+  const borroStock = z.string().regex(/^[A-Za-z]{1,8}$/, "a Borro stock's ticker (borro_markets lists them)");
+  const shares = z.string().regex(/^(all|[1-9][0-9]*)$/, "a whole number of shares, or all");
+  tool(
+    "borro_markets",
+    "Borro's stock markets on Morpho: the USDG each can lend now, the borrow rate, the LLTV and the vault's cap (half the LLTV), and whether Borro's builder program lists the stock's vault. Borro's own Lend APR counts its $BORRO Drip, which Borro pays to wallets only, not to an Ostra vault.",
+    {},
+    () => agent.borro.markets(),
+  );
+  tool("borro_position", "The agent's Borro positions: USDG lent from the vault; per stock vault its lent shares, collateral, debt and how close the debt is to liquidation.", {}, () => agent.borro.positions());
+  tool(
+    "borro_lend",
+    "Lends USDG (from the vault) or a stock (from the agent's vault of that stock) into Borro's Morpho vault of it, through Borro's builder program with Ostra's code when Borro lists that vault there. The shares stay in the agent's vault.",
+    { asset: borroAsset, amount: units },
+    (a) => agent.borro.lend(a.asset, a.amount),
+  );
+  tool("borro_withdraw", "Redeems Borro vault shares (a number, or all) of USDG or a stock back into the agent's vault of it.", { asset: borroAsset, shares }, (a) => agent.borro.redeem(a.asset, a.shares));
+  tool(
+    "borro_collateral",
+    "Posts the stock vault's Borro shares (a number, or all) as collateral on the stock's USDG market, or takes them back (the debt must stay within half the LLTV).",
+    { stock: borroStock, side: z.enum(["post", "withdraw"]), shares },
+    (a) => (a.side === "post" ? agent.borro.postCollateral(a.stock, a.shares) : agent.borro.withdrawCollateral(a.stock, a.shares)),
+  );
+  tool(
+    "borro_borrow",
+    "Borrows USDG on the stock's Borro market against the stock vault's collateral, paid into the vault (the stock vault is linked to it first when it is not; under the stock vault's lock that link waits its delay). The vault caps a loan at half of what the LLTV allows.",
+    { stock: borroStock, amount: usdg },
+    (a) => agent.borro.borrow(a.stock, a.amount),
+  );
+  tool(
+    "borro_repay",
+    "Repays the stock vault's Borro debt (an amount of USDG, or all) from the vault.",
+    { stock: borroStock, amount: z.union([usdg, z.literal("all")]) },
+    (a) => agent.borro.repay(a.stock, a.amount),
+  );
+
+  // --- the withdrawal lock (vault version 3) ---------------------------------------------------------------
+  tool(
+    "vault_lock",
+    "The withdrawal lock of the vault (USDG) or of the agent's vault of a Borro stock. status: the lock, the daily limit left, the linked vault and the changes waiting. set: turns the lock on or changes it (withdrawal: a wallet whose key is not on this device, or another seed's Ostra vault in the same token that is locked already; never one of this agent's vaults; delaySeconds 129600 to 1209600; dailyLimit in the vault's token): turning it on and tightening are at once, loosening waits the delay. off: turns it off after the delay. cancel: drops the changes still waiting.",
+    {
+      action: z.enum(["status", "set", "off", "cancel"]),
+      asset: borroAsset.optional().describe("USDG (default) or a Borro stock's ticker"),
+      withdrawal: address.optional(),
+      delaySeconds: z.number().int().min(129_600).max(1_209_600).optional(),
+      dailyLimit: units.optional(),
+    },
+    (a) => {
+      const asset = a.asset ?? "USDG";
+      if (a.action === "status") return agent.borro.guard(asset);
+      if (a.action === "cancel") return agent.borro.cancelPending(asset);
+      if (a.action === "off") return agent.borro.setLock(asset, "off", 0, "0");
+      if (a.withdrawal === undefined || a.delaySeconds === undefined || a.dailyLimit === undefined) throw new RangeError("set takes withdrawal, delaySeconds and dailyLimit");
+      return agent.borro.setLock(asset, a.withdrawal, a.delaySeconds, a.dailyLimit);
+    },
+  );
+  tool(
+    "vault_link",
+    "Sets the linked vault of the vault (USDG) or of the agent's vault of a Borro stock (another Ostra vault; none removes it): where a Borro loan is paid. Under the lock a new link waits the lock's delay; removing one is at once.",
+    { asset: borroAsset.optional(), vault: z.union([address, z.literal("none")]) },
+    (a) => agent.borro.setLink(a.asset ?? "USDG", a.vault),
+  );
+  tool(
+    "vault_approve_hash",
+    "Approves a 32-byte hash for EIP-1271 on the vault (isValidSignature answers for it), or withdraws an approval. Under the lock an approval waits the lock's delay; a new lock and every recovery end all approvals.",
+    { hash: bytes32, approved: z.boolean() },
+    (a) => agent.borro.approveHash(a.hash as `0x${string}`, a.approved),
+  );
+  tool(
+    "guard_vault",
+    "As a guardian of another, locked vault (from this vault): cancel its waiting changes, revoke one of its hash approvals, sweep its whole balance to its withdrawal address (expected: that address), or redeem its Borro shares or withdraw its Borro collateral back into it.",
+    {
+      vault: address,
+      op: z.enum(["cancel", "revoke_hash", "sweep", "redeem", "withdraw_collateral"]),
+      hash: bytes32.optional(),
+      expected: address.optional(),
+      borroVault: address.optional().describe("redeem: the Borro (Vault V2) vault"),
+      marketId: bytes32.optional().describe("withdraw_collateral: the market id"),
+      shares: z.string().regex(/^[1-9][0-9]*$/).optional(),
+    },
+    (a) => {
+      const need = <T>(v: T | undefined, name: string): T => {
+        if (v === undefined) throw new RangeError(`${a.op} takes ${name}`);
+        return v;
+      };
+      const call: GuardCall =
+        a.op === "cancel"
+          ? { op: GUARD_OP.CANCEL }
+          : a.op === "revoke_hash"
+            ? { op: GUARD_OP.REVOKE_HASH, hash: need(a.hash, "hash") as `0x${string}` }
+            : a.op === "sweep"
+              ? { op: GUARD_OP.SWEEP, expected: need(a.expected, "expected") as `0x${string}` }
+              : a.op === "redeem"
+                ? { op: GUARD_OP.REDEEM, vault: need(a.borroVault, "borroVault") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) }
+                : { op: GUARD_OP.WITHDRAW_COLLATERAL, marketId: need(a.marketId, "marketId") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) };
+      return agent.borro.guardOther(a.vault, call);
+    },
+  );
 
   // --- the launchpad: trading -------------------------------------------------------------------------------
   tool("pool_info", "A token the Ostra launchpad launched: price, market cap, taxes, circuit breaker band, airdrop round, creator shares.", { token: address }, (a) => lp().poolInfo(a.token));

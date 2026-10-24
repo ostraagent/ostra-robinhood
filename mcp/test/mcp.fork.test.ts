@@ -208,3 +208,47 @@ test("the MCP server's tools over stdio: vault, withdrawal, launch with a dev bu
     await again.close();
   }
 });
+
+test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to Borro and back, the lock on, an EIP-1271 approval", { timeout: 900_000 }, async () => {
+  const home = join(root, "home-borro");
+  const client = await connect(home);
+  try {
+    const tools = (await client.listTools()).tools.map((t) => t.name);
+    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault"]) {
+      assert.ok(tools.includes(name), `tool ${name}`);
+    }
+    const status = (await call(client, "balance")).json.vault as { feePayer: Address };
+    await fork.setBalance(status.feePayer, 10n ** 18n);
+    const opened = await call(client, "open_vault");
+    assert.ok(opened.ok, opened.text);
+    const vault = getAddress(opened.json.vault as string);
+    await fork.dealUsdg(vault, 50_000_000n);
+
+    const markets = await call(client, "borro_markets");
+    assert.ok(markets.ok && markets.text.includes('"symbol": "NVDA"'), markets.text);
+    const lent = await call(client, "borro_lend", { asset: "USDG", amount: "20" });
+    assert.ok(lent.ok && lent.json.status === "sent", lent.text);
+    const position = await call(client, "borro_position");
+    assert.ok(position.ok && Number((position.json.usdgLent as { value: string }).value) >= 19.99, position.text);
+    const back = await call(client, "borro_withdraw", { asset: "USDG", shares: "all" });
+    assert.ok(back.ok && back.json.status === "sent", back.text);
+    const nothing = await call(client, "borro_repay", { stock: "NVDA", amount: "all" });
+    assert.ok(!nothing.ok && /no NVDA vault yet|owes nothing/.test(nothing.text), nothing.text);
+
+    const off = await call(client, "vault_lock", { action: "status" });
+    assert.ok(off.ok && off.json.lockedSince === "0", off.text);
+    const missing = await call(client, "vault_lock", { action: "set" });
+    assert.ok(!missing.ok && /takes withdrawal, delaySeconds and dailyLimit/.test(missing.text), missing.text);
+    const withdrawal = fork.accounts[3]!.address;
+    const on = await call(client, "vault_lock", { action: "set", withdrawal, delaySeconds: 129_600, dailyLimit: "5" });
+    assert.ok(on.ok && on.json.status === "sent", on.text);
+    const locked = await call(client, "vault_lock", { action: "status" });
+    assert.ok(locked.ok && getAddress((locked.json.lock as { withdrawal: string }).withdrawal) === getAddress(withdrawal), locked.text);
+    const over = await call(client, "withdraw", { destination: fork.accounts[2]!.address, amount: "10" });
+    assert.ok(!over.ok && /nothing was signed/.test(over.text), over.text);
+    const approved = await call(client, "vault_approve_hash", { hash: `0x${"ab".repeat(32)}`, approved: true });
+    assert.ok(approved.ok && approved.json.status === "sent", approved.text);
+  } finally {
+    await client.close();
+  }
+});

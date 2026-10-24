@@ -17,7 +17,7 @@
 // what executes or refunds an escrow, and they are kept nowhere else.
 
 import { decodeEventLog, getAddress, type Address, type Hash, type Hex, type PublicClient } from "viem";
-import { LAUNCH_PAIRS, WETH, ostraLaunchpadAbi, signVaultTransfer, type LaunchpadDeployment, type RelayCall } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, VAULT_ACTION, WETH, ostraLaunchpadAbi, signVaultTransfer, transferParams, type LaunchpadDeployment, type RelayCall } from "@ostraagent/sdk";
 import {
   ETH,
   PoolIndex,
@@ -207,6 +207,7 @@ export class SwapService {
         order = orderFor(p.route, vault, p.tokenIn, p.to, await chainTime(this.#p.client), randomSalt());
         const escrow = escrowAddress(this.#p.swap.router, order);
         const execute = executeEscrowData(order, p.route);
+        await p.from.checkSpend(VAULT_ACTION.TRANSFER, transferParams({ to: escrow, amount: p.amountIn }), "the swap's transfer to its escrow", this.#p.sender);
         await this.#keep({ version: 1, hash: orderHash(order), escrow, tokenIn: p.tokenIn, amountIn: p.amountIn.toString(), vaultNonce: v.nonce.toString(), deadline: order.deadline.toString(), execute, at: Date.now() });
         const signed = await signVaultTransfer(keychain, v, { chainId, to: escrow, amount: p.amountIn });
         const calls: RelayCall[] = [spendCall(vault, signed), { to: this.#p.swap.router, data: execute }];

@@ -1,7 +1,7 @@
 // scripts/upgrade-vault.ts on a mainnet fork, against the live deployment
-// (deployments/robinhood-mainnet.json): prepare deploys OstraRegistry and the
-// version 2 vault implementation and prints the upgrade to schedule; finalize
-// refuses while the beacon still runs version 1; the upgrade then runs on the
+// (deployments/robinhood-mainnet.json): prepare deploys OstraVaultModule and the
+// version 3 vault implementation and prints the upgrade to schedule; finalize
+// refuses while the beacon still runs version 2; the upgrade then runs on the
 // fork (OstraUpgradeOwner, impersonated, stands in for the scheduled call it
 // executes after its delay), and finalize records it.
 
@@ -13,9 +13,9 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createWalletClient, getAddress, http, numberToHex, type Address } from "viem";
-import { ostraRegistryAbi, ostraVaultAbi, upgradeableBeaconAbi } from "../src/abi.ts";
+import { ostraVaultAbi, ostraVaultModuleAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
-import { ERC8004_IDENTITY_REGISTRY, VAULT_VERSION } from "../src/constants.ts";
+import { BORRO_CODE, ERC8004_IDENTITY_REGISTRY, VAULT_V3 } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
 import { startFork, type Fork } from "./fork.ts";
@@ -45,8 +45,8 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("prepare deploys the registry and version 2, finalize records the upgrade once it has run", async () => {
-  if (live.registry !== undefined) return; // the live record is version 2 already: nothing left to prepare
+test("prepare deploys the module and version 3, finalize records the upgrade once it has run", async () => {
+  if (live.vaultModule !== undefined) return; // the live record is version 3 already: nothing left to prepare
   const key = join(dir, "deployer.key");
   const rpc = join(dir, "rpc.url");
   const record = join(dir, "deployment.json");
@@ -61,13 +61,16 @@ test("prepare deploys the registry and version 2, finalize records the upgrade o
 
   const prepared = run("prepare");
   assert.equal(prepared.status, 0, prepared.stderr);
-  assert.match(prepared.stdout, /VAULT_V2_PREPARED/);
+  assert.match(prepared.stdout, /VAULT_V3_PREPARED/);
   assert.ok(!prepared.stdout.includes(fork.url) && !prepared.stderr.includes(fork.url), "the RPC URL is never printed");
-  const state = JSON.parse(readFileSync(`${record}.vault-v2.json`, "utf8")) as { registry: Address; implementation: Address };
+  const state = JSON.parse(readFileSync(`${record}.vault-v3.json`, "utf8")) as { module: Address; implementation: Address };
   assert.match(prepared.stdout, new RegExp(`schedule-upgrade ${live.vaultBeacon} ${state.implementation}`));
-  assert.equal(await fork.client.readContract({ address: state.implementation, abi: ostraVaultAbi, functionName: "VERSION" }), VAULT_VERSION);
+  assert.equal(await fork.client.readContract({ address: state.implementation, abi: ostraVaultAbi, functionName: "VERSION" }), VAULT_V3);
   assert.equal(getAddress((await fork.client.readContract({ address: state.implementation, abi: ostraVaultAbi, functionName: "IDENTITY_REGISTRY" })) as Address), ERC8004_IDENTITY_REGISTRY);
-  assert.equal(await fork.client.readContract({ address: state.registry, abi: ostraRegistryAbi, functionName: "MAX_URI_LENGTH" }), 256n);
+  assert.equal(getAddress((await fork.client.readContract({ address: state.implementation, abi: ostraVaultAbi, functionName: "REGISTRY" })) as Address), live.registry);
+  assert.equal(getAddress((await fork.client.readContract({ address: state.implementation, abi: ostraVaultAbi, functionName: "MODULE" })) as Address), getAddress(state.module));
+  assert.equal(getAddress((await fork.client.readContract({ address: state.module, abi: ostraVaultModuleAbi, functionName: "FACTORY" })) as Address), live.vaultFactory);
+  assert.equal(await fork.client.readContract({ address: state.module, abi: ostraVaultModuleAbi, functionName: "BORRO_CODE" }), BORRO_CODE);
 
   // Run again: nothing is deployed twice.
   const nonce = await fork.client.getTransactionCount({ address: deployer.address });
@@ -92,15 +95,16 @@ test("prepare deploys the registry and version 2, finalize records the upgrade o
 
   const done = run("finalize");
   assert.equal(done.status, 0, done.stderr);
-  assert.match(done.stdout, /VAULT_V2_RECORDED/);
-  assert.ok(!existsSync(`${record}.vault-v2.json`));
+  assert.match(done.stdout, /VAULT_V3_RECORDED/);
+  assert.ok(!existsSync(`${record}.vault-v3.json`));
   const d = parseDeployment(JSON.parse(readFileSync(record, "utf8")));
   assert.equal(d.vaultImplementation, getAddress(state.implementation));
-  assert.equal(d.registry, getAddress(state.registry));
+  assert.equal(d.vaultModule, getAddress(state.module));
+  assert.equal(d.registry, live.registry);
   assert.equal(d.beaconOwner, live.beaconOwner);
   await checkDeployment(fork.client, d);
 
   const refused = run("prepare");
   assert.notEqual(refused.status, 0);
-  assert.match(refused.stderr, /has a registry already/);
+  assert.match(refused.stderr, /has a vault module already/);
 });

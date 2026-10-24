@@ -70,6 +70,8 @@ export type ParsedCall =
   | { fn: "spend"; to: Address; action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }
   | { fn: "requestClose"; to: Address; config: ChannelConfig; amount: bigint; deadline: bigint; signature: Hex }
   | { fn: "finalizeWithdraw"; to: Address; config: ChannelConfig }
+  /** OstraVault.finishRecovery: anyone may finish a recovery past its delay. */
+  | { fn: "finishRecovery"; to: Address }
   | { fn: "spendLeaf"; to: Address; batchId: bigint; leafIndex: number; destination: Address; signature: Hex }
   | { fn: "approveBatch"; to: Address; key: Hex; batchId: bigint; state: Hex; nextKeyRoot: Hex; signature: Hex }
   | { fn: "depositWithAuthorization"; to: Address }
@@ -106,7 +108,7 @@ export type RelayTx = {
 const KNOWN = new Map<Hex, { abi: readonly unknown[]; as: string }>();
 for (const [abi, names] of [
   [ostraVaultFactoryAbi, [["createVault", "createVault"]]],
-  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"]]],
+  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"], ["finishRecovery", "finishRecovery"]]],
   [ostraPoolAbi, [["spendLeaf", "spendLeaf"], ["approveBatch", "approveBatch"], ["depositWithAuthorization", "depositWithAuthorization"], ["cancelDeposit", "cancelDeposit"], ["closeDeposit", "closeDeposit"]]],
   [ostraDevBuyAbi, [["launchFromVault", "launchFromVault"]]],
   [ostraAirdropAbi, [["claim", "airdropClaim"], ["close", "airdropClose"]]],
@@ -184,6 +186,8 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
       return { fn: "requestClose", to, config: toConfig(a[0] as never), amount: a[1] as bigint, deadline: a[2] as bigint, signature: a[3] as Hex };
     case "finalizeWithdraw":
       return { fn: "finalizeWithdraw", to, config: toConfig(a[0] as never) };
+    case "finishRecovery":
+      return { fn: "finishRecovery", to };
     case "spendLeaf":
       return { fn: "spendLeaf", to, batchId: a[0] as bigint, leafIndex: Number(a[1]), destination: getAddress(a[2] as Address), signature: a[3] as Hex };
     case "approveBatch":
@@ -216,6 +220,8 @@ export type Classified =
   | { kind: "open_relayer_channel"; ix: OpenChannelCall }
   | { kind: "spend_leaf"; ix: SpendLeafCall }
   | { kind: "unshield_vault"; create: CreateVaultCall; leaf: SpendLeafCall }
+  /** finishRecovery alone: relayed before payment as a debt of the vault when it is in the relayer's token (gate.ts). */
+  | { kind: "finish_recovery"; ix: { vault: Address } }
   | { kind: "other"; vaults: Address[] };
 
 function createVaultCall(c: ParsedCall, d: Deployment): CreateVaultCall | null {
@@ -242,7 +248,7 @@ function spendLeafCall(c: ParsedCall, d: Deployment): SpendLeafCall | null {
 export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
   const created = createVaultCall(c, d);
   if (created !== null) return created.vault;
-  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw") return c.to;
+  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery") return c.to;
   if (c.fn === "launchFromVault") return c.vault;
   return null;
 }
@@ -270,6 +276,7 @@ export function classify(tx: RelayTx, d: Deployment, relayerVault: Address, prep
     }
     const leaf = spendLeafCall(only, d);
     if (leaf !== null) return { kind: "spend_leaf", ix: leaf };
+    if (only.fn === "finishRecovery") return { kind: "finish_recovery", ix: { vault: only.to } };
   }
   if (p.length === 2 && !prepay) {
     const created = createVaultCall(p[0] as ParsedCall, d);

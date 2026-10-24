@@ -18,9 +18,11 @@ export type VaultState = {
   token: Address;
   initialKeyRoot: Hex;
   initialCrank: Address;
-  /** Root of the current one-time key, whose keychain index is `nonce`. */
+  /** Root of the current one-time key, whose keychain index is `nonce` (or `keyIndex`). */
   keyRoot: Hex;
   nonce: bigint;
+  /** Set only by an agent reading its own vault: the keychain index of keyRoot when it is not `nonce` (VaultKeyState). */
+  keyIndex?: bigint;
   /** null = no crank. */
   crank: Address | null;
 };

@@ -31,6 +31,7 @@ import {OstraToken} from "../src/launchpad/OstraToken.sol";
 import {OstraVesting} from "../src/launchpad/OstraVesting.sol";
 import {TestSwapRouter} from "./utils/TestSwapRouter.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
+import {VaultStack} from "./utils/VaultStack.sol";
 
 interface IERC6909Balance {
     function balanceOf(address owner, uint256 id) external view returns (uint256);
@@ -161,9 +162,7 @@ contract LaunchpadForkTest is Test {
         assertGt(POOL_MANAGER.code.length, 0);
         assertGt(WETH.code.length, 0);
         registry = new OstraRegistry();
-        OstraVault implementation = new OstraVault(BATCH, POOL_MANAGER, address(registry), IDENTITY_REGISTRY);
-        UpgradeableBeacon beacon = new UpgradeableBeacon(address(implementation), address(this));
-        factory = new OstraVaultFactory(address(beacon));
+        (factory,) = VaultStack.deploy(address(registry));
 
         // The hook's address carries its permission bits (v4-core Hooks): mine a CREATE2 salt for them.
         fees = new OstraFees();
@@ -913,6 +912,61 @@ contract LaunchpadForkTest is Test {
         assertEq(IERC20(USDG).balanceOf(address(bunker)), 0);
         assertEq(token.dividendOf(address(bunker)), 0);
         assertEq(bunker.nonce(), 1);
+    }
+
+    function test_underTheLockDividendsOnlyGoToTheWithdrawalAddressOrALockedLinkOfTheDividendToken() public {
+        OstraVault v = _vault(USDG, CREATOR);
+        OstraLaunchpad.LaunchParams memory p = _params(Currency.wrap(USDG), address(v), -375_400, bytes32(uint256(17)));
+        p.dividendToken = USDG;
+        (address t, PoolId id) = launchpad.launch{value: launchpad.LAUNCH_FEE()}(p);
+        OstraToken token = OstraToken(t);
+        PoolKey memory key = hook.poolKey(id);
+        vm.warp(block.timestamp + 601);
+        OstraVault buyer = _vault(USDG, BUYER);
+        OstraVault bunker = _vault(address(token), BUYER_TOKEN);
+        deal(USDG, address(buyer), 100e6);
+        _spend(buyer, BUYER, 3, _swapParams(key, Currency.unwrap(key.currency0) != address(token), 20e6, 1, address(bunker)));
+        deal(USDG, address(router), 1_000e6);
+        _buyExactIn(key, token, 200e6, address(router));
+        dispatcher.dispatch(id);
+        assertGt(token.dividendOf(address(bunker)), 0);
+
+        // The token vault links to a vault of its own token (which cannot spend USDG), then to the USDG vault.
+        OstraVault sameToken = _vault(address(token), CREATOR_TOKEN);
+        _spend(bunker, BUYER_TOKEN, 16, abi.encode(address(sameToken)));
+        _spend(sameToken, CREATOR_TOKEN, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
+        _spend(bunker, BUYER_TOKEN, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
+        bytes32 next;
+        bytes memory params;
+        bytes memory signature;
+        for (uint256 i; i < 2; ++i) {
+            params = abi.encode(i == 0 ? address(this) : address(sameToken));
+            next = WotsSigner.keyRoot(_seed(BUYER_TOKEN, bunker.nonce() + 1));
+            signature = WotsSigner.sign(_seed(BUYER_TOKEN, bunker.nonce()), bunker.spendMessage(5, next, params));
+            vm.expectRevert(OstraVault.Locked.selector);
+            bunker.spend(5, next, params, signature);
+        }
+        // A new link under the lock waits its delay; an unlocked USDG vault is still refused.
+        _spend(bunker, BUYER_TOKEN, 16, abi.encode(address(buyer)));
+        vm.warp(block.timestamp + 36 hours);
+        assertEq(bunker.linkedVault(), address(buyer));
+        params = abi.encode(address(buyer));
+        next = WotsSigner.keyRoot(_seed(BUYER_TOKEN, bunker.nonce() + 1));
+        signature = WotsSigner.sign(_seed(BUYER_TOKEN, bunker.nonce()), bunker.spendMessage(5, next, params));
+        vm.expectRevert(OstraVault.Locked.selector);
+        bunker.spend(5, next, params, signature);
+        // Locked only after the link took effect: still refused (that lock could be a thief's).
+        vm.warp(block.timestamp + 1);
+        _spend(buyer, BUYER, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
+        vm.expectRevert(OstraVault.Locked.selector);
+        bunker.spend(5, next, params, signature);
+        // Linked again under the lock, after its delay: the USDG vault was locked first, and the claim pays it.
+        _spend(bunker, BUYER_TOKEN, 16, abi.encode(address(buyer)));
+        vm.warp(block.timestamp + 36 hours);
+        uint256 owed = token.dividendOf(address(bunker));
+        uint256 before = IERC20(USDG).balanceOf(address(buyer));
+        _spend(bunker, BUYER_TOKEN, 5, params);
+        assertEq(IERC20(USDG).balanceOf(address(buyer)) - before, owed);
     }
 
     // ---------------------------------------------------------------------------------------------

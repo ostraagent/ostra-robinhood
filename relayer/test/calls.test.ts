@@ -74,6 +74,10 @@ test("every recognised Ostra function is read with its arguments", () => {
   assert.deepEqual(rc.fn === "requestClose" ? rc.config : null, config);
   const fw = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finalizeWithdraw", args: [config] }) });
   assert.equal(fw.fn, "finalizeWithdraw");
+  // finishRecovery: anyone may finish a recovery past its delay; alone, it is relayed before payment (gate.ts).
+  const fr = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finishRecovery" }) });
+  assert.deepEqual(fr, { fn: "finishRecovery", to: vault });
+  assert.deepEqual(classify(decodeRelayRequest({ calls: [{ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finishRecovery" }) }] }), d, relayerVault), { kind: "finish_recovery", ix: { vault } });
   const ab = parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "approveBatch", args: [root, 6n, next, root, sig] }) });
   assert.ok(ab.fn === "approveBatch" && ab.batchId === 6n && ab.key === root);
   assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "cancelDeposit", args: [root] }) }).fn, "cancelDeposit");

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 /** Exported name -> [source file, contract name] in out/<file>/<contract>.json. */
 export const CONTRACTS: Readonly<Record<string, readonly [string, string]>> = {
   ostraVaultAbi: ["OstraVault.sol", "OstraVault"],
+  ostraVaultModuleAbi: ["OstraVaultModule.sol", "OstraVaultModule"],
   ostraVaultFactoryAbi: ["OstraVaultFactory.sol", "OstraVaultFactory"],
   ostraRegistryAbi: ["OstraRegistry.sol", "OstraRegistry"],
   ostraPoolAbi: ["OstraPool.sol", "OstraPool"],

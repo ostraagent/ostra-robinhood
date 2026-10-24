@@ -47,6 +47,7 @@ import {
   AIRDROP,
   CIRCUIT_BREAKER,
   CREATOR_SPLIT,
+  GUARD_OP,
   VAULT_SWAP_GAS,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
@@ -152,6 +153,17 @@ export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[
   [VAULT_ACTION.SET_TOKEN_METADATA]: uriParamsLengths(3),
   [VAULT_ACTION.REGISTER_AGENT]: uriParamsLengths(1),
   [VAULT_ACTION.SET_AGENT_URI]: uriParamsLengths(2),
+  [VAULT_ACTION.SET_WITHDRAWAL_LOCK]: [96],
+  [VAULT_ACTION.CANCEL_PENDING_CHANGES]: [0],
+  [VAULT_ACTION.SET_LINKED_VAULT]: [32],
+  [VAULT_ACTION.LEND]: [96],
+  [VAULT_ACTION.REDEEM]: [96],
+  [VAULT_ACTION.POST_COLLATERAL]: [192],
+  [VAULT_ACTION.WITHDRAW_COLLATERAL]: [192],
+  [VAULT_ACTION.BORROW]: [192],
+  [VAULT_ACTION.REPAY]: [288],
+  [VAULT_ACTION.APPROVE_HASH]: [64],
+  [VAULT_ACTION.GUARD]: [128],
 };
 
 /** Throws unless `params` (hex) has a length OstraVault accepts for `action`. */
@@ -559,6 +571,202 @@ export function decodeSetAgentUriParams(params: Hex): { agentId: bigint; uri: st
   return { agentId, uri };
 }
 
+// --- Version 3: the withdrawal lock, linked vaults, Morpho (Borro), EIP-1271 and Guard ----------------------------
+
+/** A withdrawal lock: on with a withdrawal address, a delay of MIN_RECOVERY_DELAY to MAX_RECOVERY_DELAY seconds and a daily limit (base units); off as all zero. */
+export type WithdrawalLock = { withdrawal: Address; delay: number; dailyLimit: bigint };
+
+const LOCK_TYPES = [{ type: "address" }, { type: "uint32" }, { type: "uint128" }] as const;
+
+/** SetWithdrawalLock params: abi.encode(address withdrawal, uint32 delay, uint128 dailyLimit). */
+export function setWithdrawalLockParams(l: WithdrawalLock): Hex {
+  const withdrawal = addr(l.withdrawal, "withdrawal");
+  if (!Number.isInteger(l.delay)) throw new RangeError("delay must be an integer");
+  uint(l.dailyLimit, U128_MAX, "dailyLimit");
+  if (withdrawal === zeroAddress) {
+    if (l.delay !== 0 || l.dailyLimit !== 0n) throw new RangeError("turning the lock off takes a zero delay and a zero limit");
+  } else if (l.delay < MIN_RECOVERY_DELAY || l.delay > MAX_RECOVERY_DELAY) {
+    throw new RangeError(`delay must be ${MIN_RECOVERY_DELAY} to ${MAX_RECOVERY_DELAY} seconds`);
+  }
+  return encodeAbiParameters(LOCK_TYPES, [withdrawal, l.delay, l.dailyLimit]);
+}
+
+export function decodeSetWithdrawalLockParams(params: Hex): WithdrawalLock {
+  const [withdrawal, delay, dailyLimit] = decodeAbiParameters(LOCK_TYPES, paramsFor(VAULT_ACTION.SET_WITHDRAWAL_LOCK, params));
+  return { withdrawal, delay, dailyLimit };
+}
+
+/** CancelPendingChanges params: none. */
+export function cancelPendingChangesParams(): Hex {
+  return "0x";
+}
+
+/** SetLinkedVault params: abi.encode(address vault); the zero address unlinks. */
+export function setLinkedVaultParams(vault: Address): Hex {
+  return encodeAbiParameters([{ type: "address" }], [addr(vault, "vault")]);
+}
+
+export function decodeSetLinkedVaultParams(params: Hex): Address {
+  const [vault] = decodeAbiParameters([{ type: "address" }], paramsFor(VAULT_ACTION.SET_LINKED_VAULT, params));
+  return vault;
+}
+
+const VAULT_AMOUNT_MIN_TYPES = [{ type: "address" }, { type: "uint256" }, { type: "uint256" }] as const;
+
+/** Lend params: abi.encode(address vault, uint256 assets, uint256 minShares), into a Morpho Vault V2 of the vault's token. */
+export function lendParams(p: { vault: Address; assets: bigint; minShares: bigint }): Hex {
+  return encodeAbiParameters(VAULT_AMOUNT_MIN_TYPES, [nonZeroAddr(p.vault, "vault"), positive(p.assets, U256_MAX, "assets"), uint(p.minShares, U256_MAX, "minShares")]);
+}
+
+export function decodeLendParams(params: Hex): { vault: Address; assets: bigint; minShares: bigint } {
+  const [vault, assets, minShares] = decodeAbiParameters(VAULT_AMOUNT_MIN_TYPES, paramsFor(VAULT_ACTION.LEND, params));
+  return { vault, assets, minShares };
+}
+
+/** Redeem params: abi.encode(address vault, uint256 shares, uint256 minAssets). */
+export function redeemParams(p: { vault: Address; shares: bigint; minAssets: bigint }): Hex {
+  return encodeAbiParameters(VAULT_AMOUNT_MIN_TYPES, [nonZeroAddr(p.vault, "vault"), positive(p.shares, U256_MAX, "shares"), uint(p.minAssets, U256_MAX, "minAssets")]);
+}
+
+export function decodeRedeemParams(params: Hex): { vault: Address; shares: bigint; minAssets: bigint } {
+  const [vault, shares, minAssets] = decodeAbiParameters(VAULT_AMOUNT_MIN_TYPES, paramsFor(VAULT_ACTION.REDEEM, params));
+  return { vault, shares, minAssets };
+}
+
+/** Morpho Blue's MarketParams. */
+export type MarketParams = { loanToken: Address; collateralToken: Address; oracle: Address; irm: Address; lltv: bigint };
+
+const MARKET_TYPE = {
+  type: "tuple",
+  components: [
+    { name: "loanToken", type: "address" },
+    { name: "collateralToken", type: "address" },
+    { name: "oracle", type: "address" },
+    { name: "irm", type: "address" },
+    { name: "lltv", type: "uint256" },
+  ],
+} as const;
+
+function market(m: MarketParams): MarketParams {
+  return {
+    loanToken: nonZeroAddr(m.loanToken, "loanToken"),
+    collateralToken: nonZeroAddr(m.collateralToken, "collateralToken"),
+    oracle: nonZeroAddr(m.oracle, "oracle"),
+    irm: addr(m.irm, "irm"),
+    lltv: uint(m.lltv, 10n ** 18n, "lltv"),
+  };
+}
+
+/** Morpho Blue's market id: keccak256(abi.encode(MarketParams)) (MarketParamsLib.id). */
+export function marketId(m: MarketParams): Hex {
+  return keccak256(encodeAbiParameters([MARKET_TYPE], [market(m)]));
+}
+
+const MARKET_AMOUNT_TYPES = [MARKET_TYPE, { type: "uint256" }] as const;
+
+function marketAmountParams(m: MarketParams, amount: bigint, name: string): Hex {
+  return encodeAbiParameters(MARKET_AMOUNT_TYPES, [market(m), positive(amount, U256_MAX, name)]);
+}
+
+/** PostCollateral params: abi.encode(MarketParams market, uint256 shares), on a market BorroRouter lists. */
+export function postCollateralParams(p: { market: MarketParams; shares: bigint }): Hex {
+  return marketAmountParams(p.market, p.shares, "shares");
+}
+
+/** WithdrawCollateral params: abi.encode(MarketParams market, uint256 shares). */
+export function withdrawCollateralParams(p: { market: MarketParams; shares: bigint }): Hex {
+  return marketAmountParams(p.market, p.shares, "shares");
+}
+
+/** Borrow params: abi.encode(MarketParams market, uint256 assets), paid to the linked vault. */
+export function borrowParams(p: { market: MarketParams; assets: bigint }): Hex {
+  return marketAmountParams(p.market, p.assets, "assets");
+}
+
+export function decodeMarketAmountParams(action: VaultAction, params: Hex): { market: MarketParams; amount: bigint } {
+  if (action !== VAULT_ACTION.POST_COLLATERAL && action !== VAULT_ACTION.WITHDRAW_COLLATERAL && action !== VAULT_ACTION.BORROW) {
+    throw new RangeError(`action ${action} has no market and amount params`);
+  }
+  const [m, amount] = decodeAbiParameters(MARKET_AMOUNT_TYPES, paramsFor(action, params));
+  return { market: { ...m }, amount };
+}
+
+const REPAY_TYPES = [MARKET_TYPE, { type: "uint256" }, { type: "uint256" }, { type: "address" }, { type: "uint256" }] as const;
+
+export type RepayParams = { market: MarketParams; assets: bigint; shares: bigint; onBehalf: Address; maxAssets: bigint };
+
+/** Repay params: abi.encode(MarketParams market, uint256 assets, uint256 shares, address onBehalf, uint256 maxAssets); exactly one of assets and shares. */
+export function repayParams(p: RepayParams): Hex {
+  if ((p.assets === 0n) === (p.shares === 0n)) throw new RangeError("exactly one of assets and shares is not zero");
+  return encodeAbiParameters(REPAY_TYPES, [
+    market(p.market),
+    uint(p.assets, U256_MAX, "assets"),
+    uint(p.shares, U256_MAX, "shares"),
+    nonZeroAddr(p.onBehalf, "onBehalf"),
+    positive(p.maxAssets, U256_MAX, "maxAssets"),
+  ]);
+}
+
+export function decodeRepayParams(params: Hex): RepayParams {
+  const [m, assets, shares, onBehalf, maxAssets] = decodeAbiParameters(REPAY_TYPES, paramsFor(VAULT_ACTION.REPAY, params));
+  return { market: { ...m }, assets, shares, onBehalf, maxAssets };
+}
+
+/** ApproveHash params: abi.encode(bytes32 hash, bool approved). */
+export function approveHashParams(p: { hash: Hex; approved: boolean }): Hex {
+  return encodeAbiParameters([{ type: "bytes32" }, { type: "bool" }], [nonZero32(p.hash, "hash"), p.approved]);
+}
+
+export function decodeApproveHashParams(params: Hex): { hash: Hex; approved: boolean } {
+  const [hash, approved] = decodeAbiParameters([{ type: "bytes32" }, { type: "bool" }], paramsFor(VAULT_ACTION.APPROVE_HASH, params));
+  return { hash, approved };
+}
+
+export type GuardOp = (typeof GUARD_OP)[keyof typeof GUARD_OP];
+
+/** What OstraVault.guard(op, params) takes for each op (GUARD_OP). */
+export type GuardCall =
+  | { op: typeof GUARD_OP.CANCEL }
+  | { op: typeof GUARD_OP.REVOKE_HASH; hash: Hex }
+  | { op: typeof GUARD_OP.SWEEP; expected: Address }
+  | { op: typeof GUARD_OP.REDEEM; vault: Address; shares: bigint }
+  | { op: typeof GUARD_OP.WITHDRAW_COLLATERAL; marketId: Hex; shares: bigint };
+
+/** The params of OstraVault.guard for `c`. */
+export function guardCallParams(c: GuardCall): Hex {
+  switch (c.op) {
+    case GUARD_OP.CANCEL:
+      return "0x";
+    case GUARD_OP.REVOKE_HASH:
+      return encodeAbiParameters([{ type: "bytes32" }], [nonZero32(c.hash, "hash")]);
+    case GUARD_OP.SWEEP:
+      return encodeAbiParameters([{ type: "address" }], [nonZeroAddr(c.expected, "expected")]);
+    case GUARD_OP.REDEEM:
+      return encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [nonZeroAddr(c.vault, "vault"), positive(c.shares, U256_MAX, "shares")]);
+    case GUARD_OP.WITHDRAW_COLLATERAL:
+      return encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [bytes32(c.marketId, "marketId"), positive(c.shares, U256_MAX, "shares")]);
+  }
+}
+
+/** Guard spend params: abi.encode(address vault, uint8 op, bytes32 arg, uint256 amount): guard(op, ...) on `vault`, as its guardian or withdrawal address. */
+export function guardParams(vault: Address, c: GuardCall): Hex {
+  let arg: Hex = ZERO32;
+  let amount = 0n;
+  if (c.op === GUARD_OP.REVOKE_HASH) arg = nonZero32(c.hash, "hash");
+  else if (c.op === GUARD_OP.SWEEP) arg = pad(nonZeroAddr(c.expected, "expected"), { size: 32 });
+  else if (c.op === GUARD_OP.REDEEM) [arg, amount] = [pad(nonZeroAddr(c.vault, "vault"), { size: 32 }), positive(c.shares, U256_MAX, "shares")];
+  else if (c.op === GUARD_OP.WITHDRAW_COLLATERAL) [arg, amount] = [bytes32(c.marketId, "marketId"), positive(c.shares, U256_MAX, "shares")];
+  return encodeAbiParameters([{ type: "address" }, { type: "uint8" }, { type: "bytes32" }, { type: "uint256" }], [nonZeroAddr(vault, "vault"), c.op, arg, amount]);
+}
+
+export function decodeGuardParams(params: Hex): { vault: Address; op: number; arg: Hex; amount: bigint } {
+  const [vault, op, arg, amount] = decodeAbiParameters(
+    [{ type: "address" }, { type: "uint8" }, { type: "bytes32" }, { type: "uint256" }],
+    paramsFor(VAULT_ACTION.GUARD, params),
+  );
+  return { vault, op, arg, amount };
+}
+
 /** The key root a recovery moves a vault to: key `nonce` (the vault's current nonce) of the new seed's keychain. */
 export function recoveryKeyRoot(newKeychain: WotsKeychain, vaultNonce: bigint): Hex {
   return bytesToHex(newKeychain.keyRoot(uint(vaultNonce, U64_MAX, "vaultNonce")));
@@ -612,7 +820,12 @@ export function decodeVaultSpendMessage(message: Uint8Array): VaultSpend {
 export type SignedSpend = { action: VaultAction; nextKeyRoot: Hex; params: Hex; signature: Hex; message: Uint8Array };
 
 /** The vault's current key (index = on-chain nonce) as read from the vault. */
-export type VaultKeyState = { vault: Address; nonce: bigint; keyRoot: Hex };
+/**
+ * What a spend signs at: the vault, its nonce and its key root. `keyIndex`: the keychain index of that key root when
+ * it is not `nonce` (a recovery finished to this seed's key at an earlier nonce, after the vault's old key spent
+ * under the withdrawal lock); the next key is the one at `nonce + 1` either way.
+ */
+export type VaultKeyState = { vault: Address; nonce: bigint; keyRoot: Hex; keyIndex?: bigint };
 
 /** Signs a spend with key `nonce` and rotates to key `nonce + 1` of the same keychain. */
 export async function signVaultSpend(
@@ -622,7 +835,9 @@ export async function signVaultSpend(
 ): Promise<SignedSpend> {
   const nextKeyRoot = bytesToHex(keychain.keyRoot(state.nonce + 1n));
   const message = vaultSpendMessage({ chainId: a.chainId, vault: state.vault, nonce: state.nonce, nextKeyRoot, action: a.action, params: a.params });
-  const signature = await keychain.sign(state.nonce, message, hexToBytes(bytes32(state.keyRoot, "keyRoot")));
+  const index = state.keyIndex ?? state.nonce;
+  if (index > state.nonce) throw new RangeError("a key index is never above the nonce");
+  const signature = await keychain.sign(index, message, hexToBytes(bytes32(state.keyRoot, "keyRoot")));
   return { action: a.action, nextKeyRoot, params: a.params, signature: wotsSignature(signature), message };
 }
 

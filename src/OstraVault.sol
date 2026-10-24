@@ -17,21 +17,12 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {Wots} from "./Wots.sol";
+import {OstraVaultV3} from "./OstraVaultV3.sol";
 import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 
 /// @notice What a ConfigurePool spend calls (OstraHook.configure; PoolId is a bytes32).
 interface IOstraPoolSettings {
     function configure(bytes32 poolId, uint8 field, uint256 value) external;
-}
-
-/// @notice What a ClaimDividend spend calls (OstraToken.claimTo).
-interface IOstraDividends {
-    function claimTo(address recipient) external returns (uint256 amount);
-}
-
-/// @notice What a SupportRecovery spend calls (OstraVault.supportRecovery of the vault being recovered).
-interface IOstraRecovery {
-    function supportRecovery(bytes32 newKeyRoot) external;
 }
 
 /// @notice What a DevBuy spend asks of the OstraDevBuy contract that calls it (OstraDevBuy.pendingLaunch).
@@ -107,6 +98,73 @@ interface IAgentIdentityRegistry {
 ///                  The four call only those two contracts, with no value, and their URIs are 1 to
 ///                  MAX_URI_LENGTH bytes, ABI-encoded exactly (no trailing bytes). No spend can transfer an
 ///                  identity token, so an identity stays with the vault that registered it.
+/// * 14 SetWithdrawalLock: params abi.encode(address withdrawal, uint32 delay, uint128 dailyLimit). Turns the
+///                  withdrawal lock on (withdrawal not zero, MIN_RECOVERY_DELAY <= delay <= MAX_RECOVERY_DELAY) or off
+///                  (all three zero). See "Withdrawal lock" below.
+/// * 15 CancelPendingChanges: params empty. Drops a lock change and a link change that are still waiting.
+/// * 16 SetLinkedVault: params abi.encode(address vault). The owner's other vault that Borrow pays and that
+///                  repays this vault's debt (for a stock vault: its USDG vault), or address(0) for none. It must
+///                  be a vault OstraVaultFactory made, not this one.
+/// * 17 Lend:       params abi.encode(address vault, uint256 assets, uint256 minShares). Deposits `assets` of this
+///                  vault's token into a Morpho Vault V2 whose asset it is, for at least `minShares` shares, which
+///                  this vault keeps. A vault Borro lists in BorroBuilders goes through BorroBuilders with Borro
+///                  code BORRO_CODE; any other vault must be one VaultV2Factory made (isVaultV2).
+/// * 18 Redeem:     params abi.encode(address vault, uint256 shares, uint256 minAssets). Redeems `shares` of a Morpho
+///                  Vault V2 whose asset is this vault's token, for at least `minAssets`, back to this vault.
+/// * 19 PostCollateral: params abi.encode(MarketParams market, uint256 shares). Posts `shares` of the market's
+///                  collateral token, which this vault holds, as this vault's collateral on Morpho Blue, only on a
+///                  market Borro lists (BorroRouter.listed).
+/// * 20 WithdrawCollateral: params abi.encode(MarketParams market, uint256 shares). Takes `shares` of this vault's
+///                  collateral back to this vault, on any Morpho Blue market.
+/// * 21 Borrow:     params abi.encode(MarketParams market, uint256 assets). Borrows `assets` of the loan token on a
+///                  market Borro lists, in this vault's name, paid to the linked vault, whose token it must be.
+/// * 22 Repay:      params abi.encode(MarketParams market, uint256 assets, uint256 shares, address onBehalf,
+///                  uint256 maxAssets). Repays `assets` or `shares` (one of them zero; never more than the debt there
+///                  is now) of the debt of `onBehalf`, a vault OstraVaultFactory made whose linked vault is this one,
+///                  in this vault's token, paying at most `maxAssets`. It counts against the lock's daily limit unless
+///                  this vault links back to `onBehalf` and, under the lock, `onBehalf` is a locked link (below).
+///                  After Borrow and WithdrawCollateral the position's debt is at most half of what the market's
+///                  LLTV allows (MAX_LTV_OF_LLTV_BPS), at the market's own oracle price. Every allowance these
+///                  spends give is for the amount about to be used, and is set back to zero in the same spend. A
+///                  spend 17 to 22 that fails moves nothing but lands (MorphoFailed), as a failed Swap does, when it
+///                  is sent on its own (the transaction's own call); inside another contract's call it reverts and
+///                  keeps its key, since that call could have set the failure up (a flash loan, a reentrancy lock).
+/// * 23 ApproveHash: params abi.encode(bytes32 hash, bool approved). Approves `hash` for EIP-1271
+///                  (isValidSignature), or withdraws the approval (nothing to do if it is gone already). A WOTS key
+///                  signs once, so this vault never checks a WOTS signature in isValidSignature: each message is
+///                  approved by a spend of its own.
+/// * 24 Guard:      params abi.encode(address vault, uint8 op, bytes32 arg, uint256 amount). As a guardian or the
+///                  withdrawal address of another Ostra vault, calls guard(op, ...) on it (see guard). A call the other
+///                  vault refuses lands as Guarded(ok false), and so does a SupportRecovery it refuses (both only when
+///                  sent on its own, as a failed Morpho spend).
+///
+/// Withdrawal lock (optional): a fixed withdrawal address, always reachable at once, and a daily limit on every
+/// other outflow, so that a stolen seed cannot empty the vault at once, and its owner can move everything to the
+/// withdrawal address. A withdrawal address that is an Ostra vault must hold this vault's token. While it is on:
+/// * Transfer to the withdrawal address is free if it keeps what it gets: it is not an Ostra vault, or it is one
+///   whose own lock was on when it was chosen and has stayed on (an unlocked vault may share the stolen seed).
+///   Transfer elsewhere, every Swap (its input, whatever the recipient: a low minimum could be sandwiched),
+///   OpenChannel, DevBuy, Lend into a vault Borro does not list, and a Repay that is not for a locked link count
+///   against `dailyLimit`, in this vault's token: at most `dailyLimit` goes out at once, and what was used drains
+///   at `dailyLimit` per LIMIT_WINDOW (one day).
+/// * A linked vault counts as the owner's own (a locked link) only if its own lock was already on when the link
+///   was decided (set at once, or scheduled) and has stayed on since: turning a lock on is at once, so a lock
+///   turned on later may be a thief's. Borrow only pays a locked link; ClaimDividend only pays this vault, the
+///   withdrawal address (if it keeps what it gets) or a locked link, and never a vault that cannot spend the
+///   dividend token. Redeem, PostCollateral and WithdrawCollateral keep the value with the owner.
+/// * A change that loosens the lock (another withdrawal address, a shorter delay, a higher limit, turning it off),
+///   a new linked vault, and a hash approval take effect only `delay` after they are signed; meanwhile the owner
+///   (CancelPendingChanges), any guardian or the withdrawal address (guard, or Guard from a guardian vault) can
+///   drop them. A change that only tightens the lock takes effect at once and drops a loosening still waiting.
+///   Turning the lock on is at once, and drops every hash approval given before.
+/// * A key a thief has taken over (any spend picks the next key) must not end the owner's protection: SetGuardian,
+///   SetRecoveryPolicy, SetCrankKey and ConfigurePool are refused, a spend no longer stops a recovery under way, and
+///   any guardian or the withdrawal address can bring lent shares and collateral back into the vault and send the
+///   whole balance of the token to the withdrawal address (guard). A recovery that reaches its threshold drops the
+///   changes and hash approvals waiting, and while it waits nothing new may start waiting. So the guardians can
+///   recover the vault to the owner's new seed, and meanwhile the thief gets at most the daily limit. The
+///   guardians, whom the lock keeps as they are, have the last word: any one of them can keep dropping the owner's
+///   loosening changes, and a threshold of them can recover the vault.
 /// Signed message: "OSTRA/VAULT/EVM/v1" || chainid (32) || vault (20) || nonce (8) || nextKeyRoot (32)
 ///                 || action (1) || params. The key rotates and the nonce advances before any external call,
 ///                 so a signature can never be used twice. There is no expiry: a spend that did not land is
@@ -114,8 +172,10 @@ interface IAgentIdentityRegistry {
 ///
 /// Recovery (when the owner has lost the seed): once `recoveryThreshold` guardians support the same new key root,
 /// the recovery waits `recoveryDelay`; then anyone may finish it (finishRecovery), or the new seed's first spend, signed
-/// by that root, finishes it itself; the vault's key becomes that root (the nonce runs on). Every spend, signed by the current key, cancels a recovery under way and every support gathered so far: an
-/// owner who still holds the key always wins, and a stale support never counts again.
+/// by that root, finishes it itself (not under the withdrawal lock: there finishRecovery comes first, and only then does
+/// the new key sign, at the nonce in force); the vault's key becomes that root (the nonce runs on). Every spend, signed by the current key, cancels a recovery under way and every support gathered so far: an
+/// owner who still holds the key always wins, and a stale support never counts again. Under the withdrawal lock a
+/// spend cancels nothing: the guardians, whom the lock keeps as they are, have the last word.
 ///
 /// Channels the vault pays (payer = vault):
 /// * requestClose: starts the timed withdrawal of `amount`, signed by the channel's payerAuthorizer (the
@@ -142,9 +202,21 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_SET_TOKEN_METADATA = 11;
     uint8 public constant ACTION_REGISTER_AGENT = 12;
     uint8 public constant ACTION_SET_AGENT_URI = 13;
+    uint8 public constant ACTION_SET_WITHDRAWAL_LOCK = 14;
+    uint8 public constant ACTION_CANCEL_PENDING_CHANGES = 15;
+    uint8 public constant ACTION_SET_LINKED_VAULT = 16;
+    uint8 public constant ACTION_LEND = 17;
+    uint8 public constant ACTION_REDEEM = 18;
+    uint8 public constant ACTION_POST_COLLATERAL = 19;
+    uint8 public constant ACTION_WITHDRAW_COLLATERAL = 20;
+    uint8 public constant ACTION_BORROW = 21;
+    uint8 public constant ACTION_REPAY = 22;
+    uint8 public constant ACTION_APPROVE_HASH = 23;
+    uint8 public constant ACTION_GUARD = 24;
 
-    /// @notice The implementation version: 2 adds the profile, token metadata and agent identity spends.
-    uint8 public constant VERSION = 2;
+    /// @notice The implementation version: 2 adds the profile, token metadata and agent identity spends; 3 adds the
+    ///         withdrawal lock, Morpho Vault V2 and Morpho Blue (Borro) spends and EIP-1271.
+    uint8 public constant VERSION = 3;
     /// @notice Longest URI a SetProfile, SetTokenMetadata, RegisterAgent or SetAgentUri spend may carry.
     uint256 public constant MAX_URI_LENGTH = 256;
 
@@ -163,6 +235,15 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     /// @notice Longest recovery delay: the longest window in the deployed recovery designs surveyed (14 days).
     uint32 public constant MAX_RECOVERY_DELAY = 14 days;
 
+    /// @notice The withdrawal lock's daily limit drains at `dailyLimit` per LIMIT_WINDOW.
+    uint256 public constant LIMIT_WINDOW = OstraVaultV3.LIMIT_WINDOW;
+    /// @dev EIP-1271's magic value: bytes4(keccak256("isValidSignature(bytes32,bytes)")).
+    bytes4 private constant EIP1271_MAGIC = 0x1626ba7e;
+    /// @dev OstraVaultModule.guard(uint8,bytes,address).
+    bytes4 private constant MODULE_GUARD = bytes4(keccak256("guard(uint8,bytes,address)"));
+    /// @dev OstraVaultModule.run(uint8,bytes,address,bool).
+    bytes4 private constant MODULE_RUN = bytes4(keccak256("run(uint8,bytes,address,bool)"));
+
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
         keccak256("CloseRequest(bytes32 channelId,uint128 amount,uint256 nonce,uint64 deadline)");
@@ -175,6 +256,9 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     IOstraRegistry public immutable REGISTRY;
     /// @notice The ERC-8004 Identity Registry this vault registers as an agent in.
     IAgentIdentityRegistry public immutable IDENTITY_REGISTRY;
+    /// @notice OstraVaultModule, which this vault's version 3 spends (14 to 24) run in by delegatecall: apart only
+    ///         for the code size limit.
+    address public immutable MODULE;
 
     IERC20 public token;
     bytes32 public initialKeyRoot;
@@ -248,15 +332,26 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     error AlreadySupported();
     error NoRecovery();
     error RecoveryNotReady();
+    error Locked();
 
-    constructor(address batchSettlement, address poolManager, address registry, address identityRegistry)
-        EIP712("Ostra Vault", "1")
-    {
-        if (registry == address(0) || identityRegistry == address(0)) revert BadParams();
-        BATCH_SETTLEMENT = IX402BatchSettlement(batchSettlement);
-        POOL_MANAGER = IPoolManager(poolManager);
-        REGISTRY = IOstraRegistry(registry);
-        IDENTITY_REGISTRY = IAgentIdentityRegistry(identityRegistry);
+    /// @notice The contracts every vault uses, fixed in the implementation.
+    struct Externals {
+        address batchSettlement;
+        address poolManager;
+        address registry;
+        address identityRegistry;
+        address module;
+    }
+
+    constructor(Externals memory e) EIP712("Ostra Vault", "1") {
+        if (
+            e.registry == address(0) || e.identityRegistry == address(0) || e.module.code.length == 0
+        ) revert BadParams();
+        BATCH_SETTLEMENT = IX402BatchSettlement(e.batchSettlement);
+        POOL_MANAGER = IPoolManager(e.poolManager);
+        REGISTRY = IOstraRegistry(e.registry);
+        IDENTITY_REGISTRY = IAgentIdentityRegistry(e.identityRegistry);
+        MODULE = e.module;
         _disableInitializers();
     }
 
@@ -295,44 +390,57 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         uint64 spent = nonce;
         keyRoot = nextKeyRoot;
         nonce = spent + 1;
-        // The owner holds the key: a recovery under way and every support gathered so far stop counting.
-        unchecked {
-            ++recoveryRound;
+        // Lock and link changes whose wait is over apply before the spend is judged against them.
+        OstraVaultV3.Layout storage v3 = OstraVaultV3.layout();
+        OstraVaultV3.applyPendingChanges(v3);
+        bool locked = v3.lock.withdrawal != address(0);
+        // The key holder is the owner: a recovery under way and every support gathered so far stop counting. Under
+        // the withdrawal lock the key may be a thief's, so a spend does not stop the guardians.
+        if (!locked) {
+            unchecked {
+                ++recoveryRound;
+            }
         }
         emit Spent(spent, action, nextKeyRoot);
 
         if (action == ACTION_TRANSFER) {
             (address to, uint256 amount) = abi.decode(params, (address, uint256));
             if (amount == 0) revert ZeroAmount();
+            if (to != v3.lock.withdrawal || !OstraVaultV3.withdrawalKeeps(v3)) _outflow(amount);
             token.safeTransfer(to, amount);
         } else if (action == ACTION_OPEN_CHANNEL) {
             _openChannel(params);
         } else if (action == ACTION_SET_CRANK_KEY) {
+            if (locked) revert Locked();
             address newCrank = abi.decode(params, (address));
             crank = newCrank;
             emit CrankChanged(newCrank);
         } else if (action == ACTION_SWAP) {
             _swap(params);
         } else if (action == ACTION_CONFIGURE_POOL) {
+            if (locked) revert Locked();
             (address hook, bytes32 poolId, uint8 field, uint256 value) =
                 abi.decode(params, (address, bytes32, uint8, uint256));
             if (hook == address(0)) revert BadParams();
             IOstraPoolSettings(hook).configure(poolId, field, value);
-        } else if (action == ACTION_CLAIM_DIVIDEND) {
-            address recipient = abi.decode(params, (address));
-            if (recipient == address(0)) revert BadParams();
-            if (IOstraDividends(address(token)).claimTo(recipient) == 0) revert ZeroAmount();
         } else if (action == ACTION_SET_GUARDIAN) {
+            // Under the lock the guardians and the recovery policy stay as they are, so that a stolen key cannot
+            // take away the guardians' recovery or their cancels; turning the lock off waits its delay.
+            if (locked) revert Locked();
             (address guardian, bool enabled) = abi.decode(params, (address, bool));
             _setGuardian(guardian, enabled);
         } else if (action == ACTION_SET_RECOVERY_POLICY) {
+            if (locked) revert Locked();
             (uint8 threshold, uint32 delay) = abi.decode(params, (uint8, uint32));
             _setRecoveryPolicy(threshold, delay);
         } else if (action == ACTION_DEV_BUY) {
             (address devBuy, bytes32 launchHash, uint256 amount) = abi.decode(params, (address, bytes32, uint256));
             if (msg.sender != devBuy || launchHash == bytes32(0)) revert Unauthorized();
             if (IOstraDevBuyLaunch(devBuy).pendingLaunch(address(this)) != launchHash) revert Unauthorized();
-            if (amount != 0) token.safeTransfer(devBuy, amount);
+            if (amount != 0) {
+                _outflow(amount);
+                token.safeTransfer(devBuy, amount);
+            }
         } else if (action == ACTION_SET_PROFILE) {
             REGISTRY.setProfile(abi.decode(params, (string)));
         } else if (action == ACTION_SET_TOKEN_METADATA) {
@@ -344,9 +452,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             (uint256 agentId, string memory uri) = abi.decode(params, (uint256, string));
             IDENTITY_REGISTRY.setAgentURI(agentId, uri);
         } else {
-            (address vault, bytes32 newKeyRoot) = abi.decode(params, (address, bytes32));
-            if (vault == address(0) || vault == address(this) || newKeyRoot == bytes32(0)) revert BadParams();
-            IOstraRecovery(vault).supportRecovery(newKeyRoot);
+            // ClaimDividend (5), SupportRecovery (8) and the version 3 spends (14 to 24).
+            _moduleSpend(action, params);
         }
     }
 
@@ -375,6 +482,22 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             _checkUriParams(params, 3);
         } else if (action == ACTION_SET_AGENT_URI) {
             _checkUriParams(params, 2);
+        } else if (action == ACTION_CANCEL_PENDING_CHANGES) {
+            if (params.length != 0) revert BadParams();
+        } else if (action == ACTION_SET_LINKED_VAULT) {
+            if (params.length != 32) revert BadParams();
+        } else if (action == ACTION_SET_WITHDRAWAL_LOCK || action == ACTION_LEND || action == ACTION_REDEEM) {
+            if (params.length != 96) revert BadParams();
+        } else if (
+            action == ACTION_POST_COLLATERAL || action == ACTION_WITHDRAW_COLLATERAL || action == ACTION_BORROW
+        ) {
+            if (params.length != 192) revert BadParams();
+        } else if (action == ACTION_REPAY) {
+            if (params.length != 288) revert BadParams();
+        } else if (action == ACTION_GUARD) {
+            if (params.length != 128) revert BadParams();
+        } else if (action == ACTION_APPROVE_HASH) {
+            if (params.length != 64) revert BadParams();
         } else {
             revert BadAction();
         }
@@ -411,6 +534,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         // Without a voucher key nobody could sign vouchers or ask to close (the vault signs nothing but
         // WOTS spends), and with no crank the escrow could never come back.
         if (payerAuthorizer == address(0)) revert BadParams();
+        _outflow(amount);
         IX402BatchSettlement.ChannelConfig memory config = IX402BatchSettlement.ChannelConfig({
             payer: address(this),
             payerAuthorizer: payerAuthorizer,
@@ -468,6 +592,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         try POOL_MANAGER.unlock{gas: swapGas}(params) returns (bytes memory result) {
             if (_swapPending) revert UnexpectedCallback();
             (uint256 paid, uint256 received) = abi.decode(result, (uint256, uint256));
+            // What the swap took counts against the lock's daily limit, whatever the recipient.
+            _outflow(paid);
             emit Swapped(PoolId.unwrap(key.toId()), zeroForOne, paid, received, recipient);
         } catch {
             // The swap failed on its own merits: nothing moved (the PoolManager undid it all) and the key has rotated.
@@ -520,6 +646,115 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Withdrawal lock and linked vault
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice The withdrawal lock in force (a change whose wait is over counts as made). Off while `withdrawal`
+    ///         is zero.
+    function withdrawalLock() public view returns (OstraVaultV3.LockConfig memory) {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        uint64 at = l.pendingLockAt;
+        return at != 0 && block.timestamp >= at ? l.pendingLock : l.lock;
+    }
+
+    function lockActive() public view returns (bool) {
+        return withdrawalLock().withdrawal != address(0);
+    }
+
+    /// @notice When the lock in force was turned on; 0 while it is off.
+    function lockedSince() external view returns (uint64) {
+        return lockActive() ? OstraVaultV3.layout().lockedSince : 0;
+    }
+
+    /// @notice The linked vault in force (a change whose wait is over counts as made); address(0) = none.
+    function linkedVault() public view returns (address) {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        uint64 at = l.pendingLinkedAt;
+        return at != 0 && block.timestamp >= at ? l.pendingLinkedVault : l.linkedVault;
+    }
+
+    /// @notice The changes still waiting: a lock change (`lockAt` 0 = none) and a link change (`linkAt` 0 = none).
+    function pendingChanges()
+        external
+        view
+        returns (OstraVaultV3.LockConfig memory lock, uint64 lockAt, address link, uint64 linkAt)
+    {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        if (l.pendingLockAt > block.timestamp) (lock, lockAt) = (l.pendingLock, l.pendingLockAt);
+        if (l.pendingLinkedAt > block.timestamp) (link, linkAt) = (l.pendingLinkedVault, l.pendingLinkedAt);
+    }
+
+    /// @notice What may still go out against the daily limit now; type(uint256).max while the lock is off.
+    function outflowAvailable() external view returns (uint256) {
+        OstraVaultV3.LockConfig memory lock = withdrawalLock();
+        if (lock.withdrawal == address(0)) return type(uint256).max;
+        uint256 u = OstraVaultV3.used(OstraVaultV3.layout(), lock.dailyLimit);
+        return u >= lock.dailyLimit ? 0 : lock.dailyLimit - u;
+    }
+
+    /// @notice From when an approved hash is valid for EIP-1271; 0 = not approved.
+    function hashValidFrom(bytes32 hash) external view returns (uint64) {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        return l.hashValidFrom[OstraVaultV3.approvalKey(l, hash)];
+    }
+
+    /// @notice What a guardian or the withdrawal address may do while the lock is on (OstraVaultModule.guard): op 0
+    ///         drop the waiting lock and link changes; 1 withdraw a hash approval, abi.encode(bytes32 hash); 2 send
+    ///         the whole balance of the token to the withdrawal address, abi.encode(address expected), which must be
+    ///         the one in force; 3 redeem Vault V2 shares back here, abi.encode(address vault, uint256 shares); 4 take
+    ///         collateral back here, abi.encode(bytes32 marketId, uint256 shares), within the same LTV cap. So the
+    ///         owner's way out survives a key a thief has taken over. Changes whose wait is over are made first.
+    function guard(uint8 op, bytes calldata params) external nonReentrant {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        OstraVaultV3.applyPendingChanges(l);
+        address withdrawal = l.lock.withdrawal;
+        if (withdrawal == address(0)) revert Locked();
+        if (!isGuardian[msg.sender] && msg.sender != withdrawal) revert NotGuardian();
+        (bool ok, bytes memory ret) =
+            MODULE.delegatecall(abi.encodeWithSelector(MODULE_GUARD, op, params, address(token)));
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
+    }
+
+    function _outflow(uint256 amount) private {
+        OstraVaultV3.outflow(OstraVaultV3.layout(), amount);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // EIP-1271
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice EIP-1271: a hash this vault approved with an ApproveHash spend, and did not withdraw, is signed by
+    ///         this vault from the time its approval takes effect; `signature` is not read.
+    ///         Approvals given before the lock was last turned on no longer count.
+    function isValidSignature(bytes32 hash, bytes calldata) external view returns (bytes4) {
+        OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+        uint64 from = l.hashValidFrom[OstraVaultV3.approvalKey(l, hash)];
+        return from != 0 && block.timestamp >= from ? EIP1271_MAGIC : bytes4(0xffffffff);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Version 3 spends
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Runs a version 3 spend (14 to 24) in OstraVaultModule by delegatecall, and passes on its revert as it is;
+    ///      the module also learns whether a recovery is under way.
+    function _moduleSpend(uint8 action, bytes calldata params) private {
+        PendingRecovery memory p = pendingRecovery;
+        bool recovering = p.executableAt != 0 && p.round == recoveryRound;
+        (bool ok, bytes memory ret) =
+            MODULE.delegatecall(abi.encodeWithSelector(MODULE_RUN, action, params, address(token), recovering));
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Recovery
     // ---------------------------------------------------------------------------------------------
 
@@ -569,17 +804,35 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             uint64 executableAt = uint64(block.timestamp) + recoveryDelay;
             pendingRecovery = PendingRecovery({round: round, executableAt: executableAt, newKeyRoot: newKeyRoot});
             emit RecoveryStarted(round, newKeyRoot, executableAt);
+            // A recovery under way drops the changes waiting (the key may be a thief's); while it waits, the module
+            // refuses new loosening changes (_moduleSpend passes it whether a recovery is under way).
+            // So do the hash approvals given so far. Changes whose wait is over are made first.
+            OstraVaultV3.Layout storage l = OstraVaultV3.layout();
+            OstraVaultV3.applyPendingChanges(l);
+            if (l.pendingLockAt != 0 || l.pendingLinkedAt != 0) OstraVaultV3.cancelPendingChanges(l, msg.sender);
+            ++l.approvalsEpoch;
         }
     }
 
     /// @dev A spend not signed by the current key: valid only as the first spend of a recovery whose delay is over,
     ///      signed by its new key root, which finishes the recovery (the spend then rotates the key as usual).
+    ///      Not under the lock: there a spend of the key holder can land first and move the nonce, which would leave
+    ///      the new key's signature unusable (and it must not sign twice); finishRecovery comes first instead.
     function _finishRecoveryBy(bytes32 signer) private {
         PendingRecovery memory p = pendingRecovery;
-        if (p.executableAt == 0 || p.round != recoveryRound || block.timestamp < p.executableAt || signer != p.newKeyRoot) {
+        if (
+            p.executableAt == 0 || p.round != recoveryRound || block.timestamp < p.executableAt || signer != p.newKeyRoot
+                || lockActive()
+        ) {
             revert WotsSignatureInvalid();
         }
         delete pendingRecovery;
+        // Every support gathered so far stops counting, as finishRecovery does (a spend under the lock would not),
+        // and so does every hash approval.
+        unchecked {
+            ++recoveryRound;
+        }
+        ++OstraVaultV3.layout().approvalsEpoch;
         emit Recovered(p.round, p.newKeyRoot);
     }
 
@@ -594,6 +847,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         unchecked {
             recoveryRound = round + 1;
         }
+        ++OstraVaultV3.layout().approvalsEpoch;
         emit Recovered(round, p.newKeyRoot);
     }
 

@@ -27,7 +27,7 @@
 //     (SendUnknownError) and nothing is credited or charged back.
 
 import { createWalletClient, keccak256, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
-import { failedSwaps, robinhoodChain, simulateRelay } from "@ostraagent/sdk";
+import { failedModuleSpends, failedSwaps, moduleFailureText, robinhoodChain, simulateRelay } from "@ostraagent/sdk";
 
 /** Wait for a receipt before replacing the transaction (Robinhood Chain confirms in about a second). */
 export const RECEIPT_TIMEOUT_MS = 60_000;
@@ -151,13 +151,19 @@ export class RelaySender {
     }
     if (refuseFailedSwaps.length !== 0) {
       let failed: ReturnType<typeof failedSwaps>;
+      let module: ReturnType<typeof failedModuleSpends>;
       try {
-        failed = failedSwaps((await simulateRelay(this.#client, { relayer: account.address, to: tx.to, data: tx.data, value: tx.value })).logs, refuseFailedSwaps);
+        const logs = (await simulateRelay(this.#client, { relayer: account.address, to: tx.to, data: tx.data, value: tx.value })).logs;
+        failed = failedSwaps(logs, refuseFailedSwaps);
+        module = failedModuleSpends(logs, refuseFailedSwaps);
       } catch (err) {
         throw new NotSentError(`its Swap could not be checked, so it was not sent: ${(err as Error).message}`);
       }
       if (failed.length !== 0) {
         throw new NotSentError(`the Swap of ${failed.map((f) => `vault ${f.vault} (${f.reason})`).join(", ")} fails now, so it was not sent`);
+      }
+      if (module.length !== 0) {
+        throw new NotSentError(`the spend of ${module.map((f) => `vault ${f.vault} (${f.kind} ${f.action}: ${moduleFailureText(f.reason)})`).join(", ")} fails now, so it was not sent`);
       }
     }
     if (o.notAfter !== undefined) {

@@ -5,8 +5,8 @@
 //      IP address);
 //   2. checks the calls against its policy (the Kora allowed-program list on
 //      Solana): createVault on the deployment's vault factory; spend,
-//      requestClose and finalizeWithdraw on an Ostra vault of the deployment
-//      in its token; spendLeaf, approveBatch, depositWithAuthorization,
+//      requestClose, finalizeWithdraw and finishRecovery on an Ostra vault of
+//      the deployment in its token; spendLeaf, approveBatch, depositWithAuthorization,
 //      cancelDeposit and closeDeposit on the deployment's pool; and on its
 //      launchpad (design v0.4, D2): OstraDevBuy.launchFromVault alone, from a
 //      creator vault in the relayer's token, in WETH or in a listed pair
@@ -18,10 +18,14 @@
 //      (a WETH or listed pair token vault: a pair's creator vault or the
 //      token vault trading its pools; a
 //      vault holding a token the launchpad launched, launchpad.poolOf) spend
-//      only Transfer, Swap and ClaimDividend (a WETH or pair token vault
-//      also ConfigurePool, SetProfile and SetTokenMetadata, what a pair's
-//      creator vault does as its pool's owner), paid by a `payer` vault in
-//      the relayer's token; dividends (a vesting's, a launched-token vault's
+//      only Transfer, Swap, ClaimDividend and, from version 3, its withdrawal
+//      lock (SetWithdrawalLock, CancelPendingChanges), plus finishRecovery (a
+//      WETH or pair token vault also ConfigurePool, SetProfile and
+//      SetTokenMetadata, what a pair's creator vault does as its pool's owner,
+//      and SetLinkedVault, ApproveHash and Borro's Lend, Redeem,
+//      PostCollateral, WithdrawCollateral and Borrow, a stock vault's; a vault
+//      of a stock Borro lists that is not a pair, GME, is served as a pair
+//      token vault), paid by a `payer` vault in the relayer's token; dividends (a vesting's, a launched-token vault's
 //      ClaimDividend) only of a pool paying them in USDG, WETH, a listed
 //      pair token or a launched token; and of Ostra Swap (decided 21 Oct
 //      2026), when the relayer is configured with it: OstraRouter
@@ -38,15 +42,19 @@
 //      relayer's account is never the caller of anything that gives a caller
 //      a role, and no code runs but Ostra's, USDG's, WETH's, the listed pair
 //      tokens' (OSTRA's and the stock tokens') and the launchpad's, except
-//      the pool, hook and tokens a vault Swap names and the hook a vault
-//      ConfigurePool names (within the gas cap the request paid for);
+//      the pool, hook and tokens a vault Swap names, the hook a vault
+//      ConfigurePool names, and Morpho Blue with the Vault V2, market oracle
+//      and rate model a version 3 Borro spend names (the vault checks that
+//      Morpho's VaultV2Factory made the Vault V2, and borrows only on markets
+//      Borro lists), within the gas cap the request paid for;
 //   3. prices the transaction: the gas it uses, simulated from the relayer
 //      (eth_simulateV1), with its L1 data component and the swapGas each
 //      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
 //      ETH/USD + 0.5% (@ostraagent/sdk relayer.ts, the same rules an agent
 //      checks the price with). A vault Swap the simulation shows failing
-//      (SwapFailed) is refused, 422 swap_fails, unless the request asks for
-//      it with allowFailedSwaps: such a spend moves nothing and is only worth
+//      (SwapFailed) is refused, 422 swap_fails, and so is a version 3 spend
+//      that fails without reverting (MorphoFailed, Guarded with ok false),
+//      422 spend_fails, unless the request asks for it with allowFailedSwaps: such a spend moves nothing and is only worth
 //      sending to use the key up. A Swap quoted while it passed is simulated
 //      again when the request comes back to be paid, before the voucher is
 //      taken (one that reverts then is refused 422, a node that cannot
@@ -80,7 +88,15 @@
 // pay with, so its creation and the leaf are its debt; no CreateVault slot of
 // the IP address is taken); and an OpenChannel spend from a vault to the
 // relayer on the relayer's terms, whose first voucher then pays the open and
-// the vault's debt. A vault in debt, or with such an open unpaid, gets nothing
+// the vault's debt. And from vault version 3 a fifth: finishRecovery alone on
+// an Ostra vault in the relayer's token (a debt of that vault): under the
+// withdrawal lock a recovery's new key must finish it before its first spend,
+// and a new device has no relayer channel yet to pay with (its channels'
+// voucher keys were the old seed's). It reverts unless the recovery is past
+// its delay, so it lands once per recovery, at most every 36 hours a vault,
+// each staged by guardian spends that cost more than it (finishRecovery of a
+// vault in another token is an ordinary request, paid by a payer vault). An
+// open to the relayer the old key left unpaid becomes the vault's debt then. A vault in debt, or with such an open unpaid, gets nothing
 // else relayed but a spendLeaf into it while no open is unpaid.
 //
 // The request body is {"calls", "prepay"?, "payer"?, "allowFailedSwaps"?}: `prepay` makes a
@@ -111,6 +127,7 @@
 import type { IncomingMessage } from "node:http";
 import { getAddress, isAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
+  BORRO_STOCKS,
   LAUNCH_PAIRS,
   MAX_RELAY_CALLS,
   RelaySimulationError,
@@ -118,7 +135,9 @@ import {
   WETH,
   channelId,
   estimateRelay,
+  failedModuleSpends,
   failedSwaps,
+  moduleFailureText,
   ostraDevBuyAbi,
   ostraHookAbi,
   ostraLaunchpadAbi,
@@ -161,6 +180,8 @@ import { escrowRecords, wotsClaims, type SignatureEscrow, type SignatureRecord, 
 
 /** The tokens Ostra offers as pairs besides USDG and ETH (sdk pairs.ts: OSTRA and the stock tokens): their vaults are relayed like WETH's. */
 const LISTED_PAIR_TOKENS: ReadonlySet<Address> = new Set(LAUNCH_PAIRS.filter((p) => p.kind === "ostra" || p.kind === "stock").map((p) => p.address));
+/** Stock tokens Borro lends against that are not a launch pair (GME): their vaults are served as a pair token's are (Borro), never a launch. */
+const BORRO_ONLY_STOCKS: ReadonlySet<Address> = new Set(BORRO_STOCKS.map((b) => getAddress(b.token)).filter((t) => !LISTED_PAIR_TOKENS.has(t)));
 
 export type Log = (event: string, fields?: Record<string, unknown>) => void;
 
@@ -234,18 +255,39 @@ export class QuoteError extends Error {
   }
 }
 
-/** The vaults a request spends from with a Swap: only a vault Swap fails without reverting (SwapFailed), moving nothing and using the spend. */
+/**
+ * The spends of a request that can fail without reverting, moving nothing and using the spend: a vault Swap
+ * (SwapFailed) and, from version 3, a Morpho spend (Lend to Repay: MorphoFailed), a Guard and a SupportRecovery
+ * (Guarded with ok false); the vaults they spend from.
+ */
+const LANDING_ACTIONS: ReadonlySet<number> = new Set([
+  VAULT_ACTION.SWAP,
+  VAULT_ACTION.SUPPORT_RECOVERY,
+  VAULT_ACTION.LEND,
+  VAULT_ACTION.REDEEM,
+  VAULT_ACTION.POST_COLLATERAL,
+  VAULT_ACTION.WITHDRAW_COLLATERAL,
+  VAULT_ACTION.BORROW,
+  VAULT_ACTION.REPAY,
+  VAULT_ACTION.GUARD,
+]);
 function swapVaults(tx: RelayTx): Address[] {
-  return tx.parsed.flatMap((c) => (c.fn === "spend" && c.action === VAULT_ACTION.SWAP ? [c.to] : []));
+  return tx.parsed.flatMap((c) => (c.fn === "spend" && LANDING_ACTIONS.has(c.action) ? [c.to] : []));
 }
 
-/** Throws swap_fails if a Swap of the vaults `swaps` fails among the simulated `logs`. */
+/** Throws swap_fails if a Swap of the vaults `swaps` fails among the simulated `logs`, spend_fails for a version 3 spend. */
 function refuseFailedSwaps(logs: RelayMeasure["logs"], swaps: readonly Address[]): void {
   if (swaps.length === 0) return;
   const failed = failedSwaps(logs, swaps);
-  if (failed.length === 0) return;
-  const which = failed.map((f) => `vault ${f.vault} in pool ${f.poolId} (${f.reason})`).join(", ");
-  throw new QuoteError("swap_fails", `the Swap of ${which} fails now and would move nothing; send it with allowFailedSwaps to use the spend up anyway`);
+  if (failed.length !== 0) {
+    const which = failed.map((f) => `vault ${f.vault} in pool ${f.poolId} (${f.reason})`).join(", ");
+    throw new QuoteError("swap_fails", `the Swap of ${which} fails now and would move nothing; send it with allowFailedSwaps to use the spend up anyway`);
+  }
+  const module = failedModuleSpends(logs, swaps);
+  if (module.length !== 0) {
+    const which = module.map((f) => `vault ${f.vault} (${f.kind} ${f.action}: ${moduleFailureText(f.reason)})`).join(", ");
+    throw new QuoteError("spend_fails", `the spend of ${which} fails now and would move nothing; send it with allowFailedSwaps to use the spend up anyway`);
+  }
 }
 
 /** The calls are outside the relayer's policy (answered 422 refused, as a Kora refusal was). */
@@ -270,8 +312,40 @@ function liveQuote(q: Quote | undefined, now: number): Quote | undefined {
   return q !== undefined && now - q.createdAt <= QUOTE_RETENTION_MS ? q : undefined;
 }
 
+/**
+ * What a vault in another token spends through the relayer. A WETH or pair token vault (a pair's creator vault, or the
+ * token vault trading its pools; a stock vault on Borro): Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile,
+ * SetTokenMetadata, and from version 3 its withdrawal lock, its waiting changes, its link, an EIP-1271 approval and
+ * Borro (Lend, Redeem, PostCollateral, WithdrawCollateral, Borrow: Repay is the USDG vault's). A vault of a launched
+ * token: Transfer, Swap, ClaimDividend and its withdrawal lock.
+ */
+const PAIR_VAULT_ACTIONS: readonly number[] = [
+  VAULT_ACTION.TRANSFER,
+  VAULT_ACTION.SWAP,
+  VAULT_ACTION.CONFIGURE_POOL,
+  VAULT_ACTION.CLAIM_DIVIDEND,
+  VAULT_ACTION.SET_PROFILE,
+  VAULT_ACTION.SET_TOKEN_METADATA,
+  VAULT_ACTION.SET_WITHDRAWAL_LOCK,
+  VAULT_ACTION.CANCEL_PENDING_CHANGES,
+  VAULT_ACTION.SET_LINKED_VAULT,
+  VAULT_ACTION.LEND,
+  VAULT_ACTION.REDEEM,
+  VAULT_ACTION.POST_COLLATERAL,
+  VAULT_ACTION.WITHDRAW_COLLATERAL,
+  VAULT_ACTION.BORROW,
+  VAULT_ACTION.APPROVE_HASH,
+];
+const LAUNCHED_VAULT_ACTIONS: readonly number[] = [
+  VAULT_ACTION.TRANSFER,
+  VAULT_ACTION.SWAP,
+  VAULT_ACTION.CLAIM_DIVIDEND,
+  VAULT_ACTION.SET_WITHDRAWAL_LOCK,
+  VAULT_ACTION.CANCEL_PENDING_CHANGES,
+];
+
 const POOL_FNS = new Set(["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]);
-const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw"]);
+const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw", "finishRecovery"]);
 
 export class RelayerGate {
   readonly #o: GateOptions;
@@ -462,6 +536,12 @@ export class RelayerGate {
       const problem = await this.#createProblem(classified.ix);
       if (problem !== null) return problem;
     }
+    if (classified.kind === "finish_recovery") {
+      const v = await readVault(this.#o.client, this.#o.deployment, classified.ix.vault);
+      if (v === null) return json(400, { error: "not_a_vault", message: `${classified.ix.vault} is not an Ostra vault` });
+      // In another token: an ordinary request, paid by a payer vault (the policy checks it).
+      if (v.token !== this.#o.merchant.token) classified = { kind: "other", vaults: [classified.ix.vault] };
+    }
     let openProblem: string | null = null;
     if (classified.kind === "open_relayer_channel") openProblem = await this.#termsProblem(classified.ix);
 
@@ -508,6 +588,10 @@ export class RelayerGate {
         const ix = classified.ix;
         return await this.#serialized("debts", () => this.#openRelayerChannel(tx, ix, quote));
       }
+      if (classified.kind === "finish_recovery") {
+        const vault = classified.ix.vault;
+        return await this.#serialized("debts", () => this.#finishRecovery(tx, vault, quote));
+      }
       return await this.#paid(tx, classified.vaults, quote, input, request.payer, swaps);
     } catch (err) {
       if (err instanceof LedgerRefusal) return json(403, { error: err.code, message: err.message });
@@ -519,6 +603,9 @@ export class RelayerGate {
   #refusedUpfront(classified: Classified, ip: string, leafVault: Address | null, openProblem: string | null): Answer | null {
     const view = this.#o.ledger.view();
     if (classified.kind === "spend_leaf") return this.#openUnpaid(view.opens[leafVault as Address], leafVault as Address);
+    // Not refused for an open of the vault left unpaid: the old seed's (a thief's, or a device lost) can never be
+    // paid by the new one, whose recovery this finishes (#finishRecovery takes the open over as a debt).
+    if (classified.kind === "finish_recovery") return null;
     // The vault an unshield creates owes nothing yet; its token and destination were checked (#unshieldProblem).
     if (classified.kind === "unshield_vault") return null;
     if (classified.kind === "create_vault") {
@@ -600,7 +687,7 @@ export class RelayerGate {
     const token = this.#o.merchant.token;
     const wethOrLaunched = async (t: Address): Promise<"weth" | "pair" | "launched" | null> => {
       if (t === WETH) return "weth";
-      if (LISTED_PAIR_TOKENS.has(t)) return "pair";
+      if (LISTED_PAIR_TOKENS.has(t) || BORRO_ONLY_STOCKS.has(t)) return "pair";
       if (l === undefined) return null;
       const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [t] })) as Hex;
       return BigInt(id) === 0n ? null : "launched";
@@ -681,12 +768,11 @@ export class RelayerGate {
       const kind = await wethOrLaunched(v.token);
       if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched`;
       if (request.payer === null) return `calls[${i}]: a vault in ${v.token} is paid for by a payer vault in ${token}`;
-      const allowed: readonly number[] =
-        kind === "weth" || kind === "pair"
-          ? [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CONFIGURE_POOL, VAULT_ACTION.CLAIM_DIVIDEND, VAULT_ACTION.SET_PROFILE, VAULT_ACTION.SET_TOKEN_METADATA]
-          : [VAULT_ACTION.TRANSFER, VAULT_ACTION.SWAP, VAULT_ACTION.CLAIM_DIVIDEND];
+      // finishRecovery: anyone may finish a recovery past its delay (under the withdrawal lock it comes before the new key's first spend).
+      if (c.fn === "finishRecovery") continue;
+      const allowed: readonly number[] = kind === "weth" || kind === "pair" ? PAIR_VAULT_ACTIONS : LAUNCHED_VAULT_ACTIONS;
       if (c.fn !== "spend" || !allowed.includes(c.action)) {
-        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "launched" ? "Transfer, Swap and ClaimDividend" : "Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile and SetTokenMetadata"}`;
+        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "launched" ? "Transfer, Swap, ClaimDividend and its withdrawal lock" : "Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile, SetTokenMetadata, its withdrawal lock and link, and Borro (Lend, Redeem, collateral and Borrow)"}`;
       }
       if (kind === "launched" && c.action === VAULT_ACTION.CLAIM_DIVIDEND && l !== undefined) {
         const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [v.token] })) as Hex;
@@ -840,6 +926,30 @@ export class RelayerGate {
     const unpaid = this.#openUnpaid(this.#o.ledger.view().opens[vault], vault);
     if (unpaid !== null) return unpaid;
     return this.#relayAsDebt(tx, vault, quote, "leaf_spent_on_credit");
+  }
+
+  /**
+   * finishRecovery alone of a vault in the relayer's token: the vault owes it. An open to the relayer of the vault
+   * left unpaid was signed by the key the recovery replaces, and only that key's voucher could pay it: once the
+   * recovery is finished, what it owes (the open and the debt it carried) becomes the vault's debt, which the first
+   * voucher of a channel the new key opens pays.
+   */
+  async #finishRecovery(tx: RelayTx, vault: Address, quote: Quote): Promise<Answer> {
+    const open = this.#o.ledger.view().opens[vault];
+    const answer = await this.#relayAsDebt(tx, vault, quote, "recovery_finished_on_credit");
+    if (answer.status !== 200 || open === undefined) return answer;
+    await this.#o.ledger.update((data) => {
+      const now = data.opens[vault];
+      if (now === undefined || now.hash !== open.hash) return;
+      const d = data.debts[vault];
+      // The open's amount already carries the debt the vault had then; this finishRecovery comes on top.
+      const owed = BigInt(now.amount) + BigInt(quote.amount);
+      const had = BigInt(d?.amount ?? "0");
+      data.debts[vault] = { amount: (owed > had ? owed : had).toString(), txs: [...(d?.txs ?? []), now.hash] };
+      delete data.opens[vault];
+    });
+    this.#o.log("unpaid_open_taken_over", { vault, channel: open.channel, open: open.hash, amount: open.amount });
+    return answer;
   }
 
   /** createVault and spendLeaf into it (unshield): the new vault owes both. */

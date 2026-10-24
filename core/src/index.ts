@@ -4,6 +4,7 @@
 
 export * from "./ai.ts";
 export * from "./amount.ts";
+export * from "./borro.ts";
 export * from "./chain.ts";
 export * from "./channels.ts";
 export * from "./config.ts";

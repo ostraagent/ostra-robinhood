@@ -21,12 +21,13 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
-import { assertRobinhoodChain, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, WETH, assertRobinhoodChain, borroStocks, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
 import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
 import type { Prover } from "@ostraagent/swap";
 import {
   AiService,
+  BorroService,
   ChannelService,
   LaunchpadService,
   LocalSender,
@@ -113,6 +114,8 @@ export class Agent {
   /** Ostra Swap from the agent's vaults, and its private notes (null without OSTRA_SWAP_DEPLOYMENT). */
   readonly swap: SwapService | null;
   readonly privateBalance: PrivateBalanceService | null;
+  /** Borro from the agent's vaults, and the version 3 withdrawal lock, link and EIP-1271 approvals. */
+  readonly borro: BorroService;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -153,6 +156,7 @@ export class Agent {
     this.shield = new ShieldService(client, config, keys, this.buyer, this.sender);
     this.creatorShield = new ShieldService(client, config, keys, this.creator, creatorSender);
     this.unshield = new UnshieldService(client, config, keys, this.shield, (index) => this.privateVault(index));
+    this.borro = new BorroService({ client, config, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), sender: this.sender, ownVaults: () => this.ownVaults() });
     if (config.swap === null) {
       this.swap = null;
       this.privateBalance = null;
@@ -190,6 +194,26 @@ export class Agent {
       this.#tokenVaults.set(t, v);
     }
     return v;
+  }
+
+  /**
+   * Every vault of this seed known here: the buyer, creator and seller vaults, the vault of each pair's token and each
+   * pair's creator vault, and the private vaults. A withdrawal address is never one of them.
+   */
+  async ownVaults(): Promise<Address[]> {
+    const out: Address[] = [await this.buyer.vaultAddress(), await this.creator.vaultAddress()];
+    // The seller vault's address needs its crank (accept_payments sets it).
+    const seller = await this.seller.vaultAddress().catch(() => null);
+    if (seller !== null) out.push(seller);
+    for (const p of LAUNCH_PAIRS) {
+      if (p.kind === "usdg") continue;
+      out.push(await this.vaultFor(p.kind === "eth" ? WETH : p.address).vaultAddress());
+      if (this.launchpad !== null) out.push(await (await this.launchpad.pairCreator(p.symbol)).vault.vaultAddress());
+    }
+    for (const b of borroStocks()) out.push(await this.vaultFor(b.token).vaultAddress());
+    for (const v of await this.unshield.vaults()) out.push(v.vault);
+    if (this.privateBalance !== null) for (const v of await this.privateBalance.privateVaults()) out.push(v.vault);
+    return [...new Set(out.map((a) => getAddress(a)))];
   }
 
   static async open(config: McpConfig, log: Log): Promise<Agent> {

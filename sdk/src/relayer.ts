@@ -80,9 +80,21 @@ import {
   ostraTokenAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
+  ostraVaultModuleAbi,
   ostraVestingAbi,
 } from "./abi.ts";
-import { ARBITRUM_NODE_INTERFACE, CHAINLINK_ETH_USD, CHAINLINK_ETH_USD_DECIMALS, LAUNCHPAD, MULTICALL3, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE } from "./constants.ts";
+import {
+  ARBITRUM_NODE_INTERFACE,
+  CHAINLINK_ETH_USD,
+  CHAINLINK_ETH_USD_DECIMALS,
+  LAUNCHPAD,
+  MULTICALL3,
+  VAULT_ACTION,
+  VAULT_GUARD_MIN_GAS,
+  VAULT_MORPHO_MIN_GAS,
+  VAULT_SWAP_GAS,
+  VAULT_SWAP_GAS_RESERVE,
+} from "./constants.ts";
 import type { Deployment } from "./deployment.ts";
 import { decodeSwapParams } from "./messages.ts";
 import { chainlinkAggregatorAbi, multicall3Abi, nodeInterfaceAbi } from "./external-abi.ts";
@@ -398,7 +410,29 @@ export function swapGasOf(tx: { to: Address; data: Hex }): bigint[] {
  * (relayGasCap) stays within what the transaction was priced at.
  */
 export function reservedSwapGas(tx: { to: Address; data: Hex }): bigint {
-  return swapGasOf(tx).reduce((a, g) => a + g + g / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE), 0n);
+  const swaps = swapGasOf(tx).reduce((a, g) => a + g + g / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE), 0n);
+  return swaps + floorGasOf(tx).reduce((a, g) => a + g, 0n);
+}
+
+/**
+ * The gas floor each vault spend of `tx` needs left when its call starts (version 3): a Morpho spend (17 to 22)
+ * VAULT_MORPHO_MIN_GAS, a Guard or SupportRecovery spend VAULT_GUARD_MIN_GAS; with less the spend reverts. Added to
+ * what the transaction is priced at (reservedSwapGas), so the gas limit cap leaves room for it.
+ */
+export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
+  const out: bigint[] = [];
+  for (const c of relayedCalls(tx)) {
+    if (c.data.slice(0, 10).toLowerCase() !== SPEND_SELECTOR) continue;
+    let action: number;
+    try {
+      action = Number((decodeFunctionData({ abi: ostraVaultAbi, data: c.data }).args as readonly unknown[])[0]);
+    } catch {
+      continue;
+    }
+    if (action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY) out.push(BigInt(VAULT_MORPHO_MIN_GAS));
+    else if (action === VAULT_ACTION.GUARD || action === VAULT_ACTION.SUPPORT_RECOVERY) out.push(BigInt(VAULT_GUARD_MIN_GAS));
+  }
+  return out;
 }
 
 /** The selector of OstraRouter.executeEscrow(Order, address, Leg, Leg) (ostra-swap src/OstraRouter.sol; checked against its ABI by the relayer's tests). */
@@ -559,6 +593,52 @@ export function failedSwaps(logs: readonly Log[], vaults: readonly Address[]): F
     out.push({ vault: getAddress(log.address), poolId: args.poolId, reason: args.reason });
   }
   return out;
+}
+
+/** A vault's version 3 spend that failed and moved nothing (OstraVaultModule's MorphoFailed, or Guarded with ok false). */
+export type FailedModuleSpend = { vault: Address; kind: "morpho" | "guard"; action: number; reason: Hex };
+
+const MORPHO_FAILED_TOPIC = toEventSelector(
+  ostraVaultModuleAbi.find((x) => x.type === "event" && x.name === "MorphoFailed") as Parameters<typeof toEventSelector>[0],
+);
+const GUARDED_TOPIC = toEventSelector(ostraVaultModuleAbi.find((x) => x.type === "event" && x.name === "Guarded") as Parameters<typeof toEventSelector>[0]);
+
+/**
+ * The Morpho, Guard and SupportRecovery spends among `logs` that failed, by the emitting vault (the module's events
+ * are a vault's, through delegatecall). Only events of addresses in `vaults` count.
+ */
+export function failedModuleSpends(logs: readonly Log[], vaults: readonly Address[]): FailedModuleSpend[] {
+  const ours = new Set(vaults.map((v) => getAddress(v)));
+  const out: FailedModuleSpend[] = [];
+  for (const log of logs) {
+    const topic = log.topics[0]?.toLowerCase();
+    if (!ours.has(getAddress(log.address))) continue;
+    if (topic === MORPHO_FAILED_TOPIC.toLowerCase()) {
+      const e = decodeEventLog({ abi: ostraVaultModuleAbi, eventName: "MorphoFailed", topics: log.topics as [Hex, ...Hex[]], data: log.data });
+      const args = e.args as { action: number; reason: Hex };
+      out.push({ vault: getAddress(log.address), kind: "morpho", action: Number(args.action), reason: args.reason });
+    } else if (topic === GUARDED_TOPIC.toLowerCase()) {
+      const e = decodeEventLog({ abi: ostraVaultModuleAbi, eventName: "Guarded", topics: log.topics as [Hex, ...Hex[]], data: log.data });
+      const args = e.args as { op: number; ok: boolean; reason: Hex };
+      if (!args.ok) out.push({ vault: getAddress(log.address), kind: "guard", action: Number(args.op), reason: args.reason });
+    }
+  }
+  return out;
+}
+
+/** The errors of OstraVault and OstraVaultModule by selector, and the two of Solidity itself. */
+const VAULT_ERROR_NAMES = new Map<string, string>();
+for (const item of [...ostraVaultAbi, ...ostraVaultModuleAbi] as readonly { type: string; name?: string; inputs?: readonly { type: string }[] }[]) {
+  if (item.type !== "error" || item.name === undefined) continue;
+  VAULT_ERROR_NAMES.set(toFunctionSelector(`${item.name}(${(item.inputs ?? []).map((i) => i.type).join(",")})`).toLowerCase(), item.name);
+}
+VAULT_ERROR_NAMES.set("0x08c379a0", "Error(string), a check of Morpho or of the Vault V2");
+VAULT_ERROR_NAMES.set("0x4e487b71", "Panic");
+
+/** The reason a failed version 3 spend carries (FailedModuleSpend.reason, the revert's first 4 bytes), readable. */
+export function moduleFailureText(reason: Hex): string {
+  if (reason === "0x" || /^0x0{8}$/.test(reason)) return "a revert without a reason (out of gas, or a call to code that is not there)";
+  return VAULT_ERROR_NAMES.get(reason.slice(0, 10).toLowerCase()) ?? `a revert with ${reason.slice(0, 10)}`;
 }
 
 /**

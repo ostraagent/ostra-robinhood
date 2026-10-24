@@ -1,9 +1,12 @@
 // Deploys Ostra's contracts from the Foundry build (Node only; exported by
 // the SDK's Node entry). One path for the fork tests and for mainnet:
-//   1. OstraRegistry (profiles and token metadata; no owner), then the
-//      OstraVault implementation (bound to x402BatchSettlement, the Uniswap v4
-//      PoolManager, OstraRegistry and the ERC-8004 Identity Registry), its
-//      UpgradeableBeacon, and OstraVaultFactory on that beacon;
+//   1. OstraRegistry (profiles and token metadata; no owner), then
+//      OstraVaultModule (naming the factory about to be made, Morpho Blue,
+//      Morpho's VaultV2Factory, BorroBuilders, BorroRouter and Ostra's Borro
+//      code), the OstraVault implementation (bound to x402BatchSettlement, the
+//      Uniswap v4 PoolManager, OstraRegistry, the ERC-8004 Identity Registry
+//      and the module), its UpgradeableBeacon, and OstraVaultFactory on that
+//      beacon;
 //   2. OstraPool implementation, its UpgradeableBeacon, and the pool as a
 //      BeaconProxy initialized for USDG with the decided fee and limits;
 //   3. OstraSplitFactory.
@@ -37,10 +40,17 @@ import {
   ostraSplitFactoryAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
+  ostraVaultModuleAbi,
   upgradeableBeaconAbi,
 } from "./abi.ts";
 import {
+  BORRO_BUILDERS,
+  BORRO_CODE,
+  BORRO_ROUTER,
   CREATE2_DEPLOYER,
+  MORPHO_BLUE,
+  MORPHO_VAULT_V2_FACTORY,
+  VAULT_V3,
   ERC8004_IDENTITY_REGISTRY,
   LAUNCHPAD,
   POOL_FEE_BPS,
@@ -105,11 +115,25 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
   };
 
   const registry = await deploy("OstraRegistry", ostraRegistryAbi, creationCode(o.outDir, "OstraRegistry.sol", "OstraRegistry"), []);
+  // The module names the factory, which is made three transactions later (module, implementation, beacon, factory).
+  const nonce = await o.publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+  const predictedFactory = getContractAddress({ from: account.address, nonce: BigInt(nonce + 3) });
+  const vaultModule = await deploy("OstraVaultModule", ostraVaultModuleAbi, creationCode(o.outDir, "OstraVaultModule.sol", "OstraVaultModule"), [
+    predictedFactory,
+    MORPHO_BLUE,
+    MORPHO_VAULT_V2_FACTORY,
+    BORRO_BUILDERS,
+    BORRO_ROUTER,
+    BORRO_CODE,
+  ]);
   const vaultImplementation = await deploy("OstraVault", ostraVaultAbi, creationCode(o.outDir, "OstraVault.sol", "OstraVault"), [
-    X402_BATCH_SETTLEMENT,
-    UNISWAP_V4_POOL_MANAGER,
-    registry,
-    ERC8004_IDENTITY_REGISTRY,
+    {
+      batchSettlement: X402_BATCH_SETTLEMENT,
+      poolManager: UNISWAP_V4_POOL_MANAGER,
+      registry,
+      identityRegistry: ERC8004_IDENTITY_REGISTRY,
+      module: vaultModule,
+    },
   ]);
   expect("vault implementation BATCH_SETTLEMENT", await read(vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), X402_BATCH_SETTLEMENT);
   expect("vault implementation POOL_MANAGER", await read(vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
@@ -118,6 +142,7 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     o.beaconOwner,
   ]);
   const vaultFactory = await deploy("OstraVaultFactory", ostraVaultFactoryAbi, creationCode(o.outDir, "OstraVaultFactory.sol", "OstraVaultFactory"), [vaultBeacon]);
+  expect("vault factory address (the module's FACTORY)", vaultFactory, predictedFactory);
 
   const poolImplementation = await deploy("OstraPool", ostraPoolAbi, creationCode(o.outDir, "OstraPool.sol", "OstraPool"), []);
   const poolBeacon = await deploy("OstraPool beacon", upgradeableBeaconAbi, creationCode(o.outDir, "UpgradeableBeacon.sol", "UpgradeableBeacon"), [
@@ -147,6 +172,7 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     beaconOwner: getAddress(o.beaconOwner),
     fromBlock: (fromBlock ?? 0n).toString(),
     registry,
+    vaultModule,
   };
   await checkDeployment(o.publicClient, d, { treasury: o.treasury, poolAuthority: o.poolAuthority });
   return d;
@@ -167,11 +193,13 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
   same("vault implementation pool manager", await read(d.vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
   // A record without a registry is one whose vaults still run version 1 (no REGISTRY to read).
   if (d.registry !== undefined) {
-    same("vault implementation version", await read(d.vaultImplementation, ostraVaultAbi, "VERSION"), VAULT_VERSION);
+    // A record with a module is one whose vaults run version 3; without, version 2.
+    same("vault implementation version", await read(d.vaultImplementation, ostraVaultAbi, "VERSION"), d.vaultModule !== undefined ? VAULT_V3 : VAULT_VERSION);
     same("vault implementation registry", await read(d.vaultImplementation, ostraVaultAbi, "REGISTRY"), d.registry);
     same("vault implementation identity registry", await read(d.vaultImplementation, ostraVaultAbi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
     same("registry URI limit", await read(d.registry, ostraRegistryAbi, "MAX_URI_LENGTH"), VAULT_MAX_URI_LENGTH);
   }
+  if (d.vaultModule !== undefined) await checkVaultModule(client, d.vaultImplementation, d.vaultModule, d.vaultFactory);
   same("pool beacon implementation", await read(d.poolBeacon, upgradeableBeaconAbi, "implementation"), d.poolImplementation);
   same("pool beacon owner", await read(d.poolBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
   same("pool token", await read(d.pool, ostraPoolAbi, "token"), d.token);
@@ -189,6 +217,22 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
     const code = await client.getCode({ address });
     if (code === undefined || code === "0x") throw new Error(`deployment check: no code at the ${name} ${address}`);
   }
+}
+
+/** Checks that `implementation` runs its version 3 spends in `module`, and that the module is bound to `factory` and to Morpho and Borro. */
+export async function checkVaultModule(client: PublicClient, implementation: Address, module: Address, factory: Address): Promise<void> {
+  const read = <T>(address: Address, abi: Abi, functionName: string) => client.readContract({ address, abi, functionName }) as Promise<T>;
+  const same = (what: string, got: unknown, want: unknown) => {
+    const norm = (x: unknown) => (typeof x === "string" ? x.toLowerCase() : x);
+    if (norm(got) !== norm(want)) throw new Error(`deployment check: ${what} is ${String(got)}, expected ${String(want)}`);
+  };
+  same("vault implementation module", await read(implementation, ostraVaultAbi, "MODULE"), module);
+  same("vault module factory", await read(module, ostraVaultModuleAbi, "FACTORY"), factory);
+  same("vault module Morpho", await read(module, ostraVaultModuleAbi, "MORPHO"), MORPHO_BLUE);
+  same("vault module VaultV2Factory", await read(module, ostraVaultModuleAbi, "VAULT_V2_FACTORY"), MORPHO_VAULT_V2_FACTORY);
+  same("vault module BorroBuilders", await read(module, ostraVaultModuleAbi, "BORRO_BUILDERS"), BORRO_BUILDERS);
+  same("vault module BorroRouter", await read(module, ostraVaultModuleAbi, "BORRO_ROUTER"), BORRO_ROUTER);
+  same("vault module Borro code", await read(module, ostraVaultModuleAbi, "BORRO_CODE"), BORRO_CODE);
 }
 
 /** The salt and address of OstraHook through the deterministic deployer: the first salt whose address carries the hook's permission bits. */

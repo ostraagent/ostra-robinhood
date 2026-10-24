@@ -44,7 +44,7 @@ export const CREATE_VAULTS_PER_IP = 3;
  */
 export const QUOTE_RETENTION_MS = 300_000;
 
-export type QuoteKind = "create_vault" | "open_relayer_channel" | "spend_leaf" | "unshield_vault" | "other";
+export type QuoteKind = "create_vault" | "open_relayer_channel" | "spend_leaf" | "unshield_vault" | "finish_recovery" | "other";
 
 export type Quote = {
   /** Price in base units of the token, margin included. */
