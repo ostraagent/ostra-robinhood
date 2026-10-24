@@ -24,6 +24,8 @@ export type Deployment = {
   registry?: Address;
   /** OstraVaultModule, which version 3 vaults run their version 3 spends in; absent while the vaults run version 2. */
   vaultModule?: Address;
+  /** OstraBreaker (Strategy 3), which serves version 3 vaults; absent before it was deployed. */
+  breaker?: Address;
   /** The launchpad (deployLaunchpad), when it is deployed. */
   launchpad?: LaunchpadDeployment;
 };
@@ -80,6 +82,11 @@ export function parseDeployment(value: unknown): Deployment {
     if (typeof v.vaultModule !== "string" || !isAddress(v.vaultModule, { strict: false })) throw new Error("deployment vaultModule is not an address");
     if (v.registry === undefined) throw new Error("a deployment with a vaultModule has a registry");
     out.vaultModule = getAddress(v.vaultModule);
+  }
+  if (v.breaker !== undefined) {
+    if (typeof v.breaker !== "string" || !isAddress(v.breaker, { strict: false })) throw new Error("deployment breaker is not an address");
+    if (v.vaultModule === undefined) throw new Error("a deployment with a breaker has a vaultModule");
+    out.breaker = getAddress(v.breaker);
   }
   if (v.launchpad !== undefined) {
     if (typeof v.launchpad !== "object" || v.launchpad === null) throw new Error("deployment launchpad must be an object");

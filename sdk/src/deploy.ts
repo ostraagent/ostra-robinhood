@@ -16,6 +16,9 @@
 // 72-hour delay. Every step is checked on chain before
 // the next one, and the result is checked again as a whole.
 //
+// deployBreaker adds OstraBreaker (Strategy 3) next to a deployment whose vaults run version 3: no owner, bound to the
+// vault factory, Morpho's VaultV2Factory, Morpho Blue and MorphoMarketV1AdapterV2Factory.
+//
 // deployLaunchpad adds the launchpad (src/launchpad/): OstraFees, OstraHook at
 // a CREATE2 address mined through the deterministic deployer for its
 // permission bits (LAUNCHPAD.HOOK_FLAGS), OstraLaunchpad, OstraCreatorSplit,
@@ -28,6 +31,7 @@ import { readFileSync } from "node:fs";
 import { concat, encodeDeployData, encodeFunctionData, getAddress, getContractAddress, keccak256, numberToHex, type Abi, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 import {
   beaconProxyAbi,
+  ostraBreakerAbi,
   ostraAirdropAbi,
   ostraCreatorSplitAbi,
   ostraDevBuyAbi,
@@ -49,6 +53,7 @@ import {
   BORRO_ROUTER,
   CREATE2_DEPLOYER,
   MORPHO_BLUE,
+  MORPHO_MARKET_V1_ADAPTER_V2_FACTORY,
   MORPHO_VAULT_V2_FACTORY,
   VAULT_V3,
   ERC8004_IDENTITY_REGISTRY,
@@ -200,6 +205,7 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
     same("registry URI limit", await read(d.registry, ostraRegistryAbi, "MAX_URI_LENGTH"), VAULT_MAX_URI_LENGTH);
   }
   if (d.vaultModule !== undefined) await checkVaultModule(client, d.vaultImplementation, d.vaultModule, d.vaultFactory);
+  if (d.breaker !== undefined) await checkBreaker(client, d.breaker, d.vaultFactory);
   same("pool beacon implementation", await read(d.poolBeacon, upgradeableBeaconAbi, "implementation"), d.poolImplementation);
   same("pool beacon owner", await read(d.poolBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
   same("pool token", await read(d.pool, ostraPoolAbi, "token"), d.token);
@@ -233,6 +239,67 @@ export async function checkVaultModule(client: PublicClient, implementation: Add
   same("vault module BorroBuilders", await read(module, ostraVaultModuleAbi, "BORRO_BUILDERS"), BORRO_BUILDERS);
   same("vault module BorroRouter", await read(module, ostraVaultModuleAbi, "BORRO_ROUTER"), BORRO_ROUTER);
   same("vault module Borro code", await read(module, ostraVaultModuleAbi, "BORRO_CODE"), BORRO_CODE);
+}
+
+/** Deploys OstraBreaker next to `d` (whose vaults run version 3) and checks it; returns `d` with its `breaker`. */
+export async function deployBreaker(o: DeployLaunchpadOptions, d: Deployment): Promise<Deployment> {
+  const account = o.walletClient.account;
+  if (account === undefined) throw new Error("the wallet client has no account");
+  const chainId = await o.publicClient.getChainId();
+  if (chainId !== ROBINHOOD_CHAIN_ID || d.chainId !== chainId) throw new Error(`refusing to deploy on chain ${chainId}: Ostra runs on Robinhood Chain (${ROBINHOOD_CHAIN_ID})`);
+  if (d.vaultModule === undefined) throw new Error("this deployment's vaults do not run version 3: OstraBreaker needs their guard op 3");
+  if (d.breaker !== undefined) throw new Error(`this deployment has OstraBreaker already, at ${d.breaker}`);
+  const log = o.log ?? (() => undefined);
+  const hash = await o.walletClient.deployContract({
+    abi: ostraBreakerAbi,
+    bytecode: creationCode(o.outDir, "OstraBreaker.sol", "OstraBreaker"),
+    args: [d.vaultFactory, MORPHO_VAULT_V2_FACTORY, MORPHO_BLUE, MORPHO_MARKET_V1_ADAPTER_V2_FACTORY],
+    account,
+    chain: o.walletClient.chain ?? null,
+  });
+  const receipt = await o.publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success" || receipt.contractAddress === null || receipt.contractAddress === undefined) throw new Error(`OstraBreaker: deployment ${hash} failed`);
+  const breaker = getAddress(receipt.contractAddress);
+  log("deployed", { name: "OstraBreaker", address: breaker, tx: hash, gasUsed: receipt.gasUsed });
+  await checkBreaker(o.publicClient, breaker, d.vaultFactory);
+  await checkBreakerCode(o.publicClient, breaker, o.outDir);
+  return { ...d, breaker };
+}
+
+/**
+ * Checks that the code at `breaker` is this build's OstraBreaker (the Foundry build in `outDir`), byte for byte but
+ * for its immutables, which checkBreaker reads: an older build of it, bound to the same contracts, is refused. Every
+ * place an immutable is used must hold the same value, the one its getter returns.
+ */
+export async function checkBreakerCode(client: PublicClient, breaker: Address, outDir: string): Promise<void> {
+  const artifact = JSON.parse(readFileSync(`${outDir}/OstraBreaker.sol/OstraBreaker.json`, "utf8")) as {
+    deployedBytecode: { object: string; immutableReferences?: Record<string, { start: number; length: number }[]> };
+  };
+  const want = artifact.deployedBytecode.object.toLowerCase();
+  if (!/^0x[0-9a-f]+$/.test(want)) throw new Error("OstraBreaker.sol/OstraBreaker: no runtime code in the build");
+  const code = await client.getCode({ address: breaker });
+  if (code === undefined || code.length !== want.length) throw new Error(`deployment check: the code at ${breaker} is not this build's OstraBreaker`);
+  const hex = code.toLowerCase().slice(2);
+  const got = [...hex];
+  for (const [id, refs] of Object.entries(artifact.deployedBytecode.immutableReferences ?? {})) {
+    const values = new Set(refs.map(({ start, length }) => hex.slice(2 * start, 2 * (start + length))));
+    if (values.size !== 1) throw new Error(`deployment check: the code at ${breaker} uses immutable ${id} with different values`);
+    for (const { start, length } of refs) got.fill("0", 2 * start, 2 * (start + length));
+  }
+  if (`0x${got.join("")}` !== want) throw new Error(`deployment check: the code at ${breaker} is not this build's OstraBreaker`);
+}
+
+/** Checks that `breaker` is OstraBreaker bound to `factory`, Morpho's VaultV2Factory, Morpho Blue and the market adapter factory. */
+export async function checkBreaker(client: PublicClient, breaker: Address, factory: Address): Promise<void> {
+  const read = <T>(functionName: string) => client.readContract({ address: breaker, abi: ostraBreakerAbi as Abi, functionName }) as Promise<T>;
+  const same = (what: string, got: unknown, want: unknown) => {
+    const norm = (x: unknown) => (typeof x === "string" ? x.toLowerCase() : x);
+    if (norm(got) !== norm(want)) throw new Error(`deployment check: ${what} is ${String(got)}, expected ${String(want)}`);
+  };
+  same("breaker factory", await read("FACTORY"), factory);
+  same("breaker VaultV2Factory", await read("VAULT_V2_FACTORY"), MORPHO_VAULT_V2_FACTORY);
+  same("breaker Morpho", await read("MORPHO"), MORPHO_BLUE);
+  same("breaker adapter factory", await read("ADAPTER_FACTORY"), MORPHO_MARKET_V1_ADAPTER_V2_FACTORY);
 }
 
 /** The salt and address of OstraHook through the deterministic deployer: the first salt whose address carries the hook's permission bits. */

@@ -51,7 +51,7 @@ export type Fork = {
   stop: () => Promise<void>;
 };
 
-async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
+export async function rpc(url: string, method: string, params: unknown[]): Promise<unknown> {
   const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
   const body = (await res.json()) as { result?: unknown; error?: { message: string } };
   if (body.error !== undefined) throw new Error(`${method}: ${body.error.message}`);

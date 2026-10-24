@@ -2707,6 +2707,765 @@ export const ostraVaultModuleAbi = [
   }
 ] as const;
 
+/** OstraBreaker (src/OstraBreaker.sol). */
+export const ostraBreakerAbi = [
+  {
+    "type": "constructor",
+    "inputs": [
+      {
+        "name": "factory",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "vaultV2Factory",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "morpho",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "adapterFactory",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "ADAPTER_FACTORY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IMarketAdapterFactory"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "ASSETS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "BPS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "FACTORY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IOstraVaultFactory"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "LIQUIDITY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_LIQUIDITY_BPS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MORPHO",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IMorphoBlue"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "PRICE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "PRICE_SCALE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "UTILIZATION",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "VAULT_V2_FACTORY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IVaultV2Factory"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "check",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "s",
+        "type": "tuple",
+        "internalType": "struct OstraBreaker.State",
+        "components": [
+          {
+            "name": "price",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "priceMark",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "totalAssets",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "assetsMark",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "utilizationBps",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "hasLiquidityMarket",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "payout",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "shares",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "position",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "vaultTouched",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "marketTouched",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "fromSnapshot",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "reasons",
+            "type": "uint8",
+            "internalType": "uint8"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "configure",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "limits",
+        "type": "tuple",
+        "internalType": "struct OstraBreaker.Limits",
+        "components": [
+          {
+            "name": "priceDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "assetsDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "minLiquidityBps",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "assetsMarkCap",
+            "type": "uint128",
+            "internalType": "uint128"
+          }
+        ]
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "limitsHash",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "limits",
+        "type": "tuple",
+        "internalType": "struct OstraBreaker.Limits",
+        "components": [
+          {
+            "name": "priceDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "assetsDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "minLiquidityBps",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "assetsMarkCap",
+            "type": "uint128",
+            "internalType": "uint128"
+          }
+        ]
+      },
+      {
+        "name": "nonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "nonces",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "poke",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "priceMark",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "snapshotOf",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct OstraBreaker.Snapshot",
+        "components": [
+          {
+            "name": "at",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "hasLiquidityMarket",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "utilizationBps",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "totalAssets",
+            "type": "uint128",
+            "internalType": "uint128"
+          },
+          {
+            "name": "payout",
+            "type": "uint128",
+            "internalType": "uint128"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "trip",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "reasons",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "shares",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "watchOf",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct OstraBreaker.Watch",
+        "components": [
+          {
+            "name": "limits",
+            "type": "tuple",
+            "internalType": "struct OstraBreaker.Limits",
+            "components": [
+              {
+                "name": "priceDropBps",
+                "type": "uint16",
+                "internalType": "uint16"
+              },
+              {
+                "name": "assetsDropBps",
+                "type": "uint16",
+                "internalType": "uint16"
+              },
+              {
+                "name": "maxUtilizationBps",
+                "type": "uint16",
+                "internalType": "uint16"
+              },
+              {
+                "name": "minLiquidityBps",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "assetsMarkCap",
+                "type": "uint128",
+                "internalType": "uint128"
+              }
+            ]
+          },
+          {
+            "name": "assetsMark",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "PriceMarked",
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "price",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Tripped",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "reasons",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "shares",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "by",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Unwatched",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "nonce",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "Watched",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "target",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "limits",
+        "type": "tuple",
+        "indexed": false,
+        "internalType": "struct OstraBreaker.Limits",
+        "components": [
+          {
+            "name": "priceDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "assetsDropBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "maxUtilizationBps",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "minLiquidityBps",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "assetsMarkCap",
+            "type": "uint128",
+            "internalType": "uint128"
+          }
+        ]
+      },
+      {
+        "name": "assetsMark",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "nonce",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "BadLimits",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "BadTarget",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "Healthy",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotOstraVault",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotSigned",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotWatched",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NothingLent",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NothingPayable",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ReentrancyGuardReentrantCall",
+    "inputs": []
+  }
+] as const;
+
 /** OstraVaultFactory (src/OstraVaultFactory.sol). */
 export const ostraVaultFactoryAbi = [
   {

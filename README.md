@@ -169,6 +169,16 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   its key rotating. Without the owner seed and its passphrase no upgrade can ever be scheduled again:
   the beacons then stay as they are, as if renounced. `test/UpgradeOwner.fork.t.sol` hands the live
   beacons to it on the mainnet fork.
+- `src/OstraBreaker.sol`: an automatic way out of a Morpho Vault V2 for a vault (version 3) that
+  lends into one. The vault makes it a guardian, approves its limits for that Vault V2 with an
+  ApproveHash spend and turns its withdrawal lock on; then anyone may call `trip`, which redeems the
+  vault's shares back into the vault itself (guard op 3, never anywhere else) once a limit is crossed
+  on chain: the share price below its highest mark (a loss), the Vault V2's total below the total
+  signed with the limits (a run), its liquidity market too full, or too little payable now for the
+  position. The last three count only on state settled before the current second, so a flash loan
+  cannot cross them; the first trip of a second keeps what it read, so every watching vault can leave
+  in that second. It has no owner. `test/Breaker.fork.t.sol` trips it on the mainnet fork with real
+  borrowers, depositors and a curator's loss; `sdk/scripts/deploy-breaker.ts` deploys it.
 - `src/launchpad/`: the Ostra launchpad on the deployed Uniswap v4 PoolManager. `OstraLaunchpad`
   launches a fixed-supply `OstraToken` whose whole supply goes into single-sided tiers of one pool
   (the top tier open to the highest price), held forever by `OstraLocker`; `OstraHook`, the pools'
