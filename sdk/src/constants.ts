@@ -188,6 +188,10 @@ export const BORRO_CODE = "0x6f737472616167656e740000000000000000000000000000000
 export const BORRO_USDG_VAULT: Address = "0xF8e0ab443098c0738489B5BAFFbd32A1341F2289";
 /** Borro's Adaptive Curve IRM, every Borro USDG market's interest rate model. */
 export const BORRO_IRM: Address = "0x2BD3d5965B26B51814AC95127B2b80dD6CcC0fa1";
+/** Morpho's AdaptiveCurveIrm on Robinhood Chain (the same contract as BORRO_IRM): the IRM every MorphoMarketV1AdapterV2 market must use. */
+export const MORPHO_ADAPTIVE_CURVE_IRM: Address = BORRO_IRM;
+/** Morpho's MorphoMarketV1AdapterV2Factory (verified on Sourcify): isMorphoMarketV1AdapterV2 tells a Vault V2 market adapter from anything else. */
+export const MORPHO_MARKET_V1_ADAPTER_V2_FACTORY: Address = "0x79370Ed003CE325C088E530d5e8655c99c2993e1";
 /**
  * Borro's stock markets (its registry, 23 Oct 2026): the stock token, its Borro vault (a Morpho Vault V2 of the
  * stock, b<SYMBOL>), and the USDG market against that vault's shares (loan token USDG, collateral the vault, the
