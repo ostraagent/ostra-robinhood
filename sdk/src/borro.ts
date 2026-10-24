@@ -3,14 +3,16 @@
 //   * the debt of a position is Morpho's toAssetsUp (SharesMathLib, 1 virtual asset, 1e6 virtual shares);
 //   * what a Borrow may leave owed is half of what the market's LLTV allows at its oracle price
 //     (OstraVaultModule._checkLtv, MAX_LTV_OF_LLTV_BPS), rounded down.
-// Market totals are as stored on Morpho: the interest accrued since the market's last update is not in them (a
-// borrow, a repay or a collateral withdrawal accrues it first), so a debt read here can be a little lower than the
-// debt a spend then finds.
+// Market totals are the market accrued to the block read (morpho.ts readMorphoMarket: the AdaptiveCurveIrm and
+// Morpho's accrual, exact against the contracts), not the totals as stored: Morpho stores the interest only when the
+// market is touched, so stored totals leave a debt unchanged for as long as nobody interacts. Every read here is
+// taken at one block.
 
 import { getAddress, parseAbi, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import { ostraVaultAbi } from "./abi.ts";
 import { BORRO_IRM, BORRO_ROUTER, BORRO_STOCKS, BORRO_USDG_VAULT, MORPHO_BLUE, USDG, VAULT_MAX_LTV_OF_LLTV_BPS, VAULT_V3 } from "./constants.ts";
 import { marketId, type MarketParams, type WithdrawalLock } from "./messages.ts";
+import { blockTime, readMorphoMarket } from "./morpho.ts";
 
 /** What the reads call on Morpho Blue (morpho-blue src/interfaces/IMorpho.sol). */
 export const morphoBlueAbi = parseAbi([
@@ -133,31 +135,30 @@ export type BorroPosition = {
   available: bigint;
   borrowRatePerYear: bigint;
   listed: boolean;
+  /** The market's supply and borrows (USDG base units) and the time they are accrued to (unix seconds). */
+  supply: bigint;
+  borrowed: bigint;
+  at: bigint;
 };
 
 const SECONDS_PER_YEAR = 31_536_000n;
 
 export async function readBorroPosition(client: PublicClient, stockVault: Address, stock: BorroStock): Promise<BorroPosition> {
   const m = stock.market;
-  const [pos, mk, price, shares, listed] = await Promise.all([
-    client.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: "position", args: [stock.marketId, stockVault] }),
-    client.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: "market", args: [stock.marketId] }),
-    client.readContract({ address: m.oracle, abi: morphoOracleAbi, functionName: "price" }),
-    client.readContract({ address: stock.vault, abi: vaultV2Abi, functionName: "balanceOf", args: [stockVault] }),
-    client.readContract({ address: BORRO_ROUTER, abi: borroRouterAbi, functionName: "listed", args: [stock.marketId] }),
+  const at = await blockTime(client);
+  const blockNumber = at.blockNumber;
+  const [pos, market, price, shares, listed] = await Promise.all([
+    client.readContract({ address: MORPHO_BLUE, abi: morphoBlueAbi, functionName: "position", args: [stock.marketId, stockVault], blockNumber }),
+    readMorphoMarket(client, stock.marketId, at),
+    client.readContract({ address: m.oracle, abi: morphoOracleAbi, functionName: "price", blockNumber }),
+    client.readContract({ address: stock.vault, abi: vaultV2Abi, functionName: "balanceOf", args: [stockVault], blockNumber }),
+    client.readContract({ address: BORRO_ROUTER, abi: borroRouterAbi, functionName: "listed", args: [stock.marketId], blockNumber }),
   ]);
+  if (market.expected === null) throw new Error(`the ${stock.symbol} market ${stock.marketId} is not on the AdaptiveCurveIrm`);
   const [, borrowShares, collateral] = pos;
-  const [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee] = mk;
-  const [sharesValue, rate] = await Promise.all([
-    shares === 0n ? Promise.resolve(0n) : client.readContract({ address: stock.vault, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] }),
-    client.readContract({
-      address: m.irm,
-      abi: morphoIrmAbi,
-      functionName: "borrowRateView",
-      args: [m, { totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, lastUpdate, fee }],
-    }),
-  ]);
-  const debt = borrowShares === 0n ? 0n : toAssetsUp(BigInt(borrowShares), BigInt(totalBorrowAssets), BigInt(totalBorrowShares));
+  const e = market.expected;
+  const sharesValue = shares === 0n ? 0n : await client.readContract({ address: stock.vault, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares], blockNumber });
+  const debt = borrowShares === 0n ? 0n : toAssetsUp(BigInt(borrowShares), e.totalBorrowAssets, e.totalBorrowShares);
   const fullLimit = (((BigInt(collateral) * price) / 10n ** 36n) * m.lltv) / 10n ** 18n;
   return {
     stock,
@@ -169,9 +170,12 @@ export async function readBorroPosition(client: PublicClient, stockVault: Addres
     price,
     maxDebt: halfLltvMaxDebt(BigInt(collateral), price, m.lltv),
     ltvOfLltvBps: debt === 0n ? 0n : fullLimit === 0n ? 10_000n * 10n : (debt * 10_000n) / fullLimit,
-    available: BigInt(totalSupplyAssets) > BigInt(totalBorrowAssets) ? BigInt(totalSupplyAssets) - BigInt(totalBorrowAssets) : 0n,
-    borrowRatePerYear: rate * SECONDS_PER_YEAR,
+    available: market.liquidity > 0n ? market.liquidity : 0n,
+    borrowRatePerYear: market.instantBorrowRate * SECONDS_PER_YEAR,
     listed,
+    supply: e.totalSupplyAssets,
+    borrowed: e.totalBorrowAssets,
+    at: at.timestamp,
   };
 }
 

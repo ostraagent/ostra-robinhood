@@ -58,13 +58,18 @@ async function rpc(url: string, method: string, params: unknown[]): Promise<unkn
   return body.result;
 }
 
-export async function startFork(): Promise<Fork> {
+/**
+ * Starts the fork: at the latest block, or at `blockNumber` (an older block needs an archive RPC as OSTRA_FORK_RPC:
+ * the public RPC keeps only recent state).
+ */
+export async function startFork(opts: { blockNumber?: bigint } = {}): Promise<Fork> {
   const port = 20_000 + Math.floor(Math.random() * 30_000);
   const url = `http://127.0.0.1:${port}`;
   // OSTRA_FORK_RPC may carry an API key (an archive RPC such as Alchemy keeps the fork block's state, which the
   // public RPC drops after some minutes): anvil's errors are passed on line by line with the URL replaced.
   const forkUrl = process.env.OSTRA_FORK_RPC !== undefined && process.env.OSTRA_FORK_RPC !== "" ? process.env.OSTRA_FORK_RPC : ROBINHOOD_PUBLIC_RPC;
-  const child: ChildProcess = spawn("anvil", ["--fork-url", forkUrl, "--port", String(port), "--silent"], {
+  const at = opts.blockNumber === undefined ? [] : ["--fork-block-number", opts.blockNumber.toString()];
+  const child: ChildProcess = spawn("anvil", ["--fork-url", forkUrl, ...at, "--port", String(port), "--silent"], {
     stdio: ["ignore", "ignore", "pipe"],
   });
   let pendingErr = "";

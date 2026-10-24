@@ -24,6 +24,8 @@ export * from "./seed-backup.ts";
 export * from "./sessions.ts";
 export * from "./shield.ts";
 export * from "./storage.ts";
+export * from "./strategy-rules.ts";
+export * from "./strategy.ts";
 export * from "./swap.ts";
 export * from "./unshield.ts";
 export * from "./vault.ts";

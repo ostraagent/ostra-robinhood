@@ -19,5 +19,6 @@ export * from "./morpho.ts";
 export * from "./quote.ts";
 export * from "./pairs.ts";
 export * from "./reads.ts";
+export * from "./strategy.ts";
 export * from "./relayer.ts";
 export * from "./wots.ts";

@@ -726,14 +726,27 @@ export type VaultCap = { id: Hex; idData: Hex; what: CapIdKind; absoluteCap: big
 
 /** Every cap id the vault's curator ever set (from the cap events), with the cap and allocation in force read at `at`. */
 export async function readVaultV2Caps(client: PublicClient, v: VaultV2State, fromBlock: bigint): Promise<VaultCap[]> {
+  return readVaultV2CapsOf(client, v, await capIdsFromEvents(client, v.address, fromBlock, v.at.blockNumber));
+}
+
+/**
+ * Every cap id a vault's cap events named between two blocks, with its idData (lowercase id keys). A caller that
+ * keeps them reads only the blocks after the last ones it read, and merges.
+ */
+export async function capIdsFromEvents(client: PublicClient, vault: Address, fromBlock: bigint, toBlock: bigint): Promise<Map<string, Hex>> {
   const ids = new Map<string, Hex>();
   for (const event of Object.values(capEvents)) {
-    const logs = await getLogsChunked(client, { address: v.address, event, fromBlock, toBlock: v.at.blockNumber });
+    const logs = await getLogsChunked(client, { address: vault, event, fromBlock, toBlock });
     for (const l of logs) {
       const a = l.args as { id: Hex; idData: Hex };
       ids.set(a.id.toLowerCase(), a.idData);
     }
   }
+  return ids;
+}
+
+/** The caps of `ids` (as capIdsFromEvents returns them) read at the vault's block. */
+export async function readVaultV2CapsOf(client: PublicClient, v: VaultV2State, ids: ReadonlyMap<string, Hex>): Promise<VaultCap[]> {
   const out: VaultCap[] = [];
   for (const [id, idData] of ids) {
     if (keccak256(idData).toLowerCase() !== id) throw new Error(`cap event id ${id} does not match its idData`);

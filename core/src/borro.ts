@@ -12,7 +12,7 @@
 // Borro's own "Lend APR" counts its $BORRO Drip, which Borro pays to wallets only, not to contracts such as an Ostra
 // vault (borro.markets/developers): an Ostra vault earns the vault's own yield, about 0% on 24 Oct 2026.
 
-import { getAddress, isAddress, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
+import { encodeFunctionData, getAddress, isAddress, keccak256, toHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
   BORRO_USDG_VAULT,
   VAULT_GUARD_MIN_GAS,
@@ -45,7 +45,13 @@ import {
   vaultV2Abi,
   withdrawCollateralParams,
   postCollateralParams,
+  WOTS_SIGNATURE_LEN,
+  chainlinkEthUsd,
+  l1DataGas,
+  weiToTokenUnits,
+  withMargin,
   type BorroStock,
+  type EthUsdSource,
   type GuardCall,
   type VaultGuardState,
 } from "@ostraagent/sdk";
@@ -71,6 +77,14 @@ export type BorroParts = {
   sender: Sender;
   /** Every vault address this agent's seed controls that is known here: a withdrawal address is never one of them. */
   ownVaults: () => Promise<Address[]>;
+  /** ETH/USD for pricing spends in USDG (default: the chain's Chainlink feed, as the relayer prices them). */
+  ethUsd?: EthUsdSource;
+  /**
+   * The gas price spends are priced at (default: the RPC's eth_gasPrice, as the relayer prices them). A fork test
+   * passes the fork block's base fee: anvil adds a 1 gwei priority fee to eth_gasPrice that Robinhood Chain does not
+   * charge (1.02 gwei on a fork against the chain's 0.0202, read 24 Oct 2026).
+   */
+  gasPrice?: () => Promise<bigint>;
 };
 
 function isoTime(unix: bigint): string {
@@ -85,6 +99,25 @@ function amountText(text: string, decimals: number, what: string): bigint {
 
 function less(x: bigint, bps: bigint): bigint {
   return (x * (10_000n - bps)) / 10_000n;
+}
+
+/**
+ * The gas a Morpho spend and a Guard spend must have left to run (MORPHO_MIN_GAS, GUARD_MIN_GAS); the relayer prices
+ * this floor on top of the gas the spend uses (sdk reservedSwapGas).
+ */
+function gasFloor(action: number): bigint {
+  return action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY ? BigInt(VAULT_MORPHO_MIN_GAS) : action === VAULT_ACTION.GUARD ? BigInt(VAULT_GUARD_MIN_GAS) : 0n;
+}
+
+/** A stand-in signature of a WOTS signature's length, for measuring a spend's L1 data (random-looking, as one is). */
+function standInSignature(): Hex {
+  let out = "";
+  let h = keccak256(toHex("OSTRA/STRATEGY/L1-DATA"));
+  while (out.length < WOTS_SIGNATURE_LEN * 2) {
+    out += h.slice(2);
+    h = keccak256(h);
+  }
+  return `0x${out.slice(0, WOTS_SIGNATURE_LEN * 2)}`;
 }
 
 export class BorroService {
@@ -124,9 +157,7 @@ export class BorroService {
     const address = await vault.vaultAddress();
     await this.#v3(address);
     const gasUsed = await this.#simulate(address, action, params, what);
-    // A Morpho spend and a Guard spend run only with this much gas left (MORPHO_MIN_GAS, GUARD_MIN_GAS); the relayer
-    // prices the floor on top of the gas the spend uses (sdk reservedSwapGas).
-    const floor = action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY ? BigInt(VAULT_MORPHO_MIN_GAS) : action === VAULT_ACTION.GUARD ? BigInt(VAULT_GUARD_MIN_GAS) : 0n;
+    const floor = gasFloor(action);
     let gas = (gasUsed * 5n) / 4n + SPEND_GAS_HEADROOM + floor;
     if (gas < VAULT_SPEND_GAS + floor) gas = VAULT_SPEND_GAS + floor;
     return vault.operate({
@@ -224,6 +255,57 @@ export class BorroService {
     if (shares > held) throw new Error(`the vault holds ${held} shares of ${target}, fewer than ${shares}; nothing was signed`);
     const preview = (await this.#p.client.readContract({ address: target, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
     return this.#spend(vault, VAULT_ACTION.REDEEM, redeemParams({ vault: target, shares, minAssets: less(preview, BORRO_PREVIEW_SLIPPAGE_BPS) }), `Borro redeem of ${shares} shares`);
+  }
+
+  /**
+   * Lends `assets` USDG from the USDG vault into `target`, a Morpho Vault V2 of USDG that is not Borro's (Strategy 1's
+   * cash vault, checked by the caller: sdk checkCashVault). Under the withdrawal lock it counts against the daily limit.
+   */
+  async lendCash(target: Address, assets: bigint): Promise<VaultOperationResult> {
+    if (assets <= 0n) throw new RangeError("the amount must be greater than zero");
+    await this.#address(this.#p.buyer, "USDG");
+    const preview = (await this.#p.client.readContract({ address: target, abi: vaultV2Abi, functionName: "previewDeposit", args: [assets] })) as bigint;
+    return this.#spend(this.#p.buyer, VAULT_ACTION.LEND, lendParams({ vault: target, assets, minShares: less(preview, BORRO_PREVIEW_SLIPPAGE_BPS) }), `lend of ${formatUnitsAmount(assets, TOKEN_DECIMALS)} USDG to ${target}`, assets);
+  }
+
+  /**
+   * Redeems `shares` of `target` into the USDG vault. `emergency`: with minAssets 0 (design: an exit must not fail and
+   * use a key for nothing; the caller sizes it to what the vault can pay out now). Otherwise at most
+   * BORRO_PREVIEW_SLIPPAGE_BPS under the preview.
+   */
+  async redeemCash(target: Address, shares: bigint, emergency = false): Promise<VaultOperationResult> {
+    const at = await this.#address(this.#p.buyer, "USDG");
+    const held = (await this.#p.client.readContract({ address: target, abi: vaultV2Abi, functionName: "balanceOf", args: [at] })) as bigint;
+    if (shares <= 0n || shares > held) throw new Error(`the USDG vault holds ${held} shares of ${target}, not ${shares}; nothing was signed`);
+    const preview = (await this.#p.client.readContract({ address: target, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
+    const minAssets = emergency ? 0n : less(preview, BORRO_PREVIEW_SLIPPAGE_BPS);
+    return this.#spend(this.#p.buyer, VAULT_ACTION.REDEEM, redeemParams({ vault: target, shares, minAssets }), `${emergency ? "emergency " : ""}redeem of ${shares} shares of ${target}`);
+  }
+
+  /**
+   * What a spend of `action` with `params` from the vault holding `what` ("USDG" or a Borro stock) costs through the
+   * relayer now, in USDG base units, by the relayer's own rule: the gas it uses (simulated with a throwaway key: it
+   * must not fail now), the floor a Morpho or Guard spend reserves, the L1 data of its calldata, at the gas price, with
+   * the relayer's margin, at the Chainlink price.
+   */
+  async spendCost(what: string, action: number, params: Hex, label: string): Promise<{ gas: bigint; usdg: bigint }> {
+    const { vault } = this.#vaultOf(what);
+    const at = await vault.vaultAddress();
+    return this.spendCostAt(what, action, params, await this.#simulate(at, action, params, label));
+  }
+
+  /**
+   * spendCost for a spend whose gas is `gasUsed` instead of simulated: one that can run only after spends before it
+   * land (a loan before its collateral is posted), priced at a measured gas.
+   */
+  async spendCostAt(what: string, action: number, params: Hex, gasUsed: bigint): Promise<{ gas: bigint; usdg: bigint }> {
+    const { vault } = this.#vaultOf(what);
+    const at = await vault.vaultAddress();
+    const data = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256(toHex("OSTRA/STRATEGY/NEXT-ROOT")), params, standInSignature()] });
+    const [l1, gasPrice] = await Promise.all([l1DataGas(this.#p.client, at, data), this.#p.gasPrice === undefined ? this.#p.client.getGasPrice() : this.#p.gasPrice()]);
+    const gas = gasUsed + gasFloor(action) + l1;
+    const ethUsd = await (this.#p.ethUsd ?? chainlinkEthUsd(this.#p.client))();
+    return { gas, usdg: weiToTokenUnits(withMargin(gas * gasPrice), ethUsd, TOKEN_DECIMALS) };
   }
 
   // -------------------------------------------------------------------------
