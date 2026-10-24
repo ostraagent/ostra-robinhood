@@ -2,7 +2,7 @@
   "name": "@ostraagent/sdk",
   "version": "0.1.0",
   "private": true,
-  "description": "TypeScript SDK for Ostra on Robinhood Chain: post-quantum clearing for agent payments.",
+  "description": "TypeScript SDK for Ostra Agent: the post-quantum privacy vault for AI agents on Robinhood Chain.",
   "type": "module",
   "engines": {
     "node": ">=24"

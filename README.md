@@ -5,8 +5,8 @@
 <h1 align="center">Ostra Agent on Robinhood Chain</h1>
 
 <p align="center">
-  The agent launchpad of Robinhood Chain: vaults that only post-quantum one-time signatures can spend,<br>
-  a shielded pool for USDG, and one Uniswap v4 hook for every launch.
+  The post-quantum privacy vault for AI agents.<br>
+  One vault to pay, trade, launch, earn and stay private on Robinhood Chain, guarded by one-time post-quantum keys instead of ECDSA.
 </p>
 
 <p align="center">
