@@ -43,6 +43,7 @@ import {
   StrategyService,
   SwapService,
   ShieldService,
+  TradingService,
   SignatureEscrowClient,
   UnshieldService,
   VaultService,
@@ -125,6 +126,8 @@ export class Agent {
   readonly breaker: BreakerService;
   /** Ostra's strategy planner (core strategy.ts), for an agent registered in ERC-8004 through Ostra. */
   readonly strategy: StrategyService;
+  /** The trading capital (core trading.ts): its limits, positions and trades through Ostra Swap. */
+  readonly trading: TradingService;
   /** Raeto's AI models from the USDG vault (null with OSTRA_RAETO_URL=off). */
   readonly raeto: RaetoService | null;
   readonly #tokenVaults = new Map<Address, VaultService>();
@@ -170,33 +173,6 @@ export class Agent {
     this.borro = new BorroService({ client, config, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), sender: this.sender, ownVaults: () => this.ownVaults() });
     this.breaker = new BreakerService({ client, config, buyer: this.buyer, borro: this.borro, sender: this.sender, folder: keys.folder.folder("breaker") });
     this.raeto = config.raetoUrl === null ? null : new RaetoService({ client, buyer: this.buyer, borro: this.borro, folder: keys.folder.folder("raeto"), apiUrl: config.raetoUrl });
-    // OSTRA_LOGS_RPC_URL (default Robinhood Chain's public RPC) serves the planner's eth_getLogs over long windows too.
-    const strategyLogs = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
-    const launchFolder = keys.folder.folder(LAUNCHPAD_DIR);
-    this.strategy = new StrategyService({
-      client,
-      logsClient: strategyLogs,
-      config,
-      buyer: this.buyer,
-      tokenVault: (token) => this.vaultFor(token),
-      creator: this.creator,
-      borro: this.borro,
-      swap: null,
-      folder: keys.folder.folder("strategy"),
-      agentId: async () => {
-        const t = await launchFolder.read("agent.json");
-        if (t === undefined) return null;
-        try {
-          const id = (JSON.parse(t) as { agentId?: unknown }).agentId;
-          return typeof id === "string" ? id : null;
-        } catch {
-          return null;
-        }
-      },
-      // A short transport: USDe's price is one read, and a slow or down Ethereum RPC must not hold the sweep's exits up.
-      ethClient: config.ethRpcUrl === null ? null : (createPublicClient({ chain: mainnet, transport: http(config.ethRpcUrl, { retryCount: 1, timeout: 5_000 }) }) as PublicClient),
-      breaker: this.breaker,
-    });
     if (config.swap === null) {
       this.swap = null;
       this.privateBalance = null;
@@ -221,6 +197,35 @@ export class Agent {
         creator: this.creator,
       });
     }
+    // OSTRA_LOGS_RPC_URL (default Robinhood Chain's public RPC) serves the planner's eth_getLogs over long windows too.
+    const strategyLogs = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
+    const launchFolder = keys.folder.folder(LAUNCHPAD_DIR);
+    // The trading capital's gate is the strategies' (read when it is called, after the planner exists).
+    this.trading = new TradingService({ client, swap: this.swap, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), folder: keys.folder.folder("strategy"), gate: () => this.strategy.gate() });
+    this.strategy = new StrategyService({
+      client,
+      logsClient: strategyLogs,
+      config,
+      buyer: this.buyer,
+      tokenVault: (token) => this.vaultFor(token),
+      creator: this.creator,
+      borro: this.borro,
+      folder: keys.folder.folder("strategy"),
+      agentId: async () => {
+        const t = await launchFolder.read("agent.json");
+        if (t === undefined) return null;
+        try {
+          const id = (JSON.parse(t) as { agentId?: unknown }).agentId;
+          return typeof id === "string" ? id : null;
+        } catch {
+          return null;
+        }
+      },
+      // A short transport: USDe's price is one read, and a slow or down Ethereum RPC must not hold the sweep's exits up.
+      ethClient: config.ethRpcUrl === null ? null : (createPublicClient({ chain: mainnet, transport: http(config.ethRpcUrl, { retryCount: 1, timeout: 5_000 }) }) as PublicClient),
+      breaker: this.breaker,
+      trading: this.trading,
+    });
   }
 
   /** The agent's vault for `token`: the buyer vault for USDG, else its token vault (the launchpad's, when there is one). */
@@ -402,7 +407,10 @@ export class Agent {
         await step("creator shield", () => this.creatorShield.sweep());
       }
       await step("unshield", () => this.unshield.sweep());
-      if (this.swap !== null) await step("ostra swap orders", () => this.swap!.finishPending());
+      if (this.swap !== null) {
+        await step("ostra swap orders", () => this.swap!.finishPending());
+        await step("ostra swap splits", () => this.swap!.runSplits());
+      }
       if (this.privateBalance !== null && this.config.prover !== null) {
         await step("private notes", () => this.privateBalance!.refresh());
         await step("private auto-shield", () => this.privateBalance!.autoShieldStep());

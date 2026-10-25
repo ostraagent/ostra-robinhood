@@ -72,7 +72,7 @@ async function agent(name: string, seed: number, ethClient: PublicClient | null,
     return t === undefined ? null : (JSON.parse(t) as { agentId: string }).agentId;
   };
   const planner = (id: () => Promise<string | null>, e: PublicClient | null) =>
-    new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, swap: null, folder: keys.folder.folder("strategy"), agentId: id, ethClient: e });
+    new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, folder: keys.folder.folder("strategy"), agentId: id, ethClient: e });
   return { keys, buyer, creator, tokenVault, borro, lp, recorded, strategy: planner(agentId ?? recorded, ethClient), planner };
 }
 

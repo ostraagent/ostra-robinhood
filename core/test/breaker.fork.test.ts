@@ -118,7 +118,7 @@ function agent(name: string, seed: number, breakerSender?: LocalSender, mainSend
   const borro = new BorroService({ client, config, buyer, tokenVault, sender, ownVaults: async () => [await buyer.vaultAddress()], gasPrice: chainGasPrice });
   const breaker = new BreakerService({ client, config, buyer, borro, sender: breakerSender ?? sender, folder: keys.folder.folder("breaker") });
   const creator = new VaultService(client, transport, config, keys, sender, "creator");
-  const strategy = new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, swap: null, folder: keys.folder.folder("strategy"), agentId: async () => null, ethClient: null, breaker });
+  const strategy = new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, folder: keys.folder.folder("strategy"), agentId: async () => null, ethClient: null, breaker });
   return { buyer, borro, breaker, strategy, folder: keys.folder.folder("breaker") };
 }
 

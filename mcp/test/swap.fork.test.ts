@@ -138,7 +138,7 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
   let creatorVault: Address;
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["ostra_swap_quote", "ostra_swap", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover", "private_withdraw", "auto_shield"]) assert.ok(tools.includes(name), `tool ${name}`);
+    for (const name of ["ostra_swap_quote", "ostra_swap", "ostra_swap_split", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover", "private_withdraw", "auto_shield"]) assert.ok(tools.includes(name), `tool ${name}`);
     // The shielded pool's leaves left the tools in 0.1.6.
     for (const name of ["shield", "unshield", "shield_status"]) assert.ok(!tools.includes(name), `no tool ${name}`);
 
@@ -181,6 +181,9 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     assert.ok((await balanceOf(USDG, vault)) > parseUnits("900", 6));
     const orders = (await readdir(join(home, "ostra-swap"))).filter((n) => n.startsWith("order-"));
     assert.deepEqual(orders, [], "every order finished");
+    // Both swaps moved the price less than 1%: none was split.
+    const splits = await call(client, "ostra_swap_split", { action: "list" });
+    assert.ok(splits.ok && splits.text.trim() === "[]", splits.text);
 
     // A private note: 200 USDG shielded from the vault.
     const notToken = await call(client, "private_shield", { token: RECIPIENT, amount: "1" });

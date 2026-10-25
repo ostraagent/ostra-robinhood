@@ -21,9 +21,12 @@ import {
   carryMayOpen,
   carryTarget,
   depositable,
+  IMPACT_REF_MIN_OUT,
   impactBps,
+  impactLimitedSize,
   ofBps,
   positionMax,
+  referenceQuote,
   shareGrowthTooLow,
   splitByImpact,
   tradingLimits,
@@ -210,4 +213,65 @@ test("splitByImpact doubles the parts until each part moves the price within the
   assert.ok(impactBps({ amount: half, out: await q(half), refIn: 40n * USDG, refOut }) > 100n);
   await assert.rejects(splitByImpact(10_000_000n * USDG, 100n, q, 4), RangeError);
   await assert.rejects(splitByImpact(0n, 100n, q), RangeError);
+});
+
+test("splitByImpact reports the whole amount's impact in one swap", async () => {
+  const q = constantProduct(1_000_000n * USDG, 1_000_000n * USDG);
+  const r = await splitByImpact(40_000n * USDG, 100n, q);
+  const refOut = await q(40n * USDG);
+  assert.equal(r.wholeImpactBps, impactBps({ amount: 40_000n * USDG, out: await q(40_000n * USDG), refIn: 40n * USDG, refOut }));
+  assert.ok(r.wholeImpactBps > 100n);
+});
+
+test("referenceQuote takes a quote large enough that its rounding stays under 1 bps, up to a tenth of the amount", async () => {
+  // A pool where 1 USDG buys about 0.000002 of an 18-decimal token in 6-decimal units would round: here 1 unit of
+  // tokenIn pays 2 units of tokenOut, so 1/1000 of 100,000 units (100) pays about 200, under IMPACT_REF_MIN_OUT.
+  const q = constantProduct(10n ** 12n, 2n * 10n ** 12n);
+  const small = await referenceQuote(100_000n, q);
+  assert.equal(small.refIn, 10_000n);
+  assert.equal(small.refOut, await q(10_000n));
+  assert.ok(small.refOut >= IMPACT_REF_MIN_OUT);
+  // Large enough already at 1/1000.
+  const big = await referenceQuote(10_000_000_000n, q);
+  assert.equal(big.refIn, 10_000_000n);
+  // A quote that rounds to nothing or cannot be made is tried larger; at a tenth of the amount it is taken as it is.
+  let calls = 0;
+  const failing = async (x: bigint) => {
+    calls++;
+    if (x < 1_000n) throw new Error("no route");
+    return x;
+  };
+  const r = await referenceQuote(20_000n, failing);
+  // 20 and 200 cannot be quoted; 2,000 (a tenth) is taken though under IMPACT_REF_MIN_OUT.
+  assert.deepEqual([r.refIn, r.refOut, calls], [2_000n, 2_000n, 3]);
+  await assert.rejects(referenceQuote(500n, failing), /no route/);
+  await assert.rejects(referenceQuote(0n, q), RangeError);
+});
+
+test("impactLimitedSize finds the largest amount whose impact is within the limit", async () => {
+  const q = constantProduct(1_000_000n * USDG, 1_000_000n * USDG);
+  const impact = async (x: bigint) => impactBps({ amount: x, out: await q(x), ...(await referenceQuote(x, q)) });
+  // 20,000 USDG in one swap moves this pool's price about 2%: the size within 1% is about half of it.
+  const size = await impactLimitedSize(20_000n * USDG, 100n, impact);
+  assert.ok(size < 20_000n * USDG && size > 9_000n * USDG, `size ${size}`);
+  assert.ok((await impact(size)) <= 100n);
+  // A step of the resolution (1/1000 of 20,000 USDG) more moves it past the limit.
+  assert.ok((await impact(size + 2n * 20n * USDG)) > 100n);
+  // Within the limit as a whole: the whole amount; nothing for nothing.
+  assert.equal(await impactLimitedSize(1_000n * USDG, 100n, impact), 1_000n * USDG);
+  assert.equal(await impactLimitedSize(0n, 100n, impact), 0n);
+});
+
+test("splitByImpact measures each part against the reference it is given", async () => {
+  const q = constantProduct(1_000_000n * USDG, 1_000_000n * USDG);
+  const plain = await splitByImpact(40_000n * USDG, 250n, q);
+  // A reference 1% better than the small quote (a route a small quote does not reach): every part's impact is about
+  // 100 bps more, so the same limit needs more parts, and the whole amount's impact shows it.
+  const better = async (x: bigint) => {
+    const r = await referenceQuote(x, q);
+    return { refIn: r.refIn, refOut: (r.refOut * 101n) / 100n };
+  };
+  const r = await splitByImpact(40_000n * USDG, 250n, q, 16, better);
+  assert.ok(r.wholeImpactBps >= plain.wholeImpactBps + 95n && r.wholeImpactBps <= plain.wholeImpactBps + 100n, `${r.wholeImpactBps} against ${plain.wholeImpactBps}`);
+  assert.ok(r.parts > plain.parts, `${r.parts} parts against ${plain.parts}`);
 });

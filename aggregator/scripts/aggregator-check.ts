@@ -276,12 +276,17 @@ async function main(): Promise<void> {
   /** Registers the depositor's current leaf set. */
   const registerOwn = (dep: Depositor) => register(named(dep), dep.leaves, dep.key, dep.attempt);
   const named = (dep: Depositor) => ({ deposit: dep.deposit, depositor: dep.key.address, depositId: dep.depositId });
-  const poll = async (dep: Depositor, signer: PrivateKeyAccount = dep.key) => {
-    const at = BigInt(nowSeconds());
+  const poll = async (dep: Depositor, signer: PrivateKeyAccount = dep.key, at = BigInt(nowSeconds())) => {
     const signature = await signAggregatorPoll(signer, { chainId: d.chainId, pool, deposit: dep.deposit }, at);
     return http(`/v1/deposits/${dep.deposit}?at=${at}&signature=${signature}`);
   };
   const viewOf = async (dep: Depositor) => (await poll(dep)).body as AggregatorDepositView;
+  /**
+   * The deposit's view without making it fresh: a poll signed an hour ago (a poll counts from when it was signed, and
+   * only after the deposit's last expired batch). Reading a deposit's view is a poll: read a second or more after its
+   * batch was abandoned, it makes that deposit fresh again (seen on the VPS, 25 Oct 2026).
+   */
+  const viewOld = async (dep: Depositor) => (await poll(dep, dep.key, BigInt(nowSeconds() - 3_600))).body as AggregatorDepositView;
   /** The approval key index whose root is on-chain now (it rotates with every approval). */
   const approvalIndex = (dep: Depositor, onChain: Hex) => {
     for (let i = 0n; i < 16n; i++) if (bytesToHex(dep.approval.keyRoot(i)) === onChain.toLowerCase()) return i;
@@ -464,7 +469,8 @@ async function main(): Promise<void> {
       const closed = await readBatch(client, pool, b1.batchId);
       check(closed.status === "closed", "the abandoned batch is closed on-chain (it can never be sealed)");
       const rekey: AggregatorDepositView[] = [];
-      for (const dep of groupB) rekey.push(await viewOf(dep));
+      // The late deposit's view read without polling it: it stays not fresh, as it would without its depositor online.
+      for (const dep of groupB) rekey.push(await (dep === late ? viewOld(dep) : viewOf(dep)));
       check(rekey.every((v) => v.status === "rekey" && v.attempt === 1), "every deposit of the abandoned batch is asked for a new leaf set (its leaves are public in the closed batch)", rekey);
       r = await registerOwn(groupB[0] as Depositor);
       check(r.status === 200 && r.body.status === "rekey", "the leaf set of the abandoned batch is not taken again", r.body);

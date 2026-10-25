@@ -26,6 +26,7 @@ const units = z.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/, "an amount: 
 const pair = z.enum(LAUNCH_PAIRS.map((p) => p.symbol) as [string, ...string[]]);
 const slippage = z.number().int().min(0).max(1_000).optional().describe("slippage in bps (default 100 = 1%, at most 1000)");
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/, "32 bytes of 0x hex");
+const maxImpact = z.number().int().min(1).max(10_000).optional().describe("the most one swap may move the price, in bps of a small quote's price (default 100 = 1%): a larger swap is split into parts");
 /** A token of Ostra Swap: an address, or a pair's symbol (ETH and WETH: WETH). */
 const swapToken = z.string().regex(/^(0x[0-9a-fA-F]{40}|[A-Za-z0-9]{1,11})$/, "a token address or a pair's symbol (USDG, ETH, OSTRA, a listed stock token's ticker)");
 const tokenAddress = (text: string): string => {
@@ -198,15 +199,26 @@ export function registerTools(server: McpServer, agent: Agent): void {
   // --- Ostra Swap: swaps between the agent's vaults, and private balances in OstraPrivatePool -----------------
   tool(
     "ostra_swap_quote",
-    "Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault). Nothing is signed.",
-    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage },
-    (a) => ostraSwap().quote({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps) }),
+    "Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault), how far the whole amount moves the price in one swap (impactBps), and how many parts ostra_swap splits it into at maxImpactBps (null: too large for the pool even in 16 parts). Nothing is signed.",
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
+    (a) => ostraSwap().quote({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }),
   );
   tool(
     "ostra_swap",
-    "Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address.",
-    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage },
-    (a) => ostraSwap().swap({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps) }),
+    "Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault.",
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
+    (a) => ostraSwap().swap({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }),
+  );
+  tool(
+    "ostra_swap_split",
+    "The agent's split swaps (ostra_swap of a large amount). list: each one's parts done, what it spent and received, when the next part may run, and why a part waits. run: runs the parts whose time has come now (the MCP server's sweep does it each minute). cancel: ends one (by its id): no further part is signed and what was not swapped stays in the vault.",
+    { action: z.enum(["list", "run", "cancel"]), id: bytes32.optional() },
+    async (a) => {
+      if (a.action === "list") return ostraSwap().splits();
+      if (a.action === "run") return { failures: await ostraSwap().runSplits(), splits: await ostraSwap().splits() };
+      if (a.id === undefined) throw new RangeError("cancel takes id (the split swap's id)");
+      return ostraSwap().cancelSplit(a.id as `0x${string}`);
+    },
   );
   tool(
     "private_shield",
@@ -382,12 +394,11 @@ export function registerTools(server: McpServer, agent: Agent): void {
   const earnings = z.record(z.string().regex(/^[A-Z]{1,8}$/), z.number().int().min(0)).optional().describe("earnings dates the agent knows, unix seconds by stock ticker (without one NVDA stays at most 60% of its LLTV)");
   tool(
     "strategy_plan",
-    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. Nothing is signed. Only for an agent registered in ERC-8004 (register_agent).",
-    { buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days)"), tradingCapital: usdg.optional(), earnings },
+    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. The trading capital's cash (trading) stays in the vault. Nothing is signed. Only for an agent registered in ERC-8004 (register_agent).",
+    { buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days)"), earnings },
     (a) =>
       agent.strategy.plan({
         ...(a.buffer === undefined ? {} : { buffer: parseUsdg(a.buffer) }),
-        ...(a.tradingCapital === undefined ? {} : { tradingCapital: parseUsdg(a.tradingCapital) }),
         ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }),
       }),
   );
@@ -402,6 +413,44 @@ export function registerTools(server: McpServer, agent: Agent): void {
     "Each run's check: the cash vaults (their checks, settings and submitted changes, share price against the model, USDe's price), the carries' ladder; urgent actions (leaving a cash vault, repaying) run at once when execute (default true); the others are kept as a plan for strategy_apply. Never refused for the ERC-8004 gate: exits always run.",
     { execute: z.boolean().default(true), earnings },
     (a) => agent.strategy.check({ execute: a.execute, ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }) }),
+  );
+  const bpsLimit = z.number().int().min(1).max(10_000).optional();
+  tool(
+    "trading",
+    "The trading capital: USDG of the vault set aside for trades the agent decides, with Ostra's limits (an agent may only tighten them): a position at most 25% of the capital (positionMaxBps) and no larger than a buy whose quote moves the price 1% (maxImpactBps); buys stop for the day after a 5% loss of the capital that day (dailyLossBps) and for the week after 10% that week (weeklyLossBps). set: sets it (capital in USDG, the limits), only with no position open; the plans keep its cash out of the cash vaults. status: its value now (cash, positions at the quote of selling them), whether buys may happen and, with token, the most that position may be. buy: buys token with amount USDG of the capital, refused past those limits. sell: sells amount (or \"all\") of the capital's token, split like any large swap. end: ends it (positions stay in their vaults, untracked). Trades go through Ostra Swap; only for an agent registered in ERC-8004 (register_agent) to set it or buy.",
+    {
+      action: z.enum(["set", "status", "buy", "sell", "end"]),
+      capital: usdg.optional(),
+      positionMaxBps: bpsLimit,
+      maxImpactBps: bpsLimit,
+      dailyLossBps: bpsLimit,
+      weeklyLossBps: bpsLimit,
+      token: swapToken.optional(),
+      amount: z.string().regex(/^(all|(0|[1-9][0-9]*)(\.[0-9]{1,18})?)$/, "a plain decimal, or all (sell)").optional(),
+      slippageBps: slippage,
+    },
+    async (a) => {
+      const t = agent.trading;
+      if (a.action === "set") {
+        if (a.capital === undefined) throw new RangeError("set takes capital (USDG)");
+        const limits = {
+          ...(a.positionMaxBps === undefined ? {} : { positionMaxBps: BigInt(a.positionMaxBps) }),
+          ...(a.maxImpactBps === undefined ? {} : { maxImpactBps: BigInt(a.maxImpactBps) }),
+          ...(a.dailyLossBps === undefined ? {} : { dailyLossBps: BigInt(a.dailyLossBps) }),
+          ...(a.weeklyLossBps === undefined ? {} : { weeklyLossBps: BigInt(a.weeklyLossBps) }),
+        };
+        return t.set({ capital: a.capital, limits });
+      }
+      if (a.action === "status") return t.status(a.token === undefined ? undefined : (tokenAddress(a.token) as `0x${string}`));
+      if (a.action === "end") return t.end();
+      if (a.token === undefined || a.amount === undefined) throw new RangeError(`${a.action} takes token and amount`);
+      const token = tokenAddress(a.token) as `0x${string}`;
+      if (a.action === "buy") {
+        if (a.amount === "all") throw new RangeError("buy takes an amount of USDG");
+        return t.buy({ token, amount: a.amount, ...opt("slippageBps", a.slippageBps) });
+      }
+      return t.sell({ token, amount: a.amount, ...opt("slippageBps", a.slippageBps) });
+    },
   );
   tool("strategy_report", "What the strategies earn: yield per day by route at the rates now, the share growth since the first run that held each cash vault, and each carry's distance to liquidation.", {}, () => agent.strategy.report());
   const raeto = () => {

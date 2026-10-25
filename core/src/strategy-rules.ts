@@ -222,22 +222,75 @@ export function impactBps(a: { amount: bigint; out: bigint; refIn: bigint; refOu
   return ((atRef - a.out) * BPS) / atRef;
 }
 
+/** A reference quote's output is at least this many base units, so its rounding stays under 1 bps of the price it gives. */
+export const IMPACT_REF_MIN_OUT = 10_000n;
+
+/**
+ * The small quote a larger one's impact is measured against: 1/1000 of `amount` (at least 1 unit), ten times larger
+ * while its output is under IMPACT_REF_MIN_OUT units or it cannot be quoted (an output that rounds to nothing), up to
+ * 1/10 of `amount`.
+ */
+export async function referenceQuote(amount: bigint, quote: (amountIn: bigint) => Promise<bigint>): Promise<{ refIn: bigint; refOut: bigint }> {
+  if (amount <= 0n) throw new RangeError("amount must be positive");
+  const top = amount / 10n > 0n ? amount / 10n : 1n;
+  let refIn = amount / 1_000n > 0n ? amount / 1_000n : 1n;
+  for (;;) {
+    let refOut: bigint | null = null;
+    let failure: unknown = null;
+    try {
+      refOut = await quote(refIn);
+    } catch (e) {
+      failure = e;
+    }
+    if (refOut !== null && (refOut >= IMPACT_REF_MIN_OUT || refIn >= top)) return { refIn, refOut };
+    if (refIn >= top) throw failure;
+    refIn = refIn * 10n > top ? top : refIn * 10n;
+  }
+}
+
 /**
  * Splits `amount` into equal parts so that each part's quote stays within `maxImpactBps` (design: "Swap besar dipecah
  * menurut dampak harga dari quote, dengan batas dampak per bagian"). `quote(part)` returns the output of one part; the
- * parts double until one part is within the limit, at most `maxParts`. Parts trade one after another, so each sees the
- * price the previous one left: the parts are spaced by the caller.
+ * parts double until one part is within the limit, at most `maxParts`. `reference(part)` gives the small quote a part
+ * is measured against (default: referenceQuote over `quote`; a caller whose best route changes with the amount gives
+ * the better of the small quote and the part's own route at that size). `wholeImpactBps`: the impact of `amount` in one
+ * swap. Parts trade one after another, so each sees the price the previous one left: the parts are spaced by the caller.
  */
-export async function splitByImpact(amount: bigint, maxImpactBps: bigint, quote: (amountIn: bigint) => Promise<bigint>, maxParts = 16): Promise<{ parts: number; part: bigint; impactBps: bigint }> {
+export async function splitByImpact(
+  amount: bigint,
+  maxImpactBps: bigint,
+  quote: (amountIn: bigint) => Promise<bigint>,
+  maxParts = 16,
+  reference: (part: bigint) => Promise<{ refIn: bigint; refOut: bigint }> = (part) => referenceQuote(part, quote),
+): Promise<{ parts: number; part: bigint; impactBps: bigint; wholeImpactBps: bigint }> {
   if (amount <= 0n) throw new RangeError("amount must be positive");
-  const refIn = amount / 1_000n > 0n ? amount / 1_000n : 1n;
-  const refOut = await quote(refIn);
+  let whole: bigint | null = null;
   for (let parts = 1; parts <= maxParts; parts *= 2) {
     const part = amount / BigInt(parts);
-    const impact = impactBps({ amount: part, out: await quote(part), refIn, refOut });
-    if (impact <= maxImpactBps) return { parts, part, impactBps: impact };
+    if (part === 0n) break;
+    const impact = impactBps({ amount: part, out: await quote(part), ...(await reference(part)) });
+    whole ??= impact;
+    if (impact <= maxImpactBps) return { parts, part, impactBps: impact, wholeImpactBps: whole };
   }
   throw new RangeError(`even ${maxParts} parts move the price more than ${maxImpactBps} bps each: the pool is too shallow for this amount`);
+}
+
+/**
+ * The largest amount up to `upper` whose price impact (`impact(amount)`, bps) is at most `maxBps`: bisection to
+ * `resolution` (default 1/1000 of `upper`).
+ */
+export async function impactLimitedSize(upper: bigint, maxBps: bigint, impact: (amount: bigint) => Promise<bigint>, resolution?: bigint): Promise<bigint> {
+  if (upper <= 0n) return 0n;
+  const step = resolution ?? (upper / 1_000n > 0n ? upper / 1_000n : 1n);
+  if ((await impact(upper)) <= maxBps) return upper;
+  let lo = 0n;
+  let hi = upper;
+  while (hi - lo > step) {
+    const mid = (lo + hi) / 2n;
+    if ((await impact(mid)) <= maxBps) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }
 
 // --- Non-urgent steps -------------------------------------------------------------------------------------------------

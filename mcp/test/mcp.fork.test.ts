@@ -268,7 +268,7 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault", "strategy_plan", "strategy_apply", "strategy_check", "strategy_report", "breaker", "raeto"]) {
+    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault", "strategy_plan", "strategy_apply", "strategy_check", "strategy_report", "trading", "breaker", "raeto"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     const status = (await call(client, "balance")).json.vault as { feePayer: Address };
@@ -299,6 +299,11 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
     assert.ok(checked.ok && Array.isArray(checked.json.findings), checked.text);
     const refused = await call(client, "strategy_plan", {}, 600_000);
     assert.ok(!refused.ok && /register_agent/.test(refused.text), refused.text);
+    // The trading capital: set only for a registered agent; none set yet.
+    const noCapital = await call(client, "trading", { action: "set", capital: "10" }, 600_000);
+    assert.ok(!noCapital.ok && /register_agent/.test(noCapital.text), noCapital.text);
+    const noStatus = await call(client, "trading", { action: "status" });
+    assert.ok(!noStatus.ok && /no trading capital is set/.test(noStatus.text), noStatus.text);
     const raeto = await call(client, "raeto", { action: "models" });
     assert.ok(!raeto.ok && /OSTRA_RAETO_URL=off/.test(raeto.text), raeto.text);
     const unarmed = await call(client, "breaker", { action: "status" });

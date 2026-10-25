@@ -146,7 +146,7 @@ async function agent(name: string, seed: number) {
     const t = await keys.folder.folder(LAUNCHPAD_DIR).read("agent.json");
     return t === undefined ? null : (JSON.parse(t) as { agentId: string }).agentId;
   };
-  const s = new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, swap: null, folder: keys.folder.folder("strategy"), agentId, ethClient: eth });
+  const s = new StrategyService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, creator, borro, folder: keys.folder.folder("strategy"), agentId, ethClient: eth });
   return { client, buyer, creator, tokenVault, borro, lp, s };
 }
 

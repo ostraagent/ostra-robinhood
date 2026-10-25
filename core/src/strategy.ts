@@ -8,7 +8,7 @@
 // leaves its route out. The rules and their numbers are strategy-rules.ts.
 //
 //   * plan(): a conservative plan (cash, Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a
-//     balanced one (cash and the carry, Strategy 2), both with trading capital set aside when the agent asks for it.
+//     balanced one (cash and the carry, Strategy 2), both keeping the trading capital's cash (trading.ts) in the USDG vault.
 //     Each step earns more than 3x its gas within 30 days or is left out.
 //   * apply(): runs a plan's steps in order, each checked and sized again right before it is signed, and each one's
 //     effect read back on-chain after it lands; a plan that is not urgent waits a random delay first
@@ -17,13 +17,12 @@
 //     price against its model, USDe's price from Chainlink on Ethereum, the carry ladder), with the actions it calls
 //     for; urgent ones run at once, the others are kept as a plan for apply().
 //   * report(): yield per day by route, realized share growth, and each carry's distance to liquidation.
-//   * trading(): the trading capital's limits now (Ostra's; an agent may only tighten them).
 //
 // Strategy 3 (the guardian breaker, OstraBreaker, breaker.ts): each plan says whether it watches the USDG vault's cash
 // vaults. It does only under the vault's withdrawal lock (decided by Edu on 25 Oct 2026: turning the lock on arms it);
 // without the lock the MCP's sweep runs exitCheck() each minute while it runs, and leaves a failing cash vault at once.
 
-import { getAddress, parseAbi, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { getAddress, parseAbi, parseAbiItem, type Address, type Hex, type PublicClient } from "viem";
 import {
   BORRO_BUILDERS,
   BORRO_USDG_VAULT,
@@ -90,23 +89,18 @@ import {
   STEP_HORIZON,
   WAD,
   YEAR,
-  buysAllowed,
   carryAction,
   carryIdleReserve,
   carryMayOpen,
   carryTarget,
   depositable,
-  impactBps,
   ofBps,
-  positionMax,
   shareGrowthTooLow,
-  tradingLimits,
   worthIt,
   yieldOver,
   type CarryAction,
-  type TradingLimits,
 } from "./strategy-rules.ts";
-import type { SwapService } from "./swap.ts";
+import type { TradingService } from "./trading.ts";
 import type { VaultOperationResult, VaultService } from "./vault.ts";
 
 /**
@@ -119,12 +113,10 @@ export const MEASURED_MORPHO_SPEND_GAS = 603_551n;
 export const OSTRA_FEES_MAINNET: Address = "0x8e79671DC9729476614C78aFcf2345D4c1963801";
 const feesAbi = parseAbi(["function nyseClosed(uint256 time) view returns (bool)"]);
 const timelockAbi = parseAbi(["function executableAt(bytes data) view returns (uint256)", "function abdicated(bytes4 selector) view returns (bool)"]);
-const decimalsAbi = parseAbi(["function decimals() view returns (uint8)"]);
 const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
 const VAULTS_FILE = "ostra-vaults.json";
 const RUNS_FILE = "runs.jsonl";
 const PLANS_DIR = "plans";
-const TRADING_FILE = "trading.json";
 /** Blocks a log cursor stays behind the head (about 5 minutes at Robinhood Chain's 9.5 blocks a second, measured 24 Oct 2026). */
 export const LOG_RESCAN_BLOCKS = 3_000n;
 
@@ -146,7 +138,6 @@ export type StrategyParts = {
   /** The creator vault: it owns the agent's ERC-8004 identity. */
   creator: VaultService;
   borro: BorroService;
-  swap: SwapService | null;
   folder: Folder;
   /** The agent id the launchpad recorded at registration (agent.json), or null: then the Registered events are searched. */
   agentId: () => Promise<string | null>;
@@ -157,14 +148,13 @@ export type StrategyParts = {
   ethClient: PublicClient | null;
   /** OstraBreaker on the USDG vault (null: a deployment without one). */
   breaker?: BreakerService | null;
+  /** The trading capital (trading.ts): its cash stays in the USDG vault (null or absent: none). */
+  trading?: TradingService | null;
 };
 
 export type PlanOptions = {
   /** USDG kept for x402, swaps and payments; default: what the USDG vault spent over the last 7 days. */
   buffer?: bigint;
-  /** USDG set aside as trading capital (the agent trades it; Ostra gives the limits). */
-  tradingCapital?: bigint;
-  tradingLimits?: Partial<TradingLimits>;
   /** Earnings dates (unix seconds) the agent knows, by stock; without one NVDA stays at most 60% of its LLTV at all times. */
   earnings?: Readonly<Record<string, bigint>>;
 };
@@ -194,12 +184,16 @@ export type Plan = {
   profile: "conservative" | "balanced" | "check";
   at: number;
   steps: Step[];
-  /** USDG base units the USDG vault keeps when a "free" lend runs: the buffer, the trading capital, a carry's idle reserve. */
+  /**
+   * USDG base units the USDG vault keeps when a "free" lend runs: the buffer, the trading capital's cash, a carry's
+   * idle reserve. The trading capital's part is taken again when the step runs (`trading.cashUnits` is what it was).
+   */
   keep: string;
   /** What the plan earns over 30 days at the rates read now, net of every step's gas (USDG). */
   expected30d: string;
   cashApy: string;
-  trading: { capital: string; limits: { positionMaxBps: string; maxImpactBps: string; dailyLossBps: string; weeklyLossBps: string } } | null;
+  /** The trading capital (trading.ts) when one is set: its cash is kept in the USDG vault. */
+  trading: { capital: string; cash: string; cashUnits: string; limits: { positionMaxBps: string; maxImpactBps: string; dailyLossBps: string; weeklyLossBps: string } } | null;
   risks: string[];
   stopWhen: string[];
   breaker: string;
@@ -492,7 +486,10 @@ export class StrategyService {
     return spent;
   }
 
-  /** What the agent's vaults hold for the strategies: USDG, cash vault shares, and per Borro stock its vault and position. */
+  /**
+   * What the agent's vaults hold for the strategies: USDG, cash vault shares, and per Borro stock its vault, what it
+   * holds (less the trading capital's tokens) and its position.
+   */
   async holdings(): Promise<{
     buyer: Address;
     usdg: bigint;
@@ -512,11 +509,15 @@ export class StrategyService {
     }
     const stocks = [];
     const errors: string[] = [];
+    // The trading capital's tokens are its own: a carry does not lend them.
+    const traded = (await this.#p.trading?.heldTokens()) ?? new Map<Address, bigint>();
     for (const s of borroStocks()) {
       try {
         const vault = getAddress(await this.#p.tokenVault(s.token).vaultAddress());
         const exists = (await readVault(this.#p.client, d, vault)) !== null;
-        const balance = exists ? await tokenBalance(this.#p.client, s.token, vault) : 0n;
+        const held = exists ? await tokenBalance(this.#p.client, s.token, vault) : 0n;
+        const capital = traded.get(getAddress(s.token)) ?? 0n;
+        const balance = held > capital ? held - capital : 0n;
         const position = exists ? await readBorroPosition(this.#p.client, vault, s) : null;
         stocks.push({ stock: s, vault, exists, balance, position });
       } catch (e) {
@@ -581,8 +582,8 @@ export class StrategyService {
     const h = await this.holdings();
     if (h.errors.length > 0) throw new Error(`the vaults could not all be read now (${h.errors.join("; ")}): nothing was planned; ask again`);
     const buffer = o.buffer ?? (await this.spentLastDays());
-    const limits = o.tradingCapital !== undefined && o.tradingCapital > 0n ? tradingLimits(o.tradingLimits) : null;
-    const tradingCapital = limits === null ? 0n : (o.tradingCapital as bigint);
+    const kept = (await this.#p.trading?.kept()) ?? null;
+    const tradingCapital = kept === null ? 0n : await (this.#p.trading as TradingService).reservedCash();
     // The idle reserve of the carries open now stays in the USDG vault too (the 70% step repays from it).
     const existingDebt = h.stocks.reduce((a, s) => a + (s.position?.debt ?? 0n), 0n);
     const reserved = buffer + tradingCapital + carryIdleReserve(existingDebt);
@@ -599,10 +600,7 @@ export class StrategyService {
       "a carry reaches 70% of the LLTV (60% for NVDA around a closure or earnings): back to its opening level; 85%: repaid in full; its rate averaged over two runs above the cash yield less 1 point: repaid in full; its market past 90% use: the excess repaid",
     ];
     const breaker = await this.#breakerNote();
-    const trading =
-      limits === null
-        ? null
-        : { capital: usd(tradingCapital), limits: { positionMaxBps: limits.positionMaxBps.toString(), maxImpactBps: limits.maxImpactBps.toString(), dailyLossBps: limits.dailyLossBps.toString(), weeklyLossBps: limits.weeklyLossBps.toString() } };
+    const trading = kept === null ? null : { capital: usd(kept.capital), cash: usd(tradingCapital), cashUnits: tradingCapital.toString(), limits: kept.limits };
     const make = (profile: Plan["profile"], steps: Step[], keep: bigint, earn30: bigint, cost: bigint, extra: string[]): Plan => ({
       id: `${Number(now)}-${randomInt(0, 2 ** 30)}`,
       profile,
@@ -836,7 +834,7 @@ export class StrategyService {
       } else {
         plan.inFlight = { step: i, before: before.toString() };
         await dir.write(file, JSON.stringify(plan));
-        const out = await this.#runStep(s, before, BigInt(plan.keep), o);
+        const out = await this.#runStep(s, before, await this.#keepNow(plan), o);
         done.push({ step: i, kind: s.kind, what: s.what, ...out });
         if (!out.landed) {
           delete plan.inFlight;
@@ -849,6 +847,14 @@ export class StrategyService {
       await dir.write(file, JSON.stringify(plan));
     }
     return { done, next: null };
+  }
+
+  /** A plan's keep now: the trading capital's cash as it is now in place of what it was when the plan was made. */
+  async #keepNow(plan: Plan): Promise<bigint> {
+    const was = BigInt(plan.trading?.cashUnits ?? "0");
+    const now = this.#p.trading === undefined || this.#p.trading === null ? 0n : await this.#p.trading.reservedCash();
+    const k = BigInt(plan.keep) - was + now;
+    return k > 0n ? k : 0n;
   }
 
   /** What a step changes, read on-chain: cash vault shares, Borro shares, collateral, the link, or borrow shares. */
@@ -885,9 +891,11 @@ export class StrategyService {
         break;
       case "lend_stock": {
         const stock = borroStocks().find((x) => x.symbol === s.what) as BorroStock;
-        const balance = await tokenBalance(this.#p.client, stock.token, await this.#p.tokenVault(stock.token).vaultAddress());
-        const amount = min(BigInt(s.amount), balance);
-        if (amount === 0n) return { landed: true, skipped: `the vault holds no ${s.what} now` };
+        const held = await tokenBalance(this.#p.client, stock.token, await this.#p.tokenVault(stock.token).vaultAddress());
+        // Not the trading capital's tokens, which it may have bought since the plan.
+        const capital = (await this.#p.trading?.heldTokens())?.get(getAddress(stock.token)) ?? 0n;
+        const amount = min(BigInt(s.amount), held > capital ? held - capital : 0n);
+        if (amount === 0n) return { landed: true, skipped: `the vault holds no ${s.what} now beyond the trading capital's` };
         result = await this.#p.borro.lend(s.what, formatUnitsAmount(amount, 18));
         break;
       }
@@ -1221,55 +1229,5 @@ export class StrategyService {
       realized.push({ vault: c.vault, since: new Date(first.at * 1000).toISOString(), growth: pct(((nowPrice - before) * WAD) / before) });
     }
     return { routes, carries, realized };
-  }
-
-  // -------------------------------------------------------------------------------------------------------------------
-  // Trading capital
-  // -------------------------------------------------------------------------------------------------------------------
-
-  /**
-   * The trading capital's limits now: whether buys may happen (its value against the start of the day and of the week,
-   * kept here) and the most one buy of `token` may be (25% of the capital, at most the size whose quote moves the price
-   * 1%). `capitalNow`: the capital's value now in USDG base units (its USDG plus its tokens at quotes).
-   */
-  async trading(a: { capitalNow: bigint; token?: Address; limits?: Partial<TradingLimits> }): Promise<{ buys: { ok: boolean; reason: string }; positionMax: string | null; dayStart: string; weekStart: string }> {
-    await this.gate();
-    const l = tradingLimits(a.limits);
-    const now = await chainTime(this.#p.client);
-    const day = now / DAY;
-    const week = (day + 3n) / 7n; // weeks start on Monday (1 Jan 1970 was a Thursday)
-    const text = await this.#p.folder.read(TRADING_FILE);
-    const j = text === undefined ? { day: "-1", dayStart: "0", week: "-1", weekStart: "0" } : (JSON.parse(text) as { day: string; dayStart: string; week: string; weekStart: string });
-    if (j.day !== day.toString()) [j.day, j.dayStart] = [day.toString(), a.capitalNow.toString()];
-    if (j.week !== week.toString()) [j.week, j.weekStart] = [week.toString(), a.capitalNow.toString()];
-    await this.#p.folder.write(TRADING_FILE, JSON.stringify(j));
-    const buys = buysAllowed(l, { dayStart: BigInt(j.dayStart), weekStart: BigInt(j.weekStart), now: a.capitalNow });
-    let max: bigint | null = null;
-    if (a.token !== undefined && this.#p.swap !== null) {
-      const swap = this.#p.swap;
-      const token = getAddress(a.token);
-      const dec = Number(await this.#p.client.readContract({ address: token, abi: decimalsAbi, functionName: "decimals" }));
-      const quote = async (amount: bigint) => parseUnits((await swap.quote({ tokenIn: USDG, tokenOut: token, amount: usd(amount) })).expectedOut, dec);
-      const byCapital = (a.capitalNow * l.positionMaxBps) / BPS;
-      max = positionMax(l, a.capitalNow, await this.#impactLimited(byCapital, l.maxImpactBps, quote));
-    }
-    return { buys, positionMax: max === null ? null : usd(max), dayStart: usd(BigInt(j.dayStart)), weekStart: usd(BigInt(j.weekStart)) };
-  }
-
-  /** The largest amount up to `upper` whose quote moves the price at most `maxBps` (bisection over quotes, to 0.1% of `upper`). */
-  async #impactLimited(upper: bigint, maxBps: bigint, quote: (amount: bigint) => Promise<bigint>): Promise<bigint> {
-    if (upper <= 0n) return 0n;
-    const refIn = upper / 1_000n > 0n ? upper / 1_000n : 1n;
-    const refOut = await quote(refIn);
-    const fits = async (x: bigint) => impactBps({ amount: x, out: await quote(x), refIn, refOut }) <= maxBps;
-    if (await fits(upper)) return upper;
-    let lo = refIn;
-    let hi = upper;
-    while (hi - lo > refIn) {
-      const mid = (lo + hi) / 2n;
-      if (await fits(mid)) lo = mid;
-      else hi = mid;
-    }
-    return lo;
   }
 }

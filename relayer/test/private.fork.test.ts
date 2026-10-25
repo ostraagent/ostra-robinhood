@@ -181,7 +181,9 @@ after(async () => {
   if (dataDir !== undefined) await rm(dataDir, { recursive: true, force: true });
 });
 
-test("the price of a spend, per token and kind, over HTTP too; a token with no route to WETH is unpriced", { timeout: 300_000 }, async () => {
+// 900 s as the others: as the first test it quotes every pool on a cold fork (465 s in the workspace and over 600 s on
+// the VPS, 25 Oct 2026, past the 300 s it had).
+test("the price of a spend, per token and kind, over HTTP too; a token with no route to WETH is unpriced", { timeout: 900_000 }, async () => {
   const usdgSwap = await feeOf(USDG, "swap");
   const usdgUnshield = await feeOf(USDG, "unshield");
   assert.ok(usdgSwap > usdgUnshield && usdgUnshield > 0n);
