@@ -16,6 +16,7 @@ import {
   launchParams,
   openChannelParams,
   ostraAirdropAbi,
+  ostraBreakerAbi,
   ostraCreatorSplitAbi,
   ostraDispatcherAbi,
   ostraVestingAbi,
@@ -171,6 +172,11 @@ test("the launchpad's calls: a vault-funded launch acts for its creator vault an
   assert.ok(rel.fn === "splitRelease" && rel.account === at(0xc3));
   assert.equal(parseCall({ to: at(0xd1), data: encodeFunctionData({ abi: ostraVestingAbi, functionName: "release" }) }).fn, "vestingRelease");
   assert.equal(parseCall({ to: at(0xd1), data: encodeFunctionData({ abi: ostraVestingAbi, functionName: "claimDividends" }) }).fn, "vestingClaimDividends");
+  const limits = { priceDropBps: 10, assetsDropBps: 0, maxUtilizationBps: 9_900, minLiquidityBps: 0, assetsMarkCap: 0n };
+  const cfg = parseCall({ to: at(0xb7), data: encodeFunctionData({ abi: ostraBreakerAbi, functionName: "configure", args: [at(0xa1), at(0xa2), limits] }) });
+  assert.ok(cfg.fn === "breakerConfigure" && cfg.vault === at(0xa1) && cfg.target === at(0xa2));
+  const trip = parseCall({ to: at(0xb7), data: encodeFunctionData({ abi: ostraBreakerAbi, functionName: "trip", args: [at(0xa1), at(0xa2)] }) });
+  assert.ok(trip.fn === "breakerTrip" && trip.vault === at(0xa1) && trip.target === at(0xa2));
   // A launch call cut short is malformed, not unknown.
   assert.throws(() => parseCall({ to: l.devBuy, data: launch.data.slice(0, 200) as Hex }, 1), /calls\[1\]: malformed launchFromVault calldata/);
 });

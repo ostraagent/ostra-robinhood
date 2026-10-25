@@ -11,9 +11,17 @@
 // paired with NVDA, whose pool a vault without NVDA cannot buy; errors for bad
 // input. The keys stay in OSTRA_HOME (0700) and
 // a second server on the same OSTRA_HOME finds the same vault.
+// The server's event searches (OSTRA_LOGS_RPC_URL) go to a local JSON-RPC
+// endpoint that sends eth_getLogs over the chain's history to Robinhood
+// Chain's public RPC and over the fork's own blocks to the fork (core's
+// split-logs.ts), as the MCP's default logs RPC is the public one: through the
+// fork they would reach OSTRA_FORK_RPC, whose plan may cap eth_getLogs at 10
+// blocks (the VPS's, seen 25 Oct 2026), and never finish.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,21 +29,63 @@ import { after, before, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { getAddress, type Address } from "viem";
-import { USDG, usdgAbi, type Deployment } from "@ostraagent/sdk";
-import { deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { STEAKHOUSE_USDG, USDG, deployBreaker, usdgAbi, type Deployment } from "@ostraagent/sdk";
+import { OUT_DIR, deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { splitLogsClient } from "../../core/test/split-logs.ts";
 
 let fork: Fork;
 let d: Deployment;
 let root: string;
+let logsServer: Server | undefined;
+let logsUrl: string;
+
+/** A JSON-RPC endpoint over `split` (single and batch requests); an error goes back as a JSON-RPC error, so the caller's chunked log search narrows its span. */
+async function serveLogs(split: ReturnType<typeof splitLogsClient>): Promise<{ server: Server; url: string }> {
+  type Req = { id?: unknown; method: string; params?: unknown[] };
+  const one = async (m: Req) => {
+    try {
+      return { jsonrpc: "2.0", id: m.id ?? null, result: await split.request({ method: m.method, params: m.params } as never) };
+    } catch (e) {
+      return { jsonrpc: "2.0", id: m.id ?? null, error: { code: typeof (e as { code?: unknown }).code === "number" ? (e as { code: number }).code : -32603, message: (e as Error).message.split("\n")[0] } };
+    }
+  };
+  const server = createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (c: string) => (body += c));
+    req.on("end", () => {
+      void (async () => {
+        let out: unknown;
+        try {
+          const parsed = JSON.parse(body) as Req | Req[];
+          out = Array.isArray(parsed) ? await Promise.all(parsed.map(one)) : await one(parsed);
+        } catch (e) {
+          out = { jsonrpc: "2.0", id: null, error: { code: -32700, message: (e as Error).message } };
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(out));
+      })();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  return { server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
+}
 
 before(async () => {
   root = await mkdtemp(join(tmpdir(), "ostra-mcp-"));
   fork = await startFork();
+  const served = await serveLogs(splitLogsClient(fork.url, await fork.client.getBlockNumber({ cacheTime: 0 })));
+  logsServer = served.server;
+  logsUrl = served.url;
   d = await deployLaunchpadOnFork(fork, await deployOnFork(fork));
+  // With OstraBreaker (vault version 3): vault_lock sets it up before the USDG vault's lock.
+  d = await deployBreaker({ publicClient: fork.client, walletClient: fork.wallet(fork.accounts[0]!), outDir: OUT_DIR }, d);
   await writeFile(join(root, "deployment.json"), JSON.stringify(d));
 });
 
 after(async () => {
+  logsServer?.closeAllConnections();
+  await new Promise<void>((resolve) => (logsServer === undefined ? resolve() : logsServer.close(() => resolve())));
   await fork?.stop();
   if (root !== undefined) await rm(root, { recursive: true, force: true });
 });
@@ -55,6 +105,10 @@ async function connect(home: string): Promise<Client> {
       OSTRA_RELAYER_URL: "off",
       OSTRA_KEEPER_URL: "off",
       OSTRA_AGGREGATOR_URL: "off",
+      // The planner's event searches: the chain's history from the public RPC, the fork's blocks from the fork.
+      OSTRA_LOGS_RPC_URL: logsUrl,
+      OSTRA_ETH_RPC_URL: "off",
+      OSTRA_RAETO_URL: "off",
     },
     stderr: "pipe",
   });
@@ -214,7 +268,7 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault"]) {
+    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault", "strategy_plan", "strategy_apply", "strategy_check", "strategy_report", "breaker", "raeto"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     const status = (await call(client, "balance")).json.vault as { feePayer: Address };
@@ -240,8 +294,32 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
     const missing = await call(client, "vault_lock", { action: "set" });
     assert.ok(!missing.ok && /takes withdrawal, delaySeconds and dailyLimit/.test(missing.text), missing.text);
     const withdrawal = fork.accounts[3]!.address;
-    const on = await call(client, "vault_lock", { action: "set", withdrawal, delaySeconds: 129_600, dailyLimit: "5" });
-    assert.ok(on.ok && on.json.status === "sent", on.text);
+    // Strategies: the check runs for anyone (exits are never gated), a plan only for an agent registered in ERC-8004.
+    const checked = await call(client, "strategy_check", { execute: true }, 600_000);
+    assert.ok(checked.ok && Array.isArray(checked.json.findings), checked.text);
+    const refused = await call(client, "strategy_plan", {}, 600_000);
+    assert.ok(!refused.ok && /register_agent/.test(refused.text), refused.text);
+    const raeto = await call(client, "raeto", { action: "models" });
+    assert.ok(!raeto.ok && /OSTRA_RAETO_URL=off/.test(raeto.text), raeto.text);
+    const unarmed = await call(client, "breaker", { action: "status" });
+    assert.ok(unarmed.ok && unarmed.json.guardian === false && unarmed.json.locked === false, unarmed.text);
+    // A lock setLock would refuse (the withdrawal address is the agent's own vault) is refused before the breaker is set
+    // up: nothing is spent.
+    const own = await call(client, "vault_lock", { action: "set", withdrawal: vault, delaySeconds: 129_600, dailyLimit: "5" });
+    assert.ok(!own.ok && /one of this agent's own vaults/.test(own.text), own.text);
+    const stillUnarmed = await call(client, "breaker", { action: "status" });
+    assert.ok(stillUnarmed.ok && stillUnarmed.json.guardian === false && stillUnarmed.json.locked === false, stillUnarmed.text);
+    // The lock on: OstraBreaker is set up first (guardian, the approval of its limits, the limits sent), then the lock.
+    const on = await call(client, "vault_lock", { action: "set", withdrawal, delaySeconds: 129_600, dailyLimit: "5" }, 600_000);
+    const onLock = on.json.lock as { status?: string } | undefined;
+    const onSteps = (on.json.breaker as { steps?: { step: string; done: string }[] } | undefined)?.steps?.map((x) => `${x.step}:${x.done}`);
+    assert.ok(on.ok && onLock?.status === "sent", on.text);
+    assert.deepEqual(onSteps, ["guardian:now", "approve:now", "configure:now"], on.text);
+    const armed = await call(client, "breaker", { action: "status" });
+    const watches = armed.json.watches as { target: string; watched: boolean }[];
+    assert.ok(armed.ok && armed.json.guardian === true && armed.json.locked === true && watches.length === 1 && watches[0]!.watched && getAddress(watches[0]!.target) === STEAKHOUSE_USDG, armed.text);
+    const again = await call(client, "breaker", { action: "arm" });
+    assert.ok(!again.ok && /withdrawal lock is on/.test(again.text), again.text);
     const locked = await call(client, "vault_lock", { action: "status" });
     assert.ok(locked.ok && getAddress((locked.json.lock as { withdrawal: string }).withdrawal) === getAddress(withdrawal), locked.text);
     const over = await call(client, "withdraw", { destination: fork.accounts[2]!.address, amount: "10" });

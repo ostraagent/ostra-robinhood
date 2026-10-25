@@ -421,6 +421,17 @@ export class BorroService {
    * tell it from an Ostra vault not created yet, which could be created unlocked): a warning says so.
    */
   async setLock(what: string, withdrawalText: string, delaySeconds: number, dailyLimit: string): Promise<VaultOperationResult & { warning?: string }> {
+    const c = await this.checkLock(what, withdrawalText, delaySeconds, dailyLimit);
+    const r = await this.#spend(c.vault, VAULT_ACTION.SET_WITHDRAWAL_LOCK, c.params, c.off ? "turning the withdrawal lock off" : "withdrawal lock");
+    return c.warning === undefined ? r : { ...r, warning: c.warning };
+  }
+
+  /**
+   * setLock's checks, nothing signed: refused for what setLock refuses (a bad delay, one of this agent's own vaults, an
+   * unlocked withdrawal vault or one in another token), with the warning it would give. vault_lock runs them before it
+   * sets OstraBreaker up, so that no spend is made for a lock that would be refused.
+   */
+  async checkLock(what: string, withdrawalText: string, delaySeconds: number, dailyLimit: string): Promise<{ vault: VaultService; off: boolean; params: Hex; warning?: string }> {
     const { vault, decimals, stock } = this.#vaultOf(what);
     const at = await this.#address(vault, what.toUpperCase());
     const off = withdrawalText === "off";
@@ -453,8 +464,7 @@ export class BorroService {
       warning = warning === undefined ? note : `${warning}; ${note}`;
     }
     const params = setWithdrawalLockParams({ withdrawal, delay: off ? 0 : delaySeconds, dailyLimit: limit });
-    const r = await this.#spend(vault, VAULT_ACTION.SET_WITHDRAWAL_LOCK, params, off ? "turning the withdrawal lock off" : "withdrawal lock");
-    return warning === undefined ? r : { ...r, warning };
+    return { vault, off, params, ...(warning === undefined ? {} : { warning }) };
   }
 
   /** Sets (or with "none" removes) the linked vault of the vault of `what`: under the lock a new link waits its delay. */

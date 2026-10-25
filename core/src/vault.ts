@@ -564,6 +564,38 @@ export class VaultService {
     return record;
   }
 
+  /**
+   * Where the vault's next spend is signed (its nonce and one-time key index), with the spend signed there and not
+   * landed yet, decoded (the next operation sends it again before anything else), or null; null when the vault does
+   * not exist yet. A caller that keeps a slot before a spend can tell later, with signedAt, what landed at it.
+   */
+  spendSlot(): Promise<{ nonce: bigint; keyIndex: bigint; pending: { action: number; params: Hex } | null } | null> {
+    return this.#serial(async () => {
+      const vault = await this.vaultAddress().catch(() => null);
+      if (vault === null) return null;
+      const v = await this.#read(vault);
+      if (v === null) return null;
+      const p = await this.#pending(v);
+      const s = p === null ? null : decodeVaultSpendMessage(fromHex(p.message));
+      return { nonce: v.nonce, keyIndex: v.keyIndex ?? v.nonce, pending: s === null ? null : { action: s.action, params: s.params } };
+    });
+  }
+
+  /**
+   * The spend this vault's keys signed at `slot` (from spendSlot), decoded, when it was signed for that slot's nonce;
+   * null when none was. Once the vault's nonce is past the slot, it is what landed there: a one-time key signs once.
+   */
+  signedAt(slot: { nonce: bigint; keyIndex: bigint }): Promise<{ action: number; params: Hex } | null> {
+    return this.#serial(async () => {
+      const vault = getAddress(await this.vaultAddress());
+      const record = await this.#keychain.signed(slot.keyIndex);
+      if (record === undefined) return null;
+      const s = decodeVaultSpendMessage(fromHex(record.message));
+      if (s.nonce !== slot.nonce || getAddress(s.vault) !== vault || s.chainId !== this.#config.chainId) return null;
+      return { action: s.action, params: s.params };
+    });
+  }
+
   status(): Promise<BalanceResult> {
     return this.#serial(async () => {
       if (this.kind === "token") throw new Error(`the vault in ${this.token} is read with its token's tools (token_vault)`);

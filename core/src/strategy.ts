@@ -19,7 +19,9 @@
 //   * report(): yield per day by route, realized share growth, and each carry's distance to liquidation.
 //   * trading(): the trading capital's limits now (Ostra's; an agent may only tighten them).
 //
-// Strategy 3 (the guardian breaker, OstraBreaker) is stage 3: until it is deployed the plans say so.
+// Strategy 3 (the guardian breaker, OstraBreaker, breaker.ts): each plan says whether it watches the USDG vault's cash
+// vaults. It does only under the vault's withdrawal lock (decided by Edu on 25 Oct 2026: turning the lock on arms it);
+// without the lock the MCP's sweep runs exitCheck() each minute while it runs, and leaves a failing cash vault at once.
 
 import { getAddress, parseAbi, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import {
@@ -36,6 +38,8 @@ import {
   borroStocks,
   borrowParams,
   capIdsFromEvents,
+  capsAfterPending,
+  cashCollateralHolds,
   cashVaultRoom,
   checkCashVault,
   getLogsChunked,
@@ -67,6 +71,7 @@ import {
 } from "@ostraagent/sdk";
 import { formatUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { BORRO_REPAY_BUFFER_BPS, type BorroService } from "./borro.ts";
+import type { BreakerService } from "./breaker.ts";
 import { chainTime, tokenBalance } from "./chain.ts";
 import type { Config } from "./config.ts";
 import { randomInt } from "./random.ts";
@@ -150,6 +155,8 @@ export type StrategyParts = {
    * USDe's price is unknown, so no cash goes into a vault that can lend against USDe.
    */
   ethClient: PublicClient | null;
+  /** OstraBreaker on the USDG vault (null: a deployment without one). */
+  breaker?: BreakerService | null;
 };
 
 export type PlanOptions = {
@@ -228,9 +235,9 @@ function stepMoved(s: Step, before: bigint, after: bigint): boolean {
   return s.kind === "redeem_cash" || s.kind === "repay" || s.kind === "close_carry" ? after < before : after > before;
 }
 
-/** Why a cash vault takes no deposit now: its problems and USDe's price. */
-function whyNot(c: { problems: string[]; usdeProblem: string | null }): string {
-  return [...c.problems, ...(c.usdeProblem === null ? [] : [c.usdeProblem])].join("; ");
+/** Why a cash vault takes no deposit now: its problems, USDe's price, its collateral limits and what makes a run leave it. */
+function whyNot(c: { problems: string[]; usdeProblem: string | null; collateralHolds: string[]; exitReasons: string[] }): string {
+  return [...c.problems, ...(c.usdeProblem === null ? [] : [c.usdeProblem]), ...c.collateralHolds, ...c.exitReasons].join("; ");
 }
 
 /** What the collateral allows at the full LLTV, in USDG base units (debt / this = how far toward liquidation). */
@@ -238,8 +245,12 @@ function fullLimit(p: BorroPosition): bigint {
   return (((p.collateral * p.price) / 10n ** 36n) * p.stock.market.lltv) / WAD;
 }
 
+/** How long a read of USDe's price is used again (its feed answers about once a day: USDE_FEED_MAX_AGE). */
+export const USDE_CACHE_MS = 5 * 60_000;
+
 export class StrategyService {
   readonly #p: StrategyParts;
+  #usdeCache: { at: number; value: { price: bigint; stale: boolean; age: bigint; feed: Address } | { error: string } } | null = null;
 
   constructor(p: StrategyParts) {
     this.#p = p;
@@ -364,28 +375,40 @@ export class StrategyService {
 
   /**
    * USDe's price from Chainlink's USDe / USD feed on Ethereum (sdk readUsdeUsd), or why it is not known (no Ethereum
-   * client, the read failed). Read once per call of the planner.
+   * client, the read failed). Read at most every USDE_CACHE_MS, a failure included.
    */
   async usde(): Promise<{ price: bigint; stale: boolean; age: bigint; feed: Address } | { error: string }> {
     if (this.#p.ethClient === null) return { error: "no Ethereum RPC is set" };
+    // Read at most every USDE_CACHE_MS (the MCP's sweep checks each minute; Chainlink updates it about daily).
+    const c = this.#usdeCache;
+    if (c !== null && Date.now() - c.at < USDE_CACHE_MS) return c.value;
+    // A failed read is kept as long: an Ethereum RPC that is down must not hold every minute's exit check up.
+    let value: Awaited<ReturnType<StrategyService["usde"]>>;
     try {
-      return await readUsdeUsd(this.#p.ethClient);
+      value = await readUsdeUsd(this.#p.ethClient);
     } catch (e) {
-      return { error: (e as Error).message.split("\n")[0] as string };
+      value = { error: (e as Error).message.split("\n")[0] as string };
     }
+    this.#usdeCache = { at: Date.now(), value };
+    return value;
   }
 
   /**
    * Strategy 1's check of every cash vault (sdk checkCashVault, the worst case bounded with `planned` more in it), with
    * what the planner adds: a pending change that would make it fail the check once executed is a problem (sdk
    * pendingChangeProblems), and a vault whose caps can reach a USDe market takes no deposit unless USDe's price is
-   * known, fresh and at least USDE_EXIT_PRICE (`usdeProblem`). `ok`: no problem and no usdeProblem. The 5% share limit
-   * is not part of `ok`: a deposit is capped at `room` (cashVaultRoom) instead.
+   * known, fresh and at least USDE_EXIT_PRICE (`usdeProblem`), nor while a collateral limit does not hold under its caps
+   * now or once its pending cap increases are executed (sdk cashCollateralHolds: mGLO's share and NAV age,
+   * `collateralHolds`). `ok`: no problem, no usdeProblem, no collateral hold and no exit reason. The 5% share limit is not
+   * part of `ok`: a deposit is capped at `room` (cashVaultRoom) instead. A collateral hold, like usdeProblem, only stops
+   * new deposits: what is held stays.
    */
   async cashVaults(
     planned = 0n,
     usde?: Awaited<ReturnType<StrategyService["usde"]>>,
-  ): Promise<(CashVaultCheck & { room: bigint; pendingFine: string[]; pendingIgnored: string[]; usdeExposed: boolean; usdeProblem: string | null; exitReasons: string[] })[]> {
+  ): Promise<
+    (CashVaultCheck & { room: bigint; pendingFine: string[]; pendingIgnored: string[]; usdeExposed: boolean; usdeProblem: string | null; collateralHolds: string[]; exitReasons: string[] })[]
+  > {
     const holder = await this.#p.buyer.vaultAddress();
     const ostra = await this.ostraVaults(USDG);
     const out = [];
@@ -394,8 +417,14 @@ export class StrategyService {
     const now = await chainTime(this.#p.client);
     for (const v of CASH_VAULTS) {
       const c = await checkCashVault(this.#p.client, v, { capIds: await this.#capIds(v), holders: [holder], ostraVaults: ostra, planned });
-      const pending = pendingChangeProblems(c.state, c.caps, await this.pendingChanges(c.state));
+      const pendingNow = await this.pendingChanges(c.state);
+      const pending = pendingChangeProblems(c.state, c.caps, pendingNow);
       const problems = [...c.problems, ...pending.problems];
+      const total = c.state.accruedTotalAssets + planned;
+      const collateralHolds = [...(await cashCollateralHolds(this.#p.client, c.state, c.caps, total))];
+      for (const x of await cashCollateralHolds(this.#p.client, c.state, capsAfterPending(c.state, c.caps, pendingNow), total)) {
+        if (!collateralHolds.includes(x)) collateralHolds.push(`once its submitted cap increases are executed, ${x}`);
+      }
       const usdeExposed = worstCaseExposure(c.state, c.caps, c.state.accruedTotalAssets + planned).markets.some((m) => getAddress(m.params.collateralToken) === USDE);
       let usdeProblem: string | null = null;
       if (usdeExposed) {
@@ -420,7 +449,18 @@ export class StrategyService {
       if (prev !== undefined && pc !== undefined && shareGrowthTooLow({ price: BigInt(pc.sharePrice), at: BigInt(prev.at), modelApy: BigInt(pc.modelApy) }, { price: c.sharePrice, at: now }) === true) {
         exitReasons.push("its share price grew less than half of its model over the last 3 days or more");
       }
-      out.push({ ...c, ok: problems.length === 0 && usdeProblem === null && exitReasons.length === 0, problems, room: cashVaultRoom(c), pendingFine: pending.fine, pendingIgnored: pending.ignored, usdeExposed, usdeProblem, exitReasons });
+      out.push({
+        ...c,
+        ok: problems.length === 0 && usdeProblem === null && collateralHolds.length === 0 && exitReasons.length === 0,
+        problems,
+        room: cashVaultRoom(c),
+        pendingFine: pending.fine,
+        pendingIgnored: pending.ignored,
+        usdeExposed,
+        usdeProblem,
+        collateralHolds,
+        exitReasons,
+      });
     }
     return out;
   }
@@ -558,7 +598,7 @@ export class StrategyService {
       "a cash vault fails a check (sdk checkCashVault), a change to it is submitted, its share price grows less than half of its model over 3 days, it lends against USDe while Chainlink's USDe / USD price is under 0.995, or its liquidity market is 99% used: it is redeemed (an emergency redeem of what it can pay out); all Ostra vaults holding more than 5% of what it can pay out: the excess is redeemed",
       "a carry reaches 70% of the LLTV (60% for NVDA around a closure or earnings): back to its opening level; 85%: repaid in full; its rate averaged over two runs above the cash yield less 1 point: repaid in full; its market past 90% use: the excess repaid",
     ];
-    const breaker = "Strategy 3 (the guardian breaker) is not deployed yet: until it is, only the agent's own runs act, at least daily, and on Friday before 18:00 UTC and Monday after 00:00 UTC while a carry is open.";
+    const breaker = await this.#breakerNote();
     const trading =
       limits === null
         ? null
@@ -740,6 +780,22 @@ export class StrategyService {
     await dir.ensure();
     for (const p of plans) await dir.write(`${p.id}.json`, JSON.stringify(p));
     return plans;
+  }
+
+  /** What a plan says of Strategy 3: whether OstraBreaker watches the USDG vault's cash vaults now, and what acts if not. */
+  async #breakerNote(): Promise<string> {
+    const b = this.#p.breaker ?? null;
+    const runs = "the agent's own runs act (each minute while the MCP server runs, and at least daily; on Friday before 18:00 UTC and Monday after 00:00 UTC while a carry is open)";
+    if (b === null || b.address === null) return `OstraBreaker is not deployed on this deployment: ${runs}.`;
+    try {
+      const s = await b.status();
+      const watched = s.watches.filter((w) => w.watched).map((w) => w.target);
+      if (s.locked && watched.length > 0) return `OstraBreaker ${s.breaker} watches ${watched.join(", ")} for this vault: when a limit is crossed on chain (share price, a run, its liquidity market's use, what it can pay out), anyone, Ostra's breaker keeper first, redeems the shares back into the vault; ${runs} as well.`;
+      if (s.locked) return `the vault's withdrawal lock is on but OstraBreaker does not watch its cash vaults (it is set up before the lock, which then has to be turned off first): ${runs}.`;
+      return `OstraBreaker acts only under the vault's withdrawal lock, which is off: ${runs}. Turning the lock on (vault_lock) sets the breaker up first.`;
+    } catch (e) {
+      return `OstraBreaker could not be read now (${(e as Error).message.split("\n")[0]}): ${runs}.`;
+    }
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -964,7 +1020,12 @@ export class StrategyService {
           const shares = value === held.value ? held.shares : (held.shares * value) / held.value;
           if (shares > 0n) actions.push({ kind: "redeem_cash", what: "USDG", vault: c.vault, amount: shares.toString(), urgent: false, notBefore: 0, cost: "0", reason: `${c.shareProblem}: this vault's part of the excess back` });
           findings.push(`${c.vault}: ${c.shareProblem}`);
-        } else findings.push(`${c.vault}: every check passes; held ${usd(held.value)} USDG at ${pct(c.modelApy)} a year`);
+        } else {
+          // A hold (USDe's price not known, a collateral limit) stops new deposits only: what is held stays (design).
+          const holds = [...(c.usdeProblem === null ? [] : [c.usdeProblem]), ...c.collateralHolds];
+          if (holds.length > 0) findings.push(`${c.vault}: held ${usd(held.value)} USDG, kept (no exit reason); new deposits wait: ${holds.join("; ")}`);
+          else findings.push(`${c.vault}: every check passes; held ${usd(held.value)} USDG at ${pct(c.modelApy)} a year`);
+        }
       }
     } catch (e) {
       findings.push(`the cash vaults could not be checked now: ${(e as Error).message.split("\n")[0]}`);
@@ -1051,6 +1112,58 @@ export class StrategyService {
     }
     await this.#p.folder.append(RUNS_FILE, `${JSON.stringify(record)}\n`);
     return { findings, actions, plan, results };
+  }
+
+  /**
+   * The MCP's sweep, each minute (decided by Edu on 25 Oct 2026, for a vault the breaker does not watch, and alongside
+   * it for one it does): only when the USDG vault holds cash vault shares, the cash checks check() runs, and a cash vault
+   * with a problem or an exit reason is left at once (an urgent redeem of what it can pay out, minAssets 0). Nothing is
+   * kept. Nothing else of check() runs here (the carry ladder runs with the agent's own runs).
+   */
+  async exitCheck(): Promise<{ held: number; left: { vault: Address; reasons: string[]; landed?: boolean; skipped?: string; note?: string; error?: string }[] }> {
+    const buyer = getAddress(await this.#p.buyer.vaultAddress());
+    const held: { vault: Address; shares: bigint; value: bigint }[] = [];
+    for (const v of CASH_VAULTS) {
+      const shares = (await this.#p.client.readContract({ address: v, abi: vaultV2Abi, functionName: "balanceOf", args: [buyer] })) as bigint;
+      if (shares === 0n) continue;
+      const value = (await this.#p.client.readContract({ address: v, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
+      held.push({ vault: v, shares, value });
+    }
+    if (held.length === 0) return { held: 0, left: [] };
+    const checks = await this.cashVaults(0n);
+    const left = [];
+    for (const h of held) {
+      const c = checks.find((x) => x.vault === h.vault);
+      if (c === undefined) continue;
+      const reasons = [...c.problems, ...c.exitReasons];
+      if (reasons.length === 0) continue;
+      const payable = min(c.withdrawable, h.value);
+      const shares = payable === h.value ? h.shares : h.value === 0n ? 0n : (h.shares * payable) / h.value;
+      if (shares === 0n) {
+        left.push({ vault: h.vault, reasons, skipped: "it can pay out nothing now" });
+        continue;
+      }
+      const step: Step = { kind: "redeem_cash", what: "USDG", vault: h.vault, amount: shares.toString(), urgent: true, notBefore: 0, cost: "0", reason: `leave ${h.vault}: ${reasons.join("; ")}` };
+      // What it can pay out now must cover the redeem's gas, or each minute would spend a key for dust. A cost that
+      // cannot be priced now (the ETH / USD feed, the relayer) does not stop an exit: it is sent, and the reason noted.
+      let unpriced: string | undefined;
+      try {
+        const gas = await this.#cost("USDG", VAULT_ACTION.REDEEM, redeemParams({ vault: h.vault, shares, minAssets: 0n }), "the cash exit", false);
+        if (payable <= gas) {
+          left.push({ vault: h.vault, reasons, skipped: `it can pay out ${usd(payable)} USDG now, not more than the redeem's gas of ${usd(gas)}` });
+          continue;
+        }
+      } catch (e) {
+        unpriced = `the redeem's gas could not be priced (${(e as Error).message.split("\n")[0]}): sent anyway`;
+      }
+      try {
+        const done = await this.#runStep(step, await this.#measure(step), 0n, {});
+        left.push({ vault: h.vault, reasons, ...done, ...(unpriced === undefined ? {} : { note: done.note === undefined ? unpriced : `${done.note}; ${unpriced}` }) });
+      } catch (e) {
+        left.push({ vault: h.vault, reasons, error: (e as Error).message });
+      }
+    }
+    return { held: held.length, left };
   }
 
   /** The runs recorded here, oldest first; a line that cannot be parsed is skipped. */

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RelayerError, RelayerUnavailableError, formatTokenAmount, uploadImage } from "@ostraagent/core";
+import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, formatTokenAmount, raetoImages, uploadImage } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { ensurePrivateDir } from "./disk.ts";
@@ -76,6 +76,7 @@ async function run(fn: () => Promise<unknown>, rpcUrls: readonly string[]): Prom
     if (err instanceof RelayerUnavailableError) kind = "relayer_unavailable";
     else if (err instanceof RelayerError) kind = `relayer_refused ${err.status} ${err.code}`;
     else if (err instanceof QuoteError) kind = `refused_before_signing ${err.code}`;
+    else if (err instanceof RaetoError) kind = `raeto_refused ${err.status}`;
     else if (err instanceof RangeError) kind = "invalid_input";
     // The RPC URLs may carry an API key (viem's errors print them): never passed on.
     const message = rpcUrls.reduce((text, url) => redact(text, url), err instanceof Error ? err.message : String(err));
@@ -98,7 +99,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   };
   const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
-    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), [agent.config.rpcUrl, agent.config.logsRpcUrl])) as never);
+    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])])) as never);
 
   // --- the vault ---------------------------------------------------------------------------------
   tool("open_vault", "Creates the agent's vault (USDG on Robinhood Chain, post-quantum WOTS keys) or finds it. With the Ostra relayer, its creation is paid later from the vault.", {}, () => agent.buyer.open());
@@ -310,13 +311,27 @@ export function registerTools(server: McpServer, agent: Agent): void {
       withdrawal: address.optional(),
       delaySeconds: z.number().int().min(129_600).max(1_209_600).optional(),
       dailyLimit: units.optional(),
+      skipBreaker: z.boolean().optional().describe("set on the USDG vault: turn the lock on without setting OstraBreaker up first (it cannot be set up under the lock later)"),
     },
-    (a) => {
+    async (a) => {
       const asset = a.asset ?? "USDG";
       if (a.action === "status") return agent.borro.guard(asset);
       if (a.action === "cancel") return agent.borro.cancelPending(asset);
       if (a.action === "off") return agent.borro.setLock(asset, "off", 0, "0");
       if (a.withdrawal === undefined || a.delaySeconds === undefined || a.dailyLimit === undefined) throw new RangeError("set takes withdrawal, delaySeconds and dailyLimit");
+      // The USDG vault's lock going on sets OstraBreaker up first (decided 25 Oct 2026): it cannot become a guardian, nor
+      // its limits be approved at once, under the lock.
+      if (asset.toUpperCase() === "USDG" && agent.breaker.address !== null && a.skipBreaker !== true && (await agent.borro.guard("USDG")).lockedSince === 0n) {
+        // The lock's own checks first: nothing is spent on the breaker for a lock that would be refused.
+        await agent.borro.checkLock(asset, a.withdrawal, a.delaySeconds, a.dailyLimit);
+        let breaker: unknown;
+        try {
+          breaker = await agent.breaker.arm();
+        } catch (err) {
+          throw new Error(`OstraBreaker could not be set up before the lock, so the lock was not turned on: ${err instanceof Error ? err.message : String(err)}. Call again, or with skipBreaker to lock without it`);
+        }
+        return { breaker, lock: await agent.borro.setLock(asset, a.withdrawal, a.delaySeconds, a.dailyLimit) };
+      }
       return agent.borro.setLock(asset, a.withdrawal, a.delaySeconds, a.dailyLimit);
     },
   );
@@ -361,6 +376,83 @@ export function registerTools(server: McpServer, agent: Agent): void {
                 : { op: GUARD_OP.WITHDRAW_COLLATERAL, marketId: need(a.marketId, "marketId") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) };
       return agent.borro.guardOther(a.vault, call);
     },
+  );
+
+  // --- Ostra's strategies (vault version 3; for agents registered in ERC-8004 through Ostra) -------------------
+  const earnings = z.record(z.string().regex(/^[A-Z]{1,8}$/), z.number().int().min(0)).optional().describe("earnings dates the agent knows, unix seconds by stock ticker (without one NVDA stays at most 60% of its LLTV)");
+  tool(
+    "strategy_plan",
+    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. Nothing is signed. Only for an agent registered in ERC-8004 (register_agent).",
+    { buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days)"), tradingCapital: usdg.optional(), earnings },
+    (a) =>
+      agent.strategy.plan({
+        ...(a.buffer === undefined ? {} : { buffer: parseUsdg(a.buffer) }),
+        ...(a.tradingCapital === undefined ? {} : { tradingCapital: parseUsdg(a.tradingCapital) }),
+        ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }),
+      }),
+  );
+  tool(
+    "strategy_apply",
+    "Runs a plan strategy_plan or strategy_check made, step by step: each step is checked and sized again right before it is signed and its effect read back after it lands. A step that is not urgent waits its random start (so Ostra agents do not move together): call again after `next.notBefore`.",
+    { plan: z.string().regex(/^[0-9]+-[0-9]+$/, "a plan id"), earnings },
+    (a) => agent.strategy.apply(a.plan, a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }),
+  );
+  tool(
+    "strategy_check",
+    "Each run's check: the cash vaults (their checks, settings and submitted changes, share price against the model, USDe's price), the carries' ladder; urgent actions (leaving a cash vault, repaying) run at once when execute (default true); the others are kept as a plan for strategy_apply. Never refused for the ERC-8004 gate: exits always run.",
+    { execute: z.boolean().default(true), earnings },
+    (a) => agent.strategy.check({ execute: a.execute, ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }) }),
+  );
+  tool("strategy_report", "What the strategies earn: yield per day by route at the rates now, the share growth since the first run that held each cash vault, and each carry's distance to liquidation.", {}, () => agent.strategy.report());
+  const raeto = () => {
+    if (agent.raeto === null) throw new Error("Raeto is turned off here (OSTRA_RAETO_URL=off)");
+    return agent.raeto;
+  };
+  tool(
+    "raeto",
+    "Raeto (raeto.cc): 400+ AI models (text, and image models such as google/gemini-2.5-flash-image and openai/gpt-5-image-mini) through one OpenAI-compatible API, paid in Raeto credits of the vault's own Raeto account. login: signs the USDG vault in as an agent with EIP-1271 (the vault approves Raeto's login message, then withdraws the approval; refused under the withdrawal lock), its API key kept on this machine and never shown (name: the account's name; limitUsd: its spending limit). me: the account's credits. models: the models and prices per token (output: image for the image models). fund: sends `amount` USDG from the vault to Raeto, as credits. fund_yield: sends what the cash vault shares earned since the last call (at least `min`, default 1 USDG), redeemed then sent. complete: a model call, `request` in the OpenAI chat format with Raeto's model id (images it returns are saved as files in the agent's directory).",
+    {
+      action: z.enum(["login", "me", "models", "fund", "fund_yield", "complete"]),
+      name: z.string().min(1).max(64).optional(),
+      limitUsd: z.number().positive().max(100_000).optional(),
+      output: z.string().regex(/^[a-z]{1,16}$/).optional(),
+      amount: usdg.optional(),
+      min: usdg.optional(),
+      request: z.record(z.string(), z.unknown()).optional(),
+    },
+    async (a) => {
+      const r = raeto();
+      if (a.action === "login") return r.login({ name: a.name ?? "ostra-agent", ...(a.limitUsd === undefined ? {} : { limitUsd: a.limitUsd }) });
+      if (a.action === "me") return r.me();
+      if (a.action === "models") return r.models(a.output);
+      if (a.action === "fund") {
+        if (a.amount === undefined) throw new RangeError("fund takes amount (USDG)");
+        return r.fund(a.amount);
+      }
+      if (a.action === "fund_yield") return r.fundFromYield(a.min ?? "1");
+      if (a.request === undefined) throw new RangeError("complete takes request (the OpenAI chat format, with model)");
+      const answer = await r.complete(a.request);
+      const images = raetoImages(answer);
+      if (images.length === 0) return answer;
+      // The images, data: URLs in the answer, as files (the answer keeps everything else).
+      await ensurePrivateDir(aiDir);
+      const id = `raeto-${Date.now()}`;
+      const files = [];
+      for (const img of images) {
+        const bytes = Buffer.from(img.bytes);
+        const file = join(aiDir, `${id}-${img.index}.${imageExt(bytes)}`);
+        await writeFile(file, bytes, { mode: 0o600 });
+        files.push({ media_type: img.mediaType, file, bytes: bytes.length });
+      }
+      const stripped = JSON.parse(JSON.stringify(answer, (k, v) => (k === "images" ? undefined : v))) as Record<string, unknown>;
+      return { ...stripped, images: files };
+    },
+  );
+  tool(
+    "breaker",
+    "OstraBreaker on the USDG vault (Strategy 3). status: whether it is a guardian, the lock, and its watch of each cash vault (limits, marks, what is crossed now). arm: sets it up (guardian, the vault's approval of its limits, the limits sent), only before the withdrawal lock is on; vault_lock set does this first by itself.",
+    { action: z.enum(["status", "arm"]) },
+    (a) => (a.action === "status" ? agent.breaker.status() : agent.breaker.arm()),
   );
 
   // --- the launchpad: trading -------------------------------------------------------------------------------
@@ -509,6 +601,17 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("vesting_info", "The dev buy vesting of a token: schedule, what it holds, what it can release.", { token: address, vesting: address.optional() }, (a) => lp().vestingInfo({ token: a.token, ...(a.vesting === undefined ? {} : { vesting: a.vesting }) }));
   tool("vesting_release", "Releases what the dev buy vesting has vested, to the agent's token vault.", { token: address, vesting: address.optional() }, (a) => lp().vestingRelease({ token: a.token, ...(a.vesting === undefined ? {} : { vesting: a.vesting }) }));
   tool("vesting_claim_dividends", "Claims the dividends the vesting's tokens earned, to its dividend recipient.", { token: address, vesting: address.optional() }, (a) => lp().vestingClaimDividends({ token: a.token, ...(a.vesting === undefined ? {} : { vesting: a.vesting }) }));
+}
+
+/** A USDG amount (6 decimals) in base units. */
+function parseUsdg(text: string): bigint {
+  const [w, f = ""] = text.split(".");
+  return BigInt(w as string) * 1_000_000n + BigInt(f.padEnd(6, "0"));
+}
+
+/** Earnings dates by ticker, as the planner takes them. */
+function earningsOf(e: Record<string, number>): Record<string, bigint> {
+  return Object.fromEntries(Object.entries(e).map(([k, v]) => [k, BigInt(v)]));
 }
 
 const BIGINT_FIELDS = new Set(["minDividendBalance", "maxBuy", "maxWallet", "graduationThreshold"]);

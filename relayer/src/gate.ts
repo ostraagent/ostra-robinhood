@@ -14,7 +14,8 @@
 //      the relayer fronts the ETH launch fee and charges it), OstraAirdrop
 //      claim and close, OstraDispatcher.claimReferral,
 //      OstraCreatorSplit.release, and release and claimDividends of an
-//      OstraVesting OstraDevBuy made (vestingPool). Vaults in another token
+//      OstraVesting OstraDevBuy made (vestingPool); OstraBreaker.configure and
+//      trip on the deployment's breaker (Strategy 3, decided 25 Oct 2026). Vaults in another token
 //      (a WETH or listed pair token vault: a pair's creator vault or the
 //      token vault trading its pools; a
 //      vault holding a token the launchpad launched, launchpad.poolOf) spend
@@ -744,6 +745,12 @@ export class RelayerGate {
       }
       if (l !== undefined && c.fn === "claimReferral") {
         if (c.to !== l.dispatcher) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
+        continue;
+      }
+      // OstraBreaker (Strategy 3): the limits a vault approved (configure checks its EIP-1271 approval) and a trip
+      // (anyone's, into the vault itself); no other function of it, and only the deployment's breaker.
+      if (c.fn === "breakerConfigure" || c.fn === "breakerTrip") {
+        if (d.breaker === undefined || c.to !== getAddress(d.breaker)) return `calls[${i}]: ${name} on ${c.to} is not relayed: it is not this deployment's OstraBreaker`;
         continue;
       }
       if (l !== undefined && c.fn === "splitRelease") {

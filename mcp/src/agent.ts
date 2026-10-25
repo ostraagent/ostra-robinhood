@@ -21,6 +21,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
+import { mainnet } from "viem/chains";
 import { LAUNCH_PAIRS, WETH, assertRobinhoodChain, borroStocks, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
 import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
@@ -28,14 +29,18 @@ import type { Prover } from "@ostraagent/swap";
 import {
   AiService,
   BorroService,
+  BreakerService,
   ChannelService,
   LaunchpadService,
+  LAUNCHPAD_DIR,
   LocalSender,
   PRIVATE_SWAP_DIR,
   PayService,
   PrivateBalanceService,
+  RaetoService,
   RelayerClient,
   SWAP_DIR,
+  StrategyService,
   SwapService,
   ShieldService,
   SignatureEscrowClient,
@@ -116,6 +121,12 @@ export class Agent {
   readonly privateBalance: PrivateBalanceService | null;
   /** Borro from the agent's vaults, and the version 3 withdrawal lock, link and EIP-1271 approvals. */
   readonly borro: BorroService;
+  /** OstraBreaker on the USDG vault (Strategy 3). */
+  readonly breaker: BreakerService;
+  /** Ostra's strategy planner (core strategy.ts), for an agent registered in ERC-8004 through Ostra. */
+  readonly strategy: StrategyService;
+  /** Raeto's AI models from the USDG vault (null with OSTRA_RAETO_URL=off). */
+  readonly raeto: RaetoService | null;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -157,6 +168,35 @@ export class Agent {
     this.creatorShield = new ShieldService(client, config, keys, this.creator, creatorSender);
     this.unshield = new UnshieldService(client, config, keys, this.shield, (index) => this.privateVault(index));
     this.borro = new BorroService({ client, config, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), sender: this.sender, ownVaults: () => this.ownVaults() });
+    this.breaker = new BreakerService({ client, config, buyer: this.buyer, borro: this.borro, sender: this.sender, folder: keys.folder.folder("breaker") });
+    this.raeto = config.raetoUrl === null ? null : new RaetoService({ client, buyer: this.buyer, borro: this.borro, folder: keys.folder.folder("raeto"), apiUrl: config.raetoUrl });
+    // OSTRA_LOGS_RPC_URL (default Robinhood Chain's public RPC) serves the planner's eth_getLogs over long windows too.
+    const strategyLogs = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
+    const launchFolder = keys.folder.folder(LAUNCHPAD_DIR);
+    this.strategy = new StrategyService({
+      client,
+      logsClient: strategyLogs,
+      config,
+      buyer: this.buyer,
+      tokenVault: (token) => this.vaultFor(token),
+      creator: this.creator,
+      borro: this.borro,
+      swap: null,
+      folder: keys.folder.folder("strategy"),
+      agentId: async () => {
+        const t = await launchFolder.read("agent.json");
+        if (t === undefined) return null;
+        try {
+          const id = (JSON.parse(t) as { agentId?: unknown }).agentId;
+          return typeof id === "string" ? id : null;
+        } catch {
+          return null;
+        }
+      },
+      // A short transport: USDe's price is one read, and a slow or down Ethereum RPC must not hold the sweep's exits up.
+      ethClient: config.ethRpcUrl === null ? null : (createPublicClient({ chain: mainnet, transport: http(config.ethRpcUrl, { retryCount: 1, timeout: 5_000 }) }) as PublicClient),
+      breaker: this.breaker,
+    });
     if (config.swap === null) {
       this.swap = null;
       this.privateBalance = null;
@@ -367,6 +407,12 @@ export class Agent {
         await step("private notes", () => this.privateBalance!.refresh());
         await step("private auto-shield", () => this.privateBalance!.autoShieldStep());
       }
+      // Strategy 1's exits each minute (decided by Edu on 25 Oct 2026): a cash vault that fails its checks is left at once.
+      await step("cash exits", async () => {
+        const r = await this.strategy.exitCheck();
+        if (r.left.length > 0) this.#log("cash_exit", { left: r.left });
+        return r.left.filter((x) => x.error !== undefined || x.landed === false);
+      });
     } finally {
       this.#sweeping = false;
     }

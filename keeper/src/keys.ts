@@ -95,6 +95,14 @@ export async function verifyCloseRequest(merchant: Address, chainId: number, cha
   }
 }
 
+/** The fee payer key in `dir` (0700), created on first use and never printed: the breaker keeper's (breaker-main.ts). */
+export async function openFeePayer(dir: string): Promise<PrivateKeyAccount> {
+  await ensurePrivateDir(dir);
+  const key = await readOrCreateSecret(join(dir, FEE_PAYER_FILE), isPrivateKey);
+  if (!isPrivateKey(key)) throw new Error(`${FEE_PAYER_FILE} is not a valid secp256k1 private key`);
+  return privateKeyToAccount(bytesToHex(key));
+}
+
 export class KeeperKeys {
   readonly feePayer: PrivateKeyAccount;
   readonly #crankMaster: Uint8Array;

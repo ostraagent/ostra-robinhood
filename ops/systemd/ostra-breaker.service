@@ -1,0 +1,22 @@
+# Ostra's breaker keeper on Robinhood Chain: watches the vaults OstraBreaker watches and trips them when a limit is crossed.
+# Installed with the release that deploys OstraBreaker, with @NODE@ replaced by the path of node.
+[Unit]
+Description=Ostra breaker keeper on Robinhood Chain: trips OstraBreaker's watched vaults when a limit is crossed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+EnvironmentFile=/etc/ostra/robinhood/breaker.env
+ExecStart=@NODE@ src/breaker-main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target

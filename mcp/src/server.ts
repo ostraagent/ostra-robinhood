@@ -28,7 +28,7 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
 
 async function main(): Promise<void> {
   const config = await loadConfig();
-  rpcUrls = [config.rpcUrl, config.logsRpcUrl];
+  rpcUrls = [config.rpcUrl, config.logsRpcUrl, ...(config.ethRpcUrl === null ? [] : [config.ethRpcUrl])];
   const agent = await Agent.open(config, log);
   const server = new McpServer({ name: "ostra-agent", version: packaged?.version ?? "0.1.0" }, { instructions: INSTRUCTIONS });
   registerTools(server, agent);
@@ -40,7 +40,7 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
-  const urls = [process.env.OSTRA_RPC_URL, process.env.OSTRA_LOGS_RPC_URL].filter((u): u is string => u !== undefined && u !== "");
+  const urls = [process.env.OSTRA_RPC_URL, process.env.OSTRA_LOGS_RPC_URL, process.env.OSTRA_ETH_RPC_URL].filter((u): u is string => u !== undefined && u !== "" && u !== "off");
   log("fatal", { error: urls.reduce((text, url) => redact(text, url), message) });
   process.exit(1);
 });

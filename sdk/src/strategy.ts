@@ -43,13 +43,17 @@ export const CASH_VAULTS: readonly Address[] = [STEAKHOUSE_USDG];
  * The markets a cash vault may be exposed to: collateral and oracle. Decided by Edu on 24 Oct 2026: the markets
  * Steakhouse USDG caps (USDe, syrupUSDG, spUSDG, mGLO, WETH and Robinhood stock tokens), read from its cap events and
  * absoluteCap at block 96,675,780. A cap on any other collateral, or the same collateral behind another oracle, fails
- * the check until it is reviewed and added here.
+ * the check until it is reviewed and added here. Added on 25 Oct 2026 (decided by Edu, after review): the second mGLO
+ * market Steakhouse's curator submitted on 23 Oct, whose oracle reads Midas's mGLO / USD NAV feed (MGLO_NAV_FEED, the
+ * same feed as the first mGLO market's oracle) through an immutable "mGLO/USD PriceLowered" feed at 98% of it
+ * (0x713bA6049D09AB6E82A3d96a31e89B284F69C2f0; the first market's takes 94%), within CASH_COLLATERAL_LIMITS.
  */
 export const ACCEPTED_CASH_MARKETS: readonly { symbol: string; collateral: Address; oracle: Address }[] = [
   { symbol: "USDe", collateral: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34", oracle: "0xE64849bd4AD03DfaBbe02bb521de19997a19055f" },
   { symbol: "syrupUSDG", collateral: "0x40858070814a57FdF33a613ae84fE0a8b4a874f7", oracle: "0x152c638fad68913739Ee19Ba8eF47fAEB09DCa91" },
   { symbol: "spUSDG", collateral: "0xde770c84FE66E063336b31737cFE9790f18c4087", oracle: "0xe694c531F65c4BaBc88A52d7178476e095e51574" },
   { symbol: "mGLO", collateral: "0xFEd493F38c1aAcb4EA4e6A11F8b9287849EE0096", oracle: "0xCb6EdD02FDB9b0f2893e590eBeD889214F4Df650" },
+  { symbol: "mGLO", collateral: "0xFEd493F38c1aAcb4EA4e6A11F8b9287849EE0096", oracle: "0xD32146a0C1E4B79fD8D9ebcd4Adc66b2B7397D4d" },
   { symbol: "WETH", collateral: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73", oracle: "0x5E3645eD6ace5b212Ad7CF51c75154897e2f80AD" },
   { symbol: "NVDA", collateral: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", oracle: "0x418dA8bE2D981f152fd9Fc64ED42BE2Cdea52c5A" },
   { symbol: "SPY", collateral: "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C", oracle: "0xae67AE490E82F186F34977Cb6ed117b2585ECf6F" },
@@ -58,6 +62,50 @@ export const ACCEPTED_CASH_MARKETS: readonly { symbol: string; collateral: Addre
   { symbol: "TSLA", collateral: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d", oracle: "0x21167CE53F2cD12Be8bC8525e0Fda8474B042158" },
   { symbol: "SPCX", collateral: "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa", oracle: "0xb9BdE79161100a218D8B036CBf69cbcdFb71440a" },
 ];
+
+/** Midas Fasanara Global Open (mGLO): a tokenised private credit fund (short-duration trade receivables), valued monthly. */
+export const MGLO: Address = "0xFEd493F38c1aAcb4EA4e6A11F8b9287849EE0096";
+/** Midas's mGLO / USD NAV feed (an upgradeable proxy Midas runs), behind both accepted mGLO oracles. */
+export const MGLO_NAV_FEED: Address = "0x49D9Dd1Fa6EA3709aB8A5d5f16a1cf207eb91dd0";
+
+/**
+ * Limits on collateral a cash vault may lend against, beyond being an accepted market (decided by Edu on 25 Oct 2026
+ * for mGLO): what the vault's absolute caps let an allocator put against it is at most `maxShareBps` of its total
+ * assets, and its NAV feed answered within `maxNavAge`. Neither is a reason to leave the vault: while one does not
+ * hold, the vault takes no new deposit (cashCollateralHolds). mGLO's NAV is set monthly (its feed's longest gap was 58
+ * days, 24 Jun to 21 Aug 2026; then 23 Sep, 24 Sep, 25 Sep and 23 Oct): 35 days is a month and a margin, so a NAV
+ * that stopped being published stops new money going where it cannot be valued. 20% bounds what a NAV that misses a
+ * loss could cost the vault (worst case under the caps Steakhouse submitted on 23 Oct: 18.4%).
+ */
+export const CASH_COLLATERAL_LIMITS: readonly { symbol: string; collateral: Address; maxShareBps: bigint; navFeed: Address; maxNavAge: bigint }[] = [
+  { symbol: "mGLO", collateral: MGLO, maxShareBps: 2_000n, navFeed: MGLO_NAV_FEED, maxNavAge: 35n * 86_400n },
+];
+
+const navFeedAbi = parseAbi(["function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)"]);
+
+/**
+ * Why a cash vault takes no new deposit under CASH_COLLATERAL_LIMITS, for its caps `caps` (now, or after its pending
+ * changes: capsAfterPending) with `totalAssets` in it: a limited collateral its caps let an allocator reach beyond its
+ * share, or whose NAV feed is older than its limit or cannot be read. Empty: none. Read at the vault state's block.
+ */
+export async function cashCollateralHolds(client: PublicClient, v: VaultV2State, caps: readonly VaultCap[], totalAssets: bigint): Promise<string[]> {
+  const out: string[] = [];
+  const worst = worstCaseExposure(v, [...caps], totalAssets);
+  for (const l of CASH_COLLATERAL_LIMITS) {
+    const c = worst.collaterals.find((x) => getAddress(x.token) === getAddress(l.collateral));
+    if (c === undefined || c.max === 0n) continue;
+    if (c.max * 10_000n > totalAssets * l.maxShareBps) out.push(`its caps let ${c.max} go against ${l.symbol}, more than ${l.maxShareBps} bps of its ${totalAssets} total assets`);
+    try {
+      const [, answer, , updatedAt] = await client.readContract({ address: l.navFeed, abi: navFeedAbi, functionName: "latestRoundData", blockNumber: v.at.blockNumber });
+      const age = v.at.timestamp - updatedAt;
+      if (answer <= 0n) out.push(`${l.symbol}'s NAV feed answers ${answer}`);
+      else if (age > l.maxNavAge) out.push(`${l.symbol}'s NAV was last published ${age} s ago, more than ${l.maxNavAge} s`);
+    } catch (e) {
+      out.push(`${l.symbol}'s NAV feed could not be read: ${(e as Error).message.split("\n")[0]}`);
+    }
+  }
+  return out;
+}
 
 /** The shortest timelock accepted on the powers that change what a cash vault can lose (design: 3 days). */
 export const CASH_MIN_TIMELOCK = 3n * 86_400n;
@@ -230,19 +278,36 @@ export function pendingChangeProblems(v: VaultV2State, caps: readonly VaultCap[]
     else problems.push(`a submitted change: ${bad} (${label})`);
   }
   if (raised.size > 0) {
-    // The caps once every submitted absolute cap increase is executed.
-    const after: VaultCap[] = caps.map((c) => ({ ...c }));
-    for (const [key, cap] of raised) {
-      const [id, idData] = key.split("|") as [string, Hex];
-      const c = after.find((x) => x.id.toLowerCase() === id);
-      if (c !== undefined) c.absoluteCap = c.absoluteCap > cap ? c.absoluteCap : cap;
-      else after.push({ id: id as Hex, idData, what: decodeCapIdData(idData), absoluteCap: cap, relativeCap: 0n, allocation: 0n });
-    }
-    for (const m of worstCaseExposure(v, after).markets) {
+    for (const m of worstCaseExposure(v, capsAfterPending(v, caps, pending)).markets) {
       if (!isAcceptedCashMarket(m.params)) problems.push(`a submitted change: once its cap increases are executed, its caps reach a market of collateral ${m.params.collateralToken} with oracle ${m.params.oracle}, which is not an accepted market`);
     }
   }
   return { problems, fine, ignored };
+}
+
+/**
+ * A cash vault's caps once every absolute cap increase still pending (and not abdicated) is executed: each id at the
+ * larger of its cap now and the largest submitted for it, new ids added. Data that cannot be decoded is left out (it
+ * can never be executed).
+ */
+export function capsAfterPending(v: VaultV2State, caps: readonly VaultCap[], pending: readonly PendingChange[]): VaultCap[] {
+  const after: VaultCap[] = caps.map((c) => ({ ...c }));
+  const increase = sel("increaseAbsoluteCap(bytes,uint256)");
+  for (const p of pending) {
+    if (p.abdicated || getAddress(p.target) !== getAddress(v.address) || p.selector.toLowerCase() !== increase) continue;
+    let idData: Hex;
+    let cap: bigint;
+    try {
+      [idData, cap] = decodeAbiParameters([{ type: "bytes" }, { type: "uint256" }], `0x${p.data.slice(10)}` as Hex) as [Hex, bigint];
+    } catch {
+      continue;
+    }
+    const id = keccak256(idData).toLowerCase();
+    const c = after.find((x) => x.id.toLowerCase() === id);
+    if (c !== undefined) c.absoluteCap = c.absoluteCap > cap ? c.absoluteCap : cap;
+    else after.push({ id: id as Hex, idData, what: decodeCapIdData(idData), absoluteCap: cap, relativeCap: 0n, allocation: 0n });
+  }
+  return after;
 }
 
 /**

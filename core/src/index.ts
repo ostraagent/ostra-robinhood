@@ -5,6 +5,7 @@
 export * from "./ai.ts";
 export * from "./amount.ts";
 export * from "./borro.ts";
+export * from "./breaker.ts";
 export * from "./chain.ts";
 export * from "./channels.ts";
 export * from "./config.ts";
@@ -15,6 +16,7 @@ export * from "./launchpad.ts";
 export * from "./passkey.ts";
 export * from "./pay.ts";
 export * from "./publish.ts";
+export * from "./raeto.ts";
 export * from "./pending.ts";
 export * from "./pools.ts";
 export * from "./private-balance.ts";

@@ -3,9 +3,11 @@
 // ERC-8004 Identity Registry, with the agent's own fee payer sending (LocalSender):
 //   * the ERC-8004 gate: an agent whose creator vault holds no identity is refused; after register_agent it plans,
 //     found from agent.json and from the Registered events alike; another agent cannot claim that identity;
-//   * without USDe's price (no Ethereum RPC) nothing goes into Steakhouse USDG, whose caps reach a USDe market
-//     (the cash path with USDe's price is strategy-pinned.fork.test.ts, at a block before the curator's 23 Oct
-//     submission).
+//   * without USDe's price (no Ethereum RPC) nothing goes into Steakhouse USDG, whose caps reach a USDe market, and it
+//     has no other problem (the cash path with USDe's price is strategy-pinned.fork.test.ts, at a block before the
+//     curator's 23 Oct submission);
+//   * last (it moves the fork's clock 36 days on): mGLO's NAV older than 35 days holds new deposits only: a vault
+//     holding Steakhouse USDG shares is not taken out by the sweep's exit check nor by check(), which says why.
 // The vaults list comes from the fresh factory's VaultCreated events on the fork.
 
 import assert from "node:assert/strict";
@@ -13,7 +15,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { getAddress, keccak256, stringToHex, type Address, type PublicClient } from "viem";
+import { getAddress, keccak256, parseAbi, stringToHex, type Address, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { FileWotsStore, STEAKHOUSE_USDG, USDG, retryingHttp, type Deployment } from "@ostraagent/sdk";
 import { deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
@@ -41,6 +43,7 @@ let forkBlock: bigint;
 const chainGasPrice = async () => (await fork.client.getBlock({ blockNumber: forkBlock })).baseFeePerGas as bigint;
 
 const feePayer = privateKeyToAccount(keccak256(stringToHex("OSTRA/CORE/STRATEGY-FORK/fee-payer")));
+const vaultV2BalanceAbi = parseAbi(["function balanceOf(address) view returns (uint256)"]);
 
 /** An agent: its own seed and records, its USDG, token and creator vaults, Borro, the launchpad and the planner. */
 async function agent(name: string, seed: number, ethClient: PublicClient | null, agentId?: () => Promise<string | null>) {
@@ -125,8 +128,29 @@ test("without USDe's price nothing goes into Steakhouse USDG, whose caps reach a
   assert.equal(c.usdeExposed, true);
   assert.match(c.usdeProblem ?? "", /no Ethereum RPC is set/);
   assert.equal(c.ok, false);
-  // Its other problems now are the new mGLO market its curator submitted on 23 Oct 2026 (pending until 30 Oct, then
-  // reached by its caps), whose oracle is not accepted; the old setIsSentinel submission is not one.
-  for (const p of c.problems) assert.match(p, /0xD32146a0C1E4B79fD8D9ebcd4Adc66b2B7397D4d/, p);
+  // No other problem: the new mGLO market its curator submitted on 23 Oct 2026 is accepted since 25 Oct (within the mGLO
+  // limits, which hold while its NAV is fresh); the old setIsSentinel submission can never be executed.
+  assert.deepEqual(c.problems, []);
+  for (const x of c.collateralHolds) assert.match(x, /mGLO's NAV was last published/, x);
   assert.ok(c.pendingIgnored.some((x) => x.startsWith("0x920ed706")), JSON.stringify(c.pendingIgnored));
+});
+
+// Last: it moves the fork's clock 36 days on.
+test("a stale mGLO NAV holds new deposits only: shares held are not taken out by the exit check nor by check()", { timeout: 900_000 }, async () => {
+  const a = registered;
+  const vault = getAddress(await a.buyer.vaultAddress());
+  assert.equal((await a.borro.lendCash(STEAKHOUSE_USDG, 500_000_000n)).status, "sent");
+  const shares = (await fork.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2BalanceAbi, functionName: "balanceOf", args: [vault] })) as bigint;
+  assert.ok(shares > 0n);
+  // 36 days on, with no new NAV published on the fork.
+  await fork.increaseTime(36 * 86_400);
+  const c = (await a.strategy.cashVaults()).find((x) => x.vault === STEAKHOUSE_USDG)!;
+  assert.ok(c.collateralHolds.some((x) => /mGLO's NAV was last published/.test(x)), JSON.stringify(c.collateralHolds));
+  assert.deepEqual(c.problems, []);
+  assert.deepEqual(c.exitReasons, []);
+  assert.deepEqual(await a.strategy.exitCheck(), { held: 1, left: [] });
+  const r = await a.strategy.check({ execute: true });
+  assert.ok(!r.actions.some((x) => x.kind === "redeem_cash"), JSON.stringify(r.actions));
+  assert.ok(r.findings.some((f) => f.startsWith(`${STEAKHOUSE_USDG}: held `) && /kept \(no exit reason\); new deposits wait: .*mGLO's NAV was last published/.test(f)), r.findings.join("\n"));
+  assert.equal((await fork.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2BalanceAbi, functionName: "balanceOf", args: [vault] })) as bigint, shares);
 });

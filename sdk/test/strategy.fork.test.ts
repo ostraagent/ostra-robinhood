@@ -1,9 +1,12 @@
 // src/strategy.ts and the reads the planner adds to borro.ts and chain.ts, against the deployed contracts on a fork of
 // Robinhood Chain mainnet:
-//   * Strategy 1's check: Steakhouse USDG qualifies but for the new mGLO market its curator submitted, a holder's full
-//     redeem simulates, its model yield (maxRate before fees) and share price are read, its room follows the 5% share
-//     rule; NetNet Credit (whose holders cannot redeem, and whose caps reach markets outside the accepted list) fails;
+//   * Strategy 1's check: Steakhouse USDG qualifies (with the second mGLO market its curator submitted on 23 Oct,
+//     accepted on 25 Oct), a holder's full redeem simulates, its model yield (maxRate before fees) and share price are
+//     read, its room follows the 5% share rule; NetNet Credit (whose holders cannot redeem, and whose caps reach markets
+//     outside the accepted list) fails;
 //   * pending changes count only when they would fail the check once executed (real ones and ones built from its caps);
+//   * mGLO's limits (its share under the caps now and once the submitted increases are executed, its NAV's age) hold
+//     new deposits at their bounds, and are never a problem;
 //   * USDe's price from Chainlink's USDe / USD feed on Ethereum mainnet (OSTRA_ETH_RPC), found by its ENS name;
 //   * ERC-8004: an id nobody holds reads as none, and an owner that registered nothing has no agent ids;
 //   * readBorroPosition reads a market accrued to its block: equal to what Morpho.accrueInterest stores at that time;
@@ -20,15 +23,20 @@ import { mainnet } from "viem/chains";
 import { borroStock, readBorroPosition } from "../src/borro.ts";
 import { INVALID_PARAMS_RETRIES, robinhoodChain, robinhoodClient, retryingHttp } from "../src/chain.ts";
 import { MORPHO_BLUE, ROBINHOOD_PUBLIC_RPC, USDG } from "../src/constants.ts";
-import { capIdsFromEvents, instantBorrowRate, readMorphoMarket, readPendingChanges } from "../src/morpho.ts";
+import { capIdsFromEvents, instantBorrowRate, readMorphoMarket, readPendingChanges, readVaultV2, worstCaseExposure } from "../src/morpho.ts";
 import {
+  CASH_COLLATERAL_LIMITS,
   CASH_VAULTS,
+  MGLO,
+  MGLO_NAV_FEED,
   OSTRA_MAX_SHARE_OF_WITHDRAWABLE_BPS,
   STEAKHOUSE_USDG,
   USDE_EXIT_PRICE,
   USDE_FEED_MAX_AGE,
   USDE_USD_FEED_ENS,
   agentIdsRegisteredBy,
+  capsAfterPending,
+  cashCollateralHolds,
   cashVaultModel,
   cashVaultRoom,
   checkCashVault,
@@ -69,10 +77,11 @@ async function rpc(method: string, params: unknown[]): Promise<unknown> {
   return body.result;
 }
 
-// Steakhouse USDG's curator submitted (23 Oct 2026, executable from 30 Oct 08:20:55 UTC) caps for a new mGLO market
-// whose oracle is not an accepted one; before that it qualifies, after it its caps reach that market.
+// Steakhouse USDG's curator submitted (23 Oct 2026, executable from 30 Oct 08:20:55 UTC) caps for a second mGLO market,
+// at 98% of mGLO's NAV (the first one: 94%), raising mGLO's collateral cap from 50 to 100 million USDG; accepted on 25 Oct.
 const NEW_MGLO_ORACLE: Address = "0xD32146a0C1E4B79fD8D9ebcd4Adc66b2B7397D4d";
-const MGLO: Address = "0xFEd493F38c1aAcb4EA4e6A11F8b9287849EE0096";
+/** An oracle nobody accepted, for a market built from a real one. */
+const OTHER_ORACLE = someone("oracle");
 const vaultV2Writes = parseAbi([
   "function increaseAbsoluteCap(bytes idData, uint256 newAbsoluteCap)",
   "function setPerformanceFee(uint256 newPerformanceFee)",
@@ -83,7 +92,7 @@ const vaultV2Writes = parseAbi([
 ]);
 const approveAbi = parseAbi(["function approve(address, uint256) returns (bool)"]);
 
-test("Strategy 1's check: Steakhouse USDG qualifies but for the new mGLO market; a holder redeems in full; NetNet Credit does not", { timeout: 900_000 }, async () => {
+test("Strategy 1's check: Steakhouse USDG qualifies; a holder redeems in full; NetNet Credit does not", { timeout: 900_000 }, async () => {
   assert.deepEqual(CASH_VAULTS, [STEAKHOUSE_USDG]);
   // A holder with shares, so the full-redeem simulation runs.
   const me = fork.accounts[1]!;
@@ -94,7 +103,8 @@ test("Strategy 1's check: Steakhouse USDG qualifies but for the new mGLO market;
   const capIds = await capIdsFromEvents(logs, STEAKHOUSE_USDG, 0n, forkBlock);
   assert.ok(capIds.size > 0, "Steakhouse USDG has cap events");
   const c = await checkCashVault(client, STEAKHOUSE_USDG, { capIds, holders: [me.address], ostraVaults: [], planned: 0n });
-  for (const p of c.problems) assert.match(p, new RegExp(`collateral ${MGLO} with oracle ${NEW_MGLO_ORACLE}, which is not an accepted market`), `Steakhouse USDG: ${p}`);
+  assert.deepEqual(c.problems, []);
+  assert.ok(isAcceptedCashMarket({ collateralToken: MGLO, oracle: NEW_MGLO_ORACLE }));
   assert.equal(c.shareProblem, null);
   // Its deposit gate is not abdicated but waits 7 days (Morpho: it can only close new deposits); the exit gates are.
   assert.equal(c.state.timelocks.setSendAssetsGate?.abdicated, false);
@@ -130,14 +140,14 @@ test("pending changes count only when they would fail the check once executed", 
   const later = v.at.timestamp + 7n * 86_400n;
   const change = (data: `0x${string}`, target: Address = v.address): PendingChange => ({ target, selector: data.slice(0, 10) as `0x${string}`, data, executableAt: later, abdicated: false });
   // The changes really pending now: an old setIsSentinel (not timelocked: it can never be executed) is ignored, and
-  // the new mGLO market's caps (until they are executed on 30 Oct) are a problem.
+  // the second mGLO market's caps (until they are executed on 30 Oct) are fine: it is an accepted market.
   const real = await readPendingChanges(logs, v, 22_721n);
   const r = pendingChangeProblems(v, c.caps, real);
   for (const p of real) {
     if (p.selector === toFunctionSelector("function setIsSentinel(address,bool)")) assert.ok(r.ignored.some((x) => x.startsWith(p.selector)), JSON.stringify(r));
   }
-  if (real.some((p) => p.selector === toFunctionSelector("function increaseAbsoluteCap(bytes,uint256)"))) assert.ok(r.problems.some((x) => x.includes(NEW_MGLO_ORACLE)), JSON.stringify(r));
-  // Built from its real caps: a raise of an accepted market's cap is fine; the new mGLO market's cap is not.
+  assert.deepEqual(r.problems, []);
+  // Built from its real caps: a raise of an accepted market's cap is fine; an mGLO market behind another oracle is not.
   const accepted = c.caps.find((x) => x.what.kind === "market" && isAcceptedCashMarket(x.what.params) && x.absoluteCap > 0n)!;
   assert.ok(accepted !== undefined);
   const raise = encodeFunctionData({ abi: vaultV2Writes, functionName: "increaseAbsoluteCap", args: [accepted.idData, accepted.absoluteCap * 2n] });
@@ -145,10 +155,10 @@ test("pending changes count only when they would fail the check once executed", 
   const adapter = v.adapters.find((a) => a.kind === "market")!.address;
   const someMglo = c.caps.find((x) => x.what.kind === "market" && x.what.params.collateralToken === MGLO);
   assert.ok(someMglo !== undefined && someMglo.what.kind === "market");
-  const params = { ...someMglo.what.params, oracle: NEW_MGLO_ORACLE };
+  const params = { ...someMglo.what.params, oracle: OTHER_ORACLE };
   const idData = encodeAbiParameters([{ type: "string" }, { type: "address" }, { type: "tuple", components: [{ name: "loanToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "oracle", type: "address" }, { name: "irm", type: "address" }, { name: "lltv", type: "uint256" }] }], ["this/marketParams", adapter, params]);
   const unaccepted = encodeFunctionData({ abi: vaultV2Writes, functionName: "increaseAbsoluteCap", args: [idData, 10n ** 14n] });
-  assert.match(pendingChangeProblems(v, c.caps, [change(unaccepted)]).problems.join("; "), new RegExp(`oracle ${NEW_MGLO_ORACLE}, which is not an accepted market`));
+  assert.match(pendingChangeProblems(v, c.caps, [change(unaccepted)]).problems.join("; "), new RegExp(`oracle ${OTHER_ORACLE}, which is not an accepted market`));
   // A fee raised, a guarded timelock lowered: problems; a removal, a sentinel: fine and ignored; abdicated: ignored.
   const fee = encodeFunctionData({ abi: vaultV2Writes, functionName: "setPerformanceFee", args: [v.performanceFee + 1n] });
   assert.match(pendingChangeProblems(v, c.caps, [change(fee)]).problems.join(";"), /performance fee would rise/);
@@ -259,4 +269,43 @@ test("retryingHttp asks an idempotent read answered -32602 again, four times, an
   await assert.rejects(c.request({ method: "eth_sendRawTransaction", params: ["0x00"] }), (e: unknown) => /invalid params/i.test(String(e)));
   assert.equal(p.seen(), 1);
   await p.close();
+});
+
+// Last: it moves the fork's clock 36 days on.
+test("mGLO's limits hold new deposits at their bounds, now and once the submitted caps are executed, and are never a problem", { timeout: 900_000 }, async () => {
+  const limit = CASH_COLLATERAL_LIMITS.find((x) => x.symbol === "mGLO")!;
+  assert.deepEqual({ collateral: limit.collateral, navFeed: limit.navFeed, maxShareBps: limit.maxShareBps, maxNavAge: limit.maxNavAge }, { collateral: MGLO, navFeed: MGLO_NAV_FEED, maxShareBps: 2_000n, maxNavAge: 35n * 86_400n });
+  const capIds = await capIdsFromEvents(logs, STEAKHOUSE_USDG, 0n, forkBlock);
+  const c = await checkCashVault(client, STEAKHOUSE_USDG, { capIds, holders: [], ostraVaults: [], planned: 0n });
+  const v = c.state;
+  const after = capsAfterPending(v, c.caps, await readPendingChanges(logs, v, 22_721n));
+  // Once the submitted increases are executed, mGLO's collateral cap is 100 million USDG (50 million before; or already 100 million).
+  const capOf = (caps: typeof after) => caps.find((x) => x.what.kind === "collateral" && getAddress(x.what.token) === MGLO)?.absoluteCap ?? 0n;
+  assert.equal(capOf(after), 100_000_000_000_000n, `mGLO cap now ${capOf(c.caps)}, after ${capOf(after)}`);
+  const worst = (caps: typeof after, total: bigint) => worstCaseExposure(v, caps, total).collaterals.find((x) => getAddress(x.token) === MGLO)!.max;
+  const nav = (await client.readContract({ address: MGLO_NAV_FEED, abi: parseAbi(["function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)"]), functionName: "latestRoundData", blockNumber: v.at.blockNumber })) as readonly [bigint, bigint, bigint, bigint, bigint];
+  const fresh = v.at.timestamp - nav[3] <= limit.maxNavAge;
+  const navHolds = (xs: string[]) => xs.filter((x) => /NAV/.test(x));
+  // At its total assets now: under 20% now and after (18.4% at 543.7 million on 25 Oct).
+  for (const caps of [c.caps, after]) {
+    assert.ok(worst(caps, v.accruedTotalAssets) * 10_000n <= v.accruedTotalAssets * 2_000n, `worst ${worst(caps, v.accruedTotalAssets)} of ${v.accruedTotalAssets}`);
+    const holds = await cashCollateralHolds(client, v, caps, v.accruedTotalAssets);
+    assert.deepEqual(holds.filter((x) => !/NAV/.test(x)), []);
+    assert.equal(navHolds(holds).length, fresh ? 0 : 1, holds.join("; "));
+  }
+  // The share's bound: at exactly 20% of the total nothing holds; one unit of total less, the share holds deposits.
+  const m = worst(after, v.accruedTotalAssets);
+  const atBound = (m * 10_000n) / 2_000n;
+  assert.equal(worst(after, atBound), m, "the bound is the cap, not the total");
+  assert.deepEqual((await cashCollateralHolds(client, v, after, atBound)).filter((x) => !/NAV/.test(x)), []);
+  const over = await cashCollateralHolds(client, v, after, atBound - 1n);
+  assert.match(over.join("; "), /against mGLO, more than 2000 bps/);
+  // 36 days on, with no new NAV published on the fork: the NAV is older than 35 days, and deposits are held.
+  await fork.increaseTime(36 * 86_400);
+  const later = await readVaultV2(client, STEAKHOUSE_USDG);
+  const stale = await cashCollateralHolds(client, later, c.caps, later.accruedTotalAssets);
+  assert.match(stale.join("; "), /mGLO's NAV was last published [0-9]+ s ago, more than 3024000 s/);
+  // Never a problem: the check itself still passes but for that hold, which is not part of it.
+  const again = await checkCashVault(client, STEAKHOUSE_USDG, { capIds, holders: [], ostraVaults: [], planned: 0n });
+  assert.deepEqual(again.problems.filter((x) => /mGLO|NAV/.test(x)), []);
 });

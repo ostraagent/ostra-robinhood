@@ -27,6 +27,13 @@
 //                         sent by the fee payer in OSTRA_HOME, which links
 //                         them to the agent (tests and forks); otherwise they
 //                         are refused without a relayer
+//   OSTRA_ETH_RPC_URL     an Ethereum mainnet RPC, for Chainlink's USDe / USD feed
+//                         the strategies read before lending to a cash vault
+//                         that can lend against USDe (default
+//                         ETHEREUM_PUBLIC_RPC; "off": none, and then no cash
+//                         goes into such a vault). Never printed
+//   OSTRA_RAETO_URL       Raeto's API (default https://api.raeto.cc; "off":
+//                         the raeto tool refuses to run)
 //   OSTRA_PROVER          the private notes' prover: unset, the WebAssembly
 //                         build of ostra-prove (the npm package carries it in
 //                         dist/prover and checks the SHA-256 of its files;
@@ -48,7 +55,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ROBINHOOD_PUBLIC_RPC, parseDeployment } from "@ostraagent/sdk";
 import { parseSwapDeployment, type SwapDeployment } from "@ostraagent/swap";
-import { X402_NETWORK, type Config } from "@ostraagent/core";
+import { RAETO_API, X402_NETWORK, type Config } from "@ostraagent/core";
 import { checkPrivate } from "./disk.ts";
 import { packaged, type ProverHashes } from "./packaged.ts";
 
@@ -82,8 +89,15 @@ async function proverConfig(env: NodeJS.ProcessEnv): Promise<ProverConfig | null
   return { kind: "wasm", dir, sha256 };
 }
 
+/** The Ethereum RPC the strategies read USDe's price through by default (a public one; OSTRA_ETH_RPC_URL replaces it). */
+export const ETHEREUM_PUBLIC_RPC = "https://ethereum-rpc.publicnode.com";
+
 export type McpConfig = Config & {
   home: string;
+  /** Ethereum mainnet's RPC for USDe's price, or null (OSTRA_ETH_RPC_URL=off). */
+  ethRpcUrl: string | null;
+  /** Raeto's API, or null (OSTRA_RAETO_URL=off). */
+  raetoUrl: string | null;
   /** Ostra Swap's contracts, or null (its tools then refuse to run). */
   swap: SwapDeployment | null;
   /** The RPC Ostra Swap searches events through. */
@@ -134,8 +148,12 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
   if (swap !== null && swap.chainId !== deployment.chainId) throw new Error(`Ostra Swap's deployment is of chain ${swap.chainId}, not ${deployment.chainId}`);
   const logsRpcUrl = env.OSTRA_LOGS_RPC_URL !== undefined && env.OSTRA_LOGS_RPC_URL !== "" ? env.OSTRA_LOGS_RPC_URL : ROBINHOOD_PUBLIC_RPC;
   const prover = await proverConfig(env);
+  const ethRpcUrl = serviceUrl(env, "OSTRA_ETH_RPC_URL", ETHEREUM_PUBLIC_RPC);
+  const raetoUrl = serviceUrl(env, "OSTRA_RAETO_URL", RAETO_API);
   return {
     home,
+    ethRpcUrl,
+    raetoUrl,
     swap,
     logsRpcUrl,
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",

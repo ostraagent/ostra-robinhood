@@ -82,3 +82,55 @@ test("Ostra Swap: an escrow order naming the relayer's account as executor or ca
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("OstraBreaker: configure and trip are relayed only on the deployment's breaker", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { encodeFunctionData } = await import("viem");
+  const { ostraBreakerAbi, parseDeployment } = await import("@ostraagent/sdk");
+  const { Ledger } = await import("../src/ledger.ts");
+  const { RelayerGate } = await import("../src/gate.ts");
+  const dir = await mkdtemp(join(tmpdir(), "ostra-gate-breaker-"));
+  try {
+    const at = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
+    const base = {
+      version: 1,
+      chainId: 4663,
+      token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      batchSettlement: "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
+      vaultImplementation: at(1),
+      vaultBeacon: at(2),
+      vaultFactory: at(3),
+      poolImplementation: at(4),
+      poolBeacon: at(5),
+      pool: at(6),
+      splitFactory: at(7),
+      beaconOwner: at(8),
+      fromBlock: "1",
+    };
+    const breaker = at(0xb7);
+    const limits = { priceDropBps: 10, assetsDropBps: 2_000, maxUtilizationBps: 9_900, minLiquidityBps: 20_000, assetsMarkCap: 1n };
+    const configure = encodeFunctionData({ abi: ostraBreakerAbi, functionName: "configure", args: [at(0xa1), at(0xa2), limits] });
+    const trip = encodeFunctionData({ abi: ostraBreakerAbi, functionName: "trip", args: [at(0xa1), at(0xa2)] });
+    const ask = async (deployment: unknown, data: string, to: string) => {
+      const gate = new RelayerGate({ deployment, ledger: await Ledger.open(dir), merchant: { token: base.token }, sender: { address: at(0xee) } } as never);
+      return (await gate.relay({ body: JSON.stringify({ calls: [{ to, data }] }), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
+    };
+    // Without a breaker in the record, and on another address than the record's: refused by the policy.
+    const v2 = parseDeployment(base);
+    for (const data of [configure, trip]) {
+      const r = await ask(v2, data, breaker);
+      assert.equal(r.status, 422);
+      assert.match(r.body.message, /is not relayed: it is not this deployment's OstraBreaker/);
+    }
+    const v3 = { ...v2, vaultModule: at(9), breaker };
+    for (const data of [configure, trip]) {
+      const r = await ask(v3, data, at(0xb8));
+      assert.equal(r.status, 422);
+      assert.match(r.body.message, /it is not this deployment's OstraBreaker/);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

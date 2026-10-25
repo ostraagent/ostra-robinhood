@@ -21,6 +21,9 @@
 //   OstraDispatcher.claimReferral(referrer, currency)
 //   OstraCreatorSplit.release(poolId, account)
 //   OstraVesting.release(), claimDividends()
+//   OstraBreaker.configure(vault, target, limits), trip(vault, target)
+//                 (Strategy 3, decided 25 Oct 2026: the limits a vault
+//                 approved, and a trip, which anyone may send)
 //
 // and of Ostra Swap (ostra-swap src/*.sol, decided 21 Oct 2026):
 //
@@ -45,6 +48,7 @@ import {
   VAULT_ACTION,
   decodeOpenChannelParams,
   ostraAirdropAbi,
+  ostraBreakerAbi,
   ostraCreatorSplitAbi,
   ostraDevBuyAbi,
   ostraDispatcherAbi,
@@ -82,6 +86,8 @@ export type ParsedCall =
   | { fn: "airdropClaim"; to: Address; poolId: Hex; account: Address; amount: bigint }
   | { fn: "airdropClose"; to: Address; poolId: Hex }
   | { fn: "claimReferral"; to: Address; referrer: Address; currency: Address }
+  | { fn: "breakerConfigure"; to: Address; vault: Address; target: Address }
+  | { fn: "breakerTrip"; to: Address; vault: Address; target: Address }
   | { fn: "splitRelease"; to: Address; poolId: Hex; account: Address }
   | { fn: "vestingRelease"; to: Address }
   | { fn: "vestingClaimDividends"; to: Address }
@@ -115,6 +121,7 @@ for (const [abi, names] of [
   [ostraDispatcherAbi, [["claimReferral", "claimReferral"]]],
   [ostraCreatorSplitAbi, [["release", "splitRelease"]]],
   [ostraVestingAbi, [["release", "vestingRelease"], ["claimDividends", "vestingClaimDividends"]]],
+  [ostraBreakerAbi, [["configure", "breakerConfigure"], ["trip", "breakerTrip"]]],
   [ostraRouterAbi, [["executeEscrow", "executeEscrow"], ["announce", "announce"], ["closeEscrow", "closeEscrow"]]],
   [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"], ["shieldFromEscrow", "shieldFromEscrow"]]],
 ] as const) {
@@ -165,6 +172,9 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
       return { fn: "claimReferral", to, referrer: getAddress(a[0] as Address), currency: getAddress(a[1] as Address) };
     case "splitRelease":
       return { fn: "splitRelease", to, poolId: a[0] as Hex, account: getAddress(a[1] as Address) };
+    case "breakerConfigure":
+    case "breakerTrip":
+      return { fn: known.as, to, vault: getAddress(a[0] as Address), target: getAddress(a[1] as Address) };
     case "vestingRelease":
       return { fn: "vestingRelease", to };
     case "vestingClaimDividends":

@@ -71,6 +71,7 @@ import {
 } from "viem";
 import {
   ostraAirdropAbi,
+  ostraBreakerAbi,
   ostraCreatorSplitAbi,
   ostraDevBuyAbi,
   ostraDispatcherAbi,
@@ -280,6 +281,7 @@ const OSTRA_ERRORS = [
   ostraVestingAbi,
   ostraDispatcherAbi,
   ostraCreatorSplitAbi,
+  ostraBreakerAbi,
 ].flatMap((abi) => (abi as readonly { type: string }[]).filter((x) => x.type === "error"));
 
 /** The revert `data` as the Ostra error it is ("BadParams(buckets)"), or null when it is none of them. */
