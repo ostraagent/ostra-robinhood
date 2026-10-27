@@ -29,10 +29,11 @@ const MAINNET_CHAIN_ID = 4663;
 const SERVICES = { relayerUrl: "https://relayer.ostraagent.xyz", keeperUrl: "https://keeper.ostraagent.xyz", aggregatorUrl: "https://aggregator.ostraagent.xyz", aiUrl: "https://ai.ostraagent.xyz" };
 const WORKSPACE = ["@ostraagent/core", "@ostraagent/sdk", "@ostraagent/swap"];
 
-type Manifest = { name: string; version: string; dependencies?: Record<string, string> };
+type Manifest = { name: string; version: string; description?: string; dependencies?: Record<string, string> };
 const manifest = async (p: string) => JSON.parse(await readFile(here(p), "utf8")) as Manifest;
 
 const mcp = await manifest("package.json");
+if (mcp.description === undefined || mcp.description === "") throw new Error("package.json has no description");
 // The third-party dependencies of the MCP server, the core, the SDK and Ostra Swap's SDK, one version each.
 const dependencies: Record<string, string> = {};
 for (const m of [mcp, await manifest("../core/package.json"), await manifest("../sdk/package.json"), await manifest("../../ostra-swap/sdk/package.json")]) {
@@ -107,8 +108,9 @@ await writeFile(
     {
       name: mcp.name,
       version: mcp.version,
-      description: "Ostra Agent's MCP server: an AI agent's own post-quantum USDG vault on Robinhood Chain, with payments, private balances and the Ostra launchpad. The agent needs no ETH.",
-      keywords: ["mcp", "model-context-protocol", "ai-agent", "robinhood-chain", "post-quantum", "wots", "usdg", "launchpad"],
+      // The description is package.json's: one text for the workspace and npm.
+      description: mcp.description,
+      keywords: ["mcp", "model-context-protocol", "ai-agent", "robinhood-chain", "post-quantum", "privacy", "wots", "usdg", "x402", "launchpad"],
       homepage: "https://ostraagent.xyz",
       repository: { type: "git", url: "git+https://github.com/ostraagent/ostra-robinhood.git", directory: "mcp" },
       bugs: { url: "https://github.com/ostraagent/ostra-robinhood/issues" },

@@ -19,7 +19,7 @@ import { robinhoodChain } from "../src/chain.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
 import { UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload } from "../src/messages.ts";
-import { OUT_DIR, handBeaconsTo, startFork, type Fork } from "./fork.ts";
+import { OUT_DIR, handBeaconsTo, startFork, vaultBeaconAtRecord, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/upgrade-owner.ts", import.meta.url));
 const live = parseDeployment(JSON.parse(readFileSync(fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url)), "utf8")));
@@ -43,7 +43,9 @@ after(async () => {
 test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyone runs it; a scheduled call can be cancelled", async () => {
   const testOwner = fork.accounts[3]?.address;
   if (testOwner === undefined) throw new Error("no fork account 3");
-  // The live beacons go to the test key on the fork (whoever owns them on mainnet).
+  // The vault beacon at the record's implementation (a scheduled upgrade mainnet has not run yet, run on the fork), and
+  // the live beacons to the test key on the fork (whoever owns them on mainnet).
+  await vaultBeaconAtRecord(fork, live);
   await handBeaconsTo(fork, [live.vaultBeacon, live.poolBeacon], testOwner);
   await fork.setBalance(testOwner, 10n ** 18n);
 

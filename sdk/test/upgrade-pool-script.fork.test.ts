@@ -17,7 +17,7 @@ import { robinhoodChain } from "../src/chain.ts";
 import { USDG } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
-import { handBeaconsTo, startFork, type Fork } from "./fork.ts";
+import { handBeaconsTo, startFork, vaultBeaconAtRecord, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/upgrade-pool.ts", import.meta.url));
 const live = parseDeployment(JSON.parse(readFileSync(fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url)), "utf8")));
@@ -61,6 +61,7 @@ test("upgrades the live pool from version 1 to 2 with the beacon owner's key, ke
 
   // The live beacons go to the test key on the fork, and the pool goes back to version 1 there (the live pool
   // runs version 2 since 19 Oct 2026), so the upgrade from version 1 is what is run, whatever mainnet runs.
+  await vaultBeaconAtRecord(fork, live);
   await handBeaconsTo(fork, [live.poolBeacon, live.vaultBeacon], testOwner);
   await fork.setBalance(testOwner, 10n ** 18n);
   if (getAddress((await read(live.poolBeacon, upgradeableBeaconAbi, "implementation")) as Address) !== V1_POOL_IMPLEMENTATION) {

@@ -1,8 +1,7 @@
 // scripts/swap-check.ts on a fork of Robinhood Chain mainnet, as the mainnet run will go: Ostra's live deployment
-// (deployments/robinhood-mainnet.json) with every vault on OstraVault version 2 (the upgrade OstraUpgradeOwner
-// scheduled, run on the fork by the owner, impersonated, when mainnet has not run it yet, and the record as
-// sdk/scripts/upgrade-vault.ts finalize then writes it: the keeper and the relayer check the record against the
-// vault beacon when they start, so they refuse a version 1 record once the beacon runs version 2), Ostra Swap deployed by
+// (deployments/robinhood-mainnet.json) with every vault on the version the record names (the upgrade OstraUpgradeOwner
+// scheduled, run on the fork by the owner, impersonated, when mainnet has not run it yet: the keeper and the relayer
+// check the record against the vault beacon when they start), Ostra Swap deployed by
 // ostra-swap's deploy code (deploySwap) from its Foundry
 // build, the services set up by relayer/scripts/setup-mainnet.ts, the keeper and the relayer started from their
 // environment files (the relayer's with OSTRA_SWAP_DEPLOYMENT added, and the socket address as the client's: no
@@ -21,8 +20,8 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { createPublicClient, createWalletClient, getAddress, http, numberToHex, parseUnits, type Address, type PrivateKeyAccount, type PublicClient } from "viem";
-import { VAULT_VERSION, checkDeployment, ostraVaultAbi, parseDeployment, robinhoodChain, upgradeableBeaconAbi, type Deployment } from "@ostraagent/sdk";
-import { startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { VAULT_V3, VAULT_VERSION, checkDeployment, ostraVaultAbi, parseDeployment } from "@ostraagent/sdk";
+import { startFork, vaultBeaconAtRecord, type Fork } from "@ostraagent/sdk/test/fork";
 import { PoolIndex, ROBINHOOD_PUBLIC_RPC, USDG, WETH, findRoute } from "@ostraagent/swap";
 import { setupMainnet } from "../../relayer/scripts/setup-mainnet.ts";
 import { deploySwap } from "../../../ostra-swap/sdk/scripts/deploy.ts";
@@ -30,11 +29,6 @@ import { deploySwap } from "../../../ostra-swap/sdk/scripts/deploy.ts";
 const here = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 const LIVE_DEPLOYMENT = here("../../deployments/robinhood-mainnet.json");
 const SWAP_OUT = here("../../../ostra-swap/out");
-/**
- * OstraVault version 2, the code OstraUpgradeOwner scheduled for the vault beacon (upgradeTo, transaction
- * 0xd4adb65a26c60f0f7f498237419bdc9bb3026931e0a746a6280bb6d9a260c3b7), runnable from 22 Oct 2026 09:07 UTC.
- */
-const VAULT_V2 = getAddress("0xd20c6744cfa46d9ec564b119cc923bab2f9f9331");
 const SERVICES = { keeper: { script: here("../../keeper/src/main.ts"), env: "keeper.env" }, relayer: { script: here("../../relayer/src/server.ts"), env: "relayer.env" } } as const;
 
 let fork: Fork;
@@ -56,39 +50,6 @@ async function anvil(method: string, params: unknown[]): Promise<void> {
   const res = await fetch(fork.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
   const body = (await res.json()) as { error?: { message: string } };
   if (body.error !== undefined) throw new Error(`${method}: ${body.error.message}`);
-}
-
-/**
- * Every vault on version 2: the scheduled upgrade, sent on the fork by the beacon's owner when mainnet has not run it.
- * Returns the deployment record to run on: `live`, or what upgrade-vault.ts finalize writes after the upgrade (the
- * version 2 implementation and its OstraRegistry, which the implementation names).
- */
-async function vaultsOnV2(live: Deployment, livePath: string, dir: string): Promise<{ how: string; record: string }> {
-  const beacon = live.vaultBeacon;
-  const read = () => fork.client.readContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "implementation" }) as Promise<Address>;
-  let how = "on mainnet already";
-  if (getAddress(await read()) !== VAULT_V2) {
-    const owner = getAddress((await fork.client.readContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "owner" })) as Address);
-    await anvil("anvil_impersonateAccount", [owner]);
-    await anvil("anvil_setBalance", [owner, numberToHex(10n ** 18n)]);
-    const wallet = createWalletClient({ account: owner, chain: robinhoodChain, transport: http(fork.url) });
-    const hash = await wallet.writeContract({ address: beacon, abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [VAULT_V2], account: owner, chain: robinhoodChain });
-    assert.equal((await fork.client.waitForTransactionReceipt({ hash })).status, "success");
-    await anvil("anvil_stopImpersonatingAccount", [owner]);
-    how = "upgraded on the fork as scheduled";
-  }
-  assert.equal(getAddress(await read()), VAULT_V2);
-  assert.equal(await fork.client.readContract({ address: VAULT_V2, abi: ostraVaultAbi, functionName: "VERSION" }), VAULT_VERSION);
-  if (live.registry !== undefined) {
-    assert.equal(live.vaultImplementation, VAULT_V2, "the live record names version 2");
-    return { how, record: livePath };
-  }
-  const registry = getAddress((await fork.client.readContract({ address: VAULT_V2, abi: ostraVaultAbi, functionName: "REGISTRY" })) as Address);
-  const record = join(dir, "deployment-v2.json");
-  const d: Deployment = { ...live, vaultImplementation: VAULT_V2, registry };
-  await checkDeployment(fork.client, d);
-  writeFileSync(record, `${JSON.stringify(d, null, 2)}\n`, { mode: 0o644 });
-  return { how: `${how}; the record as finalize writes it (registry ${registry})`, record };
 }
 
 /** The variables of an environment file (KEY=value lines, as systemd's EnvironmentFile reads them). */
@@ -130,9 +91,13 @@ async function keepPoolIndex(home: string): Promise<void> {
 
 test("scripts/swap-check.ts passes through the relayer and keeper processes set up as on mainnet", { timeout: 2_400_000 }, async () => {
   const live = parseDeployment(JSON.parse(readFileSync(LIVE_DEPLOYMENT, "utf8")));
-  const v2 = await vaultsOnV2(live, LIVE_DEPLOYMENT, dir);
-  console.log(`vault version ${VAULT_VERSION}: ${v2.how}`);
-  const deploymentPath = v2.record;
+  // Every vault on the record's version: the scheduled upgrade run on the fork when mainnet has not run it yet.
+  const how = await vaultBeaconAtRecord(fork, live);
+  await checkDeployment(fork.client, live);
+  const version = live.vaultModule === undefined ? VAULT_VERSION : VAULT_V3;
+  assert.equal(await fork.client.readContract({ address: live.vaultImplementation, abi: ostraVaultAbi, functionName: "VERSION" }), version);
+  console.log(`vault version ${version}: ${how}`);
+  const deploymentPath = LIVE_DEPLOYMENT;
   const deployer = fork.accounts[0] as PrivateKeyAccount;
   const { deployment: swap, gasUsed } = await deploySwap(fork.client, fork.wallet(deployer), SWAP_OUT);
   console.log(`Ostra Swap deployed on the fork: ${gasUsed} gas`);
@@ -209,8 +174,8 @@ test("scripts/swap-check.ts passes through the relayer and keeper processes set 
   assert.equal(lines.filter((l) => l.startsWith("FAIL ")).length, 0, out);
   assert.equal(lines.filter((l) => l.startsWith("FUND ")).length, 1, "the agent asked for its funding once");
   assert.equal(lines.filter((l) => l.startsWith("PASS TX ")).length, 7, "seven transactions measured");
-  // The agent's vault ran version 2 throughout (the beacon's code for every vault).
+  // The agent's vault ran the record's version throughout (the beacon's code for every vault).
   const vault = /^FUND (0x[0-9a-fA-F]{40}) /.exec(lines.find((l) => l.startsWith("FUND ")) ?? "")?.[1];
   assert.ok(vault !== undefined);
-  assert.equal(await fork.client.readContract({ address: getAddress(vault), abi: ostraVaultAbi, functionName: "VERSION" }), VAULT_VERSION, "the agent's vault runs version 2");
+  assert.equal(await fork.client.readContract({ address: getAddress(vault), abi: ostraVaultAbi, functionName: "VERSION" }), version, "the agent's vault runs the record's version");
 });

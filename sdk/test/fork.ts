@@ -172,3 +172,21 @@ export async function handBeaconsTo(fork: Fork, beacons: readonly Address[], to:
     await rpc(fork.url, "anvil_stopImpersonatingAccount", [owner]);
   }
 }
+
+/**
+ * The vault beacon at the implementation `d` names: when mainnet has not run the scheduled upgrade yet, its call is
+ * sent on the fork by the beacon's owner (impersonated), as OstraUpgradeOwner executes it after its delay. Returns how.
+ */
+export async function vaultBeaconAtRecord(fork: Fork, d: Deployment): Promise<string> {
+  const read = async () => getAddress((await fork.client.readContract({ address: d.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address);
+  if ((await read()) === getAddress(d.vaultImplementation)) return "on mainnet already";
+  const owner = getAddress((await fork.client.readContract({ address: d.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "owner" })) as Address);
+  await rpc(fork.url, "anvil_impersonateAccount", [owner]);
+  await rpc(fork.url, "anvil_setBalance", [owner, numberToHex(10n ** 18n)]);
+  const wallet = createWalletClient({ account: owner, chain: robinhoodChain, transport: http(fork.url) });
+  const hash = await wallet.writeContract({ address: d.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [d.vaultImplementation], account: owner, chain: robinhoodChain });
+  if ((await fork.client.waitForTransactionReceipt({ hash })).status !== "success") throw new Error(`upgradeTo ${d.vaultImplementation} failed on the fork`);
+  await rpc(fork.url, "anvil_stopImpersonatingAccount", [owner]);
+  if ((await read()) !== getAddress(d.vaultImplementation)) throw new Error("the vault beacon is not at the record's implementation after the upgrade");
+  return "upgraded on the fork as scheduled";
+}

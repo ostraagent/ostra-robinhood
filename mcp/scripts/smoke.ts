@@ -2,7 +2,8 @@
 // OSTRA_HOME and npm cache: the tools are listed, `tokens` reads the
 // launchpad from the chain, `balance` answers, `ostra_ai_credit` reaches Ostra
 // AI (no payment), `private_recover` reads the private pool's whole history
-// (its events against its trees: a fresh seed holds no notes), and `backup`
+// (its events against its trees: a fresh seed holds no notes), `borro_markets`
+// reads Borro's markets on Morpho (NVDA among them, listed), and `backup`
 // without arguments prints its usage. Run on the packed tarball before publishing and on the
 // published version after:
 //
@@ -53,8 +54,9 @@ try {
   const { tools } = await client.listTools();
   const names = new Set(tools.map((t) => t.name));
   assert.deepEqual([...names].sort(), [...expected].sort(), "the tools listed are the tools in src/tools.ts");
+  // Past the MCP client's default 60 s: borro_markets reads Borro's 12 markets, over 60 s through a busy RPC.
   const call = async (name: string, args: Record<string, unknown>) => {
-    const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content: { text: string }[] };
+    const r = (await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 })) as { isError?: boolean; content: { text: string }[] };
     return { ok: r.isError !== true, text: r.content[0]?.text ?? "" };
   };
   const tokens = await call("tokens", { limit: 1 });
@@ -69,11 +71,15 @@ try {
   const found = JSON.parse(recovered.text) as { pool?: string; notes?: number; tokens?: unknown[]; privateVaults?: unknown[] };
   assert.ok(typeof found.pool === "string" && found.notes === 0 && Array.isArray(found.tokens) && found.tokens.length === 0, recovered.text);
   assert.ok(Array.isArray(found.privateVaults) && found.privateVaults.length === 0, recovered.text);
+  const markets = await call("borro_markets", {});
+  assert.ok(markets.ok, markets.text);
+  const rows = JSON.parse(markets.text) as { symbol: string; listed: boolean }[];
+  assert.ok(rows.some((m) => m.symbol === "NVDA" && m.listed), markets.text);
   await client.close();
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");
   process.stdout.write(
-    `${info?.name}@${info?.version}: ${names.size} tools; tokens: ${tokens.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nSMOKE_OK\n`,
+    `${info?.name}@${info?.version}: ${names.size} tools; tokens: ${tokens.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nSMOKE_OK\n`,
   );
 } catch (err) {
   process.stderr.write(`${stderr.slice(-3000)}\n`);

@@ -119,8 +119,13 @@ async function connect(home: string): Promise<Client> {
 
 type Answer = { ok: boolean; text: string; json: Record<string, unknown> };
 
-async function call(client: Client, name: string, args: Record<string, unknown> = {}, timeout?: number): Promise<Answer> {
-  const r = (await client.callTool({ name, arguments: args }, undefined, timeout === undefined ? undefined : { timeout })) as { isError?: boolean; content: { type: string; text: string }[] };
+// Past the MCP client's default request timeout (60 s): on a fork, the first reads of a contract fetch its state from
+// the upstream RPC, and borro_markets reads the 12 Borro markets cold (23 s through the public RPC, over 60 s through
+// a busy one).
+const CALL_TIMEOUT_MS = 300_000;
+
+async function call(client: Client, name: string, args: Record<string, unknown> = {}, timeout = CALL_TIMEOUT_MS): Promise<Answer> {
+  const r = (await client.callTool({ name, arguments: args }, undefined, { timeout })) as { isError?: boolean; content: { type: string; text: string }[] };
   const text = r.content[0]?.text ?? "";
   let json: Record<string, unknown> = {};
   try {
