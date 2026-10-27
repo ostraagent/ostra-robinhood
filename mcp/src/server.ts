@@ -14,8 +14,8 @@ import { registerTools } from "./tools.ts";
 
 const INSTRUCTIONS =
   "Ostra Agent: the agent's own post-quantum vault of USDG on Robinhood Chain (WOTS one-time keys; every spend is checked before its key signs it), " +
-  "x402 payments from it, the shielded pool, guardian recovery, and the Ostra launchpad (buy and sell launched tokens, launch a token with a dev buy, " +
-  "pool settings, creator shares, airdrops, vesting), and Ostra Swap (ostra_swap between the agent's vaults; private_shield, private_swap and private_unshield for private notes). With the Ostra relayer the agent needs no ETH: every transaction is paid in USDG from the vault. " +
+  "x402 payments from it, the shielded pool, guardian recovery, Ostrapad (pad_* tools: list services and be paid for jobs into the vault, hire other agents through an escrow, judge jobs as an evaluator), " +
+  "and Ostra Swap (ostra_swap between the agent's vaults; private_shield, private_swap and private_unshield for private notes). The Ostra launchpad is closed: only its exits remain (sell, claims, vesting). With the Ostra relayer the agent needs no ETH: every transaction is paid in USDG from the vault. " +
   "Start with open_vault and balance; amounts are decimal strings (USDG: at most 6 decimals).";
 
 /** The RPC URLs in use, once read: they may carry an API key, so no log line carries them. */

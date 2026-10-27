@@ -1,6 +1,6 @@
 // Runs the npm package as an MCP client does, through npx, in a fresh
-// OSTRA_HOME and npm cache: the tools are listed, `tokens` reads the
-// launchpad from the chain, `balance` answers, `ostra_ai_credit` reaches Ostra
+// OSTRA_HOME and npm cache: the tools are listed (the launchpad's closed ones
+// absent), `pad_search` reads Ostra's Ostrapad index, `balance` answers, `ostra_ai_credit` reaches Ostra
 // AI (no payment), `private_recover` reads the private pool's whole history
 // (its events against its trees: a fresh seed holds no notes), `borro_markets`
 // reads Borro's markets on Morpho (NVDA among them, listed), and `backup`
@@ -31,7 +31,10 @@ if (arg === undefined) throw new Error("usage: node scripts/smoke.ts <tarball | 
 // npx runs a tarball's command by name (--package); a published version as an MCP client's config does.
 const npx = arg.endsWith(".tgz") ? ["-y", `--package=${resolve(arg)}`, "ostra-mcp"] : ["-y", arg];
 const source = await readFile(new URL("../src/tools.ts", import.meta.url), "utf8");
-const expected = new Set([...source.matchAll(/tool\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string));
+const closedList = /CLOSED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
+if (closedList === null) throw new Error("src/tools.ts has no CLOSED_LAUNCHPAD_TOOLS list");
+const closed = new Set([...(closedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string));
+const expected = new Set([...source.matchAll(/tool\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string).filter((n) => !closed.has(n)));
 
 const root = await mkdtemp(join(tmpdir(), "ostra-mcp-smoke-"));
 const env: Record<string, string> = {};
@@ -53,14 +56,16 @@ try {
   const info = client.getServerVersion();
   const { tools } = await client.listTools();
   const names = new Set(tools.map((t) => t.name));
-  assert.deepEqual([...names].sort(), [...expected].sort(), "the tools listed are the tools in src/tools.ts");
+  assert.deepEqual([...names].sort(), [...expected].sort(), "the tools listed are the open tools in src/tools.ts");
+  for (const n of closed) assert.ok(!names.has(n), `the closed launchpad tool ${n} is not listed`);
   // Past the MCP client's default 60 s: borro_markets reads Borro's 12 markets, over 60 s through a busy RPC.
   const call = async (name: string, args: Record<string, unknown>) => {
     const r = (await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 })) as { isError?: boolean; content: { text: string }[] };
     return { ok: r.isError !== true, text: r.content[0]?.text ?? "" };
   };
-  const tokens = await call("tokens", { limit: 1 });
-  assert.ok(tokens.ok, tokens.text);
+  const listings = await call("pad_search", { limit: 1 });
+  assert.ok(listings.ok, listings.text);
+  assert.match(listings.text, /"total": \d+/, listings.text);
   const balance = await call("balance", {});
   assert.ok(balance.ok, balance.text);
   const credit = await call("ostra_ai_credit", {});
@@ -79,7 +84,7 @@ try {
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");
   process.stdout.write(
-    `${info?.name}@${info?.version}: ${names.size} tools; tokens: ${tokens.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nSMOKE_OK\n`,
+    `${info?.name}@${info?.version}: ${names.size} tools; pad_search: ${listings.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nSMOKE_OK\n`,
   );
 } catch (err) {
   process.stderr.write(`${stderr.slice(-3000)}\n`);

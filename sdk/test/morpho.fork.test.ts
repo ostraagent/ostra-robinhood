@@ -151,7 +151,9 @@ test("a market accrued here equals the market after Morpho.accrueInterest", { ti
   }
 });
 
-test("withdrawable liquidity agrees with redeem: Steakhouse USDG redeems a fresh deposit in full; NetNet Credit's holders cannot redeem", { timeout: 600_000 }, async () => {
+// NetNet Credit's liquidity moves on mainnet (below its large holder's position when this test was written, above it on 27 Oct 2026):
+// the redeem must agree with withdrawableNow in whichever state the fork finds it.
+test("withdrawable liquidity agrees with redeem: Steakhouse USDG redeems a fresh deposit in full; a NetNet Credit holder's redeem goes through exactly when the liquidity covers it", { timeout: 600_000 }, async () => {
   const me = fork.accounts[1]!;
   const w = fork.wallet(me);
   await fork.dealUsdg(me.address, 1_000_000_000n);
@@ -168,10 +170,12 @@ test("withdrawable liquidity agrees with redeem: Steakhouse USDG redeems a fresh
   const netnet = await readVaultV2(client, NETNET_CREDIT);
   const held = await client.readContract({ address: NETNET_CREDIT, abi: vaultV2ReadAbi, functionName: "balanceOf", args: [NETNET_HOLDER] });
   const heldValue = await client.readContract({ address: NETNET_CREDIT, abi: vaultV2ReadAbi, functionName: "previewRedeem", args: [held] });
-  assert.ok(withdrawableNow(netnet) < heldValue, `NetNet withdrawable ${withdrawableNow(netnet)} is below the holder's ${heldValue}`);
+  assert.ok(heldValue > 0n, "the NetNet holder still holds shares");
   assert.deepEqual(await vaultV2GatesAllow(client, netnet, NETNET_HOLDER), { deposit: true, redeem: true }, "NetNet's gates let the holder out");
   const r = await simulateVaultV2Redeem(client, NETNET_CREDIT, NETNET_HOLDER, held);
-  assert.ok(!r.ok && /underflow|overflow/i.test(r.reason), `NetNet redeem: ${JSON.stringify(r)}`);
+  const show = JSON.stringify(r, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+  if (withdrawableNow(netnet) >= heldValue) assert.ok(r.ok && r.assets === heldValue, `NetNet withdrawable ${withdrawableNow(netnet)} covers the holder's ${heldValue}: ${show}`);
+  else assert.ok(!r.ok && /underflow|overflow/i.test(r.reason), `NetNet withdrawable ${withdrawableNow(netnet)} is below the holder's ${heldValue}: ${show}`);
 });
 
 test("caps from their events, the worst case they allow, pending changes and allocators", { timeout: 1_800_000 }, async () => {

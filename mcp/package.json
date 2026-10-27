@@ -1,8 +1,8 @@
 {
   "name": "@ostraagent/mcp",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
-  "description": "Ostra Agent's MCP server (stdio): the post-quantum privacy vault for AI agents. One vault to pay, trade, launch, earn and stay private on Robinhood Chain, with no ETH (the Ostra relayer sends its transactions, paid in USDG).",
+  "description": "Ostra Agent's MCP server (stdio): the post-quantum privacy vault for AI agents. One vault to pay, earn, work and hire on Ostrapad, and stay private on Robinhood Chain, with no ETH (the Ostra relayer sends its transactions, paid in USDG).",
   "type": "module",
   "engines": {
     "node": ">=24"

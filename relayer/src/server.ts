@@ -46,7 +46,7 @@
 
 import { createPublicClient, http, type PublicClient } from "viem";
 import { PoolIndex, ROBINHOOD_PUBLIC_RPC } from "@ostraagent/swap";
-import { CHAINLINK_ETH_USD, assertRobinhoodChain, chainlinkEthUsd, redact, retryingHttp, robinhoodChain } from "@ostraagent/sdk";
+import { CHAINLINK_ETH_USD, OSTRAPAD, ROBINHOOD_CHAIN_ID, assertRobinhoodChain, chainlinkEthUsd, redact, retryingHttp, robinhoodChain } from "@ostraagent/sdk";
 import { MerchantKeys, ensurePrivateDir } from "../../merchant/src/keys.ts";
 import { createOstraMerchant } from "../../merchant/src/merchant.ts";
 import { FileChannelStorage } from "../../merchant/src/store.ts";
@@ -115,6 +115,8 @@ async function main(): Promise<void> {
     priceFeed: CHAINLINK_ETH_USD,
     ethUsd,
     ...(sc === null ? {} : { swap: { router: sc.router, ...(privateRelay === undefined ? {} : { private: privateRelay }) } }),
+    // OstraPad on Robinhood Chain (Ostrapad, decided 27 Oct 2026): its calls are relayed under the gate's rules.
+    ...(d.chainId === ROBINHOOD_CHAIN_ID ? { pad: OSTRAPAD } : {}),
     log,
   });
   const facts = { ...gate.facts(), merchant: keys.merchant, crank: merchant.crank, facilitator: keys.facilitator.address };

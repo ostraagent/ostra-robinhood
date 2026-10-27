@@ -131,6 +131,7 @@ import {
   BORRO_STOCKS,
   LAUNCH_PAIRS,
   MAX_RELAY_CALLS,
+  MULTICALL3,
   RelaySimulationError,
   VAULT_ACTION,
   WETH,
@@ -142,6 +143,8 @@ import {
   ostraDevBuyAbi,
   ostraHookAbi,
   ostraLaunchpadAbi,
+  readPadAppeal,
+  readPadJob,
   readVault,
   relayGasCap,
   relayPriceWei,
@@ -209,6 +212,8 @@ export type GateOptions = {
   ethUsd: EthUsdSource;
   /** Ostra Swap (OSTRA_SWAP_DEPLOYMENT): its router's escrow orders are relayed; `private` relays private spends. */
   swap?: { router: Address; private?: PrivateRelay };
+  /** OstraPad (Ostrapad): its calls are relayed, none naming the relayer's account or Multicall3 in a role (#padProblem). */
+  pad?: Address;
   log: Log;
 };
 
@@ -747,6 +752,12 @@ export class RelayerGate {
         if (c.to !== l.dispatcher) return `calls[${i}]: ${name} on ${c.to} is not relayed`;
         continue;
       }
+      if (this.#o.pad !== undefined && c.to === getAddress(this.#o.pad)) {
+        if (c.fn !== "pad") return `calls[${i}]: ${name} on OstraPad ${c.to} is not relayed`;
+        const p = await this.#padProblem(i, c);
+        if (p !== null) return p;
+        continue;
+      }
       // OstraBreaker (Strategy 3): the limits a vault approved (configure checks its EIP-1271 approval) and a trip
       // (anyone's, into the vault itself); no other function of it, and only the deployment's breaker.
       if (c.fn === "breakerConfigure" || c.fn === "breakerTrip") {
@@ -787,6 +798,63 @@ export class RelayerGate {
         if (p !== null) return p;
       }
     }
+    return null;
+  }
+
+  /**
+   * Why an OstraPad call is not relayed, or null. OstraPad authorizes a role by msg.sender or by the role's EIP-1271
+   * approval of the action's digest, and pulls a payment from a calling payer by transferFrom. Relayed, the caller is
+   * the relayer's account (a lone call) or Multicall3 (several): so no call is relayed whose job, appeal or account
+   * names either of them in any role, or anyone could act in that role through the relayer (an evaluator's decision,
+   * a provider's acceptance, a pool membership). Every other check is OstraPad's own, in the simulation.
+   */
+  async #padProblem(i: number, c: { fn: "pad"; to: Address; name: string; args: readonly unknown[] }): Promise<string | null> {
+    const callers = new Set([getAddress(this.#o.sender.address), getAddress(MULTICALL3)]);
+    const roles: Address[] = [];
+    const add = (a: unknown) => {
+      if (typeof a === "string" && isAddress(a, { strict: false })) roles.push(getAddress(a));
+    };
+    const job = async (id: Hex) => {
+      const j = await readPadJob(this.#o.client, id, c.to);
+      if (j === null) return;
+      add(j.client);
+      add(j.provider);
+      add(j.evaluator);
+      if (j.status === "Appealed" || c.name === "vote" || c.name === "drawPanel" || c.name === "settle" || c.name === "sweepAppealBox") {
+        const a = await readPadAppeal(this.#o.client, id, c.to);
+        add(a.appellant);
+        for (const m of a.panel) add(m);
+      }
+    };
+    switch (c.name) {
+      case "create":
+      case "sweepJobBox": {
+        const t = c.args[0] as { client: Address; provider: Address; evaluator: Address };
+        add(t.client);
+        add(t.provider);
+        add(t.evaluator);
+        break;
+      }
+      case "claim":
+      case "joinPool":
+      case "leavePool":
+      case "prune":
+      case "withdrawEvaluatorBond":
+      case "depositProviderBond":
+      case "withdrawProviderBond":
+      case "sweepBondBox":
+        add(c.args[0]);
+        break;
+      case "sweepAppealBox":
+        add(c.args[2]);
+        await job(c.args[0] as Hex);
+        break;
+      default:
+        // cancel, accept, reveal, lapseReveal, draw, submit, decide, openAppeal, drawPanel, vote, settle: a job's id first.
+        await job(c.args[0] as Hex);
+    }
+    const named = roles.find((r) => callers.has(r));
+    if (named !== undefined) return `calls[${i}]: OstraPad.${c.name} names ${named} (the relayer's account or Multicall3, its callers) in a role: anyone could act in that role through the relayer, so it is not relayed`;
     return null;
   }
 

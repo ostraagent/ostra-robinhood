@@ -13,13 +13,17 @@
 //                             Pinata's, then ipfs.io; ipfs.ts)
 //   OSTRA_INDEXER_SOURCIFY    the Sourcify API each launched token's source is verified on (default
 //                             https://sourcify.dev/server; "off": none; sourcify.ts)
+//   OSTRA_PAD_INDEXER_STATE   Ostrapad's index state file (default: pad-state.json next to OSTRA_INDEXER_STATE;
+//                             "off": no Ostrapad index; pad.ts)
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
 import { readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
+import { PadIndexer } from "./pad.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
@@ -81,11 +85,16 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   log("sourcify", { api: sourcify === null ? "off" : new URL(sourcifyApi).host });
   log("ipfs", { gateways: gateways.map((g) => new URL(g).host) });
   log("logs_rpc", { host: new URL(logsUrl).host === new URL(rpcUrl).host ? "<rpc>" : new URL(logsUrl).host });
-  const server = createIndexerServer(indexer, log);
-  server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString() }));
+  const padStatePath = process.env.OSTRA_PAD_INDEXER_STATE || join(dirname(statePath), "pad-state.json");
+  const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri) });
+  const server = createIndexerServer(indexer, log, pad);
+  server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString(), pad: pad === null ? "off" : padStatePath }));
   indexer.start(everyMs);
+  // Ostrapad's index: its own scans, a few seconds apart (its files and records are read again every few minutes).
+  pad?.start(Math.max(everyMs, 5_000));
   const stop = () => {
     indexer.stop();
+    pad?.stop();
     server.close(() => process.exit(0));
   };
   process.on("SIGINT", stop);

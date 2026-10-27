@@ -59,6 +59,7 @@ import {
   DEV_BUY,
   LAUNCHPAD,
   NO_DEV_BUY,
+  PAD_SERVICE_NAME,
   POOL_SETTING,
   QUOTE_DEFAULT_SLIPPAGE_BPS,
   VAULT_ACTION,
@@ -114,7 +115,7 @@ import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmoun
 import { tokenBalance, tokenDecimals } from "./chain.ts";
 import { quoteOfPool, readLaunchedPool, readPoolView, type LaunchedPool as Pool, type PoolView } from "./pools.ts";
 import { LOG_WINDOW_BLOCKS } from "./channels.ts";
-import { profileFile, tokenMetadataFile, uploadJson, type PublicFields } from "./publish.ts";
+import { profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFields } from "./publish.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
@@ -1280,6 +1281,15 @@ export class LaunchpadService {
     const vault = await this.#identityVault();
     const record = await this.#agentRecord();
     const file = profileFile({ ...p, vault, agentId: record?.agentId ?? null });
+    // An Ostrapad listing in the profile published before is kept: pad_publish is what changes it. A profile published
+    // before that cannot be read now is not replaced (its listing would be dropped without a word).
+    uploaderUrl(this.#config.relayerUrl); // no uploader: refused here, before anything is read
+    const beforeUri = await this.#profileUri(vault);
+    const before = await readIpfsJson(beforeUri);
+    if (beforeUri !== null && beforeUri.startsWith("ipfs://") && before === null) throw new Error(`the profile published before (${beforeUri}) cannot be read now, so its Ostrapad listing could not be kept: try again later; nothing was signed`);
+    const services = before !== null && typeof before === "object" ? (before as { services?: unknown }).services : undefined;
+    const listings = Array.isArray(services) ? services.filter((s) => typeof s === "object" && s !== null && (s as { name?: unknown }).name === PAD_SERVICE_NAME) : [];
+    if (listings.length > 0) (file.services as unknown[]).push(...listings);
     const uri = await uploadJson(this.#config.relayerUrl, file);
     const profile = await this.setProfile(uri);
     // A token's page shows the profile of its pool's creator vault: the creator vaults of the other pairs this agent
@@ -1300,6 +1310,19 @@ export class LaunchpadService {
     }
     if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null, pairCreators };
     return { uri, profile, agentUri: await this.setAgentUri(uri), pairCreators };
+  }
+
+  /**
+   * Pins `file`, a registration file built from the current one (Ostrapad's listing, pad.ts), and makes it the
+   * agent's profile in OstraRegistry and its ERC-8004 registration file when it is registered.
+   */
+  async publishRegistrationFile(file: Record<string, unknown>): Promise<{ uri: string; profile: VaultOperationResult; agentUri: VaultOperationResult | null }> {
+    await this.#identityVault();
+    const record = await this.#agentRecord();
+    const uri = await uploadJson(this.#config.relayerUrl, file);
+    const profile = await this.setProfile(uri);
+    if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null };
+    return { uri, profile, agentUri: await this.setAgentUri(uri) };
   }
 
   /** Publishes the metadata of a token this agent launched (description, image, links), pins it and sets it in OstraRegistry. */

@@ -1,0 +1,25 @@
+# Ostrapad's evaluator bot on Robinhood Chain: Ostra's evaluator accounts judge the pool jobs they are drawn for and
+# vote on appeals, and every job is moved along (draw, lapseReveal, drawPanel, settle).
+# Installed with the release that adds Ostrapad's tools, with @NODE@ replaced by the path of node. It runs as the
+# other Ostra services do and may write only under /etc/ostra/robinhood: OSTRA_PAD_DATA and OSTRA_PAD_SECRETS go
+# there (the bot writes its state once at start, so a path it cannot write stops it at once, never mid-window).
+[Unit]
+Description=Ostrapad evaluator bot on Robinhood Chain
+After=network-online.target ostra-uploader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+EnvironmentFile=/etc/ostra/robinhood/pad-evaluator.env
+ExecStart=@NODE@ src/pad-evaluator-main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target

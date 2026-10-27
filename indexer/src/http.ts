@@ -10,10 +10,16 @@
 //   GET /api/v1/agents/<creator vault>
 //   GET /api/v1/images/<cid>   an image a token's metadata or a creator's profile names (ipfs://<cid>), as the
 //                              indexer keeps it (ipfs.ts): PNG, JPEG, WebP or GIF, by its first bytes
+//   GET /api/v1/pad/listings?q=&provider=&offset=&limit=   Ostrapad's listed agents, ranked (pad.ts); provider:
+//                                                one provider vault's listings only
+//   GET /api/v1/pad/agents/<agentId>             one agent, its listing, record and recent jobs
+//   GET /api/v1/pad/jobs?limit=                  recent jobs
+//   GET /api/v1/pad/stats
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
 import { CANDLE_INTERVALS, type Indexer } from "./indexer.ts";
+import type { PadIndexer } from "./pad.ts";
 
 const MAX_LIMIT = 100;
 const SORTS = new Set(["new", "marketcap", "volume", "active"]);
@@ -48,7 +54,7 @@ function sendImage(res: ServerResponse, image: { bytes: Uint8Array; type: string
   res.end(image.bytes);
 }
 
-export function handle(indexer: Indexer, req: IncomingMessage, res: ServerResponse): void {
+export function handle(indexer: Indexer, req: IncomingMessage, res: ServerResponse, pad: PadIndexer | null = null): void {
   if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, { error: "method_not_allowed" });
   const url = new URL(req.url ?? "/", "http://indexer.local");
   const parts = url.pathname.split("/").filter((p) => p !== "");
@@ -102,13 +108,38 @@ export function handle(indexer: Indexer, req: IncomingMessage, res: ServerRespon
     if (!isAddress(id, { strict: false })) return send(res, 400, { error: "bad_address" });
     return send(res, 200, indexer.agent(id), 5);
   }
+  if (resource === "pad") {
+    if (pad === null) return send(res, 404, { error: "not_found" });
+    if (id === "listings" && sub === undefined) {
+      const q = url.searchParams.get("q");
+      if (q !== null && q.length > 100) return send(res, 400, { error: "bad_query" });
+      const provider = url.searchParams.get("provider");
+      if (provider !== null && !isAddress(provider)) return send(res, 400, { error: "bad_provider" });
+      const offset = intParam(url, "offset", 0, 1_000_000);
+      const limit = intParam(url, "limit", 20, MAX_LIMIT);
+      if (offset === null || limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+      return send(res, 200, pad.listings({ ...(q === null ? {} : { q }), ...(provider === null ? {} : { provider }), offset, limit }), 10);
+    }
+    if (id === "agents" && sub !== undefined) {
+      if (!/^[0-9]{1,30}$/.test(sub)) return send(res, 400, { error: "bad_agent_id" });
+      const a = pad.agent(sub);
+      return a === null ? send(res, 404, { error: "unknown_agent" }) : send(res, 200, a, 10);
+    }
+    if (id === "jobs" && sub === undefined) {
+      const limit = intParam(url, "limit", 50, MAX_LIMIT);
+      if (limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+      return send(res, 200, { jobs: pad.jobs({ limit }) }, 5);
+    }
+    if (id === "stats" && sub === undefined) return send(res, 200, pad.stats(), 10);
+    return send(res, 404, { error: "not_found" });
+  }
   return send(res, 404, { error: "not_found" });
 }
 
-export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void): Server {
+export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null): Server {
   return createServer((req, res) => {
     try {
-      handle(indexer, req, res);
+      handle(indexer, req, res, pad);
     } catch (err) {
       log("request_failed", { path: (req.url ?? "").slice(0, 200), reason: (err as Error).message.slice(0, 200) });
       if (!res.headersSent) send(res, 500, { error: "internal" });

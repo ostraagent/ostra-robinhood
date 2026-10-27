@@ -34,6 +34,10 @@
 //                         goes into such a vault). Never printed
 //   OSTRA_RAETO_URL       Raeto's API (default https://api.raeto.cc; "off":
 //                         the raeto tool refuses to run)
+//   OSTRA_PAD_INDEXER_URL Ostra's Ostrapad index, for pad_search (default, on
+//                         the packaged mainnet deployment, the web app's host
+//                         https://app.ostraagent.xyz; "off": pad_search
+//                         refuses, an agent's listing is still read by its id)
 //   OSTRA_PROVER          the private notes' prover: unset, the WebAssembly
 //                         build of ostra-prove (the npm package carries it in
 //                         dist/prover and checks the SHA-256 of its files;
@@ -89,6 +93,9 @@ async function proverConfig(env: NodeJS.ProcessEnv): Promise<ProverConfig | null
   return { kind: "wasm", dir, sha256 };
 }
 
+/** Ostra's Ostrapad index on mainnet: the indexer under the web app's host (/api/v1/pad/...). */
+export const PAD_INDEXER_URL = "https://app.ostraagent.xyz";
+
 /** The Ethereum RPC the strategies read USDe's price through by default (a public one; OSTRA_ETH_RPC_URL replaces it). */
 export const ETHEREUM_PUBLIC_RPC = "https://ethereum-rpc.publicnode.com";
 
@@ -98,6 +105,8 @@ export type McpConfig = Config & {
   ethRpcUrl: string | null;
   /** Raeto's API, or null (OSTRA_RAETO_URL=off). */
   raetoUrl: string | null;
+  /** Ostra's Ostrapad index, or null (OSTRA_PAD_INDEXER_URL=off, or not the packaged deployment and unset). */
+  padIndexerUrl: string | null;
   /** Ostra Swap's contracts, or null (its tools then refuse to run). */
   swap: SwapDeployment | null;
   /** The RPC Ostra Swap searches events through. */
@@ -150,10 +159,12 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
   const prover = await proverConfig(env);
   const ethRpcUrl = serviceUrl(env, "OSTRA_ETH_RPC_URL", ETHEREUM_PUBLIC_RPC);
   const raetoUrl = serviceUrl(env, "OSTRA_RAETO_URL", RAETO_API);
+  const padIndexerUrl = serviceUrl(env, "OSTRA_PAD_INDEXER_URL", services !== null ? PAD_INDEXER_URL : null);
   return {
     home,
     ethRpcUrl,
     raetoUrl,
+    padIndexerUrl,
     swap,
     logsRpcUrl,
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",

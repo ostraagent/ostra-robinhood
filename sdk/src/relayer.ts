@@ -97,6 +97,7 @@ import {
   VAULT_SWAP_GAS_RESERVE,
 } from "./constants.ts";
 import type { Deployment } from "./deployment.ts";
+import { ostraPadAbi } from "./pad-abi.ts";
 import { decodeSwapParams } from "./messages.ts";
 import { chainlinkAggregatorAbi, multicall3Abi, nodeInterfaceAbi } from "./external-abi.ts";
 
@@ -282,6 +283,7 @@ const OSTRA_ERRORS = [
   ostraDispatcherAbi,
   ostraCreatorSplitAbi,
   ostraBreakerAbi,
+  ostraPadAbi,
 ].flatMap((abi) => (abi as readonly { type: string }[]).filter((x) => x.type === "error"));
 
 /** The revert `data` as the Ostra error it is ("BadParams(buckets)"), or null when it is none of them. */

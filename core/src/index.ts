@@ -13,6 +13,7 @@ export * from "./encoding.ts";
 export * from "./escrow.ts";
 export * from "./keys.ts";
 export * from "./launchpad.ts";
+export * from "./pad.ts";
 export * from "./passkey.ts";
 export * from "./pay.ts";
 export * from "./publish.ts";

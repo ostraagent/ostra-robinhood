@@ -26,7 +26,7 @@ import type { Deployment } from "./deployment.ts";
 import { checkDevBuyTerms, launchFromVaultData, signVaultDevBuy, type DevBuyTerms, type LaunchParams } from "./launch.ts";
 import { poolId, signVaultSpend, signVaultSwap, type SignedSpend, type SwapParams, type VaultKeyState } from "./messages.ts";
 import { readVault } from "./reads.ts";
-import { RelaySimulationError, simulateRelay } from "./relayer.ts";
+import { RelaySimulationError, relayTransaction, simulateRelay, type RelayCall } from "./relayer.ts";
 import { WotsKeychain, randomBytes32, type WotsStore } from "./wots.ts";
 
 /** OstraVault.keyRoot's storage slot (forge inspect OstraVault storageLayout: slot 5, below it EIP712's two strings, token, initialKeyRoot, initialCrank). */
@@ -317,6 +317,39 @@ export async function simulateVaultSpend(
       nonce: state.nonce,
       sign: (k, s) => signVaultSpend(k, s, { chainId: d.chainId, action: a.action as never, params: a.params }),
       call: (signed) => ({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, signed.signature] }) }),
+    });
+  } catch (err) {
+    if (err instanceof RelaySimulationError && err.reverted) throw new QuoteError("spend_fails", `the vault operation fails now: ${err.message}`);
+    throw err;
+  }
+}
+
+/**
+ * `vault`'s spend (action, params) followed by the calls `then`, in one relayed transaction (Multicall3) as the relayer
+ * sends it, simulated with a throwaway key as simulateVaultSpend does: an EIP-1271 approval and the call it
+ * authorizes (Ostrapad), for one. Throws QuoteError spend_fails when the transaction reverts.
+ */
+export async function simulateVaultSpendThen(
+  client: PublicClient,
+  d: Deployment,
+  a: { relayer: Address; vault: Address; action: number; params: Hex; then: readonly RelayCall[] },
+): Promise<{ gasUsed: bigint; logs: readonly Log[]; time: bigint }> {
+  if (a.then.length === 0) throw new QuoteError("bad_request", "no call follows the spend");
+  const vault = getAddress(a.vault);
+  const state = await readVault(client, d, vault);
+  if (state === null) throw new QuoteError("bad_request", `${vault} is not an Ostra vault of this deployment`);
+  await checkKeyRootSlot(client, vault, state.keyRoot);
+  try {
+    return await throwawayRun(client, {
+      relayer: a.relayer,
+      vault,
+      nonce: state.nonce,
+      sign: (k, s) => signVaultSpend(k, s, { chainId: d.chainId, action: a.action as never, params: a.params }),
+      call: (signed) =>
+        relayTransaction([
+          { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, signed.signature] }) },
+          ...a.then,
+        ]),
     });
   } catch (err) {
     if (err instanceof RelaySimulationError && err.reverted) throw new QuoteError("spend_fails", `the vault operation fails now: ${err.message}`);

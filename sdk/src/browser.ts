@@ -17,6 +17,7 @@ export * from "./leaves.ts";
 export * from "./lthash.ts";
 export * from "./messages.ts";
 export * from "./morpho.ts";
+export * from "./pad.ts";
 export * from "./quote.ts";
 export * from "./pairs.ts";
 export * from "./reads.ts";

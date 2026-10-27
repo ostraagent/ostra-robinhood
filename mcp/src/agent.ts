@@ -35,6 +35,7 @@ import {
   LAUNCHPAD_DIR,
   LocalSender,
   PRIVATE_SWAP_DIR,
+  PadService,
   PayService,
   PrivateBalanceService,
   RaetoService,
@@ -47,6 +48,7 @@ import {
   SignatureEscrowClient,
   UnshieldService,
   VaultService,
+  uploadJson,
   type Keys,
   type PrivateVaultContext,
   type Sender,
@@ -130,6 +132,8 @@ export class Agent {
   readonly trading: TradingService;
   /** Raeto's AI models from the USDG vault (null with OSTRA_RAETO_URL=off). */
   readonly raeto: RaetoService | null;
+  /** Ostrapad from the USDG vault: hired, hiring and judging work through OstraPad (null without the launchpad's identity tools). */
+  readonly pad: PadService | null;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -226,6 +230,31 @@ export class Agent {
       breaker: this.breaker,
       trading: this.trading,
     });
+    // Ostrapad: the agent's identity (creator vault, ERC-8004 id and registration file) comes from the launchpad service's
+    // identity tools (publish_profile, register_agent), which stay when launches are closed.
+    const lp = this.launchpad;
+    this.pad =
+      lp === null
+        ? null
+        : new PadService({
+            client,
+            logsClient: strategyLogs,
+            config,
+            buyer: this.buyer,
+            sender: this.sender,
+            folder: keys.folder,
+            identity: async () => {
+              const p = await lp.profile();
+              return { agentId: p.agentId === null ? null : BigInt(p.agentId), creatorVault: getAddress(p.account) };
+            },
+            currentFile: async () => {
+              const p = await lp.profile();
+              return typeof p.profile === "object" && p.profile !== null && !Array.isArray(p.profile) ? (p.profile as Record<string, unknown>) : null;
+            },
+            publishFile: (file) => lp.publishRegistrationFile(file),
+            upload: (file) => uploadJson(config.relayerUrl, file),
+            indexerUrl: config.padIndexerUrl,
+          });
   }
 
   /** The agent's vault for `token`: the buyer vault for USDG, else its token vault (the launchpad's, when there is one). */
@@ -414,6 +443,11 @@ export class Agent {
       if (this.privateBalance !== null && this.config.prover !== null) {
         await step("private notes", () => this.privateBalance!.refresh());
         await step("private auto-shield", () => this.privateBalance!.autoShieldStep());
+      }
+      // Ostrapad: reveal this agent's secrets in time and move its jobs along (draw, lapseReveal, settle).
+      if (this.pad !== null) {
+        const pad = this.pad;
+        await step("ostrapad", async () => (await pad.sweep()).failed);
       }
       // Strategy 1's exits each minute (decided by Edu on 25 Oct 2026): a cash vault that fails its checks is left at once.
       await step("cash exits", async () => {
