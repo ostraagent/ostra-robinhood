@@ -12,7 +12,9 @@
 // later; one signed at a nonce another transaction holds (a node behind) is
 // not sent; when the reads of that check fail, the replacement proof decides.
 // What it says never holds the RPC URL, which may carry an API key, also
-// when the replacement proof decides.
+// when the replacement proof decides. A transaction that earns a gas refund
+// needs a limit above what it uses: sent within the gate's cap of its priced
+// gas alone it is refused, within sendGasCap it lands.
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
@@ -20,8 +22,9 @@ import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { concat, createPublicClient, encodeFunctionData, getAddress, http, keccak256, numberToHex, stringToHex, toEventSelector, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { USDG, failedSwaps, ostraVaultAbi, retryingHttp, robinhoodChain, usdgAbi } from "@ostraagent/sdk";
+import { USDG, estimateRelay, failedSwaps, ostraVaultAbi, relayGasCap, retryingHttp, robinhoodChain, usdgAbi } from "@ostraagent/sdk";
 import { startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { sendGasCap } from "../src/gate.ts";
 import { NotSentError, RelaySender } from "../src/send.ts";
 
 let fork: Fork;
@@ -302,4 +305,26 @@ test("nor does a refusal the chain could not confirm, proven by its replacement"
   } finally {
     await f.close();
   }
+});
+
+test("a transaction that earns a gas refund needs a limit above what it is priced at: within sendGasCap it lands", async () => {
+  // Code that clears ten storage slots and stops, as finalizeWithdraw clears a channel's: each clear earns a refund,
+  // so the gas it uses is about a fifth below the limit it needs.
+  const clearer = getAddress("0x00000000000000000000000000000000c1ea4e45");
+  // PUSH1 0, PUSH1 i, SSTORE (slot i = 0), ten times, then STOP.
+  const code = `0x${Array.from({ length: 10 }, (_, i) => `600060${i.toString(16).padStart(2, "0")}55`).join("")}00` as Hex;
+  await rpc("anvil_setCode", [clearer, code]);
+  for (let i = 0; i < 10; i++) await rpc("anvil_setStorageAt", [clearer, numberToHex(i, { size: 32 }), numberToHex(1, { size: 32 })]);
+  const tx = { to: clearer, data: "0x" as Hex };
+  const m = await estimateRelay(fork.client, { relayer: account.address, ...tx });
+  const limit = await fork.client.estimateGas({ account: account.address, ...tx });
+  assert.ok(limit > relayGasCap(m.gas), `limit ${limit}, priced ${m.gas}`);
+  const nonce = await fork.client.getTransactionCount({ address: account.address });
+  await assert.rejects(sender.send(tx, { maxGas: sendGasCap({ gas: m.gas.toString() }, false) }), (err: unknown) => err instanceof NotSentError && err.overCap);
+  assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce);
+  const landed = await sender.send(tx, { maxGas: sendGasCap({ gas: m.gas.toString(), limit: limit.toString() }, false) });
+  const receipt = await fork.client.getTransactionReceipt({ hash: landed.txHash });
+  assert.equal(receipt.status, "success");
+  assert.ok(receipt.gasUsed < limit, `used ${receipt.gasUsed}, limit ${limit}`);
+  for (let i = 0; i < 10; i++) assert.equal(await fork.client.getStorageAt({ address: clearer, slot: numberToHex(i, { size: 32 }) }), numberToHex(0, { size: 32 }));
 });

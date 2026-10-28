@@ -54,6 +54,12 @@ export type Quote = {
   /** ETH the transaction sends (a vault-funded launch's fee), charged without the margin; absent: 0. */
   value?: string;
   gas: string;
+  /**
+   * The gas limit the transaction needs from the relayer's account at the quote (eth_estimateGas), above the gas it
+   * uses when it earns a refund (a storage slot cleared, as finalizeWithdraw does); absent in quotes made before it was
+   * recorded (28 Oct 2026). The price is on `gas`, what it uses.
+   */
+  limit?: string;
   gasPrice: string;
   /** The Chainlink ETH/USD answer the price was converted at (8 decimals, before the deviation). */
   ethUsd: string;

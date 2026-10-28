@@ -66,7 +66,13 @@
 //      of at most what it was priced at plus the margin (relayGasCap): code
 //      that uses more gas when sent than simulated (a hook or a contract the
 //      agent picks) cannot make the relayer pay more than it was paid, and a
-//      transaction that needs more than that now is not sent. A request with
+//      transaction that needs more than that now is not sent. A transaction
+//      that earns a gas refund (a storage slot cleared, as finalizeWithdraw
+//      does) needs a gas limit above what it uses: its quote also records
+//      the limit eth_estimateGas finds, and it is sent with at most that plus
+//      the margin when that is the larger, counted up to 1.3 times the
+//      priced gas (sendGasCap; seen on 28 Oct 2026: a finalizeWithdraw
+//      priced at 97,335 gas needed a limit of 110,124). A request with
 //      a WOTS signature the escrow did not take (not by the key the chain
 //      holds, as the relayer rebuilds its message) that simulates fine is
 //      refused (422 signature_not_escrowed): its message is not the one the
@@ -252,6 +258,30 @@ function fromInstructions(r: HTTPResponseInstructions): Answer {
 }
 
 /** The quote could not be made (answered 422, or 503 without a usable price). */
+/**
+ * How far above the gas it is priced at a transaction's gas limit may go (sendGasCap): a refund is at most a fifth of
+ * the gas used before it (EIP-3529), so the limit a refund needs is at most 1.25 times what the transaction uses, plus
+ * what nested calls keep back (a sixty-fourth at each). The price stays on the gas used, which is what the agent
+ * computes too (2% tolerance), so code that uses more when sent than quoted can make the relayer pay at most this
+ * share more than it was paid, at its own expense.
+ */
+export const LIMIT_OVER_PRICED_BPS = 13_000n;
+
+/**
+ * The highest gas limit a quoted transaction is sent with: its margin (relayGasCap) on the larger of the gas it was
+ * priced at and the limit eth_estimateGas found at the quote (`limit`: what a transaction earning a refund needs above
+ * what it uses), that limit counted up to LIMIT_OVER_PRICED_BPS of the priced gas. An escrow execution (`atCap`, sent
+ * at exactly this limit) keeps the cap of its priced gas, which already holds the gas its refund path needs (sdk
+ * escrowGasLimit).
+ */
+export function sendGasCap(quote: Pick<Quote, "gas" | "limit">, atCap: boolean): bigint {
+  const priced = BigInt(quote.gas);
+  if (atCap || quote.limit === undefined) return relayGasCap(priced);
+  const bound = (priced * LIMIT_OVER_PRICED_BPS) / 10_000n;
+  const limit = BigInt(quote.limit);
+  return relayGasCap(limit <= priced ? priced : limit >= bound ? bound : limit);
+}
+
 export class QuoteError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {
@@ -897,6 +927,14 @@ export class RelayerGate {
       throw new QuoteError("signature_not_escrowed", "a WOTS signature in the request passes the contract but is not the message the relayer escrows; nothing is relayed for it");
     }
     refuseFailedSwaps(m.logs, swaps);
+    // The gas limit it needs from the relayer's account, above what it uses when it earns a refund (sendGasCap).
+    let limit: bigint;
+    try {
+      limit = await this.#o.client.estimateGas({ account: this.#o.sender.address, to: tx.to, data: tx.data, value: relayValue(this.#o.deployment, tx) });
+    } catch (err) {
+      const e = err as { shortMessage?: string; name?: string };
+      throw new QuoteError("simulation_unavailable", `the node cannot estimate the transaction's gas limit: ${e.shortMessage ?? e.name ?? "no reason given"}`);
+    }
 
     let amount: bigint;
     let price: EthUsd;
@@ -912,6 +950,7 @@ export class RelayerGate {
       wei: m.wei.toString(),
       value: m.value.toString(),
       gas: m.gas.toString(),
+      limit: limit.toString(),
       gasPrice: m.gasPrice.toString(),
       ethUsd: price.answer.toString(),
       to: tx.to,
@@ -931,20 +970,21 @@ export class RelayerGate {
       pruneQuotes(data, Date.now());
       data.quotes[tx.hash] = quote;
     });
-    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
+    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, limit: quote.limit, gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
     return quote;
   }
 
   /**
-   * Sends the quoted transaction with a gas limit of at most what it was priced at (relayGasCap); `swaps`: the
-   * vaults whose Swap in it must not fail (the sender checks it just before sending).
+   * Sends the quoted transaction with a gas limit of at most sendGasCap: the margin on what it was priced at, or on
+   * the limit it needs when that is larger; `swaps`: the vaults whose Swap in it must not fail (the sender checks it
+   * just before sending).
    */
   async #send(quote: Quote, swaps: readonly Address[] = []): Promise<Landed> {
     const tx = { to: getAddress(quote.to), data: quote.data as `0x${string}` };
     try {
       // An escrow execution keeps gas back for its refund, beyond what eth_estimateGas finds: sent at the cap it was priced for.
       const gasAtCap = escrowCalls(tx) > 0;
-      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: relayGasCap(BigInt(quote.gas)), value: BigInt(quote.value ?? "0"), gasAtCap });
+      return await this.#o.sender.send(tx, { refuseFailedSwaps: swaps, maxGas: sendGasCap(quote, gasAtCap), value: BigInt(quote.value ?? "0"), gasAtCap });
     } catch (err) {
       // Its quote no longer holds: the request sent again is priced anew.
       if (err instanceof NotSentError && err.overCap) {

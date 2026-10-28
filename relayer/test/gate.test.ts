@@ -6,7 +6,8 @@ import { test } from "node:test";
 import { getAddress } from "viem";
 import { encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentPayload } from "@x402/core/types";
-import { paymentChannel } from "../src/gate.ts";
+import { relayGasCap } from "@ostraagent/sdk";
+import { paymentChannel, sendGasCap } from "../src/gate.ts";
 
 const payer = getAddress("0x00000000000000000000000000000000000aa001");
 const receiverAuthorizer = getAddress("0x00000000000000000000000000000000000ee001");
@@ -133,4 +134,13 @@ test("OstraBreaker: configure and trip are relayed only on the deployment's brea
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("sendGasCap: the margin on the priced gas, or on the limit a refund needs when larger, up to 1.3 times the priced gas; escrows keep their priced cap", () => {
+  const q = (gas: number, limit?: number) => ({ gas: String(gas), ...(limit === undefined ? {} : { limit: String(limit) }) });
+  assert.equal(sendGasCap(q(100_000), false), relayGasCap(100_000n));
+  assert.equal(sendGasCap(q(100_000, 90_000), false), relayGasCap(100_000n));
+  assert.equal(sendGasCap(q(97_335, 110_124), false), relayGasCap(110_124n));
+  assert.equal(sendGasCap(q(100_000, 500_000), false), relayGasCap(130_000n));
+  assert.equal(sendGasCap(q(100_000, 120_000), true), relayGasCap(100_000n));
 });
