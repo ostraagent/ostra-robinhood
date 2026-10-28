@@ -6,12 +6,21 @@
 // transaction whose vault Swap fails now (SwapFailed) is not sent when the
 // gate asks the sender to refuse it, and none is sent with more gas than the
 // gate's cap: code that burns all the gas it gets when sent burns no more.
+// A send the RPC answers with a JSON-RPC error (through an RPC in front of
+// the fork) counts as refused only once the chain agrees: one the node took
+// all the same lands and is reported as landed, also when it is mined only
+// later; one signed at a nonce another transaction holds (a node behind) is
+// not sent; when the reads of that check fail, the replacement proof decides.
+// What it says never holds the RPC URL, which may carry an API key, also
+// when the replacement proof decides.
 
 import assert from "node:assert/strict";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
-import { concat, encodeFunctionData, getAddress, http, keccak256, numberToHex, stringToHex, toEventSelector, type Hex, type PrivateKeyAccount } from "viem";
+import { concat, createPublicClient, encodeFunctionData, getAddress, http, keccak256, numberToHex, stringToHex, toEventSelector, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { USDG, failedSwaps, ostraVaultAbi, usdgAbi } from "@ostraagent/sdk";
+import { USDG, failedSwaps, ostraVaultAbi, retryingHttp, robinhoodChain, usdgAbi } from "@ostraagent/sdk";
 import { startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { NotSentError, RelaySender } from "../src/send.ts";
 
@@ -47,7 +56,7 @@ before(async () => {
   account = privateKeyToAccount(keccak256(stringToHex("OSTRA/EVM/RELAYER-SEND-TEST/account")));
   await fork.setBalance(account.address, 10n ** 17n);
   await fork.dealUsdg(account.address, 5n);
-  sender = new RelaySender(fork.client, http(fork.url), account, { receiptTimeoutMs: 2_000, settleTimeoutMs: 20_000 });
+  sender = new RelaySender(fork.client, http(fork.url), account, { receiptTimeoutMs: 2_000, settleTimeoutMs: 20_000, refusalCheckMs: 3_000 });
 });
 after(async () => {
   await fork?.stop();
@@ -126,4 +135,171 @@ test("the gas limit is at most the gate's cap: one that needs more now is not se
   const burnt = await sender.send({ to: burner, data: "0x" }, { maxGas: 100_000n });
   const tx = await fork.client.getTransaction({ hash: burnt.txHash });
   assert.ok(tx.gas <= 100_000n && burnt.gasUsed <= tx.gas && burnt.gasUsed > tx.gas - 5_100n, `limit ${tx.gas}, used ${burnt.gasUsed}`);
+});
+
+type Hook = (request: { id?: unknown; method?: string; params?: unknown[] }, answer: string) => { status: number; body: string } | null;
+
+/**
+ * An RPC in front of the fork: `stop` may answer a request without passing it on; every other request is passed on,
+ * then `hook` may replace the answer the sender gets.
+ */
+async function front(hook: Hook, path = "", stop: (request: { id?: unknown; method?: string }) => { status: number; body: string } | null = () => null): Promise<{ sender: RelaySender; events: { event: string; fields?: Record<string, unknown> }[]; close: () => Promise<void> }> {
+  const server: Server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (d: Buffer) => (body += d.toString()));
+    req.on("end", () => {
+      void (async () => {
+        const request = JSON.parse(body) as { id?: unknown; method?: string; params?: unknown[] };
+        const stopped = stop(request);
+        if (stopped !== null) {
+          res.writeHead(stopped.status, { "content-type": "application/json" });
+          res.end(stopped.body);
+          return;
+        }
+        const answer = await fetch(fork.url, { method: "POST", headers: { "content-type": "application/json" }, body });
+        const text = await answer.text();
+        const other = hook(request, text);
+        res.writeHead(other?.status ?? answer.status, { "content-type": "application/json" });
+        res.end(other?.body ?? text);
+      })();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const transport = retryingHttp(`http://127.0.0.1:${(server.address() as AddressInfo).port}${path}`);
+  const client = createPublicClient({ chain: robinhoodChain, transport }) as PublicClient;
+  const events: { event: string; fields?: Record<string, unknown> }[] = [];
+  const flaky = new RelaySender(client, transport, account, { receiptTimeoutMs: 2_000, settleTimeoutMs: 20_000, refusalCheckMs: 5_000, log: (event, fields) => events.push({ event, ...(fields === undefined ? {} : { fields }) }) });
+  return {
+    sender: flaky,
+    events,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** The answer an RPC provider can give to a send it passed on: a JSON-RPC error. */
+const sendError = (id: unknown) => ({ status: 200, body: JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "the upstream did not answer in time" } }) });
+
+test("a send the RPC answers with an error after passing it on to the node lands, and is reported as landed", async () => {
+  let sends = 0;
+  const f = await front((r) => (r.method === "eth_sendRawTransaction" && sends++ === 0 ? sendError(r.id) : null));
+  try {
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    const landed = await f.sender.send(transfer(1n));
+    assert.equal((await fork.client.getTransactionReceipt({ hash: landed.txHash })).status, "success");
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce + 1);
+    assert.equal(sends, 1);
+    assert.deepEqual(f.events.map((e) => [e.event, e.fields?.seen]), [["send_answered_error", "landed"]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("one the node takes but mines only seconds later lands too", async () => {
+  let sends = 0;
+  const f = await front((r) => (r.method === "eth_sendRawTransaction" && sends++ === 0 ? sendError(r.id) : null));
+  await rpc("evm_setAutomine", [false]);
+  try {
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    const sending = f.sender.send(transfer(1n));
+    // Mined once the node holds it, two seconds after it was sent.
+    const deadline = Date.now() + 15_000;
+    while (sends === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 2_000));
+    await rpc("evm_mine", []);
+    const landed = await sending;
+    assert.equal((await fork.client.getTransactionReceipt({ hash: landed.txHash })).status, "success");
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce + 1);
+  } finally {
+    await rpc("evm_setAutomine", [true]);
+    await f.close();
+  }
+});
+
+test("one signed at a nonce another transaction holds (a node behind) is not sent", async () => {
+  // The first pending nonce the sender reads is one behind, as from a node that lags: the node refuses the send.
+  // (A nonce behind needs one used: a transfer first when this test runs alone.)
+  if ((await fork.client.getTransactionCount({ address: account.address })) === 0) await sender.send(transfer(1n));
+  let lag = true;
+  const f = await front((r, answer) => {
+    if (r.method !== "eth_getTransactionCount" || r.params?.[1] !== "pending" || !lag) return null;
+    lag = false;
+    const n = BigInt((JSON.parse(answer) as { result: string }).result);
+    return { status: 200, body: JSON.stringify({ jsonrpc: "2.0", id: r.id, result: `0x${(n - 1n).toString(16)}` }) };
+  });
+  try {
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    await assert.rejects(f.sender.send(transfer(1n)), (err: unknown) => err instanceof NotSentError && /is used by another transaction/.test(err.message));
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce);
+  } finally {
+    await f.close();
+  }
+});
+
+test("when the reads of the check fail, the replacement proof decides: one the node took lands", async () => {
+  // After the send (answered with an error, though the node took it), receipts and nonces fail for 12 seconds:
+  // longer than the check (5 s), shorter than the replacement proof (20 s).
+  let failUntil = 0;
+  const f = await front((r) => {
+    if (r.method === "eth_sendRawTransaction" && failUntil === 0) {
+      failUntil = Date.now() + 12_000;
+      return sendError(r.id);
+    }
+    if ((r.method === "eth_getTransactionReceipt" || r.method === "eth_getTransactionCount") && Date.now() < failUntil) return { status: 503, body: "{}" };
+    return null;
+  });
+  try {
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    const landed = await f.sender.send(transfer(1n));
+    assert.equal((await fork.client.getTransactionReceipt({ hash: landed.txHash })).status, "success");
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce + 1);
+    assert.deepEqual(f.events.map((e) => [e.event, e.fields?.seen]), [["send_answered_error", "unknown"]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("what a refusal says holds no RPC URL (it may carry an API key)", async () => {
+  const f = await front(() => null, "/v2/OSTRA-TEST-SECRET-KEY");
+  // USDG for the transfer (the tests before spent it), and no ETH for its gas: the node refuses it.
+  await fork.dealUsdg(account.address, 5n);
+  await fork.setBalance(account.address, 1n);
+  try {
+    await assert.rejects(f.sender.send(transfer(1n)), (err: unknown) => err instanceof NotSentError && /the node refused/.test(err.message) && !err.message.includes("OSTRA-TEST-SECRET-KEY") && !err.message.includes("127.0.0.1"));
+    assert.deepEqual(f.events.map((e) => [e.event, e.fields?.seen]), [["send_answered_error", "refused"]]);
+    assert.ok(!JSON.stringify(f.events).includes("OSTRA-TEST-SECRET-KEY"));
+  } finally {
+    await fork.setBalance(account.address, 10n ** 17n);
+    await f.close();
+  }
+});
+
+test("nor does a refusal the chain could not confirm, proven by its replacement", async () => {
+  // The send is answered with an error and not passed on (refused), and receipts and nonces fail for 12 seconds:
+  // the check cannot tell, so the replacement proves it (it lands at the nonce).
+  let failUntil = 0;
+  const f = await front(
+    (r) => ((r.method === "eth_getTransactionReceipt" || r.method === "eth_getTransactionCount") && Date.now() < failUntil ? { status: 503, body: "{}" } : null),
+    "/v2/OSTRA-TEST-SECRET-KEY",
+    (r) => {
+      if (r.method !== "eth_sendRawTransaction" || failUntil !== 0) return null;
+      failUntil = Date.now() + 12_000;
+      return sendError(r.id);
+    },
+  );
+  try {
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    await assert.rejects(
+      f.sender.send(transfer(1n)),
+      (err: unknown) => err instanceof NotSentError && /was replaced at nonce/.test(err.message) && /answered the send with an error/.test(err.message) && !err.message.includes("OSTRA-TEST-SECRET-KEY") && !err.message.includes("127.0.0.1"),
+    );
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce + 1);
+    assert.deepEqual(f.events.map((e) => [e.event, e.fields?.seen]), [["send_answered_error", "unknown"]]);
+    assert.ok(!JSON.stringify(f.events).includes("OSTRA-TEST-SECRET-KEY"));
+  } finally {
+    await f.close();
+  }
 });

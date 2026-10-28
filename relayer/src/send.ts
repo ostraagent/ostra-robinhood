@@ -16,7 +16,15 @@
 //     on-chain), with the wei the gas cost (the gate keeps that much of what
 //     was paid);
 //   * the node answering the send with a JSON-RPC error: it refused the
-//     transaction (Robinhood Chain's sequencer keeps no mempool), not sent;
+//     transaction (Robinhood Chain's sequencer keeps no mempool), not sent,
+//     once the chain agrees: an RPC provider can answer an error after
+//     passing the transaction on (seen on 28 Oct 2026: a relayer channel open
+//     landed while its send was answered with an error). For REFUSAL_CHECK_MS
+//     its receipt and the account's nonce are read: a receipt is its outcome;
+//     the nonce used by another transaction means it can never land (not
+//     sent); still no receipt and the nonce free, every read having answered,
+//     it was refused (not sent); reads that did not answer leave it to the
+//     replacement proof below;
 //   * no receipt within RECEIPT_TIMEOUT_MS, or the send failing without an
 //     answer from the node (a timeout, an HTTP error): an EVM transaction has
 //     no expiry, so "not sent" is proven by replacing it:
@@ -37,6 +45,19 @@ export const SETTLE_TIMEOUT_MS = 600_000;
 export const GAS_LIMIT_MARGIN_PERCENT = 20n;
 /** A send with a deadline (`notAfter`) is signed only while the chain's latest block is at least this many seconds before it. */
 export const DEADLINE_SPARE_SECONDS = 30n;
+/** How long a send answered with a JSON-RPC error is looked for on the chain before it counts as refused. */
+export const REFUSAL_CHECK_MS = 20_000;
+/** The longest one read of that check may take (the transport retries for longer): one that does not answer in time failed. */
+const CHECK_READ_MS = 5_000;
+/** Once the nonce shows used, how long at least its receipt is looked for (a node behind the one that counted the nonce). */
+const USED_NONCE_RECEIPT_MS = 5_000;
+
+/** An error's text without its URL: viem's shortMessage and details (an RPC URL may carry an API key; its message names it). */
+function errorText(err: unknown): string {
+  const e = err as { shortMessage?: string; details?: string; name?: string } | null;
+  const short = e?.shortMessage ?? e?.name ?? "error";
+  return e?.details !== undefined && e.details !== "" && e.details !== short ? `${short} (${e.details})` : short;
+}
 const POLL_MS = 1_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -84,6 +105,22 @@ export function isNodeRefusal(err: unknown): boolean {
 /** A landed transaction: its gas, its gas price and the ETH it sent (value). */
 export type Landed = { txHash: Hash; gasUsed: bigint; effectiveGasPrice: bigint; block: bigint; value: bigint };
 
+/** The service's log (gate.ts Log): what the RPC answered to a send the chain then showed taken, or could not tell. */
+type SendLog = (event: string, fields?: Record<string, unknown>) => void;
+
+/** A read of the refusal check: its value, or null when it failed or did not answer within CHECK_READ_MS. */
+async function bounded<T>(read: Promise<T>): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), CHECK_READ_MS);
+  });
+  try {
+    return await Promise.race([read.catch(() => null), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type SendOptions = { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint; gasAtCap?: boolean; notAfter?: bigint };
 
 export class RelaySender {
@@ -92,15 +129,24 @@ export class RelaySender {
   readonly #account: PrivateKeyAccount;
   readonly #receiptTimeoutMs: number;
   readonly #settleTimeoutMs: number;
+  readonly #refusalCheckMs: number;
+  readonly #log: SendLog;
   #tail: Promise<unknown> = Promise.resolve();
 
-  /** `o` shortens the waits for tests; the service uses RECEIPT_TIMEOUT_MS and SETTLE_TIMEOUT_MS. */
-  constructor(client: PublicClient, transport: Transport, account: PrivateKeyAccount, o: { receiptTimeoutMs?: number; settleTimeoutMs?: number } = {}) {
+  /** `o` shortens the waits for tests; the service uses RECEIPT_TIMEOUT_MS, SETTLE_TIMEOUT_MS and REFUSAL_CHECK_MS, and passes its log. */
+  constructor(
+    client: PublicClient,
+    transport: Transport,
+    account: PrivateKeyAccount,
+    o: { receiptTimeoutMs?: number; settleTimeoutMs?: number; refusalCheckMs?: number; log?: SendLog } = {},
+  ) {
     this.#client = client;
     this.#transport = transport;
     this.#account = account;
     this.#receiptTimeoutMs = o.receiptTimeoutMs ?? RECEIPT_TIMEOUT_MS;
     this.#settleTimeoutMs = o.settleTimeoutMs ?? SETTLE_TIMEOUT_MS;
+    this.#refusalCheckMs = o.refusalCheckMs ?? REFUSAL_CHECK_MS;
+    this.#log = o.log ?? (() => undefined);
   }
 
   get address(): Address {
@@ -132,6 +178,47 @@ export class RelaySender {
       return { txHash: hash, gasUsed: r.gasUsed, effectiveGasPrice: r.effectiveGasPrice, block: r.blockNumber, value };
     } catch {
       return null; // not found (yet)
+    }
+  }
+
+  /** The transaction's receipt (its outcome), "none" when the node answered that it has none, or null when the read failed. */
+  async #lookup(hash: Hash, value: bigint): Promise<Landed | { reverted: bigint } | "none" | null> {
+    let missing = false;
+    const r = await bounded(
+      this.#client.getTransactionReceipt({ hash }).catch((err: unknown) => {
+        if ((err as { name?: unknown }).name === "TransactionReceiptNotFoundError") missing = true;
+        throw err;
+      }),
+    );
+    if (r === null) return missing ? "none" : null;
+    if (r.status !== "success") return { reverted: r.gasUsed * r.effectiveGasPrice };
+    return { txHash: hash, gasUsed: r.gasUsed, effectiveGasPrice: r.effectiveGasPrice, block: r.blockNumber, value };
+  }
+
+  /**
+   * After a send answered with a JSON-RPC error, what the chain shows within the refusal check: the transaction's
+   * outcome (its receipt), "nonce used" (another transaction holds its nonce: it can never land), "refused" (no
+   * receipt and the nonce still free, every read of the last round having answered), or "unknown" (a read did not
+   * answer: left to the replacement proof).
+   */
+  async #afterRefusal(hash: Hash, nonce: number, value: bigint): Promise<Landed | { reverted: bigint } | "nonce used" | "refused" | "unknown"> {
+    const deadline = Date.now() + this.#refusalCheckMs;
+    for (;;) {
+      const found = await this.#lookup(hash, value);
+      if (found !== null && found !== "none") return found;
+      const count = await bounded(this.#client.getTransactionCount({ address: this.#account.address, blockTag: "latest" }));
+      if (count !== null && count > nonce) {
+        // The nonce is used for good: by this transaction (its receipt shows, give or take a node's lag) or by another.
+        const until = Math.max(deadline, Date.now() + USED_NONCE_RECEIPT_MS);
+        for (;;) {
+          const again = await this.#lookup(hash, value);
+          if (again !== null && again !== "none") return again;
+          if (Date.now() >= until) return again === "none" ? "nonce used" : "unknown";
+          await sleep(POLL_MS);
+        }
+      }
+      if (Date.now() >= deadline) return found === "none" && count !== null ? "refused" : "unknown";
+      await sleep(POLL_MS);
     }
   }
 
@@ -186,6 +273,8 @@ export class RelaySender {
     });
     const hash = keccak256(signed);
     let sendError: unknown;
+    /** Why the replacement proof runs after a send answered with an error (in place of the transport failure's text). */
+    let sendNote: string | undefined;
     try {
       await this.#client.sendRawTransaction({ serializedTransaction: signed });
     } catch (err) {
@@ -196,7 +285,18 @@ export class RelaySender {
       // (an RPC error's message, never its URL), such as insufficient funds for gas * price + value.
       const e = sendError as { shortMessage?: string; message?: string; details?: string };
       const reason = e.shortMessage ?? e.message ?? String(sendError);
-      throw new NotSentError(`the node refused transaction ${hash}: ${reason}${e.details !== undefined && e.details !== "" && e.details !== reason ? ` (${e.details})` : ""}`, hash);
+      const answered = `${reason}${e.details !== undefined && e.details !== "" && e.details !== reason ? ` (${e.details})` : ""}`;
+      // Refused only if the chain agrees (REFUSAL_CHECK_MS).
+      const seen = await this.#afterRefusal(hash, nonce, tx.value);
+      this.#log("send_answered_error", { txHash: hash, nonce, answered, seen: typeof seen === "string" ? seen : "reverted" in seen ? "reverted" : "landed" });
+      if (seen === "refused") throw new NotSentError(`the node refused transaction ${hash}: ${answered}`, hash);
+      if (seen === "nonce used") throw new NotSentError(`the node refused transaction ${hash} (${answered}) and nonce ${nonce} is used by another transaction`, hash);
+      if (seen !== "unknown") {
+        if ("reverted" in seen) throw new NotSentError(`transaction ${hash} reverted on-chain`, hash, false, seen.reverted);
+        return seen;
+      }
+      // Not known either way: proven below by replacing the nonce.
+      sendNote = `the node answered the send with an error (${answered}) and the chain could not be read to tell`;
     }
     if (sendError === undefined) {
       const deadline = Date.now() + this.#receiptTimeoutMs;
@@ -226,7 +326,7 @@ export class RelaySender {
       if (r !== null && "reverted" in r) throw new NotSentError(`transaction ${hash} reverted on-chain`, hash, false, r.reverted);
       if (r !== null) return r;
       if ((await this.#receipt(replacementHash, 0n)) !== null) {
-        const why = sendError === undefined ? `no receipt within ${this.#receiptTimeoutMs / 1_000} s` : `the send failed without an answer from the node (${(sendError as Error).message})`;
+        const why = sendNote ?? (sendError === undefined ? `no receipt within ${this.#receiptTimeoutMs / 1_000} s` : `the send failed without an answer from the node (${errorText(sendError)})`);
         throw new NotSentError(`transaction ${hash} was replaced at nonce ${nonce}: ${why}`, hash);
       }
       await sleep(POLL_MS);

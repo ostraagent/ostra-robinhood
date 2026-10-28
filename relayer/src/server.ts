@@ -92,7 +92,7 @@ async function main(): Promise<void> {
     price: 1n,
     log,
   });
-  const sender = new RelaySender(client, transport, account);
+  const sender = new RelaySender(client, transport, account, { log });
   const ethUsd = chainlinkEthUsd(client, CHAINLINK_ETH_USD);
   const sc = config.swap;
   let privateRelay: PrivateRelay | undefined;

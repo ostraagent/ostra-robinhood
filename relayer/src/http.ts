@@ -40,6 +40,7 @@ export function createRelayerServer(o: {
   facts: Record<string, unknown>;
   clientIp: "socket" | "cf-connecting-ip";
   log: Log;
+  /** Removes the RPC URL (it may carry an API key) from logs and from every answer that can carry an error's text. */
   scrub: (text: string) => string;
 }): Server {
   // The client a request counts against (rate.ts clientKey: an IPv6 address by its /64).
@@ -65,7 +66,7 @@ export function createRelayerServer(o: {
           }
           const answer = await o.privateRelay.price(getAddress(token), kind);
           res.writeHead(answer.status, answer.headers);
-          res.end(toJson(answer.body));
+          res.end(o.scrub(toJson(answer.body)));
           return;
         }
         if (path.startsWith("/v1/vaults/") && req.method === "GET") {
@@ -130,7 +131,7 @@ export function createRelayerServer(o: {
         if (path === "/v1/escrow" && req.method === "POST") {
           const answer = await o.gate.escrow({ body: await readBody(req) });
           res.writeHead(answer.status, answer.headers);
-          res.end(answer.body === undefined ? undefined : typeof answer.body === "string" ? answer.body : toJson(answer.body));
+          res.end(answer.body === undefined ? undefined : o.scrub(typeof answer.body === "string" ? answer.body : toJson(answer.body)));
           return;
         }
         if (path === "/v1/relay" && req.method === "POST") {
@@ -143,7 +144,7 @@ export function createRelayerServer(o: {
           }
           const answer = await o.gate.relay({ body, req, ip });
           res.writeHead(answer.status, answer.headers);
-          res.end(answer.body === undefined ? undefined : typeof answer.body === "string" ? answer.body : toJson(answer.body));
+          res.end(answer.body === undefined ? undefined : o.scrub(typeof answer.body === "string" ? answer.body : toJson(answer.body)));
           return;
         }
         res.writeHead(404, { "content-type": "application/json" });
