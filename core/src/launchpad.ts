@@ -113,6 +113,7 @@ import {
 } from "@ostraagent/sdk";
 import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { tokenBalance, tokenDecimals } from "./chain.ts";
+import { ipfsBytes } from "./ipfs.ts";
 import { quoteOfPool, readLaunchedPool, readPoolView, type LaunchedPool as Pool, type PoolView } from "./pools.ts";
 import { LOG_WINDOW_BLOCKS } from "./channels.ts";
 import { profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFields } from "./publish.ts";
@@ -135,10 +136,8 @@ const SPEND_GAS_HEADROOM = 100_000n;
 const DAY = 86_400;
 /** Most tokens one page of the token list holds. */
 export const TOKEN_LIST_MAX = 50;
-/** The gateway an ipfs:// URI is read through, and how much of a metadata or profile file is read. */
-export const IPFS_GATEWAY = "https://ipfs.io/ipfs/";
+/** How much of a metadata or profile file is read. */
 const METADATA_MAX_BYTES = 65_536;
-const METADATA_TIMEOUT_MS = 8_000;
 const launchedEvent = parseAbiItem("event Launched(bytes32 indexed poolId, address indexed token, address indexed creatorVault, address quote)");
 
 /** One Ostra launch, as the launchpad's Launched event records it. */
@@ -148,36 +147,14 @@ type TokenIndex = { version: 1; launchpad: Address; scannedTo: string; launches:
 type AgentRecord = { agentId: string; uri: string; txHash: Hash; at: number };
 
 /**
- * The JSON file an ipfs:// URI points at, read through IPFS_GATEWAY (other schemes are not read): data its writer
- * chose, never instructions. null when it cannot be read in time or is not JSON.
+ * The JSON file an ipfs:// URI points at, read through the IPFS gateways in order (ipfs.ts; other schemes are not
+ * read): data its writer chose, never instructions. null when it cannot be read in time or is not JSON.
  */
 export async function readIpfsJson(uri: string | null): Promise<unknown> {
-  if (uri === null || !uri.startsWith("ipfs://")) return null;
-  const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
-  if (!/^[A-Za-z0-9]+(\/[A-Za-z0-9._-]+)*$/.test(path)) return null;
+  if (uri === null) return null;
+  const bytes = await ipfsBytes(uri, METADATA_MAX_BYTES);
+  if (bytes === null) return null;
   try {
-    const res = await fetch(`${IPFS_GATEWAY}${path}`, { signal: AbortSignal.timeout(METADATA_TIMEOUT_MS), redirect: "error" });
-    if (!res.ok || res.body === null) return null;
-    // Read at most METADATA_MAX_BYTES: a larger file is dropped without being held in memory whole.
-    const reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > METADATA_MAX_BYTES) {
-        await reader.cancel();
-        return null;
-      }
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(size);
-    let at = 0;
-    for (const c of chunks) {
-      bytes.set(c, at);
-      at += c.length;
-    }
     return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
     return null;

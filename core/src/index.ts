@@ -11,6 +11,7 @@ export * from "./channels.ts";
 export * from "./config.ts";
 export * from "./encoding.ts";
 export * from "./escrow.ts";
+export * from "./ipfs.ts";
 export * from "./keys.ts";
 export * from "./launchpad.ts";
 export * from "./pad.ts";
