@@ -1,10 +1,13 @@
 // Starts the uploader: the Pinata JWT from OSTRA_UPLOADER_SECRETS/pinata.jwt (mode 0600), the HTTP endpoint on
-// OSTRA_UPLOADER_LISTEN (default 127.0.0.1:4800) and the daily byte budget OSTRA_UPLOADER_DAILY_BYTES (default
-// 200 MB). Logs are JSON lines on stdout; the JWT is never printed.
+// OSTRA_UPLOADER_LISTEN (default 127.0.0.1:4800), the daily byte budget OSTRA_UPLOADER_DAILY_BYTES (default
+// 200 MB), the directory the files it pins or reads are kept in, OSTRA_UPLOADER_STORE (default
+// /var/lib/ostra-uploader/files), and the gateways a file not kept is read from, OSTRA_UPLOADER_UPSTREAM
+// (comma-separated, each an http(s) URL ending in /, tried in order; default UPSTREAM_GATEWAYS). Logs are JSON lines
+// on stdout; the JWT is never printed.
 
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { Uploader, createUploaderServer } from "./server.ts";
+import { UPSTREAM_GATEWAYS, Uploader, createUploaderServer } from "./server.ts";
 
 function main(): void {
   const secrets = process.env.OSTRA_UPLOADER_SECRETS || "/etc/ostra/robinhood/uploader/secrets";
@@ -18,9 +21,13 @@ function main(): void {
   const dailyBytes = Number(process.env.OSTRA_UPLOADER_DAILY_BYTES || 200_000_000);
   if (!Number.isInteger(dailyBytes) || dailyBytes <= 0) throw new Error("OSTRA_UPLOADER_DAILY_BYTES must be a positive whole number");
   const log = (event: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }).split(jwt).join("<jwt>"));
-  const uploader = new Uploader({ jwt, dailyBytes, log });
+  const store = process.env.OSTRA_UPLOADER_STORE || "/var/lib/ostra-uploader/files";
+  const upstreamText = process.env.OSTRA_UPLOADER_UPSTREAM;
+  const upstream = upstreamText === undefined || upstreamText.trim() === "" ? UPSTREAM_GATEWAYS : upstreamText.split(",").map((g) => g.trim());
+  for (const g of upstream) if (!/^https?:\/\/[^/\s]+\/(\S*\/)?$/.test(g)) throw new Error(`OSTRA_UPLOADER_UPSTREAM: ${g} is not an http(s) URL ending in /`);
+  const uploader = new Uploader({ jwt, dailyBytes, log, store, upstream });
   const server = createUploaderServer(uploader, log);
-  server.listen(port, host, () => log("started", { listen: `${host}:${port}`, dailyBytes }));
+  server.listen(port, host, () => log("started", { listen: `${host}:${port}`, dailyBytes, store, upstream: upstream.map((g) => new URL(g).host) }));
   const stop = () => server.close(() => process.exit(0));
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);

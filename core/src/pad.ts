@@ -87,6 +87,10 @@ export const PAD_DIR = "pad";
 export const PAD_READ_MAX_BYTES = 65_536;
 const READ_TIMEOUT_MS = 20_000;
 const SPEND_GAS_HEADROOM = 100_000n;
+/** The blocks the discovery of jobs reads again on its next pass (5 minutes at 10 blocks a second, as the evaluator bot). */
+export const PAD_DISCOVER_RESCAN_BLOCKS = 3_000n;
+/** The version of the discovery cursor (cursor.json); one without it is read again from OstraPad's deployment block. */
+const PAD_CURSOR_VERSION = 2;
 /** isValidSignature's magic value (EIP-1271). */
 const EIP1271_MAGIC = "0x1626ba7e";
 const erc1271Abi = [
@@ -788,14 +792,21 @@ export class PadService {
   // Reads and the sweep
   // -------------------------------------------------------------------------------------------------------------
 
-  /** Finds jobs addressed to this agent's vault (as provider, drawn evaluator or panel member) and records them. */
+  /**
+   * Finds jobs addressed to this agent's vault (as provider, drawn evaluator or panel member) and records them. The
+   * logs are read up to the logs RPC's own head (another RPC's head can be ahead of the blocks it has logs for: those
+   * blocks would be passed over for good), and the last PAD_DISCOVER_RESCAN_BLOCKS are read again on the next pass,
+   * as the evaluator bot does (keeper pad-evaluator.ts). A cursor written before 0.1.10 (no version: its head came
+   * from the other RPC) is not trusted: the scan starts again from OstraPad's deployment block, once.
+   */
   async #discover(vault: Address): Promise<void> {
     const f = this.#folder();
     await f.ensure();
     const logs = this.#p.logsClient ?? this.#p.client;
-    const head = (await this.#p.client.getBlock({ blockTag: "latest" })).number;
+    const head = await logs.getBlockNumber({ cacheTime: 0 });
     const cursorText = await f.read("cursor.json");
-    const from = cursorText === undefined ? OSTRAPAD_FROM_BLOCK : BigInt((JSON.parse(cursorText) as { next: string }).next);
+    const cursor = cursorText === undefined ? null : (JSON.parse(cursorText) as { version?: number; next: string });
+    const from = cursor === null || cursor.version !== PAD_CURSOR_VERSION ? OSTRAPAD_FROM_BLOCK : BigInt(cursor.next);
     if (from > head) return;
     const found = new Map<Hex, PadJobRecord["role"]>();
     for (const l of await getLogsChunked(logs, { address: this.#pad, event: PAD_EVENTS.JobCreated, args: { provider: vault }, fromBlock: from, toBlock: head })) found.set((l.args as { jobId: Hex }).jobId, "provider");
@@ -805,7 +816,8 @@ export class PadService {
       if (a.panel.some((m) => getAddress(m) === vault) && !found.has(a.jobId)) found.set(a.jobId, "evaluator");
     }
     for (const [id, role] of found) if ((await this.#record(id)) === null) await this.#save({ id, role, steps: {}, at: Math.floor(Date.now() / 1000) });
-    await f.write("cursor.json", JSON.stringify({ next: (head + 1n).toString() }));
+    const rescan = head + 1n - PAD_DISCOVER_RESCAN_BLOCKS;
+    await f.write("cursor.json", JSON.stringify({ version: PAD_CURSOR_VERSION, next: (rescan > from ? rescan : from).toString() }));
   }
 
   /** The jobs this agent is a party to, with their state on chain and what can be done next; `jobId`: one job, with its order and delivery files. */
@@ -837,7 +849,7 @@ export class PadService {
     if (r?.terms !== undefined) return r.terms.description;
     // The provider reads the creating transaction's calldata (OstraPad.create(terms)) to learn the terms.
     const logs = this.#p.logsClient ?? this.#p.client;
-    const found = await getLogsChunked(logs, { address: this.#pad, event: PAD_EVENTS.JobCreated, args: { jobId: id }, fromBlock: OSTRAPAD_FROM_BLOCK, toBlock: (await this.#p.client.getBlock({ blockTag: "latest" })).number });
+    const found = await getLogsChunked(logs, { address: this.#pad, event: PAD_EVENTS.JobCreated, args: { jobId: id }, fromBlock: OSTRAPAD_FROM_BLOCK, toBlock: await logs.getBlockNumber({ cacheTime: 0 }) });
     const log = found[0];
     if (log === undefined) return null;
     return (await padTermsFromTransaction(this.#p.client, log.transactionHash as Hash, id, this.#pad))?.description ?? null;

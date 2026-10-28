@@ -12,6 +12,11 @@
 //   records   each provider's record and limit as OstraPad holds it (provider(), limitOf)
 //
 // Ranking (design "Dashboard"): distinct paying clients, then completed jobs, then value completed.
+//
+// The logs are read up to the logs RPC's own head (the other RPC's head can be ahead of the blocks the logs RPC has:
+// those blocks would be passed over for good), and the last RESCAN_BLOCKS are read again on the next pass, as the
+// evaluator bot does (keeper pad-evaluator.ts); reading a block again gives the same state. A state of version 1
+// (scanned to the other RPC's head) is read again from the start, once.
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { getAddress, parseAbiItem, type Address, type Hex, type PublicClient } from "viem";
@@ -41,6 +46,8 @@ const WINDOW_MAX = 2_000_000n;
 export const DETAILS_EVERY_MS = 5 * 60_000;
 /** Agents read again in one sync, at most. */
 const DETAILS_PER_SYNC = 20;
+/** The blocks read again on the next pass (5 minutes at 10 blocks a second). */
+export const RESCAN_BLOCKS = 3_000n;
 const MAX_JOBS = 20_000;
 
 export type PadJobRow = {
@@ -75,7 +82,7 @@ export type PadAgent = {
   readAt: number;
 };
 
-export type PadIndexState = { version: 1; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow> };
+export type PadIndexState = { version: 2; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow> };
 
 function usd(units: bigint): string {
   const whole = units / 1_000_000n;
@@ -119,10 +126,10 @@ export class PadIndexer {
     this.#readFile = o.readFile;
     this.#pad = getAddress(o.pad ?? OSTRAPAD);
     const d = o.deployment();
-    const fresh: PadIndexState = { version: 1, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {} };
+    const fresh: PadIndexState = { version: 2, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {} };
     if (existsSync(this.#statePath)) {
       const saved = JSON.parse(readFileSync(this.#statePath, "utf8")) as PadIndexState;
-      this.#state = saved.version === 1 && saved.chainId === d.chainId && getAddress(saved.pad) === this.#pad ? saved : fresh;
+      this.#state = saved.version === 2 && saved.chainId === d.chainId && getAddress(saved.pad) === this.#pad ? saved : fresh;
     } else {
       this.#state = fresh;
     }
@@ -145,10 +152,17 @@ export class PadIndexer {
 
   /** One pass: new agents and jobs from the logs, then some agents' files and records read again. */
   async sync(): Promise<void> {
-    const latest = (await this.#client.getBlock({ blockTag: "latest" })).number;
+    const latest = await this.#logs.getBlockNumber({ cacheTime: 0 });
+    // Each pass starts RESCAN_BLOCKS back from the head at most (never before where the scan began).
+    const back = (scannedTo: string, start: bigint) => {
+      const next = BigInt(scannedTo) + 1n;
+      const floor = latest + 1n - RESCAN_BLOCKS;
+      return next > floor && floor > start ? floor : next;
+    };
+    const d = this.#deployment();
     let changed = false;
     // Agents: AgentRegistered of Ostra vaults, by its topic.
-    let from = BigInt(this.#state.vaultsScannedTo) + 1n;
+    let from = back(this.#state.vaultsScannedTo, BigInt(d.fromBlock));
     while (from <= latest) {
       const to = from + this.#vaultWindow - 1n < latest ? from + this.#vaultWindow - 1n : latest;
       try {
@@ -172,7 +186,7 @@ export class PadIndexer {
       if (this.#vaultWindow < WINDOW_MAX) this.#vaultWindow = this.#vaultWindow * 2n > WINDOW_MAX ? WINDOW_MAX : this.#vaultWindow * 2n;
     }
     // Jobs: OstraPad's events.
-    from = BigInt(this.#state.scannedTo) + 1n;
+    from = back(this.#state.scannedTo, OSTRAPAD_FROM_BLOCK);
     while (from <= latest) {
       const to = from + this.#window - 1n < latest ? from + this.#window - 1n : latest;
       try {
@@ -210,7 +224,8 @@ export class PadIndexer {
     const time = async (b: bigint) => {
       let t = times.get(b);
       if (t === undefined) {
-        t = Number((await this.#client.getBlock({ blockNumber: b })).timestamp);
+        // The logs RPC's head can be ahead of this node's: a block it does not have yet is read from the logs RPC.
+        t = Number((await this.#client.getBlock({ blockNumber: b }).catch(() => this.#logs.getBlock({ blockNumber: b }))).timestamp);
         times.set(b, t);
       }
       return t;
@@ -232,6 +247,8 @@ export class PadIndexer {
     ]);
     for (const l of created) {
       const a = l.args as { jobId: Hex; client: Address; provider: Address; evaluator: Address };
+      // A job read in an earlier pass (the last RESCAN_BLOCKS are read again) keeps what its later events set.
+      if (this.#state.jobs[a.jobId] !== undefined) continue;
       const t = await time(l.blockNumber);
       const pool = BigInt(a.evaluator) === 0n;
       this.#state.jobs[a.jobId] = { id: a.jobId, client: getAddress(a.client), provider: getAddress(a.provider), evaluator: pool ? null : getAddress(a.evaluator), pool, funded: "0", status: "Open", createdAt: t, createdBlock: l.blockNumber.toString(), updatedAt: t, paid: null, refunded: null };

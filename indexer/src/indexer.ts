@@ -307,7 +307,9 @@ export class Indexer {
     const lp = d.launchpad;
     if (lp === undefined) throw new Error("the deployment has no launchpad");
     // Not viem's cached block number (cacheTime): a block number seconds old would leave the newest swaps to the next scan.
-    this.#latest = await this.#client.getBlockNumber({ cacheTime: 0 });
+    // The logs RPC's own head: the other RPC's can be ahead of the blocks the logs RPC has logs for, and those blocks
+    // would be passed over for good.
+    this.#latest = await this.#logsClient.getBlockNumber({ cacheTime: 0 });
     let changed = false;
     let from = BigInt(this.#state.scannedTo) + 1n;
     while (from <= this.#latest) {
@@ -417,7 +419,8 @@ export class Indexer {
   async #blockTime(block: bigint): Promise<number> {
     const known = this.#blockTimes.get(block);
     if (known !== undefined) return known;
-    const b = await this.#client.getBlock({ blockNumber: block });
+    // The logs RPC's head can be ahead of this node's: a block it does not have yet is read from the logs RPC.
+    const b = await this.#client.getBlock({ blockNumber: block }).catch(() => this.#logsClient.getBlock({ blockNumber: block }));
     const t = Number(b.timestamp);
     if (this.#blockTimes.size > 20_000) this.#blockTimes.clear();
     this.#blockTimes.set(block, t);

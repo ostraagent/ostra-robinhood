@@ -2,7 +2,7 @@
 // server) or serves other bytes than a raw CID names is passed over, sizes are capped. The gateways here are local
 // HTTP servers serving fixed bytes by path, as a gateway serves /ipfs/<cid>; the live test at the end reads the
 // registration file the Ostrapad check pinned on mainnet IPFS on 28 Oct 2026 (OSTRA_IPFS_LIVE=1: a network that can
-// reach the gateways).
+// reach the gateways; OSTRA_IPFS_GATEWAYS, when set, names the ones read through).
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
@@ -41,8 +41,8 @@ after(async () => {
   for (const g of servers) await new Promise((resolve) => g.server.close(resolve));
 });
 
-test("the default gateways: Pinata's first, then ipfs.io; OSTRA_IPFS_GATEWAYS replaces them", () => {
-  assert.deepEqual(IPFS_GATEWAYS, ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"]);
+test("the default gateways: the Ostra uploader first, then Pinata's, then ipfs.io; OSTRA_IPFS_GATEWAYS replaces them", () => {
+  assert.deepEqual(IPFS_GATEWAYS, ["https://relayer.ostraagent.xyz/v1/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"]);
   assert.deepEqual(ipfsGateways({}), IPFS_GATEWAYS);
   assert.deepEqual(ipfsGateways({ OSTRA_IPFS_GATEWAYS: " https://a.example/ipfs/ , http://127.0.0.1:8080/ipfs/ " }), ["https://a.example/ipfs/", "http://127.0.0.1:8080/ipfs/"]);
   for (const bad of ["ftp://a/", "https://a.example/ipfs", ","]) assert.throws(() => ipfsGateways({ OSTRA_IPFS_GATEWAYS: bad }), /OSTRA_IPFS_GATEWAYS/, bad);
@@ -78,6 +78,6 @@ test("live: the Ostrapad check's registration file through the default gateways"
   assert.equal(sha256(bytes), "0x5b0f5b68dfd3a2aa8a3cd1685924f58ad0335466544e81f5029efac7f994b4e1");
   const file = (await readIpfsJson(uri)) as { name?: string } | null;
   assert.equal(file?.name, "Ostrapad check");
-  // ipfs.io first (it answers 429 to a server), then Pinata's: still read.
-  assert.ok((await ipfsBytes(uri, 65_536, { gateways: [...IPFS_GATEWAYS].reverse() })) !== null, "read with ipfs.io tried first");
+  // The gateways in reverse (ipfs.io first: it answers 429 to a server): still read.
+  assert.ok((await ipfsBytes(uri, 65_536, { gateways: [...ipfsGateways()].reverse() })) !== null, "read with the gateways in reverse order");
 });

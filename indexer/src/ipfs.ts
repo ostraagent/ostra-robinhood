@@ -1,9 +1,14 @@
 // The files creators publish on IPFS (token metadata, agent profiles and the images they show), read for the
-// web app through gateways in order: Pinata's first, where Ostra's uploader pins them, then ipfs.io. Measured
-// from the VPS on 23 Oct 2026: ipfs.io and dweb.link answer 429 to a server, Pinata's gateway answers in 5 to 7
-// seconds. A raw CIDv1 with a SHA-256 multihash (bafkrei..., what the uploader makes of a JSON file or an image
+// web app through gateways in order: the Ostra uploader (GET /v1/ipfs/<cid>, the files it pinned and keeps; on the
+// VPS OSTRA_INDEXER_IPFS_GATEWAYS names it on 127.0.0.1), then Pinata's public gateway, then ipfs.io. Measured from
+// the VPS: ipfs.io and dweb.link answer 429 to a server (23 Oct 2026), and so does Pinata's gateway when the VPS has
+// read often (28 Oct 2026, retry-after 1512 s); it answers in 5 to 7 seconds otherwise. A raw CIDv1 with a SHA-256 multihash (bafkrei..., what the uploader makes of a JSON file or an image
 // up to 1 MB) is checked against the bytes a gateway returns, so no gateway can change what a CID names; other
-// CIDs are taken as the gateway returns them, as before.
+// CIDs are taken as the gateway returns them, as before. With an uploader on this machine (`uploader`, on the VPS
+// OSTRA_INDEXER_IPFS_UPLOADER), a raw CID is read from it alone: it reads the public gateways itself, one at a time,
+// leaves one that refused until its retry-after, and keeps what it read, so the indexer adds no reads of its own that
+// would get the VPS refused; other CIDs (Qm..., bafybei..., a path under a CID), which it does not serve, go through
+// the gateways.
 //
 // Images are kept on disk by CID, one file each, after their first bytes show a PNG, JPEG, WebP or GIF, and the
 // indexer serves them on the web app's own host (http.ts), so a browser needs no IPFS gateway.
@@ -14,7 +19,7 @@ import { join } from "node:path";
 import { MAX_UPLOAD_IMAGE_BYTES, imageType } from "../../core/src/publish.ts";
 
 /** The gateways, in the order they are tried. */
-export const IPFS_GATEWAYS: readonly string[] = ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
+export const IPFS_GATEWAYS: readonly string[] = ["https://relayer.ostraagent.xyz/v1/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
 /** Largest metadata or profile file read (as core reads them). */
 export const JSON_MAX_BYTES = 65_536;
 /** Largest image kept (the uploader's limit). */
@@ -71,7 +76,11 @@ export function rawSha256Digest(cid: string): Uint8Array | null {
 
 /** The raw CIDv1 (sha2-256) of `bytes`: what the check above compares with. */
 export function rawCidOf(bytes: Uint8Array): string {
-  const digest = createHash("sha256").update(bytes).digest();
+  return rawCidOfDigest(createHash("sha256").update(bytes).digest());
+}
+
+/** The raw CIDv1 naming a SHA-256 digest, in its one canonical spelling (as the uploader serves it). */
+function rawCidOfDigest(digest: Uint8Array): string {
   const all = new Uint8Array([0x01, 0x55, 0x12, 0x20, ...digest]);
   let bits = 0;
   let value = 0;
@@ -90,17 +99,25 @@ export function rawCidOf(bytes: Uint8Array): string {
 
 export type Fetch = (url: string, init: { signal: AbortSignal; redirect: "error" }) => Promise<Response>;
 
-export type IpfsReaderOptions = { gateways?: readonly string[]; timeoutMs?: number; fetch?: Fetch };
+export type IpfsReaderOptions = {
+  gateways?: readonly string[];
+  /** An Ostra uploader on this machine (".../v1/ipfs/"): raw CIDs are read from it alone. */
+  uploader?: string;
+  timeoutMs?: number;
+  fetch?: Fetch;
+};
 
 /** Reads IPFS files through the gateways in order; the first that returns bytes matching the CID wins. */
 export class IpfsReader {
   readonly #gateways: readonly string[];
+  readonly #uploader: string | null;
   readonly #timeoutMs: number;
   readonly #fetch: Fetch;
 
   constructor(o: IpfsReaderOptions = {}) {
     this.#gateways = o.gateways ?? IPFS_GATEWAYS;
-    if (this.#gateways.length === 0 || this.#gateways.some((g) => !/^https?:\/\/[^\s]+\/$/.test(g))) throw new Error("IPFS gateways must be http(s) URLs ending in /");
+    this.#uploader = o.uploader ?? null;
+    if (this.#gateways.length === 0 || [...this.#gateways, ...(this.#uploader === null ? [] : [this.#uploader])].some((g) => !/^https?:\/\/[^\s]+\/$/.test(g))) throw new Error("IPFS gateways must be http(s) URLs ending in /");
     this.#timeoutMs = o.timeoutMs ?? GATEWAY_TIMEOUT_MS;
     this.#fetch = o.fetch ?? ((url, init) => fetch(url, init));
   }
@@ -108,7 +125,9 @@ export class IpfsReader {
   /** The bytes `cid` (and `path` under it) names, at most `maxBytes`; null when no gateway returns them. */
   async bytes(cid: string, path: string, maxBytes: number): Promise<Uint8Array | null> {
     const digest = path === "" ? rawSha256Digest(cid) : null;
-    for (const gateway of this.#gateways) {
+    // The uploader serves a raw CID in its canonical spelling only: any other spelling goes through the gateways.
+    const viaUploader = digest !== null && this.#uploader !== null && rawCidOfDigest(digest) === cid;
+    for (const gateway of viaUploader ? [this.#uploader as string] : this.#gateways) {
       const got = await this.#read(`${gateway}${cid}${path === "" ? "" : `/${path}`}`, maxBytes);
       if (got === null) continue;
       if (digest !== null && !createHash("sha256").update(got).digest().equals(digest)) continue;

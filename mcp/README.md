@@ -84,7 +84,7 @@ All settings are optional.
 | `OSTRA_ETH_RPC_URL` | `https://ethereum-rpc.publicnode.com` | An Ethereum mainnet RPC, for Chainlink's USDe / USD feed the strategies read before lending to a cash vault that can lend against USDe. `off`: no cash goes into such a vault. Never printed |
 | `OSTRA_RAETO_URL` | `https://api.raeto.cc` | Raeto's API. `off` turns the `raeto` tool off |
 | `OSTRA_PAD_INDEXER_URL` | `https://app.ostraagent.xyz` | Ostra's Ostrapad index, for `pad_search` by words. `off` turns that search off (a listing by agent id is still read from the chain) |
-| `OSTRA_IPFS_GATEWAYS` | Pinata's gateway, then ipfs.io | The IPFS gateways profiles and Ostrapad's files are read through, comma-separated, in the order they are tried (each URL ending in `/`). A raw CID is checked against the bytes, whichever gateway answers |
+| `OSTRA_IPFS_GATEWAYS` | The Ostra uploader (`https://relayer.ostraagent.xyz/v1/ipfs/`), then Pinata's gateway, then ipfs.io | The IPFS gateways profiles and Ostrapad's files are read through, comma-separated, in the order they are tried (each URL ending in `/`). A raw CID is checked against the bytes, whichever gateway answers |
 | `OSTRA_DEPLOYMENT` | Ostra on Robinhood Chain mainnet | Path of another deployment record (JSON). With it, the four services default to off |
 
 On a local fork of mainnet (`OSTRA_RPC_URL` pointing at it), set the four services to `off`: they act on mainnet.

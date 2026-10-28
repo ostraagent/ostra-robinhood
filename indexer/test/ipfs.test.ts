@@ -1,7 +1,8 @@
 // Reading IPFS files through gateways (src/ipfs.ts): raw CIDs checked against the bytes, gateways tried in order,
 // sizes capped, images kept only when their first bytes are an image. The gateways here are local HTTP servers
 // serving fixed bytes by path, as a gateway serves /ipfs/<cid>; the live test at the end reads a token's real
-// metadata and image from mainnet IPFS (OSTRA_IPFS_LIVE=1: a network that can reach the gateways).
+// metadata and image from mainnet IPFS (OSTRA_IPFS_LIVE=1: a network that can reach the gateways;
+// OSTRA_INDEXER_IPFS_GATEWAYS, when set, names the ones read through, as the service reads it).
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -65,7 +66,7 @@ test("raw CIDs: the well-known CID of no bytes, round trips, other CIDs not chec
   assert.equal(parseIpfsUri("https://example.org/a.png"), null);
   assert.equal(imageCid("ipfs://bafkx"), "bafkx");
   assert.equal(imageCid("ipfs://bafkx/a.png"), null);
-  assert.deepEqual(IPFS_GATEWAYS, ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"]);
+  assert.deepEqual(IPFS_GATEWAYS, ["https://relayer.ostraagent.xyz/v1/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"]);
 });
 
 test("gateways in order: a refusal or bytes that are not the CID's go to the next", async () => {
@@ -87,6 +88,32 @@ test("gateways in order: a refusal or bytes that are not the CID's go to the nex
   assert.throws(() => new IpfsReader({ gateways: ["https://no-slash.example/ipfs"] }), /ending in \//);
 });
 
+test("an uploader on this machine: raw CIDs read from it alone, other CIDs through the gateways", async () => {
+  const cid = rawCidOf(JSON_BYTES);
+  const uploader = await gateway({ [cid]: JSON_BYTES });
+  const publicGw = await gateway({ [cid]: JSON_BYTES, "bafybeigdir/a.json": JSON_BYTES, QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o: JSON_BYTES });
+  const reader = new IpfsReader({ uploader: uploader.url, gateways: [publicGw.url] });
+  assert.deepEqual(await reader.json(`ipfs://${cid}`), JSON.parse(new TextDecoder().decode(JSON_BYTES)));
+  assert.deepEqual([uploader.hits, publicGw.hits], [[cid], []], "a raw CID from the uploader alone");
+  const missing = rawCidOf(new TextEncoder().encode("{}"));
+  assert.equal(await reader.json(`ipfs://${missing}`), null);
+  assert.deepEqual(publicGw.hits, [], "a raw CID the uploader does not have is not read from the gateways");
+  assert.ok((await reader.json("ipfs://bafybeigdir/a.json")) !== null);
+  assert.ok((await reader.json("ipfs://QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o")) !== null);
+  assert.deepEqual(publicGw.hits, ["bafybeigdir/a.json", "QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o"], "other CIDs through the gateways");
+  assert.equal(uploader.hits.length, 2, "the uploader is not asked for them");
+  // The same digest in another spelling (other padding bits in the last letter): not the uploader's, the gateways'.
+  const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+  const last = B32.indexOf(cid.at(-1) as string);
+  const respelled = cid.slice(0, -1) + B32[(last & ~3) | ((last + 1) & 3)];
+  const respelledGw = await gateway({ [respelled]: JSON_BYTES });
+  const reader2 = new IpfsReader({ uploader: uploader.url, gateways: [respelledGw.url] });
+  assert.ok((await reader2.json(`ipfs://${respelled}`)) !== null);
+  assert.deepEqual(respelledGw.hits, [respelled]);
+  assert.equal(uploader.hits.length, 2, "the uploader is not asked for another spelling");
+  assert.throws(() => new IpfsReader({ uploader: "http://127.0.0.1:4800/v1/ipfs", gateways: [publicGw.url] }), /ending in \//);
+});
+
 test("images: kept once, by CID, only when the bytes are the CID's and an image", async () => {
   const png = rawCidOf(PNG);
   const notImage = rawCidOf(JSON_BYTES);
@@ -106,7 +133,8 @@ test("images: kept once, by CID, only when the bytes are the CID's and an image"
 });
 
 test("live: token P's metadata and image through the default gateways", { skip: process.env.OSTRA_IPFS_LIVE !== "1" ? "OSTRA_IPFS_LIVE=1 reads mainnet IPFS" : false, timeout: 120_000 }, async () => {
-  const reader = new IpfsReader();
+  const named = process.env.OSTRA_INDEXER_IPFS_GATEWAYS;
+  const reader = new IpfsReader(named === undefined || named === "" ? {} : { gateways: named.split(",").map((g) => g.trim()) });
   const meta = (await reader.json("ipfs://bafkreibtzfkodmlca65podpd7fctlbx6h2wwyktgu2utz63so3j6a2qcea")) as Record<string, unknown> | null;
   assert.ok(meta !== null, "the metadata of token P is read");
   assert.equal(meta.symbol, "P");

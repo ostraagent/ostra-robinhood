@@ -14,6 +14,10 @@ Environment=OSTRA_INDEXER_LOGS_RPC=https://rpc.mainnet.chain.robinhood.com
 Environment=OSTRA_INDEXER_LISTEN=127.0.0.1:4900
 Environment=OSTRA_INDEXER_STATE=/var/lib/ostra-indexer/state.json
 Environment=OSTRA_INDEXER_EVERY_MS=3000
+# Raw CIDs through the uploader alone: it reads the public gateways one at a time and keeps what it read (they refuse
+# this VPS when it reads often); other CIDs, which it does not serve, through the public gateways.
+Environment=OSTRA_INDEXER_IPFS_UPLOADER=http://127.0.0.1:4800/v1/ipfs/
+Environment=OSTRA_INDEXER_IPFS_GATEWAYS=https://gateway.pinata.cloud/ipfs/,https://ipfs.io/ipfs/
 ExecStart=@NODE@ src/main.ts
 Restart=always
 RestartSec=5

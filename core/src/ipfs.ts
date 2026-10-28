@@ -1,8 +1,8 @@
 // Reading ipfs:// files (profiles, registration files, Ostrapad's orders, deliveries and reasons, token metadata)
-// through public gateways in order: Pinata's first, where Ostra's uploader pins them, then ipfs.io. ipfs.io and
-// dweb.link answer 429 to a server (measured from the VPS on 23 Oct 2026 for the indexer, indexer/src/ipfs.ts, and
-// again on 28 Oct 2026: 429 with retry-after 900), so an agent run on a server reads through Pinata's gateway; on a
-// machine ipfs.io takes it does not matter which answers. A raw CIDv1 with a SHA-256 multihash (bafkrei..., what the
+// through gateways in order: the Ostra uploader first (GET /v1/ipfs/<cid>: what it pinned, kept on its server, and
+// any other raw CID read once from the public gateways and kept), then Pinata's public gateway, then ipfs.io. The
+// public gateways answer 429 to a server that reads often (ipfs.io and dweb.link measured from the VPS on 23 Oct 2026,
+// Pinata's on 28 Oct 2026, retry-after 900 and 1512 s), so they are only the fallback. A raw CIDv1 with a SHA-256 multihash (bafkrei..., what the
 // uploader makes of a JSON file or an image) is checked against the bytes a gateway returns, so no gateway can change
 // what a CID names; other CIDs are taken as the gateway returns them. OSTRA_IPFS_GATEWAYS (comma-separated http(s)
 // URLs ending in /) replaces the list, in the order given.
@@ -11,7 +11,7 @@ import { sha256 } from "viem";
 import { padDigestFromCid } from "@ostraagent/sdk";
 
 /** The gateways, in the order they are tried (unless OSTRA_IPFS_GATEWAYS names others). */
-export const IPFS_GATEWAYS: readonly string[] = ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
+export const IPFS_GATEWAYS: readonly string[] = ["https://relayer.ostraagent.xyz/v1/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
 
 /** The gateways a read uses: OSTRA_IPFS_GATEWAYS when it is set, else IPFS_GATEWAYS. */
 export function ipfsGateways(env: Record<string, string | undefined> = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {}): readonly string[] {

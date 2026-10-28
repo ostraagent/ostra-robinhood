@@ -3,7 +3,9 @@
 // offers (its USDG vault approving the listing), a second agent registered by an account that is not an Ostra vault
 // is left out, a client orders, the provider accepts and delivers and the client approves; the index then serves the
 // listed agent with its record, the job with its status and pay, and its stats. Files are kept in memory under the
-// CID the uploader gives them (CIDv1 raw sha2-256 of the bytes), as core's pad.fork.test.ts does.
+// CID the uploader gives them (CIDv1 raw sha2-256 of the bytes), as core's pad.fork.test.ts does. Mainnet holds
+// agents and jobs of its own (Ostrapad's first jobs, 28 Oct 2026), which the fork carries: an index read before the
+// test's own steps is the baseline, and the counts are checked against it.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -117,7 +119,17 @@ async function agent(name: string, seed: number) {
   return { pad, buyer, vault: getAddress(await buyer.vaultAddress()), creatorVault, register };
 }
 
+/** USDG text (as the index writes it) in base units. */
+const units = (text: string) => {
+  const [w, f = ""] = text.split(".");
+  return BigInt(w as string) * 1_000_000n + BigInt(f.padEnd(6, "0").slice(0, 6));
+};
+
 test("the index serves listed agents ranked with their record, jobs with status and pay, and leaves out what is not a listing", { timeout: 1_200_000 }, async () => {
+  // What mainnet holds already, at the fork's block.
+  const baseline = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-baseline.json"), log: () => {}, readFile: readJson });
+  await baseline.sync();
+  const base = baseline.stats();
   const provider = await agent("provider", 51);
   const client = await agent("client", 52);
   await fork.dealUsdg(provider.vault, 10_000_000n);
@@ -142,9 +154,10 @@ test("the index serves listed agents ranked with their record, jobs with status 
 
   const index = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
   await index.sync();
-  const l = index.listings();
-  assert.equal(l.total, 1, JSON.stringify(l));
-  const a = l.agents[0]!;
+  const l = index.listings({ limit: 50 });
+  assert.equal(l.total, base.listed + 1, JSON.stringify(l));
+  const a = l.agents.find((x) => x.agentId === agentId.toString())!;
+  assert.ok(a !== undefined, "the test's agent is listed");
   assert.equal(a.agentId, agentId.toString());
   assert.equal(a.owner, provider.creatorVault);
   assert.equal(a.provider, provider.vault);
@@ -153,23 +166,23 @@ test("the index serves listed agents ranked with their record, jobs with status 
   assert.deepEqual(a.offers.map((x) => x.id), ["token-report"]);
   assert.equal(a.record?.fixedCompleted, 1);
   assert.equal(a.record?.limit, "5");
-  assert.equal(index.listings({ q: "token" }).total, 1);
+  assert.ok(index.listings({ q: "token", limit: 50 }).agents.some((x) => x.agentId === agentId.toString()));
   assert.equal(index.listings({ q: "nothing like it" }).total, 0);
   assert.equal(index.listings({ provider: provider.vault }).total, 1, "one provider vault's listings");
   assert.equal(index.listings({ provider: client.vault }).total, 0);
-  const jobs = index.jobs();
-  assert.equal(jobs.length, 1);
-  assert.equal(jobs[0]?.id, id);
-  assert.equal(jobs[0]?.status, "Completed");
-  assert.equal(jobs[0]?.paid, "1.99");
-  assert.equal(jobs[0]?.funded, "2");
+  const jobs = index.jobs({ limit: 1_000 });
+  assert.equal(jobs.length, base.jobs + 1);
+  const job = jobs.find((j) => j.id === id);
+  assert.equal(job?.status, "Completed");
+  assert.equal(job?.paid, "1.99");
+  assert.equal(job?.funded, "2");
   assert.equal(index.agent(agentId.toString())?.jobs.length, 1);
   const s = index.stats();
-  assert.equal(s.agents, 1, "only the Ostra vault's registration is kept");
-  assert.equal(s.completed, 1);
-  assert.equal(s.valueCompleted, "1.99");
+  assert.equal(s.agents, base.agents + 1, "only the Ostra vault's registration is kept");
+  assert.equal(s.completed, base.completed + 1);
+  assert.equal(units(s.valueCompleted), units(base.valueCompleted) + 1_990_000n);
 
   // A state written and read back: the same listing.
   const again = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
-  assert.equal(again.listings().total, 1);
+  assert.equal(again.listings({ limit: 50 }).total, base.listed + 1);
 });

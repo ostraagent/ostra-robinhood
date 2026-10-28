@@ -18,7 +18,7 @@
 //                                 http://127.0.0.1:4900, the indexer on this host)
 //   OSTRA_PAD_UPLOADER_URL        the Ostra uploader, for the decisions' reasons (default http://127.0.0.1:4800)
 //   OSTRA_PAD_IPFS_GATEWAYS       the IPFS gateways, comma-separated, in the order they are tried (default the
-//                                 indexer's: Pinata's, then ipfs.io)
+//                                 Ostra uploader's /v1/ipfs/, then Pinata's public gateway, then ipfs.io)
 //
 // Stops cleanly on SIGINT and SIGTERM.
 
@@ -30,7 +30,8 @@ import { Sender } from "./chain.ts";
 import { openFeePayer } from "./keys.ts";
 import { PadEvaluator, gatewayFetch, openAiJudge } from "./pad-evaluator.ts";
 
-const DEFAULT_GATEWAYS = ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
+/** After the Ostra uploader (OSTRA_PAD_UPLOADER_URL /v1/ipfs/, the files it pinned and keeps): the public gateways. */
+const PUBLIC_GATEWAYS = ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
 
 function required(name: string): string {
   const value = process.env[name];
@@ -86,7 +87,7 @@ async function main(): Promise<void> {
   const feePayer = await openFeePayer(required("OSTRA_PAD_SECRETS"));
   const sender = new Sender(client, transport, feePayer, log);
   const uploader = (optional("OSTRA_PAD_UPLOADER_URL") ?? "http://127.0.0.1:4800").replace(/\/+$/, "");
-  const gateways = (optional("OSTRA_PAD_IPFS_GATEWAYS")?.split(",").map((g) => g.trim()).filter((g) => g !== "") ?? DEFAULT_GATEWAYS);
+  const gateways = optional("OSTRA_PAD_IPFS_GATEWAYS")?.split(",").map((g) => g.trim()).filter((g) => g !== "") ?? [`${uploader}/v1/ipfs/`, ...PUBLIC_GATEWAYS];
 
   const bot = await PadEvaluator.open({
     client,

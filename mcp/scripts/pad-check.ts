@@ -2,8 +2,9 @@
 // chain: two servers (src/server.ts, or an installed npm package's bundle named by OSTRA_CHECK_MCP) are spawned over
 // stdio, a provider on OSTRA_CHECK_HOME/provider and a client on OSTRA_CHECK_HOME/client, and the relayer sends every
 // transaction, paid from each vault's relayer channel. Files go to IPFS through the Ostra uploader and are read back
-// through public gateways (core ipfs.ts). Nothing is simulated: every step is a real transaction, and the job is a
-// real job of the smallest budget (0.1 USDG) with the client as its evaluator (no pool, no evaluator fee).
+// through the gateways core reads through (core ipfs.ts). Nothing is simulated: every step is a real transaction,
+// and the job is a real job of the smallest budget (0.1 USDG) with the client as its evaluator (no pool, no
+// evaluator fee). A wait for a file on IPFS stops at once when the first gateway refuses (ipfsRefusal).
 //
 //   1. Both servers list the Ostrapad and identity tools and none of the closed launchpad tools, and send through the
 //      relayer; Ostra's Ostrapad index answers.
@@ -58,7 +59,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createPublicClient, formatUnits, getAddress, http, parseAbi, parseEventLogs, parseUnits, sha256, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt } from "viem";
 import { ERC8004_IDENTITY_REGISTRY, OSTRAPAD, PAD_SERVICE_NAME, USDG, ostraPadAbi, padDigestFromCid, padProviderPay, redact, usdgAbi } from "@ostraagent/sdk";
-import { ipfsBytes } from "@ostraagent/core";
+import { ipfsBytes, ipfsGateways } from "@ostraagent/core";
 import { ROBINHOOD_PUBLIC_RPC } from "@ostraagent/swap";
 
 /** One USDG in base units. */
@@ -216,8 +217,9 @@ function moved(receipt: TransactionReceipt, token: Address, who: Address): bigin
 }
 
 /**
- * An ipfs:// file read through the gateways the server reads through, in order (core ipfs.ts: Pinata's, then
- * ipfs.io), its bytes checked again here against the CID's sha256; null until it reads.
+ * An ipfs:// file read through the gateways the server reads through, in order (core ipfs.ts: the Ostra uploader,
+ * Pinata's, then ipfs.io; OSTRA_IPFS_GATEWAYS), its bytes checked again here against the CID's sha256; null until it
+ * reads.
  */
 async function ipfsJson(uri: string): Promise<unknown> {
   const digest = padDigestFromCid(uri);
@@ -243,17 +245,41 @@ async function index(base: string, path: string): Promise<unknown> {
   }
 }
 
-/** `probe` again every POLL_MS until it answers something other than null or undefined, or `seconds` pass (null then). */
-async function until<T>(what: string, seconds: number, probe: () => Promise<T | null | undefined>): Promise<T | null> {
+/**
+ * `probe` again every POLL_MS until it answers something other than null or undefined, or `seconds` pass (null then).
+ * `refused`, when given, is asked after each empty answer: a reason from it (a refusal that waiting would not end)
+ * stops the wait at once.
+ */
+async function until<T>(what: string, seconds: number, probe: () => Promise<T | null | undefined>, refused?: () => Promise<string | null>): Promise<T | null> {
   const deadline = Date.now() + seconds * 1000;
   let waited = false;
   for (;;) {
     const got = await probe();
     if (got !== null && got !== undefined) return got;
+    const why = refused === undefined ? null : await refused();
+    if (why !== null) throw new Error(`${what}: ${why}; waiting would not end`);
     if (Date.now() >= deadline) return null;
     if (!waited) console.log(`WAIT ${what} (up to ${seconds} s)`);
     waited = true;
     await sleep(POLL_MS);
+  }
+}
+
+/**
+ * Whether the first gateway the server reads through refuses reads of `uri` now: 429 or 403, or the Ostra uploader's
+ * 503 upstream_refused (the public gateways refuse this server and it does not keep the file). A 404 is not a
+ * refusal (a file just pinned may not have reached a gateway yet).
+ */
+async function ipfsRefusal(uri: string | null): Promise<string | null> {
+  if (uri === null || !uri.startsWith("ipfs://")) return null;
+  const gateway = ipfsGateways()[0] as string;
+  try {
+    const res = await fetch(`${gateway}${uri.slice("ipfs://".length)}`, { signal: AbortSignal.timeout(30_000), redirect: "error" });
+    const after = res.headers.get("retry-after");
+    await res.body?.cancel().catch(() => {});
+    return res.status === 429 || res.status === 403 || res.status === 503 ? `${new URL(gateway).host} answers ${res.status} for ${uri}${after === null ? "" : ` (retry-after ${after} s)`}` : null;
+  } catch {
+    return null;
   }
 }
 
@@ -306,7 +332,7 @@ async function main(): Promise<void> {
     if (!now.ok) throw new Error(`profile failed: ${now.text}`);
     const uri = now.json.profileUri;
     if (typeof uri !== "string") return;
-    const file = await until(`the current profile on IPFS, before ${what}`, waitSeconds, () => ipfsJson(uri));
+    const file = await until(`the current profile on IPFS, before ${what}`, waitSeconds, () => ipfsJson(uri), () => ipfsRefusal(uri));
     check(file !== null, `the current profile reads back from IPFS before ${what}`, { uri });
   };
   try {
@@ -411,7 +437,7 @@ async function main(): Promise<void> {
       const firstProfile = (first.json.profile ?? {}) as { status?: string; txHash?: Hash };
       check(first.ok && typeof first.json.uri === "string" && firstProfile.status === "sent" && first.json.agentUri === null, "publish_profile: the registration file pinned and set in OstraRegistry (the creator vault's relayer channel opens first)", first.ok ? { uri: first.json.uri, txHash: firstProfile.txHash } : first.text);
       sent.push({ what: "the profile", hash: firstProfile.txHash as Hash });
-      const file1 = (await until("the registration file on IPFS", waitSeconds, () => ipfsJson(first.json.uri as string))) as { name?: string } | null;
+      const file1 = (await until("the registration file on IPFS", waitSeconds, () => ipfsJson(first.json.uri as string), () => ipfsRefusal(first.json.uri as string))) as { name?: string } | null;
       check(file1 !== null && file1.name === PROFILE.name, "the registration file reads back from IPFS", file1 === null ? "not read" : { name: file1.name });
       const registered = await call(p.client, "register_agent", { uri: first.json.uri as string });
       check(registered.ok && registered.json.status === "sent" && typeof registered.json.agentId === "string", "register_agent: the creator vault owns an ERC-8004 identity", registered.ok ? { agentId: registered.json.agentId, txHash: registered.json.txHash } : registered.text);
@@ -429,7 +455,7 @@ async function main(): Promise<void> {
       check(second.ok && secondProfile.status === "sent" && secondAgentUri.status === "sent", "publish_profile again: the file names the identity, and the identity points at it", second.ok ? { uri: second.json.uri } : second.text);
       await record({ profileAgain: true });
       sent.push({ what: "the profile again", hash: secondProfile.txHash as Hash }, { what: "the identity's file", hash: secondAgentUri.txHash as Hash });
-      const file2 = (await until("the registration file naming the identity on IPFS", waitSeconds, () => ipfsJson(second.json.uri as string))) as { registrations?: { agentId: number }[] } | null;
+      const file2 = (await until("the registration file naming the identity on IPFS", waitSeconds, () => ipfsJson(second.json.uri as string), () => ipfsRefusal(second.json.uri as string))) as { registrations?: { agentId: number }[] } | null;
       check(file2 !== null && file2.registrations?.[0]?.agentId === Number(id), "the registration file reads back from IPFS and names the identity", file2?.registrations ?? "not read");
     }
 
@@ -524,10 +550,18 @@ async function main(): Promise<void> {
         return ((r.json.jobs ?? []) as JobRow[]).find((j) => same(j.id, job) && j.role === "provider") ?? null;
       });
       check(seen !== null && seen.status === "Open", "the provider finds the job on chain", seen ?? "not found");
-      const read = (await until("the order file on IPFS (pad_jobs read)", waitSeconds, async () => {
-        const r = await statusOf();
-        return r.read.order === null || r.read.order === undefined ? null : r.read;
-      })) as { order: { offer: string; input: string; client: string }; orderUri: string } | null;
+      // The order's URI, from the client's record of it: what the provider's read needs from IPFS.
+      const mine = await call(c.client, "pad_jobs", { action: "read", jobId: job });
+      const orderUri = ((mine.json.record ?? {}) as { orderUri?: string }).orderUri ?? null;
+      const read = (await until(
+        "the order file on IPFS (pad_jobs read)",
+        waitSeconds,
+        async () => {
+          const r = await statusOf();
+          return r.read.order === null || r.read.order === undefined ? null : r.read;
+        },
+        () => ipfsRefusal(orderUri),
+      )) as { order: { offer: string; input: string; client: string }; orderUri: string } | null;
       check(read !== null && read.order.offer === OFFER.id && read.order.input === INPUT && read.order.client.endsWith(clientVault), "the provider reads the order file from IPFS by the job's description", read === null ? "not read" : { orderUri: read.orderUri, input: read.order.input });
       const accepted = await call(p.client, "pad_jobs", { action: "accept", jobId: job });
       check(accepted.ok && typeof accepted.json.accepted === "string" && accepted.json.pool === false, "accept (pad_jobs)", accepted.ok ? { txHash: accepted.json.accepted } : accepted.text);
@@ -546,11 +580,18 @@ async function main(): Promise<void> {
     // 6. The client reads the delivery and approves it.
     const pay = padProviderPay(BUDGET_UNITS);
     if (st.status === "Submitted") {
-      const got = (await until("the delivery file on IPFS (the client's pad_jobs read)", waitSeconds, async () => {
-        const r = await call(c.client, "pad_jobs", { action: "read", jobId: job });
-        if (!r.ok) throw new Error(`pad_jobs read failed: ${r.text}`);
-        return r.json.delivery === null || r.json.delivery === undefined ? null : r.json;
-      })) as { job: { status: string }; delivery: { output: string; job: string }; deliveryUri: string } | null;
+      let deliverable: string | null = deliveryUri;
+      const got = (await until(
+        "the delivery file on IPFS (the client's pad_jobs read)",
+        waitSeconds,
+        async () => {
+          const r = await call(c.client, "pad_jobs", { action: "read", jobId: job });
+          if (!r.ok) throw new Error(`pad_jobs read failed: ${r.text}`);
+          deliverable = ((r.json.job ?? {}) as { deliverable?: string | null }).deliverable ?? deliverable;
+          return r.json.delivery === null || r.json.delivery === undefined ? null : r.json;
+        },
+        () => ipfsRefusal(deliverable),
+      )) as { job: { status: string }; delivery: { output: string; job: string }; deliveryUri: string } | null;
       check(
         got !== null && got.job.status === "Submitted" && got.delivery.output === OUTPUT && same(got.delivery.job, job) && (deliveryUri === null || got.deliveryUri === deliveryUri),
         "the client reads the delivery from IPFS by the job's deliverable",
@@ -567,7 +608,7 @@ async function main(): Promise<void> {
         `OstraPad paid the provider's vault ${usdg(pay)} USDG and the ${usdg(fee)} USDG fee half to its burn sink, half to its treasury`,
       );
       check((await balanceAt(vault, r4.blockNumber)) >= p0 + pay, "the provider's vault holds the pay");
-      const reason = (await until("the decision's reason on IPFS", waitSeconds, () => ipfsJson(decided.json.reasonUri as string))) as { approve?: boolean; reason?: string; job?: string } | null;
+      const reason = (await until("the decision's reason on IPFS", waitSeconds, () => ipfsJson(decided.json.reasonUri as string), () => ipfsRefusal(decided.json.reasonUri as string))) as { approve?: boolean; reason?: string; job?: string } | null;
       check(reason !== null && reason.approve === true && reason.reason === REASON && same(reason.job ?? "", job), "the reason file reads back from IPFS by its digest", reason ?? "not read");
       st = await statusOf();
     }
@@ -598,7 +639,7 @@ async function main(): Promise<void> {
       await landed(unlistedAgentUri.txHash);
     }
     const uriNow = await chain.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityAbi, functionName: "tokenURI", args: [BigInt(id)] });
-    const fileNow = (await until("the identity's file on IPFS", waitSeconds, () => ipfsJson(uriNow))) as { services?: { name?: string }[] } | null;
+    const fileNow = (await until("the identity's file on IPFS", waitSeconds, () => ipfsJson(uriNow), () => ipfsRefusal(uriNow))) as { services?: { name?: string }[] } | null;
     check(fileNow !== null && Array.isArray(fileNow.services) && !fileNow.services.some((s) => s.name === PAD_SERVICE_NAME), "the file the identity points at on chain reads back from IPFS with no Ostrapad entry", { uri: uriNow, services: fileNow?.services ?? "not read" });
     const gone = await until("pad_search by agent id to find no listing", waitSeconds, async () => {
       const r = await call(c.client, "pad_search", { agentId: id });

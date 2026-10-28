@@ -10,7 +10,9 @@
 //   OSTRA_INDEXER_IMAGES      the directory the images of metadata and profiles are kept in (default
 //                             /var/lib/ostra-indexer/images)
 //   OSTRA_INDEXER_IPFS_GATEWAYS  the IPFS gateways, comma-separated, in the order they are tried (default
-//                             Pinata's, then ipfs.io; ipfs.ts)
+//                             the Ostra uploader's, Pinata's, then ipfs.io; ipfs.ts)
+//   OSTRA_INDEXER_IPFS_UPLOADER  an Ostra uploader on this machine (http://127.0.0.1:4800/v1/ipfs/ on the VPS):
+//                             raw CIDs are read from it alone, other CIDs through the gateways (default none)
 //   OSTRA_INDEXER_SOURCIFY    the Sourcify API each launched token's source is verified on (default
 //                             https://sourcify.dev/server; "off": none; sourcify.ts)
 //   OSTRA_PAD_INDEXER_STATE   Ostrapad's index state file (default: pad-state.json next to OSTRA_INDEXER_STATE;
@@ -77,13 +79,15 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   if (record.chainId !== (await client.getChainId())) throw new Error(`${recordPath} is a deployment on chain ${record.chainId}`);
   const gatewaysText = process.env.OSTRA_INDEXER_IPFS_GATEWAYS;
   const gateways = gatewaysText === undefined || gatewaysText === "" ? IPFS_GATEWAYS : gatewaysText.split(",").map((g) => g.trim());
-  const reader = new IpfsReader({ gateways });
+  const uploaderText = process.env.OSTRA_INDEXER_IPFS_UPLOADER;
+  const uploader = uploaderText === undefined || uploaderText === "" ? null : uploaderText.trim();
+  const reader = new IpfsReader({ gateways, ...(uploader === null ? {} : { uploader }) });
   const images = new ImageStore(process.env.OSTRA_INDEXER_IMAGES || "/var/lib/ostra-indexer/images", reader);
   const sourcifyApi = process.env.OSTRA_INDEXER_SOURCIFY || SOURCIFY_API;
   const sourcify = sourcifyApi === "off" ? null : new Sourcify({ api: sourcifyApi, chainId: record.chainId });
   const indexer = new Indexer({ client, logsClient, deployment, statePath, log, readFile: (uri) => reader.json(uri), images, sourcify });
   log("sourcify", { api: sourcify === null ? "off" : new URL(sourcifyApi).host });
-  log("ipfs", { gateways: gateways.map((g) => new URL(g).host) });
+  log("ipfs", { uploader: uploader === null ? null : new URL(uploader).host, gateways: gateways.map((g) => new URL(g).host) });
   log("logs_rpc", { host: new URL(logsUrl).host === new URL(rpcUrl).host ? "<rpc>" : new URL(logsUrl).host });
   const padStatePath = process.env.OSTRA_PAD_INDEXER_STATE || join(dirname(statePath), "pad-state.json");
   const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri) });

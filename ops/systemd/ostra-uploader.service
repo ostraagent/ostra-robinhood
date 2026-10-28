@@ -1,5 +1,7 @@
 # Ostra uploader: pins agents' profiles, token metadata and images to IPFS (uploader/src/server.ts).
 # Installed with @NODE@ replaced by the path of node; the Pinata key is /etc/ostra/robinhood/uploader/secrets/pinata.jwt (0600).
+# The files it pins or reads are kept in /var/lib/ostra-uploader/files (public IPFS files, one per CID) and served
+# on GET /v1/ipfs/<cid>.
 [Unit]
 Description=Ostra uploader: pins agents' profiles, token metadata and images to IPFS
 After=network-online.target
@@ -11,9 +13,11 @@ WorkingDirectory=/srv/apps/ostra-robinhood/uploader
 Environment=OSTRA_UPLOADER_SECRETS=/etc/ostra/robinhood/uploader/secrets
 Environment=OSTRA_UPLOADER_LISTEN=127.0.0.1:4800
 Environment=OSTRA_UPLOADER_DAILY_BYTES=200000000
+Environment=OSTRA_UPLOADER_STORE=/var/lib/ostra-uploader/files
 ExecStart=@NODE@ src/main.ts
 Restart=always
 RestartSec=5
+StateDirectory=ostra-uploader
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
