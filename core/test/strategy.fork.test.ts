@@ -1,7 +1,7 @@
 // The strategy planner (StrategyService) through the core services, on a fork of Robinhood Chain mainnet with Ostra
 // and its launchpad deployed fresh (version 3 vaults), against the live Steakhouse USDG, Borro, Morpho Blue and the
 // ERC-8004 Identity Registry, with the agent's own fee payer sending (LocalSender):
-//   * the ERC-8004 gate: an agent whose creator vault holds no identity is refused; after register_agent it plans,
+//   * the ERC-8004 gate: an agent whose creator vault holds no identity is refused; after registerAgent it plans,
 //     found from agent.json and from the Registered events alike; another agent cannot claim that identity;
 //   * without USDe's price (no Ethereum RPC) nothing goes into Steakhouse USDG, whose caps reach a USDe market, and it
 //     has no other problem (the cash path with USDe's price is strategy-pinned.fork.test.ts, at a block before the
@@ -93,11 +93,11 @@ after(async () => {
 
 let registered: Awaited<ReturnType<typeof agent>>;
 
-test("the ERC-8004 gate: refused without an identity; after register_agent, found from agent.json and from the Registered events; not claimable by another agent", { timeout: 900_000 }, async () => {
+test("the ERC-8004 gate: refused without an identity; after registerAgent, found from agent.json and from the Registered events; not claimable by another agent", { timeout: 900_000 }, async () => {
   const a = await agent("registered", 71, null);
   const buyer = (await a.buyer.open()).vault;
   await fork.dealUsdg(buyer, 2_000_000_000n);
-  await assert.rejects(a.strategy.plan(), (e: unknown) => e instanceof StrategyGateError && /register_agent/.test((e as Error).message));
+  await assert.rejects(a.strategy.plan(), (e: unknown) => e instanceof StrategyGateError && /publish_profile/.test((e as Error).message));
   await a.lp.fundCreatorVault("5");
   const r = await a.lp.registerAgent("ipfs://bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy");
   assert.equal(r.status, "sent");
@@ -106,6 +106,12 @@ test("the ERC-8004 gate: refused without an identity; after register_agent, foun
   assert.deepEqual(await a.strategy.gate(), { agentId: r.agentId, creatorVault });
   // Without agent.json: the Registered events of the creator vault.
   assert.deepEqual(await a.planner(async () => null, null).gate(), { agentId: r.agentId, creatorVault });
+  // The same agent on a machine whose agent.json is gone (its registration landed after a call stopped): it is never
+  // registered twice. The registration is found on chain, written back, and nothing is signed.
+  const lost = await agent("registered", 71, null);
+  assert.equal(await lost.recorded(), null);
+  await assert.rejects(lost.lp.registerAgent("ipfs://bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy"), new RegExp(`registered already as agent ${r.agentId}`));
+  assert.equal(await lost.recorded(), r.agentId);
   // Another agent, claiming that identity, and with none.
   const b = await agent("other", 72, null, async () => r.agentId as string);
   await assert.rejects(b.strategy.gate(), (e: unknown) => e instanceof StrategyGateError && new RegExp(`agent ${r.agentId} is not`).test((e as Error).message));

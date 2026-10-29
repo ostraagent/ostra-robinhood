@@ -1,5 +1,6 @@
 // The uploader against the real Pinata API when OSTRA_PINATA_JWT_FILE names the key (the VPS; it pins two
-// small files, then serves them back from its store), and everywhere: its refusals, which reach no pinning service,
+// small files and an agent card, then serves them back from its store), and everywhere: its refusals and a card kept
+// already, which reach no pinning service,
 // and its reads, against local HTTP servers serving fixed bytes by path as a gateway serves /ipfs/<cid> (one that
 // answers 429, one that serves other bytes, one that serves the file).
 
@@ -11,7 +12,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { MAX_IMAGE_BYTES, UPLOADS_PER_HOUR, Uploader, createUploaderServer, rawCidDigest, rawCidOf, sniffImage } from "../src/server.ts";
+import { agentCardSvg } from "../../sdk/src/agent-card.ts";
+import { MAX_IMAGE_BYTES, SVG_POLICY, UPLOADS_PER_HOUR, Uploader, createUploaderServer, isSvg, rawCidDigest, rawCidOf, sniffImage } from "../src/server.ts";
 
 const jwtFile = process.env.OSTRA_PINATA_JWT_FILE;
 const jwt = jwtFile === undefined || jwtFile === "" ? "x".repeat(40) : readFileSync(jwtFile, "utf8").trim();
@@ -66,6 +68,11 @@ test("refusals: not an image, a mislabelled image, too large, not JSON, not an o
     [post("/v1/ipfs/json", "[1]", "application/json"), 400, "not_an_object"],
     [post("/v1/ipfs/json", "{}", "text/plain"), 415, "unsupported_media_type"],
     [fetch(`${base}/v1/ipfs/other`), 404, "not_found"],
+    [post("/v1/ipfs/agent-card", JSON.stringify({ agentId: "12a" }), "application/json"), 400, "bad_agent_id"],
+    [post("/v1/ipfs/agent-card", JSON.stringify({ agentId: 20074 }), "application/json"), 400, "bad_agent_id"],
+    [post("/v1/ipfs/agent-card", JSON.stringify({}), "application/json"), 400, "bad_agent_id"],
+    [post("/v1/ipfs/agent-card", "{", "application/json"), 400, "invalid_json"],
+    [post("/v1/ipfs/agent-card", JSON.stringify({ agentId: "1" }), "text/plain"), 415, "unsupported_media_type"],
   ];
   for (const [p, status, code] of cases) {
     const res = await p;
@@ -88,6 +95,26 @@ test("the web app's origin gets CORS and its preflight 204; other sites none", a
   const other = await fetch(`${base}/v1/ipfs/health`, { headers: { origin: "https://evil.example" } });
   assert.equal(other.headers.get("access-control-allow-origin"), null);
   await other.arrayBuffer();
+});
+
+test("an agent card kept already is answered without pinning, and served as SVG under a policy that runs nothing", async () => {
+  // The JWT here may be a stand-in: a pin would fail, so a 200 shows nothing was pinned.
+  const bytes = new TextEncoder().encode(agentCardSvg("424242"));
+  const cid = rawCidOf(bytes);
+  assert.ok(uploader.keep(cid, bytes));
+  const before = uploader.health().bytesUsed;
+  const res = await post("/v1/ipfs/agent-card", JSON.stringify({ agentId: "424242" }), "application/json");
+  const body = (await res.json()) as { cid: string; uri: string };
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.deepEqual(body, { cid, uri: `ipfs://${cid}` });
+  assert.equal(uploader.health().bytesUsed, before, "nothing counted against the day's budget");
+  const served = await fetch(`${base}/v1/ipfs/${cid}`);
+  assert.equal(served.status, 200);
+  assert.equal(served.headers.get("content-type"), "image/svg+xml");
+  assert.equal(served.headers.get("content-security-policy"), SVG_POLICY);
+  assert.equal(served.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(new Uint8Array(await served.arrayBuffer()), bytes);
+  assert.ok(isSvg(bytes) && !isSvg(PNG));
 });
 
 test("raw CIDs: the CID of bytes names their sha2-256, as Ostrapad's files are named", () => {
@@ -198,6 +225,14 @@ test("pins an image and a JSON object on IPFS through Pinata", { skip: jwtFile =
   assert.equal(meta.status, 200, JSON.stringify(metaBody));
   assert.equal(metaBody.uri, `ipfs://${metaBody.cid}`);
   assert.ok(uploader.health().bytesUsed > 0);
+  // An agent card: Pinata's CID is the raw CID of the card's bytes, so the URI names Ostra's card of that agent.
+  for (const id of [null, "20074"]) {
+    const card = await post("/v1/ipfs/agent-card", JSON.stringify({ agentId: id }), "application/json", "203.0.113.9");
+    const cardBody = (await card.json()) as { cid: string; uri: string };
+    assert.equal(card.status, 200, JSON.stringify(cardBody));
+    assert.equal(cardBody.cid, rawCidOf(new TextEncoder().encode(agentCardSvg(id))));
+    assert.ok(existsSync(join(store, cardBody.cid)), `card ${cardBody.cid} kept`);
+  }
   // Both are kept as Pinata pinned them (the CID names the bytes kept) and served from the store.
   for (const [cid, bytes] of [[imgBody.cid, PNG], [metaBody.cid, new TextEncoder().encode(JSON.stringify({ name: "Ostra uploader test", image: imgBody.uri }))]] as const) {
     assert.ok(existsSync(join(store, cid)), `${cid} kept`);

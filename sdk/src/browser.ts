@@ -2,6 +2,7 @@
 // (FileWotsStore in wots-file.ts, deployOstra in deploy.ts).
 
 export * from "./abi.ts";
+export * from "./agent-card.ts";
 export * from "./aggregator.ts";
 export * from "./airdrop.ts";
 export * from "./backup.ts";

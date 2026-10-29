@@ -8,7 +8,8 @@
 //            sent again is answered without a second charge (kept
 //            QUOTE_RETENTION_MS)
 //   debts    per vault: CreateVault and SpendLeaf transactions relayed
-//            before payment (alone, or together for unshield)
+//            before payment (alone, or together for unshield), a
+//            finishRecovery, and a vault spend asked on credit
 //   opens    per vault: the relayer-channel open relayed before payment, and
 //            what its first voucher owes (that open's price and the debt)
 //   credits  per vault: what the agent paid for a transaction that then
@@ -44,7 +45,7 @@ export const CREATE_VAULTS_PER_IP = 3;
  */
 export const QUOTE_RETENTION_MS = 300_000;
 
-export type QuoteKind = "create_vault" | "open_relayer_channel" | "spend_leaf" | "unshield_vault" | "finish_recovery" | "other";
+export type QuoteKind = "create_vault" | "open_relayer_channel" | "spend_leaf" | "unshield_vault" | "finish_recovery" | "spend_on_credit" | "other";
 
 export type Quote = {
   /** Price in base units of the token, margin included. */

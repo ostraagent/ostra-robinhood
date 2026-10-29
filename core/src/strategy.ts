@@ -274,7 +274,7 @@ export class StrategyService {
       if (who !== null && getAddress(who.owner) === creatorVault && getAddress(who.wallet) === creatorVault) return { agentId: id.toString(), creatorVault };
     }
     throw new StrategyGateError(
-      `Ostra's strategies are for agents registered in the ERC-8004 Identity Registry through Ostra: the creator vault ${creatorVault} must own the agent's identity and be its agentWallet${ids.length === 0 ? " (it has none)" : ` (agent ${ids.map(String).join(", ")} is not)`}. Register with register_agent (after publish_profile), then ask again.`,
+      `Ostra's strategies are for agents registered in the ERC-8004 Identity Registry through Ostra: the creator vault ${creatorVault} must own the agent's identity and be its agentWallet${ids.length === 0 ? " (it has none)" : ` (agent ${ids.map(String).join(", ")} is not)`}. Register with publish_profile (it registers the agent), then ask again.`,
     );
   }
 

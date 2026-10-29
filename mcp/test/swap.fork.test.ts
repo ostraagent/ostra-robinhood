@@ -75,7 +75,7 @@ after(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true });
 });
 
-async function connect(home: string, o: { prover?: boolean; localSpends?: boolean } = {}): Promise<Client> {
+async function connect(home: string, o: { prover?: boolean; localSpends?: boolean; answerMs?: string } = {}): Promise<Client> {
   const prover = o.prover !== false;
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -94,6 +94,9 @@ async function connect(home: string, o: { prover?: boolean; localSpends?: boolea
       // No relayer here: the fee payer sends the private spends too (which links them to the agent).
       ...(o.localSpends !== false ? { OSTRA_PRIVATE_LOCAL_SPENDS: "yes" } : {}),
       ...(prover ? {} : { OSTRA_PROVER: "off" }),
+      // A swap on a fork can take longer than the default 40 s: these servers wait for it (the calls wait up to 300 s);
+      // the pending answer is tested with its own short wait.
+      OSTRA_SWAP_ANSWER_MS: o.answerMs ?? "290000",
     },
     stderr: "pipe",
   });
@@ -138,7 +141,7 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
   let creatorVault: Address;
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["ostra_swap_quote", "ostra_swap", "ostra_swap_split", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover", "private_withdraw", "auto_shield"]) assert.ok(tools.includes(name), `tool ${name}`);
+    for (const name of ["ostra_swap_quote", "ostra_swap", "ostra_swap_split", "ostra_swap_orders", "private_shield", "private_balance", "private_swap", "private_unshield", "private_recover", "private_withdraw", "auto_shield"]) assert.ok(tools.includes(name), `tool ${name}`);
     // The shielded pool's leaves left the tools in 0.1.6.
     for (const name of ["shield", "unshield", "shield_status"]) assert.ok(!tools.includes(name), `no tool ${name}`);
 
@@ -181,6 +184,17 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     assert.ok((await balanceOf(USDG, vault)) > parseUnits("900", 6));
     const orders = (await readdir(join(home, "ostra-swap"))).filter((n) => n.startsWith("order-"));
     assert.deepEqual(orders, [], "every order finished");
+    // Both finished orders are kept for ostra_swap_orders, newest first, with what they paid.
+    const kept = await call(client, "ostra_swap_orders");
+    assert.ok(kept.ok, kept.text);
+    assert.deepEqual(kept.json.pending, []);
+    assert.deepEqual(kept.json.open, []);
+    const finished = kept.json.finished as { order: string; swapped: boolean; amountIn: string; amountOut: string; tokenIn: string; to: string }[];
+    assert.deepEqual(finished.map((f) => f.order), [back.json.order, swapped.json.order]);
+    assert.ok(finished[1]!.swapped && finished[1]!.amountIn === "100" && finished[1]!.amountOut === swapped.json.amountOut && getAddress(finished[1]!.to) === wethVault, kept.text);
+    assert.equal(finished[0]!.amountOut, back.json.amountOut);
+    const one = await call(client, "ostra_swap_orders", { order: swapped.json.order });
+    assert.ok(one.ok && (one.json.finished as unknown[]).length === 1 && (one.json.open as unknown[]).length === 0, one.text);
     // Both swaps moved the price less than 1%: none was split.
     const splits = await call(client, "ostra_swap_split", { action: "list" });
     assert.ok(splits.ok && splits.text.trim() === "[]", splits.text);
@@ -332,5 +346,64 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     assert.deepEqual(withPayout.json.tokens, [{ token: getAddress(USDG), amount: "225", notes: 3, largestNote: "200" }]);
   } finally {
     await fresh.close();
+  }
+});
+
+test("ostra_swap answers pending when its swap takes longer than OSTRA_SWAP_ANSWER_MS, refuses a second from that vault meanwhile, and ostra_swap_orders tells how it ended", { timeout: 900_000 }, async () => {
+  const home = join(root, "home-pending");
+  // 1 ms: every swap answers pending.
+  const client = await connect(home, { answerMs: "1" });
+  try {
+    const status = (await call(client, "balance")).json.vault as { feePayer: Address };
+    await fork.setBalance(status.feePayer, 10n ** 19n);
+    const opened = await call(client, "open_vault");
+    assert.ok(opened.ok, opened.text);
+    const vault = getAddress(opened.json.vault as string);
+    await fork.dealUsdg(vault, parseUnits("50", 6));
+    await mkdir(join(home, "ostra-swap"), { recursive: true, mode: 0o700 });
+    await copyFile(join(root, "home", "ostra-swap", "pool-index.json"), join(home, "ostra-swap", "pool-index.json"));
+
+    const waitEnded = async (id: string) => {
+      for (let i = 0; i < 120; i++) {
+        const now = await call(client, "ostra_swap_orders");
+        assert.ok(now.ok, now.text);
+        const mine = (now.json.pending as { swap: string; state: string }[]).find((x) => x.swap === id);
+        assert.ok(mine !== undefined, now.text);
+        if (mine.state !== "running") return { entry: mine as Record<string, unknown>, all: now.json };
+        await new Promise((r) => setTimeout(r, 1_000));
+      }
+      throw new Error(`swap ${id} still running after 120 s`);
+    };
+
+    const pending = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "10" });
+    assert.ok(pending.ok && pending.json.status === "pending" && typeof pending.json.swap === "string" && /do not send it again/.test(pending.json.note as string), pending.text);
+    // While it runs, another swap from the USDG vault is refused before anything is signed.
+    const again = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
+    assert.ok(!again.ok && /is still running .*nothing was signed/.test(again.text), again.text);
+    const ended = await waitEnded(pending.json.swap as string);
+    assert.equal(ended.entry.state, "ended", JSON.stringify(ended.entry));
+    const result = ended.entry.result as { status: string; swapped: boolean; order: string; amountOut: string };
+    assert.ok(result.status === "sent" && result.swapped === true && Number(result.amountOut) > 0, JSON.stringify(result));
+    assert.equal(ended.entry.order, result.order);
+    const finished = ended.all.finished as { order: string; amountOut: string; amountIn: string }[];
+    assert.deepEqual(finished.map((f) => [f.order, f.amountIn, f.amountOut]), [[result.order, "10", result.amountOut]]);
+    assert.deepEqual(ended.all.open, []);
+    assert.equal(await balanceOf(USDG, vault), parseUnits("40", 6));
+
+    // Once it ended, the vault swaps again.
+    const next = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
+    assert.ok(next.ok && next.json.status === "pending", next.text);
+    const second = await waitEnded(next.json.swap as string);
+    assert.equal((second.entry.result as { swapped: boolean }).swapped, true, JSON.stringify(second.entry));
+    // A swap that fails after answering pending says why: more than the vault holds, refused before signing.
+    const tooMuch = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "500" });
+    if (tooMuch.ok) {
+      assert.equal(tooMuch.json.status, "pending", tooMuch.text);
+      const failed = await waitEnded(tooMuch.json.swap as string);
+      assert.ok(failed.entry.state === "failed" && /less than 500; nothing was signed/.test(failed.entry.error as string), JSON.stringify(failed.entry));
+    } else assert.match(tooMuch.text, /less than 500; nothing was signed/);
+    assert.equal(await balanceOf(USDG, vault), parseUnits("39", 6));
+  } finally {
+    await client.close();
   }
 });

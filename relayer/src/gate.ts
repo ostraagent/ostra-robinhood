@@ -103,11 +103,18 @@
 // its delay, so it lands once per recovery, at most every 36 hours a vault,
 // each staged by guardian spends that cost more than it (finishRecovery of a
 // vault in another token is an ordinary request, paid by a payer vault). An
-// open to the relayer the old key left unpaid becomes the vault's debt then. A vault in debt, or with such an open unpaid, gets nothing
+// open to the relayer the old key left unpaid becomes the vault's debt then. And a sixth (decided 29 Oct 2026): one
+// spend alone of an Ostra vault in the relayer's token whose request asks for it (`onCredit`), a debt of that vault.
+// A spend signed and not landed holds the vault's one-time key, so the vault can open no new channel to pay for it,
+// and its old channels may have no deposit left: the agent's client asks for that spend on credit, then opens a
+// channel whose first voucher pays it. It is relayed only for a vault that owes nothing and has no open unpaid, and
+// only when the vault holds after it (simulated) at least CREDIT_BALANCE_MULTIPLE times its price: enough to pay it and
+// the open that pays it. A vault in debt, or with such an open unpaid, gets nothing
 // else relayed but a spendLeaf into it while no open is unpaid.
 //
-// The request body is {"calls", "prepay"?, "payer"?, "allowFailedSwaps"?}: `prepay` makes a
-// createVault an ordinary paid request instead of a debt; `payer` names the
+// The request body is {"calls", "prepay"?, "payer"?, "allowFailedSwaps"?, "onCredit"?}: `prepay` makes a
+// createVault an ordinary paid request instead of a debt; `onCredit` asks for a vault spend before payment (above);
+// `payer` names the
 // Ostra vault whose relayer channel pays. That vault's credit is taken off the
 // price (with a voucher from one of its channels, at least one base unit,
 // authorizing it). GET /v1/vaults/<vault> (vaultState) shows a vault's debt,
@@ -221,14 +228,45 @@ export type GateOptions = {
   /** OstraPad (Ostrapad): its calls are relayed, none naming the relayer's account or Multicall3 in a role (#padProblem). */
   pad?: Address;
   log: Log;
+  /** How long a quote may take (QUOTE_DEADLINE_MS; shorter in tests). */
+  quoteDeadlineMs?: number;
 };
 
 export type RelayInput = { body: string; req: IncomingMessage; ip: string };
 
 /** What the request body asks besides the calls. */
-type RelayRequest = { prepay: boolean; payer: Address | null; allowFailedSwaps: boolean };
+type RelayRequest = { prepay: boolean; payer: Address | null; allowFailedSwaps: boolean; onCredit: boolean };
+
+/**
+ * A spend relayed on credit leaves the vault at least this many times its price (decided 29 Oct 2026): its debt, and
+ * the channel open that pays it (a vault spend too, priced like it or less).
+ */
+export const CREDIT_BALANCE_MULTIPLE = 2n;
+
+/**
+ * The longest a request's quote may take before it is answered 503 (decided 29 Oct 2026): a swap's quote once took
+ * 261 s, longer than the 240 s the agent waits for the relayer. Its reads are each bounded too (server.ts).
+ */
+export const QUOTE_DEADLINE_MS = 60_000;
 
 const RELAY_DESCRIPTION = "Ostra relayer: one transaction";
+const erc20BalanceAbi = [{ type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ name: "account", type: "address" }], outputs: [{ type: "uint256" }] }] as const;
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/** What `logs` move into `account` of `token` less what they move out of it (ERC-20 Transfer events), in base units. */
+export function tokenFlow(logs: RelayMeasure["logs"], token: Address, account: Address): bigint {
+  let flow = 0n;
+  const me = account.toLowerCase();
+  for (const l of logs) {
+    if (getAddress(l.address) !== getAddress(token) || l.topics[0]?.toLowerCase() !== TRANSFER_TOPIC || l.topics.length !== 3) continue;
+    const from = `0x${(l.topics[1] as string).slice(26)}`.toLowerCase();
+    const to = `0x${(l.topics[2] as string).slice(26)}`.toLowerCase();
+    const value = BigInt(l.data);
+    if (from === me) flow -= value;
+    if (to === me) flow += value;
+  }
+  return flow;
+}
 const DEBT_NOTE = "the vault owes this amount; it is paid with the first voucher of the vault's channel to the relayer, and nothing else is relayed for the vault until then";
 
 /**
@@ -426,7 +464,7 @@ export class RelayerGate {
 
   async relay(input: RelayInput): Promise<Answer> {
     let tx: RelayTx;
-    let body: { calls?: unknown; prepay?: unknown; payer?: unknown; allowFailedSwaps?: unknown };
+    let body: { calls?: unknown; prepay?: unknown; payer?: unknown; allowFailedSwaps?: unknown; onCredit?: unknown };
     try {
       body = JSON.parse(input.body) as typeof body;
       if (body === null || typeof body !== "object") throw new Error("the request must be a JSON object");
@@ -445,11 +483,14 @@ export class RelayerGate {
       if (body.prepay !== undefined && typeof body.prepay !== "boolean") throw new Error("prepay must be true or false");
       if (body.payer !== undefined && (typeof body.payer !== "string" || !isAddress(body.payer, { strict: false }))) throw new Error("payer must be a vault address");
       if (body.allowFailedSwaps !== undefined && typeof body.allowFailedSwaps !== "boolean") throw new Error("allowFailedSwaps must be true or false");
+      if (body.onCredit !== undefined && typeof body.onCredit !== "boolean") throw new Error("onCredit must be true or false");
       request = {
         prepay: body.prepay === true,
         payer: body.payer === undefined ? null : getAddress(body.payer as string),
         allowFailedSwaps: body.allowFailedSwaps === true,
+        onCredit: body.onCredit === true,
       };
+      if (request.onCredit && request.payer !== null) throw new Error("a spend on credit is the debt of its own vault: no payer");
     } catch (err) {
       return json(400, { error: "bad_transaction", message: (err as Error).message });
     }
@@ -547,7 +588,7 @@ export class RelayerGate {
 
     let classified: Classified;
     try {
-      classified = classify(tx, this.#o.deployment, this.#o.vault, request.prepay);
+      classified = classify(tx, this.#o.deployment, this.#o.vault, request.prepay, request.onCredit);
     } catch (err) {
       return json(400, { error: "bad_transaction", message: (err as Error).message });
     }
@@ -578,6 +619,11 @@ export class RelayerGate {
       // In another token: an ordinary request, paid by a payer vault (the policy checks it).
       if (v.token !== this.#o.merchant.token) classified = { kind: "other", vaults: [classified.ix.vault] };
     }
+    if (classified.kind === "spend_on_credit") {
+      const v = await readVault(this.#o.client, this.#o.deployment, classified.ix.vault);
+      if (v === null) return json(400, { error: "not_a_vault", message: `a spend is relayed on credit only from an Ostra vault in ${this.#o.merchant.token}: ${classified.ix.vault} is not an Ostra vault` });
+      if (v.token !== this.#o.merchant.token) return json(400, { error: "wrong_mint", message: `a spend is relayed on credit only from a vault in ${this.#o.merchant.token}, whose channel to the relayer pays it` });
+    }
     let openProblem: string | null = null;
     if (classified.kind === "open_relayer_channel") openProblem = await this.#termsProblem(classified.ix);
 
@@ -597,12 +643,25 @@ export class RelayerGate {
     // The vaults whose Swap in this request must not fail (SwapFailed); none with allowFailedSwaps.
     const swaps = request.allowFailedSwaps ? [] : swapVaults(tx);
     let quote: Quote;
+    let timer: NodeJS.Timeout | undefined;
     try {
-      quote = await this.#quote(tx, classified, leafVault, swaps, request, unescrowed);
+      // Bounded as a whole (QUOTE_DEADLINE_MS): an agent waits for the relayer, and gives up at 240 s.
+      const deadline = this.#o.quoteDeadlineMs ?? QUOTE_DEADLINE_MS;
+      const late = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          this.#o.log("quote_late", { request: tx.hash, afterMs: deadline });
+          reject(new QuoteError("simulation_unavailable", `the node did not answer the quote's reads within ${deadline / 1_000} s; send the request again`));
+        }, deadline);
+      });
+      const pricing = this.#quote(tx, classified, leafVault, swaps, request, unescrowed);
+      pricing.catch(() => undefined);
+      quote = await Promise.race([pricing, late]);
     } catch (err) {
       if (err instanceof PolicyRefusal) return json(422, { error: "refused", message: err.message });
       if (err instanceof QuoteError) return json(err.code === "price_unavailable" || err.code === "simulation_unavailable" ? 503 : 422, { error: err.code, message: err.message });
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
 
     try {
@@ -628,6 +687,10 @@ export class RelayerGate {
         const vault = classified.ix.vault;
         return await this.#serialized("debts", () => this.#finishRecovery(tx, vault, quote));
       }
+      if (classified.kind === "spend_on_credit") {
+        const vault = classified.ix.vault;
+        return await this.#serialized("debts", () => this.#spendOnCredit(tx, vault, quote, swaps));
+      }
       return await this.#paid(tx, classified.vaults, quote, input, request.payer, swaps);
     } catch (err) {
       if (err instanceof LedgerRefusal) return json(403, { error: err.code, message: err.message });
@@ -644,6 +707,7 @@ export class RelayerGate {
     if (classified.kind === "finish_recovery") return null;
     // The vault an unshield creates owes nothing yet; its token and destination were checked (#unshieldProblem).
     if (classified.kind === "unshield_vault") return null;
+    if (classified.kind === "spend_on_credit") return this.#owesAlready(view, classified.ix.vault);
     if (classified.kind === "create_vault") {
       const limit = createVaultLimitReached(view, ip, Date.now());
       return limit === null ? null : json(403, { error: limit.code, message: limit.message });
@@ -662,6 +726,14 @@ export class RelayerGate {
       }
     }
     return null;
+  }
+
+  /** 403 when `vault` owes the relayer or has an open to it unpaid (nothing more is relayed for it on credit), or null. */
+  #owesAlready(view: Readonly<LedgerData>, vault: Address): Answer | null {
+    const unpaid = this.#openUnpaid(view.opens[vault], vault);
+    if (unpaid !== null) return unpaid;
+    if (view.debts[vault] === undefined) return null;
+    return json(403, { error: "vault_in_debt", message: `vault ${vault} owes the relayer; open a channel to the relayer's vault ${this.#o.vault} and pay its first voucher first` });
   }
 
   /** 403 when `vault` has an open to the relayer that is not paid yet (`pending`), or null. */
@@ -966,10 +1038,16 @@ export class RelayerGate {
               : [classified.ix.vault],
       createdAt: Date.now(),
     };
+    // A quote that finished after its request was answered late (QUOTE_DEADLINE_MS) never replaces the one a request
+    // sent again stored meanwhile: the agent was asked to pay that one.
+    let kept: Quote | undefined;
     await this.#o.ledger.update((data) => {
-      pruneQuotes(data, Date.now());
-      data.quotes[tx.hash] = quote;
+      const now = Date.now();
+      pruneQuotes(data, now);
+      kept = liveQuote(data.quotes[tx.hash], now);
+      if (kept === undefined) data.quotes[tx.hash] = quote;
     });
+    if (kept !== undefined) return kept;
     this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, limit: quote.limit, gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
     return quote;
   }
@@ -1067,20 +1145,47 @@ export class RelayerGate {
     return answer;
   }
 
+  /**
+   * One spend of a vault in the relayer's token asked on credit: the vault owes it, when it owes nothing yet and holds
+   * after it (simulated now) at least CREDIT_BALANCE_MULTIPLE times its price.
+   */
+  async #spendOnCredit(tx: RelayTx, vault: Address, quote: Quote, swaps: readonly Address[]): Promise<Answer> {
+    const owes = this.#owesAlready(this.#o.ledger.view(), vault);
+    if (owes !== null) return owes;
+    const token = this.#o.merchant.token;
+    let logs: RelayMeasure["logs"];
+    try {
+      logs = (await simulateRelay(this.#o.client, { relayer: this.#o.sender.address, to: tx.to, data: tx.data, value: relayValue(this.#o.deployment, tx) })).logs;
+    } catch (err) {
+      if (err instanceof RelaySimulationError) return json(err.reverted ? 422 : 503, { error: err.code, message: err.message });
+      throw err;
+    }
+    const now = (await this.#o.client.readContract({ address: token, abi: erc20BalanceAbi, functionName: "balanceOf", args: [vault] })) as bigint;
+    const after = now + tokenFlow(logs, token, vault);
+    const need = BigInt(quote.amount) * CREDIT_BALANCE_MULTIPLE;
+    if (after < need) {
+      return json(403, {
+        error: "credit_refused",
+        message: `vault ${vault} would hold ${after} base units after this spend, less than the ${need} that pay for it and the channel open that pays it: it is not relayed on credit; fund the vault or send it with ETH`,
+      });
+    }
+    return this.#relayAsDebt(tx, vault, quote, "spend_sent_on_credit", swaps);
+  }
+
   /** createVault and spendLeaf into it (unshield): the new vault owes both. */
   async #unshieldVault(tx: RelayTx, vault: Address, quote: Quote): Promise<Answer> {
     return this.#relayAsDebt(tx, vault, quote, "vault_unshielded_on_credit");
   }
 
-  /** Sends `tx` with its price added to `vault`'s debt (taken back if it is not sent). */
-  async #relayAsDebt(tx: RelayTx, vault: Address, quote: Quote, event: string): Promise<Answer> {
+  /** Sends `tx` with its price added to `vault`'s debt (taken back if it is not sent); `swaps`: as #send's. */
+  async #relayAsDebt(tx: RelayTx, vault: Address, quote: Quote, event: string, swaps: readonly Address[] = []): Promise<Answer> {
     await this.#o.ledger.update((data) => {
       const prior = data.debts[vault];
       data.debts[vault] = { amount: (BigInt(prior?.amount ?? "0") + BigInt(quote.amount)).toString(), txs: [...(prior?.txs ?? []), tx.hash] };
     });
     let landed: Landed;
     try {
-      landed = await this.#send(quote);
+      landed = await this.#send(quote, swaps);
     } catch (err) {
       if (err instanceof SendUnknownError) return this.#unknown(tx, err);
       await this.#o.ledger.update((data) => {

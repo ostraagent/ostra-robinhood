@@ -61,6 +61,10 @@ import { FeeSweeper } from "./sweep.ts";
 import { RelaySender } from "./send.ts";
 import { SignatureEscrow, SignaturePruner } from "./signatures.ts";
 
+/** Retries of a transient RPC failure (1, 2 and 4 s apart) and the time each attempt is given: at most about 67 s. */
+const RELAYER_RPC_RETRIES = 3;
+const RELAYER_RPC_TIMEOUT_MS = 15_000;
+
 async function main(): Promise<void> {
   const config = loadRelayerConfig();
   const scrub = (text: string) => redact(text, config.rpcUrl);
@@ -69,7 +73,9 @@ async function main(): Promise<void> {
     console.log(scrub(line));
   };
 
-  const transport = retryingHttp(config.rpcUrl);
+  // Bounded retries, each one logged (decided 29 Oct 2026): a swap's quote once waited 261 s on the default eight
+  // retries, longer than the agent waits for the relayer (240 s); failing within a few seconds, it can be asked again.
+  const transport = retryingHttp(config.rpcUrl, { retryCount: RELAYER_RPC_RETRIES, timeoutMs: RELAYER_RPC_TIMEOUT_MS, onRetry: (r) => log("rpc_retry", r) });
   const client = createPublicClient({ chain: robinhoodChain, transport }) as PublicClient;
   await assertRobinhoodChain(client);
   const d = config.deployment;

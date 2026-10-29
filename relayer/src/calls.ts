@@ -1,6 +1,6 @@
 // Reads a relay request's calls (the Solana relayer decoded a v1 transaction
 // and its instructions here, tx.ts). A request is {"calls": [{to, data}],
-// "prepay"?, "payer"?, "allowFailedSwaps"?}; the relayer sends one call as it is and several
+// "prepay"?, "payer"?, "allowFailedSwaps"?, "onCredit"?}; the relayer sends one call as it is and several
 // through Multicall3 (sdk relayTransaction), and the request hash binds a
 // quote and a payment to exactly that transaction (sdk relayRequestHash).
 //
@@ -243,6 +243,8 @@ export type Classified =
   | { kind: "unshield_vault"; create: CreateVaultCall; leaf: SpendLeafCall }
   /** finishRecovery alone: relayed before payment as a debt of the vault when it is in the relayer's token (gate.ts). */
   | { kind: "finish_recovery"; ix: { vault: Address } }
+  /** One vault spend alone that the request asks to be relayed before payment (`onCredit`): a debt of that vault (gate.ts). */
+  | { kind: "spend_on_credit"; ix: { vault: Address } }
   | { kind: "other"; vaults: Address[] };
 
 function createVaultCall(c: ParsedCall, d: Deployment): CreateVaultCall | null {
@@ -276,12 +278,25 @@ export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
 
 /**
  * The relayer's reading of a request (design v0.3, decided 15 Oct 2026):
- * the four kinds relayed before payment, each the whole request, or any other
+ * the kinds relayed before payment, each the whole request, or any other
  * request with the vaults it acts for. A createVault the request asks to pay
- * for up front (`prepay`) is an ordinary paid request for its vault.
+ * for up front (`prepay`) is an ordinary paid request for its vault. A
+ * request that asks to be relayed before payment (`onCredit`, from 29 Oct
+ * 2026) is one vault spend alone (an open to the relayer is relayed before
+ * payment anyway); anything else asking it is refused.
  */
-export function classify(tx: RelayTx, d: Deployment, relayerVault: Address, prepay = false): Classified {
+export function classify(tx: RelayTx, d: Deployment, relayerVault: Address, prepay = false, onCredit = false): Classified {
   const p = tx.parsed;
+  if (onCredit) {
+    const only = p.length === 1 ? (p[0] as ParsedCall) : null;
+    if (only === null || only.fn !== "spend") throw new Error("onCredit is for one vault spend alone");
+    if (prepay) throw new Error("onCredit and prepay do not go together");
+    if (only.action === VAULT_ACTION.OPEN_CHANNEL) {
+      const open = decodeOpenChannelParams(only.params);
+      if (getAddress(open.receiverAuthorizer) === relayerVault) return { kind: "open_relayer_channel", ix: { vault: only.to, open } };
+    }
+    return { kind: "spend_on_credit", ix: { vault: only.to } };
+  }
   if (p.length === 1) {
     const only = p[0] as ParsedCall;
     const created = createVaultCall(only, d);

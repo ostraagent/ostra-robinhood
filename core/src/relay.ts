@@ -133,6 +133,12 @@ export type Reservation = { channel: Hex; amount: bigint };
 export type SendOptions = {
   /** A createVault paid up front instead of becoming the vault's debt (the seller vault). */
   prepay?: boolean;
+  /**
+   * The relayer sends the buyer vault's one spend before payment, as the vault's debt, which the first voucher of the
+   * vault's next channel to the relayer pays (relayer gate: a spend on credit; from 29 Oct 2026). For a spend signed
+   * earlier that holds the vault's key when no channel has deposit left to pay for it (PendingSpendUnpaidError).
+   */
+  onCredit?: boolean;
   /** How a relayer channel is opened when one is needed; inside the buyer vault's queue, its unqueued opener. */
   openChannel?: OpenRelayerChannel;
   /** The reservation made before the vault spend in this request was signed. */
@@ -220,12 +226,17 @@ export class RelayerUnavailableError extends Error {
 /**
  * A vault spend signed earlier waits to be sent and no relayer channel can
  * pay for it: a new relayer channel cannot be opened before it, since the open
- * needs the same one-time key (vault.ts sends it with the local fee payer).
+ * needs the same one-time key. vault.ts asks the relayer to send it on credit
+ * (`onCredit`: the vault whose key it holds sends it so, from its queue or,
+ * called by that vault itself, inside it), else sends it with the local fee
+ * payer.
  */
 export class PendingSpendUnpaidError extends Error {
-  constructor(message: string) {
+  readonly onCredit: { owner: object; queued: () => Promise<unknown>; unqueued: () => Promise<unknown> } | undefined;
+  constructor(message: string, onCredit?: { owner: object; queued: () => Promise<unknown>; unqueued: () => Promise<unknown> }) {
     super(message);
     this.name = "PendingSpendUnpaidError";
+    this.onCredit = onCredit;
   }
 }
 
@@ -748,9 +759,10 @@ export class RelayerClient implements Sender {
     else this.#reserved.delete(reservation.channel);
   }
 
-  async #post(calls: readonly RelayCall[], extra: { prepay?: boolean; payer: Address | null; allowFailedSwaps?: boolean }, headers: Record<string, string> = {}): Promise<Answer> {
+  async #post(calls: readonly RelayCall[], extra: { prepay?: boolean; payer: Address | null; allowFailedSwaps?: boolean; onCredit?: boolean }, headers: Record<string, string> = {}): Promise<Answer> {
     const body: Record<string, unknown> = { calls: calls.map((c) => ({ to: getAddress(c.to), data: c.data })) };
     if (extra.prepay === true) body.prepay = true;
+    if (extra.onCredit === true) body.onCredit = true;
     if (extra.payer !== null) body.payer = extra.payer;
     if (extra.allowFailedSwaps === true) body.allowFailedSwaps = true;
     return this.#http("POST", "/v1/relay", JSON.stringify(body), headers);
@@ -957,10 +969,13 @@ export class RelayerClient implements Sender {
 
   async send(calls: RelayCall[], options: SendOptions = {}): Promise<Hash> {
     await this.facts();
+    const credit = options.onCredit === true;
+    // A spend on credit is the debt of its own vault: it names no payer.
+    const post = async () => this.#post(calls, { prepay: options.prepay === true, payer: credit ? null : await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true, onCredit: credit });
     // Why the relayer did not send the request the last time it said so: named in the error once the resends run out.
     let notSent = "";
     for (let resend = 0; resend < MAX_RESENDS; resend++) {
-      let answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true });
+      let answer = await post();
       let again = false;
       for (let step = 0; step < MAX_STEPS && !again; step++) {
         const b = answer.body;
@@ -974,14 +989,16 @@ export class RelayerClient implements Sender {
           await this.#landed(hash);
           return hash;
         }
+        // A relayer from before spends on credit prices the request instead: nothing was sent.
+        if (answer.status === 402 && credit) throw new RelayerError(402, "no_credit", "the relayer does not send this spend on credit (it asks for payment); nothing was sent");
         if (answer.status === 402) {
           answer = await this.#pay(calls, answer, options);
           continue;
         }
         if (answer.status === 403 && (error === "vault_in_debt" || error === "open_unpaid")) {
-          if (options.reservation !== undefined && options.reservation !== null) throw new RelayerError(403, error, String(b?.message ?? error));
+          if (credit || (options.reservation !== undefined && options.reservation !== null)) throw new RelayerError(403, error, String(b?.message ?? error));
           await this.#ensureChannel(1n, options.openChannel, null);
-          answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true });
+          answer = await post();
           continue;
         }
         if (answer.status === 409 && error === "not_sent") {

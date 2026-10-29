@@ -57,6 +57,7 @@ import {
   CREATOR_SPLIT,
   WETH,
   DEV_BUY,
+  ERC8004_IDENTITY_REGISTRY,
   LAUNCHPAD,
   NO_DEV_BUY,
   PAD_SERVICE_NAME,
@@ -67,7 +68,10 @@ import {
   VAULT_VERSION,
   LAUNCH_PAIRS,
   airdropRoundAmountParams,
+  agentRegisteredEvent,
   findLaunchPair,
+  getLogsChunked,
+  identityRegistryAbi,
   launchPair,
   quoteUnitsToUsd,
   readPairUsdPrice,
@@ -91,6 +95,7 @@ import {
   ostraVestingAbi,
   quoteVaultLaunch,
   quoteVaultSwap,
+  readAgentIdentity,
   readVault,
   registerAgentParams,
   setAgentUriParams,
@@ -116,7 +121,7 @@ import { tokenBalance, tokenDecimals } from "./chain.ts";
 import { ipfsBytes } from "./ipfs.ts";
 import { quoteOfPool, readLaunchedPool, readPoolView, type LaunchedPool as Pool, type PoolView } from "./pools.ts";
 import { LOG_WINDOW_BLOCKS } from "./channels.ts";
-import { profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFields } from "./publish.ts";
+import { agentCardUri, profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFields } from "./publish.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
@@ -272,10 +277,13 @@ export type LaunchpadParts = {
   buyerSender: Sender;
   creator: VaultService;
   creatorSender: Sender;
+  /** The RPC for long log windows (OSTRA_LOGS_RPC_URL); default `client`. */
+  logsClient?: PublicClient;
 };
 
 export class LaunchpadService {
   readonly #client: PublicClient;
+  readonly #logsClient: PublicClient;
   readonly #transport: Transport;
   readonly #config: Config;
   readonly #keys: Keys;
@@ -291,6 +299,7 @@ export class LaunchpadService {
   constructor(p: LaunchpadParts) {
     if (p.creator.kind !== "creator" || p.buyer.kind !== "buyer") throw new Error("the launchpad takes the agent's buyer and creator vaults");
     this.#client = p.client;
+    this.#logsClient = p.logsClient ?? p.client;
     this.#transport = p.transport;
     this.#config = p.config;
     this.#keys = p.keys;
@@ -1181,6 +1190,55 @@ export class LaunchpadService {
     return text === undefined ? null : (JSON.parse(text) as AgentRecord);
   }
 
+  /**
+   * The agent's registration read from the chain when agent.json does not hold it: an identity its creator vault
+   * registered (the Identity Registry's Registered events from the deployment's first block) and still owns. A
+   * registration that landed after its call stopped (the relayer refused the send and a later operation sent the kept
+   * spend, or the process stopped before agent.json was written) is found here and written to agent.json, so the agent
+   * is never registered twice. An identity someone else registered and sent to the creator vault (an ERC-721 transfer
+   * the vault accepts) is no registration of this agent: with no Registered event of the vault, this is null. A
+   * registration sent again just now is read from its receipt instead (#recordFromReceipt), not from logs that may lag.
+   */
+  async #recoverAgentRecord(): Promise<AgentRecord | null> {
+    const vault = getAddress(await this.#creator.vaultAddress());
+    const owned = (await this.#client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityRegistryAbi, functionName: "balanceOf", args: [vault] })) as bigint;
+    if (owned === 0n) return null;
+    const to = await this.#logsClient.getBlockNumber({ cacheTime: 0 });
+    const logs = await getLogsChunked(this.#logsClient, { address: ERC8004_IDENTITY_REGISTRY, event: agentRegisteredEvent, args: { owner: vault }, fromBlock: BigInt(this.#config.deployment.fromBlock), toBlock: to });
+    for (const log of logs) {
+      const { agentId, agentURI } = log.args as { agentId: bigint; agentURI: string };
+      const who = await readAgentIdentity(this.#client, agentId);
+      if (who === null || getAddress(who.owner) !== vault) continue;
+      const record: AgentRecord = { agentId: agentId.toString(), uri: agentURI, txHash: log.transactionHash as Hash, at: Math.floor(Date.now() / 1000) };
+      await this.#folder.write("agent.json", JSON.stringify(record, null, 2));
+      return record;
+    }
+    return null;
+  }
+
+  /**
+   * The registration transaction `txHash` of the creator vault, read from its receipt (the vault's AgentRegistered
+   * event) and written to agent.json; null when it registered nothing. `uri` is the file it registered with.
+   */
+  async #recordFromReceipt(txHash: Hash, uri: string): Promise<AgentRecord | null> {
+    const vault = getAddress(await this.#creator.vaultAddress());
+    const receipt = await this.#client.getTransactionReceipt({ hash: txHash });
+    let agentId: string | undefined;
+    for (const log of receipt.logs) {
+      if (getAddress(log.address) !== vault) continue;
+      try {
+        const e = decodeEventLog({ abi: ostraVaultAbi, data: log.data, topics: log.topics });
+        if (e.eventName === "AgentRegistered") agentId = (e.args as { agentId: bigint }).agentId.toString();
+      } catch {
+        // another event of the vault
+      }
+    }
+    if (agentId === undefined) return null;
+    const record: AgentRecord = { agentId, uri, txHash, at: Math.floor(Date.now() / 1000) };
+    await this.#folder.write("agent.json", JSON.stringify(record, null, 2));
+    return record;
+  }
+
   /** The agent's identity: its creator vault, the profile URI it set and its ERC-8004 agent id; or, given `account`, that account's profile URI. */
   async profile(accountText?: string): Promise<{ account: Address; profileUri: string | null; profile: unknown; agentId: string | null }> {
     const account = accountText === undefined ? await this.#creator.vaultAddress() : address(accountText, "account");
@@ -1199,26 +1257,14 @@ export class LaunchpadService {
   /** Registers the creator vault as an agent in the ERC-8004 Identity Registry, its registration file at `uri`; the vault owns the identity and is its agentWallet. */
   async registerAgent(uri: string): Promise<VaultOperationResult & { agentId?: string }> {
     checkUri(uri);
-    const vault = await this.#identityVault();
-    const existing = await this.#agentRecord();
-    if (existing !== null) throw new Error(`this agent is registered already as agent ${existing.agentId}: update it with set_agent_uri; nothing was signed`);
+    await this.#identityVault();
+    const existing = (await this.#agentRecord()) ?? (await this.#recoverAgentRecord());
+    if (existing !== null) throw new Error(`this agent is registered already as agent ${existing.agentId}: publish_profile publishes its profile again; nothing was signed`);
     const r = await this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.REGISTER_AGENT, registerAgentParams(uri), "agent registration");
     if (r.status !== "sent") return r;
-    const receipt = await this.#client.getTransactionReceipt({ hash: r.txHash });
-    let agentId: string | undefined;
-    for (const log of receipt.logs) {
-      if (getAddress(log.address) !== vault) continue;
-      try {
-        const e = decodeEventLog({ abi: ostraVaultAbi, data: log.data, topics: log.topics });
-        if (e.eventName === "AgentRegistered") agentId = (e.args as { agentId: bigint }).agentId.toString();
-      } catch {
-        // another event of the vault
-      }
-    }
-    if (agentId === undefined) throw new Error(`the registration ${r.txHash} landed without an AgentRegistered event`);
-    const record: AgentRecord = { agentId, uri, txHash: r.txHash, at: Math.floor(Date.now() / 1000) };
-    await this.#folder.write("agent.json", JSON.stringify(record, null, 2));
-    return { ...r, agentId };
+    const record = await this.#recordFromReceipt(r.txHash, uri);
+    if (record === null) throw new Error(`the registration ${r.txHash} landed without an AgentRegistered event`);
+    return { ...r, agentId: record.agentId };
   }
 
   /** Points the agent's ERC-8004 identity at a new registration file. */
@@ -1226,7 +1272,7 @@ export class LaunchpadService {
     checkUri(uri);
     await this.#identityVault();
     const record = await this.#agentRecord();
-    if (record === null) throw new Error("this agent has no ERC-8004 identity yet: register_agent first; nothing was signed");
+    if (record === null) throw new Error("this agent has no ERC-8004 identity yet: publish_profile registers it; nothing was signed");
     const r = await this.#simulatedSpend(this.#creator, this.#creatorSender, VAULT_ACTION.SET_AGENT_URI, setAgentUriParams({ agentId: BigInt(record.agentId), uri }), "agent registration file");
     if (r.status === "sent") await this.#folder.write("agent.json", JSON.stringify({ ...record, uri, at: Math.floor(Date.now() / 1000) }, null, 2));
     return r;
@@ -1255,22 +1301,58 @@ export class LaunchpadService {
   }
 
   /**
-   * Publishes the agent's profile: builds its ERC-8004 registration file (name, description, image, links, the
-   * creator vault as its agentWallet, its registration once it has one), pins it through the uploader, sets it in
-   * OstraRegistry, and points the ERC-8004 identity at it too when the agent is registered.
+   * Publishes the agent's Ostra profile, the same for every Ostra agent (profileFile: its name and number, Ostra's
+   * description, its Ostra card, its creator vault as agentWallet), and registers the agent in ERC-8004 when it is not
+   * registered yet: the profile without a number is published, the creator vault registers the agent with it, and the
+   * profile is published again with the agent's number and card, its ERC-8004 identity pointed at it. Called again, it
+   * carries on from where it stopped (what the chain and agent.json hold decides).
    */
-  async publishProfile(p: PublicFields & { name: string }): Promise<{
+  async publishProfile(): Promise<{
+    agentId: string | null;
+    uri: string;
+    profile: VaultOperationResult;
+    /** The registration of this call (null when the agent was registered before), and the profile it registered with. */
+    registration: (VaultOperationResult & { agentId?: string }) | null;
+    unnumbered: { uri: string; profile: VaultOperationResult } | null;
+    agentUri: VaultOperationResult | null;
+    pairCreators: { pair: string; vault: Address; result?: VaultOperationResult; error?: string }[];
+  }> {
+    const before = (await this.#agentRecord()) ?? (await this.#recoverAgentRecord());
+    if (before !== null) return { agentId: before.agentId, registration: null, unnumbered: null, ...(await this.#publishProfileFile(before)) };
+    const first = await this.#publishProfileFile(null);
+    const unnumbered = { uri: first.uri, profile: first.profile };
+    if (first.profile.status !== "sent") {
+      // The profile's spend sent one signed earlier instead (resent_pending): when that was the kept registration, the
+      // agent is registered now (read from that transaction's receipt), and its numbered profile is published at once.
+      const resent = first.profile.status === "resent_pending" ? first.profile.resent : null;
+      const landed =
+        resent !== null && resent.operation === "vault_spend" && resent.action === VAULT_ACTION.REGISTER_AGENT ? await this.#recordFromReceipt(resent.txHash, first.uri) : null;
+      if (landed === null) return { agentId: null, registration: null, unnumbered, ...first };
+      return { agentId: landed.agentId, registration: null, unnumbered, ...(await this.#publishProfileFile(landed)) };
+    }
+    const registration = await this.registerAgent(first.uri);
+    const record = await this.#agentRecord();
+    if (registration.status !== "sent" || record === null) return { agentId: null, registration, unnumbered, ...first };
+    return { agentId: record.agentId, registration, unnumbered, ...(await this.#publishProfileFile(record)) };
+  }
+
+  /**
+   * Builds the profile of the agent (`record`: its registration, or null before it has one), pins it through the
+   * uploader, sets it in OstraRegistry (for the creator vaults of the other pairs it launched from too), and points the
+   * ERC-8004 identity at it when the agent is registered.
+   */
+  async #publishProfileFile(record: AgentRecord | null): Promise<{
     uri: string;
     profile: VaultOperationResult;
     agentUri: VaultOperationResult | null;
     pairCreators: { pair: string; vault: Address; result?: VaultOperationResult; error?: string }[];
   }> {
     const vault = await this.#identityVault();
-    const record = await this.#agentRecord();
-    const file = profileFile({ ...p, vault, agentId: record?.agentId ?? null });
+    const agentId = record?.agentId ?? null;
+    uploaderUrl(this.#config.relayerUrl); // no uploader: refused here, before anything is read
+    const file = profileFile({ vault, agentId, image: await agentCardUri(this.#config.relayerUrl, agentId) });
     // An Ostrapad listing in the profile published before is kept: pad_publish is what changes it. A profile published
     // before that cannot be read now is not replaced (its listing would be dropped without a word).
-    uploaderUrl(this.#config.relayerUrl); // no uploader: refused here, before anything is read
     const beforeUri = await this.#profileUri(vault);
     const before = await readIpfsJson(beforeUri);
     if (beforeUri !== null && beforeUri.startsWith("ipfs://") && before === null) throw new Error(`the profile published before (${beforeUri}) cannot be read now, so its Ostrapad listing could not be kept: try again later; nothing was signed`);

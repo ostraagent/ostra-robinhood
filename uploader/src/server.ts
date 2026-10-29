@@ -6,6 +6,9 @@
 //                         MAX_IMAGE_BYTES), Content-Type the image's type
 //   POST /v1/ipfs/json    a JSON object of at most MAX_JSON_BYTES (a profile, an ERC-8004 registration file
 //                         or a token's metadata)
+//   POST /v1/ipfs/agent-card   {"agentId": "<decimal>" | null}: the Ostra agent card of that agent (sdk
+//                         agent-card.ts), built here, so only Ostra's card is ever pinned as SVG; a card pinned before is
+//                         answered again without pinning
 //   GET  /v1/ipfs/health  how much of today's budget is used
 //   GET  /v1/ipfs/<cid>   the bytes a raw CIDv1 (sha2-256, in its one canonical spelling) names, at most
 //                         MAX_READ_BYTES, from the files kept here. A file not kept is read from the public gateways
@@ -33,6 +36,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { applyCors } from "../../merchant/src/cors.ts";
+import { AGENT_CARD_TYPE, agentCardSvg } from "../../sdk/src/agent-card.ts";
 
 export const MAX_IMAGE_BYTES = 1_048_576;
 export const MAX_JSON_BYTES = 16_384;
@@ -106,6 +110,16 @@ export class UploadError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * Whether the bytes are an SVG document (the agent cards pinned here). A file served from here with this type also
+ * carries a policy that runs nothing in it (SVG_POLICY), whatever SVG it is.
+ */
+export function isSvg(b: Uint8Array): boolean {
+  return Buffer.from(b.subarray(0, 64)).toString("utf8").startsWith("<svg xmlns=\"http://www.w3.org/2000/svg\"");
+}
+/** The Content-Security-Policy an SVG is served with: no script, no fetch, no navigation; its own inline styles only. */
+export const SVG_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /** The image type the bytes start with, or null. */
 export function sniffImage(b: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | "image/gif" | null {
@@ -308,6 +322,32 @@ export class Uploader {
     return { cid, uri: `ipfs://${cid}` };
   }
 
+  /**
+   * The Ostra agent card of `agentId` (null: the card without a number), built here from the SDK: what is pinned is
+   * always Ostra's card, never an SVG a caller sent. A card kept here already (pinned before) is answered without
+   * pinning it again; `admit` counts only a new pin.
+   */
+  async agentCard(agentId: string | null, admit: (bytes: number) => void): Promise<{ cid: string; uri: string }> {
+    let svg: string;
+    try {
+      svg = agentCardSvg(agentId);
+    } catch (err) {
+      throw new UploadError(400, "bad_agent_id", (err as Error).message);
+    }
+    const bytes = new TextEncoder().encode(svg);
+    const expected = rawCidOf(bytes);
+    if (this.#kept(expected) !== null) return { cid: expected, uri: `ipfs://${expected}` };
+    admit(bytes.length);
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type: AGENT_CARD_TYPE }), "ostra-agent.svg");
+    form.append("pinataOptions", JSON.stringify({ cidVersion: 1 }));
+    form.append("pinataMetadata", JSON.stringify({ name: "ostra-agent-card" }));
+    const cid = await this.#pin("pinFileToIPFS", form);
+    if (cid !== expected) this.#o.log?.("card_cid_differs", { pinned: cid, expected });
+    if (!this.keep(cid, bytes)) this.#o.log?.("not_kept", { cid });
+    return { cid, uri: `ipfs://${cid}` };
+  }
+
   async json(value: unknown): Promise<{ cid: string; uri: string }> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) throw new UploadError(400, "not_an_object", "send a JSON object");
     const bytes = new TextEncoder().encode(JSON.stringify(value));
@@ -383,7 +423,14 @@ export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"]):
           if (rawCidDigest(cid) === null) throw new UploadError(404, "not_found", "only a raw CIDv1 (sha2-256, bafkrei...) is served here");
           const got = await u.file(cid, { upstream: onThisMachine(req) });
           if ("bytes" in got) {
-            res.writeHead(200, { "content-type": sniffImage(got.bytes) ?? "application/octet-stream", "content-length": String(got.bytes.length), "cache-control": "public, max-age=31536000, immutable" });
+            const svg = isSvg(got.bytes);
+            res.writeHead(200, {
+              "content-type": svg ? AGENT_CARD_TYPE : (sniffImage(got.bytes) ?? "application/octet-stream"),
+              "content-length": String(got.bytes.length),
+              "cache-control": "public, max-age=31536000, immutable",
+              "x-content-type-options": "nosniff",
+              ...(svg ? { "content-security-policy": SVG_POLICY } : {}),
+            });
             res.end(req.method === "HEAD" ? undefined : Buffer.from(got.bytes));
             return;
           }
@@ -393,8 +440,26 @@ export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"]):
           }
           throw new UploadError(404, "not_found", onThisMachine(req) ? "the file is not kept here and no public gateway has it" : "the file is not kept here (read it from a public IPFS gateway)");
         }
-        if (req.method !== "POST" || (path !== "/v1/ipfs/image" && path !== "/v1/ipfs/json")) throw new UploadError(404, "not_found", "POST /v1/ipfs/image or /v1/ipfs/json, GET /v1/ipfs/<cid>");
+        if (req.method !== "POST" || (path !== "/v1/ipfs/image" && path !== "/v1/ipfs/json" && path !== "/v1/ipfs/agent-card")) {
+          throw new UploadError(404, "not_found", "POST /v1/ipfs/image, /v1/ipfs/json or /v1/ipfs/agent-card, GET /v1/ipfs/<cid>");
+        }
         const type = String(req.headers["content-type"] ?? "");
+        if (path === "/v1/ipfs/agent-card") {
+          if (!type.toLowerCase().startsWith("application/json")) throw new UploadError(415, "unsupported_media_type", "send application/json");
+          let asked: unknown;
+          try {
+            asked = JSON.parse(Buffer.from(await readBody(req, 256)).toString("utf8"));
+          } catch (err) {
+            if (err instanceof UploadError) throw err;
+            throw new UploadError(400, "invalid_json", "the body is not valid JSON");
+          }
+          const id = typeof asked === "object" && asked !== null ? (asked as { agentId?: unknown }).agentId : undefined;
+          if (id !== null && typeof id !== "string") throw new UploadError(400, "bad_agent_id", 'send {"agentId": "<decimal>"} or {"agentId": null}');
+          const address = clientAddress(req);
+          const out = await u.agentCard(id, (bytes) => u.admit(address, bytes));
+          log?.("pinned", { kind: "agent_card", agentId: id, cid: out.cid });
+          return reply(res, 200, out);
+        }
         const image = path === "/v1/ipfs/image";
         const body = await readBody(req, image ? MAX_IMAGE_BYTES : MAX_JSON_BYTES);
         let value: unknown;

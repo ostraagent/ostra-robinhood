@@ -84,7 +84,7 @@ async function agent(name: string, seed: number) {
   await creator.open();
   const creatorVault = getAddress(await creator.vaultAddress());
   let agentId: bigint | null = null;
-  let file: Record<string, unknown> | null = profileFile({ name, description: `${name} does reports`, vault: creatorVault });
+  let file: Record<string, unknown> | null = { ...profileFile({ vault: creatorVault }), name, description: `${name} does reports` };
   const pad = new PadService({
     client,
     config,

@@ -84,6 +84,9 @@ export const SPLIT_SLACK_SECONDS = 900;
 const POOL_INDEX = "pool-index.json";
 const ORDER_PREFIX = "order-";
 const SPLIT_PREFIX = "split-";
+const DONE_PREFIX = "done-";
+/** Finished orders kept (ostra_swap_orders): beyond this many, the oldest are dropped. */
+export const DONE_ORDERS_KEPT = 100;
 
 /** A split swap, kept from before its first part (and never dropped: the trading capital's books read it). Amounts in base units. */
 type SplitRecord = {
@@ -150,6 +153,47 @@ type OrderRecord = {
   deadline: string;
   /** OstraRouter.executeEscrow calldata along the order's route. */
   execute: Hex;
+  at: number;
+  /** From 0.1.12: a block before the order, where its events are searched from; the output token, the vaults and decimals. */
+  fromBlock?: string;
+  tokenOut?: Address;
+  from?: Address;
+  to?: Address;
+  inDecimals?: number;
+  outDecimals?: number;
+};
+
+/** A finished order, kept for ostra_swap_orders (the newest DONE_ORDERS_KEPT). Amounts in the tokens' units. */
+export type DoneOrder = {
+  version: 1;
+  order: Hex;
+  txHash: Hash;
+  swapped: boolean;
+  tokenIn: Address;
+  tokenOut: Address | null;
+  amountIn: string;
+  amountOut: string;
+  /** The least it could pay (null when it was finished by the sweep, which does not know it). */
+  minOut: string | null;
+  from: Address | null;
+  to: Address | null;
+  refusal?: string;
+  /** Unix ms: when it finished here. */
+  at: number;
+};
+
+/** An order kept here and not finished: signed or about to be (its Transfer may still land), or landed and being finished. */
+export type OpenOrder = {
+  order: Hex;
+  tokenIn: Address;
+  tokenOut: Address | null;
+  amountIn: string;
+  escrow: Address;
+  /** "landed": its escrow swapped (what it spent and paid below) and the sweep finishes its record; "open": not finished yet. */
+  state: "open" | "landed";
+  spent?: string;
+  received?: string;
+  /** Unix ms: when its record was kept. */
   at: number;
 };
 
@@ -446,7 +490,23 @@ export class SwapService {
         const escrow = escrowAddress(this.#p.swap.router, order);
         const execute = executeEscrowData(order, p.route);
         await p.from.checkSpend(VAULT_ACTION.TRANSFER, transferParams({ to: escrow, amount: p.amountIn }), "the swap's transfer to its escrow", this.#p.sender);
-        await this.#keep({ version: 1, hash: orderHash(order), escrow, tokenIn: p.tokenIn, amountIn: p.amountIn.toString(), vaultNonce: v.nonce.toString(), deadline: order.deadline.toString(), execute, at: Date.now() });
+        await this.#keep({
+          version: 1,
+          hash: orderHash(order),
+          escrow,
+          tokenIn: p.tokenIn,
+          amountIn: p.amountIn.toString(),
+          vaultNonce: v.nonce.toString(),
+          deadline: order.deadline.toString(),
+          execute,
+          at: Date.now(),
+          fromBlock: fromBlock.toString(),
+          tokenOut: p.tokenOut,
+          from: vault,
+          to: p.to,
+          inDecimals: p.inDecimals,
+          outDecimals: p.outDecimals,
+        });
         await o.onOrder?.(orderHash(order), fromBlock, escrow);
         const signed = await signVaultTransfer(keychain, v, { chainId, to: escrow, amount: p.amountIn });
         const calls: RelayCall[] = [spendCall(vault, signed), { to: this.#p.swap.router, data: execute }];
@@ -476,6 +536,21 @@ export class SwapService {
         note: `the swap landed in ${result.txHash}; what it paid could not be read now (${(e as Error).message.split("\n")[0]}): do not send it again, its order ${orderHash(placed)} is read again later`,
       };
     }
+    await this.#keepDone({
+      version: 1,
+      order: orderHash(placed),
+      txHash: result.txHash,
+      swapped: outcome.swapped,
+      tokenIn: p.tokenIn,
+      tokenOut: p.tokenOut,
+      amountIn: formatUnitsAmount(p.amountIn, p.inDecimals),
+      amountOut: formatUnitsAmount(outcome.amountOut, p.outDecimals),
+      minOut: formatUnitsAmount(p.route.minOut, p.outDecimals),
+      from: p.fromVault,
+      to: p.to,
+      ...(outcome.swapped ? {} : { refusal: outcome.why ?? "OstraRouter gave no reason" }),
+      at: Date.now(),
+    });
     await this.#p.folder.remove(`${ORDER_PREFIX}${orderHash(placed)}.json`);
     return {
       status: "sent",
@@ -842,6 +917,95 @@ export class SwapService {
     return { swapped, amountOut: 0n, ...(reason === null ? {} : { why: refusalOf(reason, outDecimals) }) };
   }
 
+  /** Keeps a finished order for ostra_swap_orders, and drops the oldest beyond DONE_ORDERS_KEPT. */
+  async #keepDone(d: DoneOrder): Promise<void> {
+    await this.#p.folder.ensure();
+    await this.#p.folder.write(`${DONE_PREFIX}${d.order.toLowerCase()}.json`, `${JSON.stringify(d)}\n`);
+    const names = (await this.#p.folder.list()).filter((n) => n.startsWith(DONE_PREFIX) && n.endsWith(".json"));
+    if (names.length <= DONE_ORDERS_KEPT) return;
+    const dated: { name: string; at: number }[] = [];
+    for (const n of names) {
+      const text = await this.#p.folder.read(n);
+      dated.push({ name: n, at: text === undefined ? 0 : Number((JSON.parse(text) as DoneOrder).at) });
+    }
+    dated.sort((a, b) => a.at - b.at);
+    for (const x of dated.slice(0, dated.length - DONE_ORDERS_KEPT)) await this.#p.folder.remove(x.name);
+  }
+
+  /**
+   * Keeps what a kept order did once the sweep finishes it: from the transaction that executed it (`tx`), else from
+   * OstraRouter's events from the record's block. Best effort: an order whose events cannot be read now is not kept
+   * (a record from before 0.1.12 has no block to search from).
+   */
+  async #doneFrom(r: OrderRecord, tx: Hash | null): Promise<void> {
+    try {
+      let hash: Hash | null = tx;
+      if (hash === null && r.fromBlock !== undefined) {
+        const toBlock = await this.#p.logsClient.getBlockNumber({ cacheTime: 0 });
+        const logs = await getLogsChunked(this.#p.logsClient, { address: this.#p.swap.router, event: getAbiItem({ abi: ostraRouterAbi, name: "EscrowExecuted" }) as AbiEvent, args: { orderHash: r.hash }, fromBlock: BigInt(r.fromBlock), toBlock });
+        const moved = logs.find((l) => (l.args as { received: bigint }).received !== 0n);
+        hash = moved === undefined ? null : (moved.transactionHash as Hash);
+      }
+      if (hash === null) return;
+      const inDecimals = r.inDecimals ?? (await tokenDecimals(this.#p.client, r.tokenIn));
+      const outDecimals = r.outDecimals ?? (r.tokenOut === undefined ? 18 : await tokenDecimals(this.#p.client, r.tokenOut));
+      const o = await this.#outcome(hash, r.hash, outDecimals);
+      await this.#keepDone({
+        version: 1,
+        order: r.hash,
+        txHash: hash,
+        swapped: o.swapped,
+        tokenIn: r.tokenIn,
+        tokenOut: r.tokenOut ?? null,
+        amountIn: formatUnitsAmount(BigInt(r.amountIn), inDecimals),
+        amountOut: formatUnitsAmount(o.amountOut, outDecimals),
+        minOut: null,
+        from: r.from ?? null,
+        to: r.to ?? null,
+        ...(o.swapped ? {} : { refusal: o.why ?? "OstraRouter gave no reason" }),
+        at: Date.now(),
+      });
+    } catch {
+      // Its events could not be read now: the order is finished all the same.
+    }
+  }
+
+  /**
+   * The agent's orders kept here: those not finished (signed or about to be, or landed and being finished; oldest
+   * first) and the finished ones (newest first, at most `limit`). With `order`, that order alone in either list.
+   */
+  async orders(o: { order?: Hex; limit?: number } = {}): Promise<{ open: OpenOrder[]; finished: DoneOrder[] }> {
+    const want = o.order?.toLowerCase();
+    const open: OpenOrder[] = [];
+    const finished: DoneOrder[] = [];
+    for (const name of await this.#p.folder.list()) {
+      const isOrder = name.startsWith(ORDER_PREFIX);
+      if ((!isOrder && !name.startsWith(DONE_PREFIX)) || !name.endsWith(".json")) continue;
+      if (want !== undefined && name.slice((isOrder ? ORDER_PREFIX : DONE_PREFIX).length, -".json".length).toLowerCase() !== want) continue;
+      const text = await this.#p.folder.read(name);
+      if (text === undefined) continue;
+      if (!isOrder) {
+        finished.push(JSON.parse(text) as DoneOrder);
+        continue;
+      }
+      const r = JSON.parse(text) as OrderRecord;
+      const inDecimals = r.inDecimals ?? (await tokenDecimals(this.#p.client, r.tokenIn));
+      const x: OpenOrder = { order: r.hash, tokenIn: r.tokenIn, tokenOut: r.tokenOut ?? null, amountIn: formatUnitsAmount(BigInt(r.amountIn), inDecimals), escrow: r.escrow, state: "open", at: r.at };
+      if (r.fromBlock !== undefined) {
+        const res = await this.orderResult(r.hash, BigInt(r.fromBlock), r.escrow);
+        if (res.spent > 0n || res.received > 0n) {
+          x.state = "landed";
+          x.spent = formatUnitsAmount(res.spent, inDecimals);
+          x.received = formatUnitsAmount(res.received, r.outDecimals ?? 18);
+        }
+      }
+      open.push(x);
+    }
+    open.sort((a, b) => a.at - b.at);
+    finished.sort((a, b) => b.at - a.at);
+    return { open, finished: finished.slice(0, o.limit ?? 20) };
+  }
+
   /**
    * Finishes the orders whose escrow was paid without being executed (a signed spend sent again on its own):
    * executeEscrow sends the input along the order's route, or back to its vault past the deadline. Records of orders
@@ -859,12 +1023,16 @@ export class SwapService {
         const nonce = (await this.#p.vaultFor(r.tokenIn).state()).nonce;
         const held = await tokenBalance(this.#p.client, r.tokenIn, r.escrow);
         if (held >= BigInt(r.amountIn)) {
-          await this.#p.sender.send([{ to: this.#p.swap.router, data: r.execute }]);
+          const tx = await this.#p.sender.send([{ to: this.#p.swap.router, data: r.execute }]);
+          await this.#doneFrom(r, tx);
           await this.#p.folder.remove(name);
           continue;
         }
         // Landed and holding less than the order: executed (what is left was sent there by someone else).
-        if (nonce !== null && nonce > BigInt(r.vaultNonce)) await this.#p.folder.remove(name);
+        if (nonce !== null && nonce > BigInt(r.vaultNonce)) {
+          await this.#doneFrom(r, null);
+          await this.#p.folder.remove(name);
+        }
       } catch (err) {
         failures.push({ order: r.hash, error: err instanceof Error ? err.message : String(err) });
       }

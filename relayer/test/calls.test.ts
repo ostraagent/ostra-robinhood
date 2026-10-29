@@ -231,3 +231,18 @@ test("the SDK's executeEscrow selector and EscrowExecuted topic are OstraRouter'
   assert.ok(event);
   assert.equal(toEventSelector(event as AbiEvent), ESCROW_EXECUTED_TOPIC);
 });
+
+test("onCredit: one vault spend alone is a spend on credit of its vault; an open to the relayer stays an open; anything else is refused", () => {
+  const kind = (calls: { to: Address; data: Hex }[], prepay = false) => classify(decodeRelayRequest({ calls }), d, relayerVault, prepay, true);
+  const transfer = spend(vault, VAULT_ACTION.TRANSFER, transferParams({ to: at(0xcc), amount: 5n }));
+  assert.deepEqual(kind([transfer]), { kind: "spend_on_credit", ix: { vault } });
+  // An open to anyone else is a spend like any other; an open to the relayer is relayed before payment as it is.
+  assert.deepEqual(kind([openTo(at(0xee02))]), { kind: "spend_on_credit", ix: { vault } });
+  assert.equal(kind([openTo(relayerVault)]).kind, "open_relayer_channel");
+  assert.throws(() => kind([transfer, transfer]), /one vault spend alone/);
+  assert.throws(() => kind([createVault()]), /one vault spend alone/);
+  assert.throws(() => kind([spendLeaf(vault)]), /one vault spend alone/);
+  assert.throws(() => kind([transfer], true), /onCredit and prepay/);
+  // Without onCredit the same spend is an ordinary request.
+  assert.deepEqual(classify(decodeRelayRequest({ calls: [transfer] }), d, relayerVault), { kind: "other", vaults: [vault] });
+});

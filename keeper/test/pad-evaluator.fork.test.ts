@@ -13,7 +13,9 @@
 //     its CID with its bytes checked; on the panel, the decision and its reason too;
 //   * an order file that cannot be read: the bot waits (it does not reject the provider over it), and at the late
 //     point of its window decides with what it has instead of staying silent (which would get it slashed);
-//   * finished jobs are dropped from the passes; a bot started again on the same data sends nothing twice.
+//   * finished jobs are dropped from the passes; a bot started again on the same data sends nothing twice;
+//   * the jobs mainnet held already at the fork (real agents' jobs since 28 Oct 2026, judged by their clients) are
+//     seen too, as on mainnet, and the bot sends nothing for those already finished then.
 // Two things are not reached here: IPFS (files are kept in memory under the CID the uploader gives them, CIDv1 raw
 // sha2-256 of the bytes, as core's pad.fork.test.ts does) and the judge's model (a rule stands in for it: approve a
 // delivery unless its output says REFUSED; openAiJudge is checked against the real API by scripts/pad-judge-check.ts).
@@ -28,9 +30,12 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   FileWotsStore,
   OSTRAPAD,
+  OSTRAPAD_FROM_BLOCK,
   PAD,
+  PAD_EVENTS,
   USDG,
   VAULT_ACTION,
+  getLogsChunked,
   ostraPadAbi,
   ostraVaultAbi,
   padCidFromDigest,
@@ -103,7 +108,7 @@ async function agent(name: string, seed: number) {
   await creator.open();
   const creatorVault = getAddress(await creator.vaultAddress());
   let agentId: bigint | null = null;
-  let file: Record<string, unknown> | null = profileFile({ name, description: `${name}, a test agent`, vault: creatorVault });
+  let file: Record<string, unknown> | null = { ...profileFile({ vault: creatorVault }), name, description: `${name}, a test agent` };
   const pad = new PadService({
     client,
     config,
@@ -140,6 +145,16 @@ async function agent(name: string, seed: number) {
 
 test("the bot draws, judges, decides with a pinned reason, settles, and sits on the appeal panel", { timeout: 2_400_000 }, async () => {
   const c = fork.client as PublicClient;
+  // The jobs on mainnet before this test's: the bot reads every job since OstraPad's deployment, as it does on mainnet.
+  const forked = await c.getBlockNumber();
+  const onChain = (await getLogsChunked(c, { address: OSTRAPAD, event: PAD_EVENTS.JobCreated, fromBlock: OSTRAPAD_FROM_BLOCK, toBlock: forked })).map((l) => (l.args as { jobId: Hex }).jobId);
+  // Those finished at the fork: nothing is ever sent for them. (One still open is the bot's to settle once the test's
+  // warps pass its expiry, as on mainnet.)
+  const finishedThen = new Set<string>();
+  for (const id of onChain) {
+    const s = (await readPadJob(c, id))?.status;
+    if (s === "Completed" || s === "Rejected" || s === "Expired" || s === "Cancelled") finishedThen.add(id);
+  }
   const provider = await agent("provider", 61);
   const client = await agent("client", 62);
   await fork.dealUsdg(provider.vault, 20_000_000n);
@@ -192,7 +207,8 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
     nowMs: () => clock,
   };
   const bot = await PadEvaluator.open(parts);
-  const sent = (what: string) => logs.filter((l) => l.event === "pad_sent" && l.fields.what === what).length;
+  // What the bot sent for this test's jobs (one mainnet held still open would add its own).
+  const sent = (what: string) => logs.filter((l) => l.event === "pad_sent" && l.fields.what === what && !onChain.includes(l.fields.jobId as Hex)).length;
 
   // Job A: approved, reason pinned, settled.
   const p0 = await usdg(provider.vault);
@@ -301,9 +317,10 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
 
   // Finished jobs are dropped from the passes. A bot started again on the same data: nothing sent twice.
   assert.ok(!bot.jobs.includes(a) && !bot.jobs.includes(b), "finished jobs dropped");
-  assert.deepEqual([...bot.seen].sort(), [a, b, cid].sort());
+  assert.deepEqual([...bot.seen].sort(), [...onChain, a, b, cid].sort());
+  assert.equal(logs.filter((l) => l.event === "pad_sent" && finishedThen.has(l.fields.jobId as string)).length, 0, "nothing sent for the jobs mainnet had finished already");
   const again = await PadEvaluator.open(parts);
-  assert.deepEqual([...again.seen].sort(), [a, b, cid].sort());
+  assert.deepEqual([...again.seen].sort(), [...onChain, a, b, cid].sort());
   const before = logs.length;
   await again.tick();
   assert.equal(logs.slice(before).filter((l) => l.event === "pad_sent").length, 0);

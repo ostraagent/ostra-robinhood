@@ -38,6 +38,10 @@
 //                         the packaged mainnet deployment, the web app's host
 //                         https://app.ostraagent.xyz; "off": pad_search
 //                         refuses, an agent's listing is still read by its id)
+//   OSTRA_SWAP_ANSWER_MS  how long ostra_swap and trading buy and sell wait
+//                         for their swap before answering "pending" while it
+//                         goes on (milliseconds, 1 to 600000; default 40000,
+//                         within the 60 s many MCP clients wait for a call)
 //   OSTRA_PROVER          the private notes' prover: unset, the WebAssembly
 //                         build of ostra-prove (the npm package carries it in
 //                         dist/prover and checks the SHA-256 of its files;
@@ -115,7 +119,19 @@ export type McpConfig = Config & {
   privateLocalSpends: boolean;
   /** The private notes' prover, or null (the private tools then refuse to spend). */
   prover: ProverConfig | null;
+  /** How long a swap is waited for before its call answers "pending" (OSTRA_SWAP_ANSWER_MS), in ms. */
+  swapAnswerMs: number;
 };
+
+/** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
+export const DEFAULT_SWAP_ANSWER_MS = 40_000;
+
+function swapAnswerMs(env: NodeJS.ProcessEnv): number {
+  const v = env.OSTRA_SWAP_ANSWER_MS;
+  if (v === undefined || v === "") return DEFAULT_SWAP_ANSWER_MS;
+  if (!/^[1-9][0-9]{0,5}$/.test(v) || Number(v) > 600_000) throw new Error("OSTRA_SWAP_ANSWER_MS is a whole number of milliseconds from 1 to 600000");
+  return Number(v);
+}
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
   const value = env[name];
@@ -168,6 +184,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     swap,
     logsRpcUrl,
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",
+    swapAnswerMs: swapAnswerMs(env),
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,

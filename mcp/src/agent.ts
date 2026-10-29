@@ -170,7 +170,7 @@ export class Agent {
     this.creatorRelayer?.attachBuyerVault(this.creator);
     this.creatorChannels = new ChannelService(client, config, p.creatorKeys, this.creator, creatorSender);
     this.launchpad =
-      config.deployment.launchpad === undefined ? null : new LaunchpadService({ client, transport, config, keys, buyer: this.buyer, buyerSender: this.sender, creator: this.creator, creatorSender });
+      config.deployment.launchpad === undefined ? null : new LaunchpadService({ client, transport, config, keys, buyer: this.buyer, buyerSender: this.sender, creator: this.creator, creatorSender, logsClient: createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient });
     this.shield = new ShieldService(client, config, keys, this.buyer, this.sender);
     this.creatorShield = new ShieldService(client, config, keys, this.creator, creatorSender);
     this.unshield = new UnshieldService(client, config, keys, this.shield, (index) => this.privateVault(index));
@@ -231,7 +231,7 @@ export class Agent {
       trading: this.trading,
     });
     // Ostrapad: the agent's identity (creator vault, ERC-8004 id and registration file) comes from the launchpad service's
-    // identity tools (publish_profile, register_agent), which stay when launches are closed.
+    // identity tool (publish_profile), which stays when launches are closed.
     const lp = this.launchpad;
     this.pad =
       lp === null

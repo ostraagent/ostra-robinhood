@@ -10,7 +10,8 @@
 //      the relayer's fees, the gas price and that quote (amounts()); the script prints
 //      `FUND <vault> <base units> <USDG>` and waits until the vault holds that much USDG, sent by whoever funds the run;
 //      once funded the amounts are worked out again at the prices then (a second FUND line if they need more).
-//   3. ostra_swap 1 USDG to WETH (an escrow order paying the agent's WETH vault's address), then all of that WETH
+//   3. ostra_swap 1 USDG to WETH (an escrow order paying the agent's WETH vault's address; a swap that answers pending
+//      is followed through ostra_swap_orders, as an agent follows it), then all of that WETH
 //      back to USDG (the WETH vault is created first, paid by the vault's relayer channel).
 //   4. private_shield: the pool holds that much more USDG.
 //   5. private_swap of USDG into a WETH note: the relayer's fee comes out of the note and the change stays a note; the
@@ -119,6 +120,27 @@ async function call(client: Client, name: string, args: Record<string, unknown> 
     json = {};
   }
   return { ok: r.isError !== true, text, json };
+}
+
+/**
+ * ostra_swap as an agent runs it from 0.1.12: a swap not done within OSTRA_SWAP_ANSWER_MS answers "pending" and goes
+ * on in the server; ostra_swap_orders then tells how it ended (every 2 s here, for up to TOOL_TIMEOUT_MS). Answers
+ * with the swap's own result either way.
+ */
+async function swap(client: Client, args: Record<string, unknown>): Promise<Answer> {
+  const first = await call(client, "ostra_swap", args);
+  if (!first.ok || first.json.status !== "pending") return first;
+  const id = first.json.swap as string;
+  for (const until = Date.now() + TOOL_TIMEOUT_MS; Date.now() < until; ) {
+    await new Promise((r) => setTimeout(r, 2_000));
+    const now = await call(client, "ostra_swap_orders");
+    if (!now.ok) return now;
+    const mine = (now.json.pending as { swap: string; state: string; result?: Record<string, unknown>; error?: string }[] | undefined)?.find((x) => x.swap === id);
+    if (mine === undefined) return { ok: false, text: `ostra_swap_orders does not list swap ${id}: ${now.text}`, json: {} };
+    if (mine.state === "ended") return { ok: true, text: JSON.stringify(mine.result), json: mine.result ?? {} };
+    if (mine.state === "failed") return { ok: false, text: `swap ${id} failed after answering pending: ${mine.error ?? ""}`, json: {} };
+  }
+  return { ok: false, text: `swap ${id} still running after ${TOOL_TIMEOUT_MS / 1_000} s`, json: {} };
 }
 
 type Price = { fee: bigint; pool: Address; gasPrice: bigint };
@@ -235,13 +257,13 @@ async function main(): Promise<void> {
     check(held >= plan.fund, "the vault holds the run's USDG at the prices now", { vault, holds: usdg(held), needs: usdg(plan.fund) });
 
     // 3. Vault to vault: 1 USDG to WETH and all of it back. Amounts are checked by the Transfer logs of each transaction.
-    const toWeth = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
+    const toWeth = await swap(client, { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
     check(toWeth.ok && toWeth.json.status === "sent" && toWeth.json.swapped === true && getAddress(toWeth.json.to as string) === wethVault, "ostra_swap 1 USDG to the WETH vault (escrow order, relayed)", toWeth.ok ? { amountOut: toWeth.json.amountOut, minOut: toWeth.json.minOut, txHash: toWeth.json.txHash } : toWeth.text);
     sent.push({ what: "escrow swap USDG to WETH", hash: toWeth.json.txHash as Hash });
     const r1 = await landed(toWeth.json.txHash);
     check(moved(r1, USDG, vault) === -USDG_UNIT && moved(r1, WETH, wethVault) === parseUnits(toWeth.json.amountOut as string, 18), "the vault paid 1 USDG and the WETH vault got the output", { weth: toWeth.json.amountOut });
     const wethHeld = await balanceAt(WETH, wethVault, r1.blockNumber);
-    const back = await call(client, "ostra_swap", { tokenIn: "WETH", tokenOut: "USDG", amount: weth(wethHeld) });
+    const back = await swap(client, { tokenIn: "WETH", tokenOut: "USDG", amount: weth(wethHeld) });
     check(back.ok && back.json.status === "sent" && back.json.swapped === true, "ostra_swap all of the WETH vault back to USDG (its spend paid by the vault's channel)", back.ok ? { amountIn: back.json.amountIn, amountOut: back.json.amountOut, txHash: back.json.txHash } : back.text);
     sent.push({ what: "escrow swap WETH to USDG", hash: back.json.txHash as Hash });
     const r2 = await landed(back.json.txHash);
@@ -283,8 +305,8 @@ async function main(): Promise<void> {
     check(parseUnits(outUsdg.json.change as string, 6) >= KEEP_USDG, "the USDG note keeps its change", { change: outUsdg.json.change });
     check(moved(r6, USDG, vault) === UNSHIELD_USDG && moved(r6, USDG, pool) === -(UNSHIELD_USDG + parseUnits(outUsdg.json.fee as string, 6)), "the vault got it and the pool paid it and the fee");
     const wethLeft = await balanceAt(WETH, wethVault, r6.blockNumber);
-    const sweep = await call(client, "ostra_swap", { tokenIn: "WETH", tokenOut: "USDG", amount: weth(wethLeft) });
-    check(sweep.ok && sweep.json.status === "sent" && sweep.json.swapped === true, "ostra_swap the unshielded WETH back to USDG", sweep.ok ? { amountIn: sweep.json.amountIn, amountOut: sweep.json.amountOut, txHash: sweep.json.txHash } : sweep.text);
+    const sweep = await swap(client, { tokenIn: "WETH", tokenOut: "USDG", amount: weth(wethLeft) });
+    check(sweep.ok && sweep.json.status === "sent" && sweep.json.swapped === true, "ostra_swap the unshielded WETH back to USDG", sweep.ok && sweep.json.status === "sent" ? { amountIn: sweep.json.amountIn, amountOut: sweep.json.amountOut, txHash: sweep.json.txHash } : sweep.text);
     sent.push({ what: "escrow swap WETH to USDG", hash: sweep.json.txHash as Hash });
     const r7 = await landed(sweep.json.txHash);
     check(moved(r7, WETH, wethVault) === -wethLeft && moved(r7, USDG, vault) === parseUnits(sweep.json.amountOut as string, 6), "the WETH vault paid all of it and the vault got the USDG");

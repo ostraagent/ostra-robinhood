@@ -140,11 +140,12 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "set_profile", "register_agent", "set_agent_uri", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
-    // The launchpad is closed (decided 26 Oct 2026): no launching, buying or promoting a launch.
-    for (const name of ["shield", "unshield", "shield_status", "launch", "buy", "quote_swap", "pool_info", "pairs", "tokens", "token_info", "launches", "airdrop_start", "airdrop_fund", "claim_referral", "set_pool_setting", "set_creator_share", "set_token_metadata", "publish_token_metadata"]) {
+    // The launchpad is closed (decided 26 Oct 2026): no launching, buying or promoting a launch. Every Ostra agent's
+    // profile is Ostra's own (29 Oct 2026): publish_profile is the one identity tool.
+    for (const name of ["shield", "unshield", "shield_status", "launch", "buy", "quote_swap", "pool_info", "pairs", "tokens", "token_info", "launches", "airdrop_start", "airdrop_fund", "claim_referral", "set_pool_setting", "set_creator_share", "set_token_metadata", "publish_token_metadata", "set_profile", "register_agent", "set_agent_uri"]) {
       assert.ok(!tools.includes(name), `no tool ${name}`);
     }
     assert.equal(((await stat(home)).mode & 0o777).toString(8), "700");
@@ -169,37 +170,28 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
 
     // Ostrapad before the agent has an identity: listing refused, nothing signed.
     const early = await call(client, "pad_publish", { action: "publish", offers: [{ id: "report", title: "Report", description: "A report.", input: "A topic.", price: "1", hours: 24, evaluator: "pool" }] });
-    assert.ok(!early.ok && /register_agent|creator vault/.test(early.text), early.text);
+    assert.ok(!early.ok && /publish_profile|creator vault/.test(early.text), early.text);
 
     const funded = await call(client, "fund_creator_vault", { amount: "20" });
     assert.ok(funded.ok, funded.text);
-    // The creator vault's identity: profile and ERC-8004 registration (against the live Identity Registry).
-    const badUri = await call(client, "set_profile", { uri: "not a uri" });
-    assert.equal(badUri.ok, false);
-    const profiled = await call(client, "set_profile", { uri: "ipfs://bafkreiprofileone" });
-    assert.ok(profiled.ok && profiled.json.status === "sent", profiled.text);
-    const registered = await call(client, "register_agent", { uri: "ipfs://bafkreiagentone" });
-    assert.ok(registered.ok && registered.json.status === "sent" && typeof registered.json.agentId === "string", registered.text);
-    const twice = await call(client, "register_agent", { uri: "ipfs://bafkreiagenttwo" });
-    assert.ok(!twice.ok && /registered already/.test(twice.text), twice.text);
-    const moved = await call(client, "set_agent_uri", { uri: "ipfs://bafkreiagenttwo" });
-    assert.ok(moved.ok && moved.json.status === "sent", moved.text);
-    const me = await call(client, "profile");
-    assert.ok(me.ok && me.json.profileUri === "ipfs://bafkreiprofileone" && me.json.agentId === registered.json.agentId, me.text);
-    // Publishing goes through the relayer's uploader: without a relayer it is refused before anything is signed.
-    const unpublished = await call(client, "publish_profile", { name: "Ostra MCP Agent" });
+    // The creator vault's identity: publish_profile pins Ostra's profile and card through the relayer's uploader, so
+    // without a relayer it is refused before anything is signed (the pad check runs it on mainnet, uploader included).
+    const unpublished = await call(client, "publish_profile");
     assert.ok(!unpublished.ok && /OSTRA_RELAYER_URL/.test(unpublished.text), unpublished.text);
+    const me = await call(client, "profile");
+    assert.ok(me.ok && me.json.profileUri === null && me.json.agentId === null, me.text);
 
-    // Ostrapad's tools: a listing needs a profile that can be read (these URIs name no file); reads and refusals.
+    // Ostrapad's tools: a listing needs the agent registered (publish_profile); reads and refusals, against agent 20025
+    // (Ostra's first Ostrapad check agent, unlisted since 28 Oct 2026).
     const noProfile = await call(client, "pad_publish", { action: "publish", offers: [{ id: "report", title: "Report", description: "A report.", input: "A topic.", price: "1", hours: 24, evaluator: "pool" }] });
-    assert.ok(!noProfile.ok && /no published profile/.test(noProfile.text), noProfile.text);
+    assert.ok(!noProfile.ok && /publish_profile registers it/.test(noProfile.text), noProfile.text);
     const badOffer = await call(client, "pad_publish", { action: "publish", offers: [{ id: "Bad Id", title: "x", description: "x", input: "x", price: "1", hours: 24, evaluator: "pool" }] });
     assert.equal(badOffer.ok, false);
-    const noListing = await call(client, "pad_search", { agentId: registered.json.agentId as string });
+    const noListing = await call(client, "pad_search", { agentId: "20025" });
     assert.ok(noListing.ok && noListing.text === "null", noListing.text);
     const noIndex = await call(client, "pad_search", { q: "report" });
     assert.ok(!noIndex.ok && /OSTRA_PAD_INDEXER_URL/.test(noIndex.text), noIndex.text);
-    const noOrder = await call(client, "pad_order", { action: "order", agentId: registered.json.agentId as string, offer: "report", input: "x" });
+    const noOrder = await call(client, "pad_order", { action: "order", agentId: "20025", offer: "report", input: "x" });
     assert.ok(!noOrder.ok && /no Ostrapad listing/.test(noOrder.text), noOrder.text);
     const jobs = await call(client, "pad_jobs");
     assert.ok(jobs.ok && Array.isArray(jobs.json.jobs) && (jobs.json.jobs as unknown[]).length === 0, jobs.text);
@@ -258,10 +250,10 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
     const checked = await call(client, "strategy_check", { execute: true }, 600_000);
     assert.ok(checked.ok && Array.isArray(checked.json.findings), checked.text);
     const refused = await call(client, "strategy_plan", {}, 600_000);
-    assert.ok(!refused.ok && /register_agent/.test(refused.text), refused.text);
+    assert.ok(!refused.ok && /publish_profile/.test(refused.text), refused.text);
     // The trading capital: set only for a registered agent; none set yet.
     const noCapital = await call(client, "trading", { action: "set", capital: "10" }, 600_000);
-    assert.ok(!noCapital.ok && /register_agent/.test(noCapital.text), noCapital.text);
+    assert.ok(!noCapital.ok && /publish_profile/.test(noCapital.text), noCapital.text);
     const noStatus = await call(client, "trading", { action: "status" });
     assert.ok(!noStatus.ok && /no trading capital is set/.test(noStatus.text), noStatus.text);
     const raeto = await call(client, "raeto", { action: "models" });

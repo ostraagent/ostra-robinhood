@@ -296,7 +296,7 @@ test("the trading capital: its position limit, a buy, a stop for the day's loss,
   const usdgVault = (await a.buyer.open()).vault;
   await fork.dealUsdg(usdgVault, 1_500_000_000n);
   // Not registered: refused.
-  await assert.rejects(a.trading.set({ capital: "1000" }), /register_agent/);
+  await assert.rejects(a.trading.set({ capital: "1000" }), /publish_profile/);
   await a.lp.fundCreatorVault("5");
   assert.equal((await a.lp.registerAgent("ipfs://bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")).status, "sent");
   await assert.rejects(a.trading.set({ capital: "2000" }), /holds .* less than 2000/);

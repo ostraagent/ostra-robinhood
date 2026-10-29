@@ -144,3 +144,61 @@ test("sendGasCap: the margin on the priced gas, or on the limit a refund needs w
   assert.equal(sendGasCap(q(100_000, 500_000), false), relayGasCap(130_000n));
   assert.equal(sendGasCap(q(100_000, 120_000), true), relayGasCap(100_000n));
 });
+
+test("tokenFlow: what ERC-20 Transfer logs of the token move into an account less what they move out of it", async () => {
+  const { encodeAbiParameters, pad } = await import("viem");
+  const { tokenFlow } = await import("../src/gate.ts");
+  const token = getAddress("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");
+  const other = getAddress("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73");
+  const topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+  const t = (address: string, from: string, to: string, value: bigint) => ({ address, topics: [topic, pad(from as `0x${string}`), pad(to as `0x${string}`)], data: encodeAbiParameters([{ type: "uint256" }], [value]) });
+  const logs = [t(token, payer, receiverAuthorizer, 7n), t(token, receiverAuthorizer, payer, 2n), t(other, payer, receiverAuthorizer, 100n), { address: token, topics: [topic], data: "0x" }] as never;
+  assert.equal(tokenFlow(logs, token, payer), -5n);
+  assert.equal(tokenFlow(logs, token, receiverAuthorizer), 5n);
+  assert.equal(tokenFlow([] as never, token, payer), 0n);
+});
+
+test("a quote whose reads do not answer within the quote deadline is answered 503 and logged, and nothing is sent", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { encodeFunctionData } = await import("viem");
+  const { ostraBreakerAbi, parseDeployment } = await import("@ostraagent/sdk");
+  const { Ledger } = await import("../src/ledger.ts");
+  const { RelayerGate } = await import("../src/gate.ts");
+  const dir = await mkdtemp(join(tmpdir(), "ostra-gate-deadline-"));
+  try {
+    const at = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
+    const breaker = at(0xb7);
+    const deployment = {
+      ...parseDeployment({ version: 1, chainId: 4663, token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", batchSettlement: "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003", vaultImplementation: at(1), vaultBeacon: at(2), vaultFactory: at(3), poolImplementation: at(4), poolBeacon: at(5), pool: at(6), splitFactory: at(7), beaconOwner: at(8), fromBlock: "1" }),
+      vaultModule: at(9),
+      breaker,
+    };
+    // A node that never answers: every read of the quote waits.
+    const client = new Proxy({}, { get: () => () => new Promise(() => undefined) });
+    const logged: { event: string; fields: Record<string, unknown> }[] = [];
+    let sent = 0;
+    const gate = new RelayerGate({
+      client,
+      deployment,
+      ledger: await Ledger.open(dir),
+      merchant: { token: deployment.token },
+      sender: { address: at(0xee), send: async () => { sent++; throw new Error("not sent in this test"); } },
+      ethUsd: () => new Promise(() => undefined),
+      log: (event: string, fields: Record<string, unknown> = {}) => logged.push({ event, fields }),
+      quoteDeadlineMs: 300,
+    } as never);
+    const trip = encodeFunctionData({ abi: ostraBreakerAbi, functionName: "trip", args: [at(0xa1), at(0xa2)] });
+    const t0 = Date.now();
+    const r = (await gate.relay({ body: JSON.stringify({ calls: [{ to: breaker, data: trip }] }), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
+    assert.equal(r.status, 503, JSON.stringify(r));
+    assert.equal(r.body.error, "simulation_unavailable");
+    assert.match(r.body.message, /within 0\.3 s; send the request again/);
+    assert.ok(Date.now() - t0 < 5_000);
+    assert.equal(sent, 0);
+    assert.ok(logged.some((l) => l.event === "quote_late" && l.fields.afterMs === 300), JSON.stringify(logged));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

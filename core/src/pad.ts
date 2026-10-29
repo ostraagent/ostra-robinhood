@@ -109,7 +109,7 @@ export type PadParts = {
   /** Who sends the buyer vault's transactions and the open calls (the relayer, paid from the buyer vault). */
   sender: Sender;
   folder: Folder;
-  /** The agent's ERC-8004 identity: its agent id (null before register_agent) and its creator vault, which owns it. */
+  /** The agent's ERC-8004 identity: its agent id (null before publish_profile registers it) and its creator vault, which owns it. */
   identity: () => Promise<{ agentId: bigint | null; creatorVault: Address }>;
   /** The agent's current registration file (its profile), as published, or null before publish_profile. */
   currentFile: () => Promise<Record<string, unknown> | null>;
@@ -429,7 +429,7 @@ export class PadService {
   publish(offers: unknown[] | null): Promise<Record<string, unknown>> {
     return this.#serial(async () => {
       const { agentId, creatorVault } = await this.#p.identity();
-      if (agentId === null) throw new Error("this agent is not registered in ERC-8004 yet: publish_profile, then register_agent; nothing was signed");
+      if (agentId === null) throw new Error("this agent is not registered in ERC-8004 yet: publish_profile registers it; nothing was signed");
       const vault = await this.#vault();
       const current = await this.#p.currentFile();
       if (current === null) throw new Error("this agent has no published profile yet: publish_profile first; nothing was signed");

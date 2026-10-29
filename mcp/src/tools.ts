@@ -7,13 +7,14 @@
 // `pairs` tool); its market cap is in US dollars. Ostra Swap's tools take a
 // token as an address or the symbol of a pair (ETH: WETH, which a vault holds).
 
+import { randomBytes } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, formatTokenAmount, raetoImages, uploadImage } from "@ostraagent/core";
-import { GUARD_OP, LAUNCH_PAIRS, QuoteError, WETH, redact, type GuardCall } from "@ostraagent/sdk";
+import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { ensurePrivateDir } from "./disk.ts";
 
@@ -38,7 +39,7 @@ const tokenAddress = (text: string): string => {
   return p.address;
 };
 const uri = z.string().max(256).regex(/^(ipfs|https):\/\/[^\s]+$/, "an ipfs:// or https:// URI of at most 256 bytes");
-/** What a profile or a token's metadata tells: texts and https links; image an ipfs:// or https:// URI (upload_image makes one). */
+/** What a token's metadata tells: texts and https links; image an ipfs:// or https:// URI (upload_image makes one). */
 const publicFields = {
   description: z.string().max(1_000).optional(),
   image: uri.optional(),
@@ -72,8 +73,9 @@ const FINAL_JOB = ["completed", "failed", "cancelled", "expired"];
  * The launchpad's tools that are closed (decided by Edu on 26 Oct 2026: the launchpad is closed for new launches and
  * Ostrapad replaces it): launching, buying, and what promotes a launch. What lets a holder or a creator leave stays:
  * sell, token_vault, transfer_token, claim_dividends, the creator vault's funds and payouts, vesting releases, and an
- * open airdrop round's claim and close; and the agent's identity (profile, publish_profile, register_agent), which
- * Ostrapad and the strategies need.
+ * open airdrop round's claim and close; and the agent's identity (profile, publish_profile), which Ostrapad and the
+ * strategies need. upload_image stays for the files of Ostrapad orders and deliveries; an agent's profile image is its
+ * Ostra card (decided by Edu on 29 Oct 2026: every Ostra agent's profile is Ostra's own).
  */
 export const CLOSED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set([
   "pool_info",
@@ -92,6 +94,28 @@ export const CLOSED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set([
   "airdrop_fund",
   "airdrop_start",
 ]);
+
+/** Swaps that answered "pending" and ended, kept in memory for ostra_swap_orders: the newest this many. */
+const ENDED_SWAPS_KEPT = 20;
+
+/** A swap still running after its call answered "pending", or ended since (this server's, in memory). */
+type RunningSwap = {
+  id: string;
+  what: string;
+  tokenIn: string;
+  tokenOut: string;
+  amount: string;
+  /** Unix ms. */
+  startedAt: number;
+  /** True once its call answered "pending" (before that, its call is still waiting for it). */
+  answered: boolean;
+  /** Its order, or its split swap, once kept (before anything is signed). */
+  order?: string;
+  split?: string;
+  endedAt?: number;
+  result?: unknown;
+  error?: string;
+};
 
 /** A tool's answer: its result as JSON, or the error, with what kind of error it is. */
 async function run(fn: () => Promise<unknown>, rpcUrls: readonly string[]): Promise<CallToolResult> {
@@ -124,8 +148,98 @@ export function registerTools(server: McpServer, agent: Agent): void {
     return agent.privateBalance;
   };
   const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
+  const rpcUrls = [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])];
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
-    CLOSED_LAUNCHPAD_TOOLS.has(name) ? undefined : server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])])) as never);
+    CLOSED_LAUNCHPAD_TOOLS.has(name) ? undefined : server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), rpcUrls)) as never);
+
+  // ostra_swap and trading buy and sell wait this long for their swap before answering "pending" (config
+  // OSTRA_SWAP_ANSWER_MS): MCP clients commonly give up on a call at 60 s, a client that gave up does not stop the swap,
+  // and an agent that sends it again would swap twice. The swap goes on in the server; ostra_swap_orders tells how it
+  // ended. Swaps that answered "pending", by id:
+  const answerMs = agent.config.swapAnswerMs;
+  const swaps = new Map<string, RunningSwap>();
+  const swapView = (r: RunningSwap) => ({
+    swap: r.id,
+    what: r.what,
+    tokenIn: r.tokenIn,
+    tokenOut: r.tokenOut,
+    amount: r.amount,
+    startedAt: new Date(r.startedAt).toISOString(),
+    state: r.endedAt === undefined ? "running" : r.error === undefined ? "ended" : "failed",
+    // False while its call still waits for it (a client that gave up on that call learns the result here).
+    answeredPending: r.answered,
+    ...(r.order === undefined ? {} : { order: r.order }),
+    ...(r.split === undefined ? {} : { split: r.split }),
+    ...(r.endedAt === undefined ? {} : { endedAt: new Date(r.endedAt).toISOString() }),
+    ...(r.result === undefined ? {} : { result: r.result }),
+    ...(r.error === undefined ? {} : { error: r.error }),
+  });
+  /**
+   * Runs a swap (`start`, told its order or split swap once kept) and answers with its result if it ends within
+   * answerMs, else "pending" while it goes on. Refused while another swap from the same vault runs, whether its call
+   * is still waiting or answered "pending": a client that gave up on a call before it answered, or that sends it again
+   * by itself, would otherwise swap twice.
+   */
+  const boundedSwap = async (
+    a: { what: string; tokenIn: string; tokenOut: string; amount: string },
+    start: (hooks: { onOrder: (order: `0x${string}`) => Promise<void>; onSplit: (id: `0x${string}`) => Promise<void> }) => Promise<unknown>,
+  ): Promise<unknown> => {
+    const busy = [...swaps.values()].find((x) => x.endedAt === undefined && x.tokenIn.toLowerCase() === a.tokenIn.toLowerCase());
+    if (busy !== undefined) {
+      throw new Error(`a swap from the agent's vault of ${a.tokenIn} is still running (${busy.what} of ${busy.amount}, begun ${new Date(busy.startedAt).toISOString()}): nothing was signed for this call; ostra_swap_orders shows how that one ends, call again once it has`);
+    }
+    const r: RunningSwap = { id: randomBytes(8).toString("hex"), ...a, startedAt: Date.now(), answered: false };
+    // Kept from its start: the guard above sees it while its call waits too.
+    swaps.set(r.id, r);
+    // A start that throws at once rejects `work` like one that fails later (and so leaves the map below).
+    const work = Promise.resolve().then(() => start({
+      onOrder: async (order) => {
+        r.order = order;
+      },
+      onSplit: async (id) => {
+        r.split = id;
+      },
+    }));
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), answerMs);
+    });
+    let first: { value: unknown } | null;
+    try {
+      first = await Promise.race([work.then((value) => ({ value })), late]);
+    } catch (err) {
+      // Ended within the wait, refused or failed: answered with the error, not kept.
+      swaps.delete(r.id);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (first !== null) {
+      // Ended within the wait: answered with its result, not kept.
+      swaps.delete(r.id);
+      return first.value;
+    }
+    r.answered = true;
+    work.then(
+      (value) => {
+        r.result = value;
+        r.endedAt = Date.now();
+      },
+      (err: unknown) => {
+        r.error = rpcUrls.reduce((text, url) => redact(text, url), err instanceof Error ? err.message : String(err));
+        r.endedAt = Date.now();
+      },
+    );
+    const ended = [...swaps.values()].filter((x) => x.endedAt !== undefined).sort((x, y) => (x.endedAt as number) - (y.endedAt as number));
+    for (const x of ended.slice(0, Math.max(0, ended.length - ENDED_SWAPS_KEPT))) swaps.delete(x.id);
+    return {
+      status: "pending",
+      swap: r.id,
+      order: r.order ?? null,
+      split: r.split ?? null,
+      note: `${a.what} is still running after ${answerMs / 1_000} s and goes on in the MCP server: do not send it again. ostra_swap_orders shows how it ends (swap ${r.id}${r.order === undefined ? "" : `, order ${r.order}`}${r.split === undefined ? "" : `; split swap ${r.split}: ostra_swap_split list`}).`,
+    };
+  };
 
   // --- the vault ---------------------------------------------------------------------------------
   tool("open_vault", "Creates the agent's vault (USDG on Robinhood Chain, post-quantum WOTS keys) or finds it. With the Ostra relayer, its creation is paid later from the vault.", {}, () => agent.buyer.open());
@@ -230,9 +344,26 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "ostra_swap",
-    "Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault.",
+    `Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault. A swap not done within ${answerMs / 1_000} s answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended.`,
     { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
-    (a) => ostraSwap().swap({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }),
+    (a) => {
+      const tokenIn = tokenAddress(a.tokenIn);
+      const tokenOut = tokenAddress(a.tokenOut);
+      return boundedSwap({ what: "the swap", tokenIn, tokenOut, amount: a.amount }, (hooks) =>
+        ostraSwap().swap({ tokenIn, tokenOut, amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }, hooks),
+      );
+    },
+  );
+  tool(
+    "ostra_swap_orders",
+    "The agent's Ostra Swap orders: swaps of this MCP server still running (their call waiting, or answered pending) and those that answered pending and then ended or failed, orders kept and not finished (signed or about to be, or landed and being finished by the MCP server's sweep each minute), and the last finished ones with what they spent and paid (refusal: why one did not swap, its input back in the vault). order: that order alone. Nothing is signed.",
+    { order: bytes32.optional() },
+    async (a) => {
+      const kept = await ostraSwap().orders(a.order === undefined ? {} : { order: a.order as `0x${string}` });
+      const want = a.order?.toLowerCase();
+      const pending = [...swaps.values()].filter((x) => want === undefined || x.order?.toLowerCase() === want).sort((x, y) => y.startedAt - x.startedAt);
+      return { pending: pending.map(swapView), open: kept.open, finished: kept.finished };
+    },
   );
   tool(
     "ostra_swap_split",
@@ -419,7 +550,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   const earnings = z.record(z.string().regex(/^[A-Z]{1,8}$/), z.number().int().min(0)).optional().describe("earnings dates the agent knows, unix seconds by stock ticker (without one NVDA stays at most 60% of its LLTV)");
   tool(
     "strategy_plan",
-    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. The trading capital's cash (trading) stays in the vault. Nothing is signed. Only for an agent registered in ERC-8004 (register_agent).",
+    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. The trading capital's cash (trading) stays in the vault. Nothing is signed. Only for an agent registered in ERC-8004 (publish_profile).",
     { buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days)"), earnings },
     (a) =>
       agent.strategy.plan({
@@ -442,7 +573,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   const bpsLimit = z.number().int().min(1).max(10_000).optional();
   tool(
     "trading",
-    "The trading capital: USDG of the vault set aside for trades the agent decides, with Ostra's limits (an agent may only tighten them): a position at most 25% of the capital (positionMaxBps) and no larger than a buy whose quote moves the price 1% (maxImpactBps); buys stop for the day after a 5% loss of the capital that day (dailyLossBps) and for the week after 10% that week (weeklyLossBps). set: sets it (capital in USDG, the limits), only with no position open; the plans keep its cash out of the cash vaults. status: its value now (cash, positions at the quote of selling them), whether buys may happen and, with token, the most that position may be. buy: buys token with amount USDG of the capital, refused past those limits. sell: sells amount (or \"all\") of the capital's token, split like any large swap. end: ends it (positions stay in their vaults, untracked). Trades go through Ostra Swap; only for an agent registered in ERC-8004 (register_agent) to set it or buy.",
+    `The trading capital: USDG of the vault set aside for trades the agent decides, with Ostra's limits (an agent may only tighten them): a position at most 25% of the capital (positionMaxBps) and no larger than a buy whose quote moves the price 1% (maxImpactBps); buys stop for the day after a 5% loss of the capital that day (dailyLossBps) and for the week after 10% that week (weeklyLossBps). set: sets it (capital in USDG, the limits), only with no position open; the plans keep its cash out of the cash vaults. status: its value now (cash, positions at the quote of selling them), whether buys may happen and, with token, the most that position may be. buy: buys token with amount USDG of the capital, refused past those limits. sell: sells amount (or "all") of the capital's token, split like any large swap. A buy or sell not done in time (${agent.config.swapAnswerMs / 1_000} s) answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. end: ends it (positions stay in their vaults, untracked). Trades go through Ostra Swap; only for an agent registered in ERC-8004 (publish_profile) to set it or buy.`,
     {
       action: z.enum(["set", "status", "buy", "sell", "end"]),
       capital: usdg.optional(),
@@ -472,9 +603,11 @@ export function registerTools(server: McpServer, agent: Agent): void {
       const token = tokenAddress(a.token) as `0x${string}`;
       if (a.action === "buy") {
         if (a.amount === "all") throw new RangeError("buy takes an amount of USDG");
-        return t.buy({ token, amount: a.amount, ...opt("slippageBps", a.slippageBps) });
+        const amount = a.amount;
+        return boundedSwap({ what: "the trading buy", tokenIn: USDG, tokenOut: token, amount }, () => t.buy({ token, amount, ...opt("slippageBps", a.slippageBps) }));
       }
-      return t.sell({ token, amount: a.amount, ...opt("slippageBps", a.slippageBps) });
+      const amount = a.amount;
+      return boundedSwap({ what: "the trading sell", tokenIn: token, tokenOut: USDG, amount }, () => t.sell({ token, amount, ...opt("slippageBps", a.slippageBps) }));
     },
   );
   tool("strategy_report", "What the strategies earn: yield per day by route at the rates now, the share growth since the first run that held each cash vault, and each carry's distance to liquidation.", {}, () => agent.strategy.report());
@@ -546,7 +679,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   const files = z.array(z.string().max(200).regex(/^ipfs:\/\/[A-Za-z0-9]+(\/[A-Za-z0-9._-]+)*$/)).max(10).optional().describe("ipfs:// files (upload_image makes one)");
   tool(
     "pad_publish",
-    "Ostrapad as a provider. publish: lists offers in the agent's ERC-8004 registration file, paid into its USDG vault (the vault approves the listing once, so a listing is its own); needs publish_profile and register_agent first, and USDG in the creator vault for its relayed transactions (checked before the approval). unpublish: removes the listing. status: the agent's own listing as clients read it. bond / withdraw_bond: a voluntary provider bond (raises the limit per job to the bond, up to 500 USDG; a rejected job costs it 10% of the budget plus the evaluator fee). return_bond_box: returns USDG left in the provider bond box (a deposit whose second step failed) to the USDG vault.",
+    "Ostrapad as a provider. publish: lists offers in the agent's ERC-8004 registration file, paid into its USDG vault (the vault approves the listing once, so a listing is its own); needs publish_profile first (it registers the agent), and USDG in the creator vault for its relayed transactions (checked before the approval). unpublish: removes the listing. status: the agent's own listing as clients read it. bond / withdraw_bond: a voluntary provider bond (raises the limit per job to the bond, up to 500 USDG; a rejected job costs it 10% of the budget plus the evaluator fee). return_bond_box: returns USDG left in the provider bond box (a deposit whose second step failed) to the USDG vault.",
     { action: z.enum(["publish", "unpublish", "status", "bond", "withdraw_bond", "return_bond_box"]), offers: z.array(offer).min(1).max(20).optional(), amount: usdg.optional() },
     async (a) => {
       if (a.action === "publish") {
@@ -704,16 +837,8 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool("profile", "The agent's public identity, its creator vault: the profile URI it set, that profile read from IPFS, and its ERC-8004 agent id; or another account's profile.", { account: address.optional() }, (a) => lp().profile(a.account));
   tool(
-    "set_profile",
-    "Sets the agent's profile in OstraRegistry from its creator vault, with a WOTS-signed spend: uri is an ipfs:// (or https://) JSON file with name, description, image and links, ideally an ERC-8004 registration file.",
-    { uri },
-    (a) => lp().setProfile(a.uri),
-  );
-  tool("register_agent", "Registers the agent in the ERC-8004 Identity Registry, once: its creator vault owns the identity and is its agentWallet; uri is its ERC-8004 registration file.", { uri }, (a) => lp().registerAgent(a.uri));
-  tool("set_agent_uri", "Points the agent's ERC-8004 identity at a new registration file.", { uri }, (a) => lp().setAgentUri(a.uri));
-  tool(
     "upload_image",
-    `Pins an image file on this machine (PNG, JPEG, WebP or GIF, at most ${MAX_UPLOAD_IMAGE_BYTES} bytes) to IPFS through the Ostra uploader and returns its ipfs:// URI, for a profile or a token's metadata.`,
+    `Pins an image file on this machine (PNG, JPEG, WebP or GIF, at most ${MAX_UPLOAD_IMAGE_BYTES} bytes) to IPFS through the Ostra uploader and returns its ipfs:// URI, for the files of an Ostrapad order or delivery.`,
     { path: z.string().min(1).max(4_096) },
     async (a) => {
       const s = await stat(a.path);
@@ -723,9 +848,9 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "publish_profile",
-    "Publishes the agent's profile: builds its ERC-8004 registration file (name, description, image, links, its creator vault as agentWallet), pins it to IPFS, sets it in OstraRegistry and, once the agent is registered, points its ERC-8004 identity at it.",
-    { name: z.string().min(1).max(64), ...publicFields },
-    (a) => lp().publishProfile(a),
+    "Publishes the agent's Ostra profile and registers it in the ERC-8004 Identity Registry, with nothing to fill in: the same for every Ostra agent (\"Ostra Agent #<id>\", Ostra's description, the Ostra agent card as its image, its creator vault as agentWallet). The first call publishes the profile, registers the agent (its creator vault owns the identity) and publishes the profile again with the agent's number; a later call publishes it again (an Ostrapad listing in it is kept). Needs USDG in the creator vault (fund_creator_vault).",
+    {},
+    () => lp().publishProfile(),
   );
   tool(
     "publish_token_metadata",

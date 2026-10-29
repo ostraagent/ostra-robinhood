@@ -1,7 +1,9 @@
 // Publishing to IPFS through the Ostra uploader, served on the relayer's host (<relayer>/v1/ipfs/): the files
 // an agent publishes about itself (an ERC-8004 registration file, which is also its Ostra profile) and about the
-// tokens it launched (their metadata), and the images they show. The files are built here from fields the
-// agent gives, checked first, so what lands on IPFS has one shape.
+// tokens it launched (their metadata), and the images they show. An agent's profile is Ostra's own, the same for
+// every Ostra agent (its name and number, one description, the Ostra agent card as its image, its vault), so anyone
+// reading the ERC-8004 registry sees an Ostra agent; a token's metadata is built from fields its creator gives,
+// checked first, so what lands on IPFS has one shape.
 
 import { ERC8004_IDENTITY_REGISTRY, ROBINHOOD_CHAIN_ID } from "@ostraagent/sdk";
 import type { Address } from "viem";
@@ -49,26 +51,29 @@ function imageUri(value: string | undefined): string | undefined {
   return value;
 }
 
-/** An agent's profile as an ERC-8004 registration file (registration-v1): name, description, image, its links and its vault as services, and its registration once it has one. */
-export function profileFile(p: PublicFields & { name: string; vault: Address; agentId?: string | null }): Record<string, unknown> {
-  const services: { name: string; endpoint: string }[] = [];
-  const website = link(p.website, "website");
-  const x = link(p.x, "x");
-  const telegram = link(p.telegram, "telegram");
-  if (website !== undefined) services.push({ name: "web", endpoint: website });
-  if (x !== undefined) services.push({ name: "X", endpoint: x });
-  if (telegram !== undefined) services.push({ name: "Telegram", endpoint: telegram });
-  services.push({ name: "agentWallet", endpoint: `eip155:${ROBINHOOD_CHAIN_ID}:${p.vault}` });
+/** Every Ostra agent's name: this, then its ERC-8004 number once it has one ("Ostra Agent #20074"). */
+export const AGENT_NAME = "Ostra Agent";
+/** Every Ostra agent's description. */
+export const AGENT_DESCRIPTION =
+  "An AI agent with an Ostra post-quantum privacy vault on Robinhood Chain. Its earnings and payments stay in its own vault, signed with one-time keys.";
+
+/**
+ * An agent's profile as an ERC-8004 registration file (registration-v1): Ostra's name with the agent's number, Ostra's
+ * description, `image` (the agent's Ostra card, agentCardUri), its creator vault as agentWallet, and its registration
+ * once it has one. The type, name, description and image fields are those ERC-8004 asks for, for ERC-721 apps.
+ */
+export function profileFile(p: { vault: Address; agentId?: string | null; image?: string }): Record<string, unknown> {
+  const id = p.agentId === undefined || p.agentId === null ? null : p.agentId;
+  if (id !== null && !/^(0|[1-9][0-9]{0,29})$/.test(id)) throw new RangeError("an agent id is a decimal number");
   const image = imageUri(p.image);
-  const description = text(p.description, "description", 1_000);
   return {
     type: "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
-    name: text(p.name, "name", 64),
-    ...(description === undefined ? {} : { description }),
+    name: id === null ? AGENT_NAME : `${AGENT_NAME} #${id}`,
+    description: AGENT_DESCRIPTION,
     ...(image === undefined ? {} : { image }),
-    services,
+    services: [{ name: "agentWallet", endpoint: `eip155:${ROBINHOOD_CHAIN_ID}:${p.vault}` }],
     active: true,
-    registrations: p.agentId === undefined || p.agentId === null ? [] : [{ agentId: Number(p.agentId), agentRegistry: `eip155:${ROBINHOOD_CHAIN_ID}:${ERC8004_IDENTITY_REGISTRY}` }],
+    registrations: id === null ? [] : [{ agentId: Number(id), agentRegistry: `eip155:${ROBINHOOD_CHAIN_ID}:${ERC8004_IDENTITY_REGISTRY}` }],
   };
 }
 
@@ -113,6 +118,14 @@ export function uploaderUrl(relayerUrl: string | null): string {
 /** Pins `value` (a JSON object) and returns its ipfs:// URI. */
 export function uploadJson(relayerUrl: string | null, value: Record<string, unknown>): Promise<string> {
   return post(`${uploaderUrl(relayerUrl)}/json`, JSON.stringify(value), "application/json");
+}
+
+/**
+ * The ipfs:// URI of agent `agentId`'s Ostra card (null: the card without a number), which the uploader builds itself
+ * (sdk agent-card.ts) and pins, or answers again when it pinned it before.
+ */
+export function agentCardUri(relayerUrl: string | null, agentId: string | null): Promise<string> {
+  return post(`${uploaderUrl(relayerUrl)}/agent-card`, JSON.stringify({ agentId }), "application/json");
 }
 
 /** Pins an image (PNG, JPEG, WebP or GIF, at most MAX_UPLOAD_IMAGE_BYTES) and returns its ipfs:// URI. */

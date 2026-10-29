@@ -119,7 +119,7 @@ async function agent(name: string, seed: number) {
   });
   /** Publishes a profile and registers the creator vault in the live ERC-8004 Identity Registry. */
   const register = async () => {
-    file = profileFile({ name, description: `${name}, a test agent`, vault: creatorVault });
+    file = { ...profileFile({ vault: creatorVault }), name, description: `${name}, a test agent` };
     const uri = await upload(file);
     const r = await spend(creator, sender, VAULT_ACTION.REGISTER_AGENT, registerAgentParams(uri), "agent registration");
     assert.equal(r.status, "sent");

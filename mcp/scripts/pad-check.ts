@@ -13,8 +13,10 @@
 //      the provider's vault and waits until it holds what the steps still to come need, sent by whoever funds the run
 //      (worked out again once funded, a second FUND line if they need more). The provider's vault then sends the
 //      client's share to the client's vault.
-//   3. The provider: fund_creator_vault, publish_profile, register_agent (its ERC-8004 identity), publish_profile again
-//      (the registration file names the identity), pad_publish of one client-judged offer at 0.1 USDG. Its listing
+//   3. The provider: fund_creator_vault, then publish_profile, which publishes Ostra's profile without a number,
+//      registers the agent with it (its ERC-8004 identity) and publishes it again as "Ostra Agent #<id>" with the
+//      agent's Ostra card (the card read back from IPFS is the SDK's card of that id, byte for byte); then pad_publish
+//      of one client-judged offer at 0.1 USDG. Its listing
 //      reads back from the chain (pad_search by agent id: approved, paid into the provider's vault, limit 5 USDG) and
 //      from Ostra's index (by provider, and pad_search by words). A profile is published again only once the one
 //      before it reads back from IPFS (publish_profile and pad_publish keep what it holds, and refuse while it cannot
@@ -58,8 +60,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createPublicClient, formatUnits, getAddress, http, parseAbi, parseEventLogs, parseUnits, sha256, type Address, type Hash, type Hex, type PublicClient, type TransactionReceipt } from "viem";
-import { ERC8004_IDENTITY_REGISTRY, OSTRAPAD, PAD_SERVICE_NAME, USDG, ostraPadAbi, padDigestFromCid, padProviderPay, redact, usdgAbi } from "@ostraagent/sdk";
-import { ipfsBytes, ipfsGateways } from "@ostraagent/core";
+import { ERC8004_IDENTITY_REGISTRY, OSTRAPAD, PAD_SERVICE_NAME, USDG, agentCardSvg, ostraPadAbi, padDigestFromCid, padProviderPay, redact, usdgAbi } from "@ostraagent/sdk";
+import { AGENT_DESCRIPTION, AGENT_NAME, ipfsBytes, ipfsGateways } from "@ostraagent/core";
 import { ROBINHOOD_PUBLIC_RPC } from "@ostraagent/swap";
 
 /** One USDG in base units. */
@@ -92,7 +94,6 @@ const transferAbi = parseAbi(["event Transfer(address indexed from, address inde
 const identityAbi = parseAbi(["function tokenURI(uint256 agentId) view returns (string)", "function ownerOf(uint256 agentId) view returns (address)", "function balanceOf(address owner) view returns (uint256)"]);
 const TERMINAL = ["Completed", "Rejected", "Expired", "Cancelled"];
 
-const PROFILE = { name: "Ostrapad check", description: "A test agent Ostra runs to check Ostrapad end to end on Robinhood Chain mainnet. It takes no orders." };
 const OFFER = {
   id: "check",
   title: "Ostrapad check",
@@ -339,7 +340,7 @@ async function main(): Promise<void> {
     // 1. The tools, the relayer, the index.
     for (const [who, s] of [["provider", p], ["client", c]] as const) {
       const tools = (await s.client.listTools()).tools.map((t) => t.name);
-      const needed = ["open_vault", "balance", "withdraw", "ostra_swap_quote", "fund_creator_vault", "publish_profile", "register_agent", "profile", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"];
+      const needed = ["open_vault", "balance", "withdraw", "ostra_swap_quote", "fund_creator_vault", "publish_profile", "profile", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"];
       check(needed.every((n) => tools.includes(n)) && closed.length > 0 && closed.every((n) => !tools.includes(n)), `the ${who}'s server lists the Ostrapad and identity tools and none of the ${closed.length} closed launchpad tools`, `${tools.length} tools`);
       const status = await call(s.client, "balance");
       check(status.ok && status.json.relayer === true, `the ${who}'s server sends through the Ostra relayer`, status.ok ? "" : status.text);
@@ -433,31 +434,54 @@ async function main(): Promise<void> {
       const owned = await chain.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityAbi, functionName: "balanceOf", args: [creatorVault] });
       check(owned === 0n, "the creator vault holds no ERC-8004 identity yet (one with no record here comes from a registration spend that landed after its run stopped: the agent's records need its id before this goes on)", { identities: owned });
       await profileReadable("publishing the profile");
-      const first = await call(p.client, "publish_profile", PROFILE);
-      const firstProfile = (first.json.profile ?? {}) as { status?: string; txHash?: Hash };
-      check(first.ok && typeof first.json.uri === "string" && firstProfile.status === "sent" && first.json.agentUri === null, "publish_profile: the registration file pinned and set in OstraRegistry (the creator vault's relayer channel opens first)", first.ok ? { uri: first.json.uri, txHash: firstProfile.txHash } : first.text);
-      sent.push({ what: "the profile", hash: firstProfile.txHash as Hash });
-      const file1 = (await until("the registration file on IPFS", waitSeconds, () => ipfsJson(first.json.uri as string), () => ipfsRefusal(first.json.uri as string))) as { name?: string } | null;
-      check(file1 !== null && file1.name === PROFILE.name, "the registration file reads back from IPFS", file1 === null ? "not read" : { name: file1.name });
-      const registered = await call(p.client, "register_agent", { uri: first.json.uri as string });
-      check(registered.ok && registered.json.status === "sent" && typeof registered.json.agentId === "string", "register_agent: the creator vault owns an ERC-8004 identity", registered.ok ? { agentId: registered.json.agentId, txHash: registered.json.txHash } : registered.text);
-      sent.push({ what: "the ERC-8004 registration", hash: registered.json.txHash as Hash });
-      agentId = registered.json.agentId as string;
+      const pub = await call(p.client, "publish_profile");
+      const unnumbered = (pub.json.unnumbered ?? {}) as { uri?: string; profile?: { status?: string; txHash?: Hash } };
+      const registration = (pub.json.registration ?? {}) as { status?: string; txHash?: Hash; agentId?: string };
+      const profile = (pub.json.profile ?? {}) as { status?: string; txHash?: Hash };
+      const agentUri = (pub.json.agentUri ?? {}) as { status?: string; txHash?: Hash };
+      check(
+        pub.ok && unnumbered.profile?.status === "sent" && registration.status === "sent" && typeof pub.json.agentId === "string" && profile.status === "sent" && agentUri.status === "sent",
+        "publish_profile: Ostra's profile pinned and set, the agent registered in ERC-8004 with it, its numbered profile set and the identity pointed at it (the creator vault's relayer channel opens first)",
+        pub.ok ? { agentId: pub.json.agentId, unnumbered: unnumbered.uri, uri: pub.json.uri, registration: registration.txHash } : pub.text,
+      );
+      sent.push(
+        { what: "the profile without a number", hash: unnumbered.profile?.txHash as Hash },
+        { what: "the ERC-8004 registration", hash: registration.txHash as Hash },
+        { what: "the numbered profile", hash: profile.txHash as Hash },
+        { what: "the identity's file", hash: agentUri.txHash as Hash },
+      );
+      agentId = pub.json.agentId as string;
+      await record({ profileAgain: true });
     } else console.log(`registered in an earlier run: agent ${agentId}`);
     const id = agentId;
     const owner = getAddress(await chain.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityAbi, functionName: "ownerOf", args: [BigInt(id)] }));
     check(owner === creatorVault, "the identity's owner on chain is the creator vault", { agentId: id, owner });
     if (!progress.profileAgain) {
+      // Registered by an earlier run that stopped before its numbered profile: publish_profile publishes that one.
       await profileReadable("publishing it again");
-      const second = await call(p.client, "publish_profile", PROFILE);
-      const secondProfile = (second.json.profile ?? {}) as { status?: string; txHash?: Hash };
-      const secondAgentUri = (second.json.agentUri ?? {}) as { status?: string; txHash?: Hash };
-      check(second.ok && secondProfile.status === "sent" && secondAgentUri.status === "sent", "publish_profile again: the file names the identity, and the identity points at it", second.ok ? { uri: second.json.uri } : second.text);
+      const again = await call(p.client, "publish_profile");
+      const profile = (again.json.profile ?? {}) as { status?: string; txHash?: Hash };
+      const agentUri = (again.json.agentUri ?? {}) as { status?: string; txHash?: Hash };
+      check(again.ok && again.json.registration === null && profile.status === "sent" && agentUri.status === "sent", "publish_profile again: the numbered profile set, and the identity pointed at it", again.ok ? { uri: again.json.uri } : again.text);
       await record({ profileAgain: true });
-      sent.push({ what: "the profile again", hash: secondProfile.txHash as Hash }, { what: "the identity's file", hash: secondAgentUri.txHash as Hash });
-      const file2 = (await until("the registration file naming the identity on IPFS", waitSeconds, () => ipfsJson(second.json.uri as string), () => ipfsRefusal(second.json.uri as string))) as { registrations?: { agentId: number }[] } | null;
-      check(file2 !== null && file2.registrations?.[0]?.agentId === Number(id), "the registration file reads back from IPFS and names the identity", file2?.registrations ?? "not read");
+      sent.push({ what: "the numbered profile", hash: profile.txHash as Hash }, { what: "the identity's file", hash: agentUri.txHash as Hash });
     }
+    // The registration file the identity points at on chain: Ostra's, with this agent's number and card.
+    const tokenUri = (await chain.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityAbi, functionName: "tokenURI", args: [BigInt(id)] })) as string;
+    const reg = (await until("the numbered registration file on IPFS", waitSeconds, () => ipfsJson(tokenUri), () => ipfsRefusal(tokenUri))) as {
+      name?: string;
+      description?: string;
+      image?: string;
+      registrations?: { agentId: number }[];
+      services?: { name: string; endpoint: string }[];
+    } | null;
+    check(
+      reg !== null && reg.name === `${AGENT_NAME} #${id}` && reg.description === AGENT_DESCRIPTION && reg.registrations?.[0]?.agentId === Number(id) && reg.services?.some((x) => x.name === "agentWallet" && x.endpoint === `eip155:4663:${creatorVault}`) === true,
+      "the file the identity points at reads back from IPFS: Ostra's name with the agent's number, Ostra's description, the registration, the creator vault as agentWallet",
+      reg === null ? "not read" : { name: reg.name, image: reg.image, registrations: reg.registrations },
+    );
+    const card = typeof reg?.image === "string" ? await until("the agent's card on IPFS", waitSeconds, () => ipfsBytes(reg.image as string, 65_536), () => ipfsRefusal(reg.image as string)) : null;
+    check(card !== null && new TextDecoder().decode(card) === agentCardSvg(id), "the profile's image reads back from IPFS as the Ostra agent card of this agent, byte for byte", card === null ? "not read" : { image: reg?.image, bytes: card.length });
 
     // The job: the client's own, from an earlier run, or a new one.
     const clientJobs = async (): Promise<JobRow[]> => {
@@ -508,7 +532,7 @@ async function main(): Promise<void> {
         const l = (await index(indexer, `/api/v1/pad/listings?provider=${vault}`)) as { total: number; agents: IndexAgent[] } | null;
         const a = l !== null && l.total === 1 && l.agents[0]?.agentId === id ? l.agents[0] : null;
         if (a !== null) seen = a;
-        return a !== null && a.approved && a.name === PROFILE.name && a.offers[0]?.id === OFFER.id ? a : null;
+        return a !== null && a.approved && a.name === `${AGENT_NAME} #${id}` && a.offers[0]?.id === OFFER.id ? a : null;
       })) as IndexAgent | null;
       const last = seen as IndexAgent | null;
       check(
@@ -516,7 +540,7 @@ async function main(): Promise<void> {
         "Ostra's index lists the agent by its provider vault, its details read",
         inIndex !== null ? { agentId: inIndex.agentId, name: inIndex.name } : last === null ? "not listed" : { listedWithout: { approved: last.approved, name: last.name, offers: last.offers.map((o) => o.id) } },
       );
-      const searched = await call(c.client, "pad_search", { q: PROFILE.name });
+      const searched = await call(c.client, "pad_search", { q: OFFER.title });
       const hits = ((searched.json.agents ?? []) as IndexAgent[]).map((a) => a.agentId);
       check(searched.ok && hits.includes(id), "pad_search by words finds it through the index", searched.ok ? { total: searched.json.total, agentIds: hits } : searched.text);
 

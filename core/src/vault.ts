@@ -90,7 +90,7 @@ import { VAULT_SOFT_LIMIT, type Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { decodeVaultOpenChannelMessage, decodeVaultSetCrankKeyMessage, decodeVaultSpendHeader, decodeVaultTransferMessage } from "./pending.ts";
 import { randomBytes } from "./random.ts";
-import { LocalSender, PendingSpendUnpaidError, VAULT_SPEND_GAS, type OpenRelayerChannel, type RelayerChannelTerms, type Reservation, type Sender, type SendOptions } from "./relay.ts";
+import { LocalSender, PendingSpendUnpaidError, RelayerError, VAULT_SPEND_GAS, type OpenRelayerChannel, type RelayerChannelTerms, type Reservation, type Sender, type SendOptions } from "./relay.ts";
 
 /** Gas a createVault uses: 240,969 measured on the fork (17 Oct 2026), rounded up. */
 const CREATE_VAULT_GAS = 300_000n;
@@ -714,10 +714,14 @@ export class VaultService {
    * Runs `fn` with what a vault spend needs to be paid. With the relayer: a
    * reservation of unused relayer channel deposit for its price (a channel is
    * opened first if none has room), released once `fn` is done. When a spend
-   * signed earlier waits and no relayer channel can pay for it, the local fee
-   * payer sends it if it holds the ETH. `moves` is what the spend takes out
-   * of this vault: a relayer channel opened from the buyer vault for it
-   * leaves that much in the buyer vault.
+   * signed earlier waits and no relayer channel can pay for it (its key is
+   * the one a new channel's open needs), the relayer is asked to send it on
+   * credit, as the vault's debt, and the channel opened next pays that debt
+   * with its first voucher; `fn` then runs as usual and its result names what
+   * was sent first (`sentFirst`). Only when the relayer does not send it so,
+   * the local fee payer sends it if it holds the ETH. `moves` is what the
+   * spend takes out of this vault: a relayer channel opened from the buyer
+   * vault for it leaves that much in the buyer vault.
    */
   async #paidSpend<T>(sender: Sender, fn: (sender: Sender, reservation: Reservation | null) => Promise<T>, moves = 0n, gas = VAULT_SPEND_GAS, extraWei = 0n): Promise<T> {
     await this.#finishRecoveryFirst(sender);
@@ -730,10 +734,33 @@ export class VaultService {
       reservation = await sender.reserve(gas, sender === this.#sender ? this.#opener() : undefined, this.#paysRelayer() ? moves : 0n, extraWei);
     } catch (err) {
       if (!(err instanceof PendingSpendUnpaidError)) throw err;
+      let refused = "";
+      const credit = err.onCredit;
+      if (sender.relayed && credit !== undefined) {
+        let sentFirst: ResentSpend | null = null;
+        try {
+          // The vault whose key the spend holds sends it: this one (inside its queue already), or the vault paying for this one.
+          sentFirst = (await (credit.owner === this ? credit.unqueued() : credit.queued())) as ResentSpend | null;
+        } catch (e) {
+          // Refused (a relayer from before spends on credit, a vault that would hold too little after it): nothing was sent.
+          if (!(e instanceof RelayerError)) throw e;
+          refused = `; the relayer did not send it on credit (${e.message})`;
+        }
+        // Sent on credit (or landed meanwhile): the channel opened now pays the debt with its first voucher, then this.
+        if (refused === "") {
+          const again = await sender.reserve(gas, sender === this.#sender ? this.#opener() : undefined, this.#paysRelayer() ? moves : 0n, extraWei);
+          try {
+            const r = await fn(sender, again);
+            return (sentFirst !== null && r !== null && typeof r === "object" ? { ...r, sentFirst } : r) as T;
+          } finally {
+            sender.release(again);
+          }
+        }
+      }
       const local = new LocalSender(this.#client, this.#transport, this.#keys.feePayer, this.#keys.escrow);
       const need = gas * (await this.#client.getGasPrice()) * ETH_HEADROOM + extraWei;
       if ((await ethBalance(this.#client, this.#keys.feePayer.address)) < need) {
-        throw new Error(`${err.message}; send at least ${formatEth(need)} ETH to the fee payer ${this.#keys.feePayer.address} and call again: it sends that operation itself`);
+        throw new Error(`${err.message}${refused}; send at least ${formatEth(need)} ETH to the fee payer ${this.#keys.feePayer.address} and call again: it sends that operation itself`);
       }
       return fn(local, null);
     }
@@ -742,6 +769,26 @@ export class VaultService {
     } finally {
       sender.release(reservation);
     }
+  }
+
+  /**
+   * Sends the spend signed earlier through the relayer on credit (SendOptions.onCredit): the vault owes its price, which
+   * the first voucher of the channel opened next pays. Returns what was sent, or null when nothing waits any more.
+   */
+  async #sendPendingOnCredit(): Promise<ResentSpend | null> {
+    const sender = this.#sender;
+    if (!sender.relayed) return null;
+    const vault = await this.vaultAddress();
+    const v = await this.#read(vault);
+    if (v === null) return null;
+    const credit: Sender = {
+      relayed: true,
+      payer: () => sender.payer(),
+      send: (calls, o = {}) => sender.send(calls, { ...o, reservation: null, onCredit: true }),
+      reserve: async () => null,
+      release: () => undefined,
+    };
+    return this.#sendPending(vault, v, credit, null);
   }
 
   /**
@@ -992,7 +1039,11 @@ export class VaultService {
     const v = await this.#read(vault);
     if (v === null) throw new Error(this.#missing());
     if ((await this.#pending(v)) !== null) {
-      throw new PendingSpendUnpaidError("a vault operation signed earlier waits to be sent and no channel to the relayer has deposit left to pay for it");
+      throw new PendingSpendUnpaidError("a vault operation signed earlier waits to be sent and no channel to the relayer has deposit left to pay for it", {
+        owner: this,
+        queued: () => this.#serial(() => this.#sendPendingOnCredit()),
+        unqueued: () => this.#sendPendingOnCredit(),
+      });
     }
     await this.#notFrozen(vault, "the vault");
     const balance = await this.#balance(vault);
