@@ -501,11 +501,21 @@ async function main(): Promise<void> {
         "the client reads the listing from the chain: approved, paid into the provider's vault, limit 5 USDG",
         found === null ? "not read" : { approved: found.approved, provider: found.listing.provider, limit: found.limit, offers: found.listing.offers },
       );
+      // Until the index has read the agent's details too (its approval, its file's name and offers), not only found the
+      // agent: the index lists an agent first and reads its registration file from IPFS after.
+      let seen: IndexAgent | null = null;
       const inIndex = (await until("the listing in Ostra's index", waitSeconds, async () => {
         const l = (await index(indexer, `/api/v1/pad/listings?provider=${vault}`)) as { total: number; agents: IndexAgent[] } | null;
-        return l !== null && l.total === 1 && l.agents[0]?.agentId === id ? l.agents[0] : null;
+        const a = l !== null && l.total === 1 && l.agents[0]?.agentId === id ? l.agents[0] : null;
+        if (a !== null) seen = a;
+        return a !== null && a.approved && a.name === PROFILE.name && a.offers[0]?.id === OFFER.id ? a : null;
       })) as IndexAgent | null;
-      check(inIndex !== null && inIndex.approved && inIndex.name === PROFILE.name && inIndex.offers[0]?.id === OFFER.id, "Ostra's index lists the agent by its provider vault", inIndex === null ? "not listed" : { agentId: inIndex.agentId, name: inIndex.name });
+      const last = seen as IndexAgent | null;
+      check(
+        inIndex !== null,
+        "Ostra's index lists the agent by its provider vault, its details read",
+        inIndex !== null ? { agentId: inIndex.agentId, name: inIndex.name } : last === null ? "not listed" : { listedWithout: { approved: last.approved, name: last.name, offers: last.offers.map((o) => o.id) } },
+      );
       const searched = await call(c.client, "pad_search", { q: PROFILE.name });
       const hits = ((searched.json.agents ?? []) as IndexAgent[]).map((a) => a.agentId);
       check(searched.ok && hits.includes(id), "pad_search by words finds it through the index", searched.ok ? { total: searched.json.total, agentIds: hits } : searched.text);

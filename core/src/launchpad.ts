@@ -120,7 +120,7 @@ import { profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFie
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
-import { VAULT_SPEND_GAS, type Sender } from "./relay.ts";
+import { RelayerClient, VAULT_SPEND_GAS, type Sender } from "./relay.ts";
 import type { Folder } from "./storage.ts";
 import { spendCall, VaultService, type VaultOperationResult } from "./vault.ts";
 
@@ -245,6 +245,16 @@ function slippage(bps: number | undefined): number {
 function swapSpendGas(swapGas: bigint): bigint {
   return VAULT_SPEND_GAS + swapGas + swapGas / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE);
 }
+
+/**
+ * The most two WOTS signatures' verifications differ in gas: about 50,000 over a typical one at most (VAULT_SPEND_GAS),
+ * doubled, for the low side too. Spends simulated with a throwaway key used from 447,350 to 460,565 reserved gas on
+ * one fork (29 Oct 2026).
+ */
+const WOTS_GAS_SPREAD = 100_000n;
+
+/** A URI of an ipfs:// URI's length (a CIDv1, raw, base32: 59 characters), for simulating a profile spend before its file is pinned. */
+const STAND_IN_URI = `ipfs://bafkrei${"a".repeat(52)}`;
 
 /** The gas a simulated spend is reserved for. */
 function simulatedGas(gasUsed: bigint): bigint {
@@ -1287,6 +1297,33 @@ export class LaunchpadService {
     }
     if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null, pairCreators };
     return { uri, profile, agentUri: await this.setAgentUri(uri), pairCreators };
+  }
+
+  /**
+   * Read only: why the creator vault cannot pay for publishRegistrationFile now, or null when it can or does not pay
+   * through the relayer. Its spends (the profile and, once the agent is registered, its agent URI) are simulated as
+   * setProfile and setAgentUri send them, with the URI set now (or one of an ipfs:// URI's length) in place of the
+   * file's, and each is counted at the gas it will be reserved (simulatedGas) with WOTS_GAS_SPREAD added (a simulation
+   * signs with a throwaway key, and a WOTS signature's verification costs more or less with each message);
+   * RelayerClient.shortfall replays their payment. A
+   * spend the creator vault signed earlier and has not sent is refused here: its next operation would send that one
+   * instead of the profile.
+   */
+  async publishShortfall(): Promise<string | null> {
+    if (!(this.#creatorSender instanceof RelayerClient)) return null;
+    const s = await this.#creator.state();
+    if (!s.exists) return `the creator vault ${s.vault} does not exist yet`;
+    if ((await this.#creator.spendSlot())?.pending != null) {
+      return `the creator vault ${s.vault} signed a spend earlier that has not landed: its next operation sends that one first (publish_profile with the same fields does), then publish again`;
+    }
+    const record = await this.#agentRecord();
+    const uri = record?.uri ?? (await this.#profileUri(s.vault)) ?? STAND_IN_URI;
+    const relayer = await this.#creatorSender.payer();
+    const gasOf = async (action: number, params: Hex) => simulatedGas((await simulateVaultSpend(this.#client, this.#config.deployment, { relayer, vault: s.vault, action, params })).gasUsed + WOTS_GAS_SPREAD);
+    const gases = [await gasOf(VAULT_ACTION.SET_PROFILE, setProfileParams(uri))];
+    if (record !== null) gases.push(await gasOf(VAULT_ACTION.SET_AGENT_URI, setAgentUriParams({ agentId: BigInt(record.agentId), uri })));
+    const short = await this.#creatorSender.shortfall(gases);
+    return short === null ? null : `${short}; fund_creator_vault moves USDG into it`;
   }
 
   /**

@@ -15,8 +15,8 @@
 // (it is replaced by "<raeto key>" in whatever Raeto answers). Raeto's payTo is pinned (RAETO_PAY_TO, read 25 Oct 2026):
 // an answer naming another address is refused, so a wrong OSTRA_RAETO_URL or a changed API cannot redirect USDG.
 
-import { getAddress, hashMessage, isAddress, parseAbi, type Address, type PublicClient } from "viem";
-import { CASH_VAULTS, USDG, VAULT_ACTION, decodeApproveHashParams, decodeTransferParams, readVaultGuard } from "@ostraagent/sdk";
+import { getAddress, hashMessage, isAddress, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { CASH_VAULTS, USDG, VAULT_ACTION, decodeApproveHashParams, decodeTransferParams, readVaultGuard, toAssetsUp } from "@ostraagent/sdk";
 import { formatUnitsAmount, parseTokenAmount, TOKEN_DECIMALS } from "./amount.ts";
 import type { BorroService } from "./borro.ts";
 import { tokenBalance } from "./chain.ts";
@@ -292,15 +292,20 @@ export class RaetoService {
   }
 
   /**
-   * What the vault's cash vault shares earn, as credits. Kept here: a mark (the shares, and the highest share price read:
-   * a high-water mark, so a price that falls and comes back earns nothing until it passes its high), what is owed (the
-   * shares of each mark times the rise of the price over its high, added on every call), and USDG redeemed for it and
-   * not sent yet (`ready`), with the vault's spend slot its transfer is signed at. A call adds what the shares earned
-   * since the mark, moves the mark to now, sends what was redeemed and not sent first, and else, when what is owed is at
-   * least `min` USDG, redeems that from the cash vault and sends what the redeem paid (at most what is owed) to Raeto's
-   * payTo. A transfer of `ready` that another operation of the vault sent first (it sends a signed spend before its
-   * own) is found at its slot and not paid again. Shares added or removed count from the read after; a full exit leaves
-   * what was owed until then. Raeto's terms are checked before anything is redeemed. Calls run one after the other.
+   * What the vault's cash vault shares earn, net of the agent's Borro debts' interest, as credits. Kept here: a mark
+   * (the shares, the highest share price read: a high-water mark, so a price that falls and comes back earns nothing
+   * until it passes its high; and each Borro debt's borrow shares with what they owed), what is owed (netYieldSince,
+   * added on every call: the shares' rise over the high less the interest the marked debts accrued; it can fall below
+   * zero, and nothing is sent until it is back above `min`), and USDG redeemed for it and not sent yet (`ready`), with
+   * the vault's spend slot its transfer is signed at. The interest comes off because the carry strategy borrows USDG
+   * from Borro into this same cash vault: the shares' rise is not earned while the loan behind them owes interest.
+   * A call adds what was earned since the mark, moves the mark to now, sends what was redeemed and not sent first, and
+   * else, when what is owed is at least `min` USDG, redeems that from the cash vault and sends what the redeem paid (at
+   * most what is owed) to Raeto's payTo. A transfer of `ready` that another operation of the vault sent first (it sends
+   * a signed spend before its own) is found at its slot and not paid again. Shares and debts added or removed count
+   * from the read after; a full exit leaves what was owed until then. A mark kept before debts were marked (MCP 0.1.10
+   * and earlier) earns nothing for the time since it, as that time's interest cannot be read back. Raeto's terms are
+   * checked before anything is redeemed. Calls run one after the other.
    */
   fundFromYield(min = "1"): Promise<{ vault: Address; owed: string; sent: string; note?: string; redeem?: unknown; fund?: unknown }> {
     return this.#serial(async () => {
@@ -314,20 +319,28 @@ export class RaetoService {
         return { shares, unit, price };
       };
       const now = await read();
+      const book = await this.#p.borro.debtBook();
+      const debts: DebtMark[] = book
+        .filter((b) => b.borrowShares > 0n)
+        .map((b) => ({ marketId: b.marketId, borrowShares: b.borrowShares.toString(), debt: toAssetsUp(b.borrowShares, b.borrowed, b.borrowedShares).toString() }));
       const text = await this.#p.folder.read(YIELD_FILE);
       const kept = text === undefined ? null : (JSON.parse(text) as YieldMark);
-      const usd = (x: bigint) => formatUnitsAmount(x, TOKEN_DECIMALS);
+      // What is owed may be below zero (interest over yield): shown as 0 with what is to make up.
+      const usd = (x: bigint) => formatUnitsAmount(x > 0n ? x : 0n, TOKEN_DECIMALS);
       const write = (m: YieldMark) => this.#p.folder.write(YIELD_FILE, JSON.stringify(m));
       if (kept === null || getAddress(kept.vault) !== target) {
-        await write({ vault: target, shares: now.shares.toString(), price: now.price.toString(), owed: "0", ready: "0" });
-        return { vault: target, owed: "0", sent: "0", note: "the mark is set now: what the shares earn from here is sent as credits by later calls" };
+        await write({ vault: target, shares: now.shares.toString(), price: now.price.toString(), owed: "0", ready: "0", debts });
+        return { vault: target, owed: "0", sent: "0", note: "the mark is set now: what the shares earn from here, less the Borro debts' interest, is sent as credits by later calls" };
       }
       const high = BigInt(kept.price);
-      let owed = BigInt(kept.owed) + (now.price > high ? (BigInt(kept.shares) * (now.price - high)) / now.unit : 0n);
+      const net = netYieldSince(kept, now, book);
+      let owed = BigInt(kept.owed) + (net === null ? 0n : net.earned - net.interest);
       let ready = BigInt(kept.ready);
-      const mark: YieldMark = { ...kept, vault: target, shares: now.shares.toString(), price: (now.price > high ? now.price : high).toString(), owed: owed.toString(), ready: ready.toString() };
+      const mark: YieldMark = { ...kept, vault: target, shares: now.shares.toString(), price: (now.price > high ? now.price : high).toString(), owed: owed.toString(), ready: ready.toString(), debts };
       await write(mark);
-      if (ready === 0n && (owed === 0n || owed < minimum)) return { vault: target, owed: usd(owed), sent: "0", note: `under ${min} USDG: kept for a later call` };
+      const unmarked = net === null ? "the mark did not follow the Borro debts yet (kept by an earlier version): nothing is counted for the time since it, and the mark now follows them; " : "";
+      if (ready === 0n && owed < 0n) return { vault: target, owed: "0", sent: "0", note: `${unmarked}the Borro debts' interest since the mark is more than the shares earned: ${formatUnitsAmount(-owed, TOKEN_DECIMALS)} USDG to make up before anything is sent` };
+      if (ready === 0n && (owed === 0n || owed < minimum)) return { vault: target, owed: usd(owed), sent: "0", note: `${unmarked}under ${min} USDG: kept for a later call` };
       const { payTo } = await this.terms();
       // `ready` signed earlier, at the kept slot or after it (a relayer channel opened first, or another operation of the
       // vault, takes a slot before the transfer): the spends that landed since are read, one slot after the other.
@@ -365,7 +378,7 @@ export class RaetoService {
         ready = paid <= 0n ? 0n : paid < owed ? paid : owed;
         owed -= ready;
         const afterHigh = BigInt(mark.price) > after.price ? BigInt(mark.price) : after.price;
-        await write({ vault: target, shares: after.shares.toString(), price: afterHigh.toString(), owed: owed.toString(), ready: ready.toString() });
+        await write({ vault: target, shares: after.shares.toString(), price: afterHigh.toString(), owed: owed.toString(), ready: ready.toString(), debts });
         if (ready === 0n) return { vault: target, owed: usd(owed), sent: "0", note: "the redeem paid nothing into the vault", redeem };
       }
       // The first slot the transfer can be signed at, kept before it is signed (with nothing signed and unsent there:
@@ -385,8 +398,41 @@ export class RaetoService {
   }
 }
 
-/** `price`: the highest share price read (a high-water mark). `readySlot`: the vault's spend slot the transfer of `ready` is signed at. */
-type YieldMark = { vault: Address; shares: string; price: string; owed: string; ready: string; readySlot?: { nonce: string; keyIndex: string } | undefined };
+/** A Borro debt at the yield mark: its market, the stock vault's borrow shares then, and what they owed then (USDG base units). */
+export type DebtMark = { marketId: Hex; borrowShares: string; debt: string };
+
+/**
+ * `price`: the highest share price read (a high-water mark). `owed`: may be below zero. `readySlot`: the vault's spend
+ * slot the transfer of `ready` is signed at. `debts`: the agent's Borro debts at the mark (absent in a mark kept by
+ * MCP 0.1.10 and earlier).
+ */
+export type YieldMark = { vault: Address; shares: string; price: string; owed: string; ready: string; readySlot?: { nonce: string; keyIndex: string } | undefined; debts?: DebtMark[] };
+
+/**
+ * What the vault earned since `mark`: `earned`, the mark's cash vault shares times the rise of the share price over
+ * the mark's high (nothing while the price is under it), and `interest`, what each of the mark's Borro debts accrued
+ * since (its borrow shares then, valued now by its market's borrows and borrow shares in `book`, less what they owed
+ * then: borrow shares added since count from the next mark, as shares bought since do; borrow shares repaid since
+ * count to now, which takes off more interest than was paid, never less). Null when the mark carries no debts (kept
+ * before they were marked) or names a market `book` does not read: that time's interest is not known.
+ */
+export function netYieldSince(
+  mark: Pick<YieldMark, "shares" | "price" | "debts">,
+  now: { unit: bigint; price: bigint },
+  book: readonly { marketId: Hex; borrowed: bigint; borrowedShares: bigint }[],
+): { earned: bigint; interest: bigint } | null {
+  if (mark.debts === undefined) return null;
+  const high = BigInt(mark.price);
+  const earned = now.price > high ? (BigInt(mark.shares) * (now.price - high)) / now.unit : 0n;
+  let interest = 0n;
+  for (const d of mark.debts) {
+    const m = book.find((b) => b.marketId.toLowerCase() === d.marketId.toLowerCase());
+    if (m === undefined) return null;
+    const owesNow = toAssetsUp(BigInt(d.borrowShares), m.borrowed, m.borrowedShares);
+    if (owesNow > BigInt(d.debt)) interest += owesNow - BigInt(d.debt);
+  }
+  return { earned, interest };
+}
 
 /** A Raeto answer's images (OpenAI-compatible: choices[].message.images[].image_url.url as data: URLs), decoded. */
 export function raetoImages(answer: unknown): { index: number; mediaType: string; bytes: Uint8Array }[] {

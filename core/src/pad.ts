@@ -115,6 +115,8 @@ export type PadParts = {
   currentFile: () => Promise<Record<string, unknown> | null>;
   /** Pins `file` and makes it the agent's profile and ERC-8004 registration file (publish_profile's last steps). */
   publishFile: (file: Record<string, unknown>) => Promise<{ uri: string; profile: VaultOperationResult; agentUri: VaultOperationResult | null }>;
+  /** Read only: why publishFile's spends (the creator vault's) cannot be paid now, or null (default: not checked). */
+  publishShortfall?: () => Promise<string | null>;
   /** Pins a JSON file through the Ostra uploader; its ipfs:// URI. */
   upload: (file: Record<string, unknown>) => Promise<string>;
   /** Ostra's Ostrapad index (GET <indexerUrl>/api/v1/pad/listings), for search; null: search is not available. */
@@ -436,7 +438,13 @@ export class PadService {
       if (offers !== null) {
         const entry = padServiceEntry({ provider: vault, offers: offers as PadOffer[] }, this.#pad, this.#p.config.chainId);
         const digest = padListingDigest(agentId, creatorVault, this.#pad, this.#p.config.chainId);
-        if (!(await this.#approved(vault, digest))) approval = await this.#approveAlone(digest, "Ostrapad listing approval");
+        if (!(await this.#approved(vault, digest))) {
+          // The approval goes first, from the USDG vault; the creator vault then publishes the file. Checked before the
+          // approval, so it is not left on chain while the listing it allows is not.
+          const short = this.#p.publishShortfall === undefined ? null : await this.#p.publishShortfall();
+          if (short !== null) throw new Error(`the creator vault could not publish the listing now, so its approval is not given: ${short}; nothing was signed`);
+          approval = await this.#approveAlone(digest, "Ostrapad listing approval");
+        }
         services.push(entry);
       }
       const out = await this.#p.publishFile({ ...current, services });

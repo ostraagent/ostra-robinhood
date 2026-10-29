@@ -229,6 +229,22 @@ export class BorroService {
     return { buyerVault: buyer, usdgLent: { shares: usdg.shares.toString(), value: formatUnitsAmount(usdg.value, TOKEN_DECIMALS) }, stocks };
   }
 
+  /**
+   * Per Borro stock whose vault of this agent exists: its market, the stock vault's borrow shares, and the market's
+   * borrows and borrow shares accrued to this block, so that any number of borrow shares is valued now as
+   * toAssetsUp(shares, borrowed, borrowedShares) (what fundFromYield takes off as the debt's interest).
+   */
+  async debtBook(): Promise<{ symbol: string; marketId: Hex; borrowShares: bigint; borrowed: bigint; borrowedShares: bigint }[]> {
+    const out = [];
+    for (const s of borroStocks()) {
+      const v = await this.#p.tokenVault(s.token).vaultAddress();
+      if ((await readVault(this.#p.client, this.#p.config.deployment, v)) === null) continue;
+      const p = await readBorroPosition(this.#p.client, v, s);
+      out.push({ symbol: s.symbol, marketId: s.marketId, borrowShares: p.borrowShares, borrowed: p.borrowed, borrowedShares: p.borrowedShares });
+    }
+    return out;
+  }
+
   // -------------------------------------------------------------------------
   // Lend and redeem
   // -------------------------------------------------------------------------

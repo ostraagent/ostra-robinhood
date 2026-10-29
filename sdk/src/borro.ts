@@ -138,6 +138,8 @@ export type BorroPosition = {
   /** The market's supply and borrows (USDG base units) and the time they are accrued to (unix seconds). */
   supply: bigint;
   borrowed: bigint;
+  /** The market's borrow shares, accrued to `at` with `borrowed`: what any number of borrow shares owes now is toAssetsUp(shares, borrowed, borrowedShares). */
+  borrowedShares: bigint;
   at: bigint;
 };
 
@@ -175,6 +177,7 @@ export async function readBorroPosition(client: PublicClient, stockVault: Addres
     listed,
     supply: e.totalSupplyAssets,
     borrowed: e.totalBorrowAssets,
+    borrowedShares: e.totalBorrowShares,
     at: at.timestamp,
   };
 }

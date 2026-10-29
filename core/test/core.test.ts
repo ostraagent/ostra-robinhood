@@ -46,6 +46,8 @@ import {
   payCapacity,
   privateVaultKeychainId,
   relayerChannelDeposit,
+  notLandedError,
+  relayerSpendPlan,
   relayerOfferProblem,
   sellerKeychainId,
   shieldApprovalKeychainId,
@@ -290,4 +292,37 @@ test("an unshield waits a uniform random time within its window", () => {
   }
   assert.throws(() => unshieldDelaySeconds(UNSHIELD_MAX_WINDOW_HOURS + 1));
   assert.throws(() => unshieldDelaySeconds(-1));
+});
+
+test("notLandedError names the relayer's last not_sent reason, at most 500 characters, or none", () => {
+  const reason = "the transaction needs 110124 gas now, more than the 106986 it was priced for, so it was not sent; sent again, it is priced anew";
+  assert.equal(notLandedError(3, reason).message, `the relayer could not land the request in 3 attempts; it answered last: ${reason}`);
+  assert.equal(notLandedError(3, "  ").message, "the relayer could not land the request in 3 attempts");
+  assert.equal(notLandedError(3, "x".repeat(900)).message.length, "the relayer could not land the request in 3 attempts; it answered last: ".length + 500);
+});
+
+test("relayerSpendPlan replays reserve's payment: channel room first, then a new channel from the vault", () => {
+  // Mainnet-sized: a spend reserved at 0.02 USDG, an open's own spend 0.02, a debt of 0.01.
+  const a = 20_000n;
+  const base = { amounts: [a, a], debt: 10_000n, openCost: 20_000n };
+  // Without debt, a channel with room for both: nothing else needed; room for one only and an empty vault: the second
+  // cannot be paid.
+  assert.equal(relayerSpendPlan({ ...base, debt: 0n, rooms: [2n * a], balance: 0n }), true);
+  assert.equal(relayerSpendPlan({ ...base, debt: 0n, rooms: [a], balance: 0n }), false);
+  // In debt, room in a channel does not pay (the relayer takes only an open then): an empty vault cannot pay at all;
+  // with what one open needs, its leftover room pays the second.
+  assert.equal(relayerSpendPlan({ ...base, rooms: [10n * a], balance: 0n }), false);
+  assert.equal(relayerSpendPlan({ ...base, rooms: [10n * a], balance: base.debt + base.openCost + 2n * a }), true);
+  // No channel: one open pays the debt, its own spend and the first; its deposit (all the vault holds, under
+  // RELAYER_CHANNEL_DEPOSIT) must leave room for the second.
+  const need = base.debt + base.openCost + 2n * a;
+  assert.equal(relayerSpendPlan({ ...base, rooms: [], balance: need }), true);
+  assert.equal(relayerSpendPlan({ ...base, rooms: [], balance: need - 1n }), false);
+  // Over RELAYER_CHANNEL_DEPOSIT the deposit is that much, which leaves the second spend room too.
+  assert.equal(relayerSpendPlan({ ...base, rooms: [], balance: 5_000_000n }), true);
+  // Fork-sized spends (over a deposit each): the second needs a second open, without the debt.
+  const big = { amounts: [1_200_000n, 1_200_000n], rooms: [], debt: 100_000n, openCost: 1_300_000n };
+  const two = big.debt + big.openCost + 1_200_000n + big.openCost + 1_200_000n;
+  assert.equal(relayerSpendPlan({ ...big, balance: two }), true);
+  assert.equal(relayerSpendPlan({ ...big, balance: two - 1n }), false);
 });

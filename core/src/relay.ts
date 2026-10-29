@@ -94,6 +94,19 @@ const REQUEST_TIMEOUT_MS = 240_000;
 const MAX_STEPS = 8;
 /** Sends of one request after the relayer could not land it (409 not_sent; what was paid is credit). */
 const MAX_RESENDS = 3;
+/** The most of the relayer's not_sent message the error repeats. */
+const NOT_SENT_MESSAGE_MAX = 500;
+
+/**
+ * The error once `attempts` sends of one request all came back not_sent: it names the relayer's last reason (its
+ * not_sent message, at most NOT_SENT_MESSAGE_MAX characters), which says what to do about it (on 28 Oct 2026 the
+ * client said only that the request could not land, while the relayer's log said the transaction needed more gas
+ * than it was priced for).
+ */
+export function notLandedError(attempts: number, lastReason: string): Error {
+  const reason = lastReason.trim().slice(0, NOT_SENT_MESSAGE_MAX);
+  return new Error(`the relayer could not land the request in ${attempts} attempts${reason === "" ? "" : `; it answered last: ${reason}`}`);
+}
 /** How long a transaction the relayer reports is waited for on this RPC. */
 const LANDED_TIMEOUT_MS = 60_000;
 /**
@@ -330,6 +343,35 @@ export function relayerChannelDeposit(needed: bigint, vaultBalance: bigint, keep
   }
   const want = needed > RELAYER_CHANNEL_DEPOSIT ? needed : RELAYER_CHANNEL_DEPOSIT;
   return want < available ? want : available;
+}
+
+/**
+ * Whether spends of `amounts` (in order) can be paid as RelayerClient.reserve pays them: each from a channel with room
+ * for it (`rooms`: what the usable channels have left; not while the vault owes `debt`, which only an open pays), or
+ * else from a new channel opened from the vault's `balance`,
+ * whose deposit (relayerChannelDeposit) first pays `debt` (only the first open owes it) and `openCost` (the open's own
+ * spend), then the spend; what the deposit has left is a channel's room for the spends after it.
+ */
+export function relayerSpendPlan(p: { amounts: readonly bigint[]; rooms: readonly bigint[]; balance: bigint; debt: bigint; openCost: bigint }): boolean {
+  const rooms = [...p.rooms];
+  let balance = p.balance;
+  let debt = p.debt;
+  for (const a of p.amounts) {
+    // The relayer refuses a vault in debt anything but an open (403 vault_in_debt), and a reserved spend is not
+    // opened for then: while the debt stands, the spend is paid from a new channel, whose open pays the debt.
+    const i = debt > 0n ? -1 : rooms.findIndex((r) => r >= a);
+    if (i >= 0) {
+      rooms[i] = (rooms[i] as bigint) - a;
+      continue;
+    }
+    const needed = debt + p.openCost + a;
+    if (balance < needed) return false;
+    const deposit = relayerChannelDeposit(needed, balance);
+    balance -= deposit;
+    debt = 0n;
+    rooms.push(deposit - needed);
+  }
+  return true;
 }
 
 /**
@@ -585,6 +627,64 @@ export class RelayerClient implements Sender {
     return null;
   }
 
+  /**
+   * Read only (nothing is retired, opened or signed): why this vault cannot pay, now, vault spends that reserve `gases`
+   * (each as VaultService.operate reserves it: reserve's amount for that gas), or null when it can. The spends are
+   * played in order as reserve and #ensureChannel would pay them: each from a usable relayer channel with room for it,
+   * or else from a new channel, whose open needs the vault's debt and the open's own spend (#spendBound) on top and
+   * takes RELAYER_CHANNEL_DEPOSIT or what it needs, at most what the vault holds. The vault's credit at the relayer is
+   * not counted: it lowers a price only after the reservation is made. An unpaid open the relayer holds for the vault
+   * is refused here (it is paid before anything else). An operation that sends something first (an approval before the
+   * call it allows) checks this before its first spend, so it does not leave the first done and the rest unpaid.
+   */
+  async shortfall(gases: readonly bigint[]): Promise<string | null> {
+    const facts = await this.facts();
+    const vault = await this.#buyerVault().vaultAddress();
+    if ((await readVault(this.#client, this.#config.deployment, vault)) === null) return `the vault ${vault} does not exist yet`;
+    const state = await this.vaultState(vault);
+    if (state.unpaidOpen !== null) return `the relayer holds an unpaid open of the vault's relayer channel ${state.unpaidOpen.channel}: the vault's next relayed operation pays it first`;
+    const amounts: bigint[] = [];
+    for (const g of gases) amounts.push(await this.#reserveAmount(g));
+    const bound = await this.#spendBound();
+    const payer = await this.#payer();
+    const rooms: bigint[] = [];
+    for (const c of await this.#records()) {
+      if (c.retired || now() >= c.openedAt + SESSION_MAX_AGE_SECONDS) continue;
+      const free = this.#free(c, null);
+      if (free <= 0n) continue;
+      const ch = await readChannel(this.#client, this.#config.deployment.batchSettlement, c.channel);
+      const usable =
+        payer !== null &&
+        getAddress(c.config.payer) === payer &&
+        getAddress(c.config.receiverAuthorizer) === facts.vault &&
+        getAddress(c.config.receiver) === facts.split &&
+        ch.pendingWithdrawal === null;
+      const onChain = ch.balance - BigInt(c.cumulative);
+      if (usable) rooms.push(free < onChain ? free : onChain);
+    }
+    const balance = await tokenBalance(this.#client, this.#config.deployment.token, vault);
+    const plan = (held: bigint): boolean => relayerSpendPlan({ amounts, rooms, balance: held, debt: state.debt, openCost: bound });
+    if (plan(balance)) return null;
+    // The least the vault must hold for the plan (the plan only gets easier with more): found by halving.
+    let lo = balance;
+    let hi = balance > 0n ? balance * 2n : 1n;
+    while (!plan(hi)) hi *= 2n;
+    while (hi - lo > 1n) {
+      const mid = (lo + hi) / 2n;
+      if (plan(mid)) hi = mid;
+      else lo = mid;
+    }
+    const n = gases.length;
+    return `the vault ${vault} holds ${formatTokenAmount(balance)} USDG: ${n === 1 ? "its relayed transaction needs" : `its ${n} relayed transactions need`} it to hold ${formatTokenAmount(hi)} USDG now (with what its relayer channels have left, and a new channel's open where needed)`;
+  }
+
+  /** What reserve sets aside for a spend of `gas` (and `extraWei` of ETH it sends): the relayer's price for it, margin and tolerance included. */
+  async #reserveAmount(gas: bigint, extraWei = 0n): Promise<bigint> {
+    // The relayer's rule: the gas with its margin, plus the ETH the transaction sends (no margin on that).
+    const wei = withMargin(gas * (await this.#client.getGasPrice())) + extraWei;
+    return maxAcceptedQuote(weiToTokenUnits(wei, await this.#ethUsd(), TOKEN_DECIMALS));
+  }
+
   /** Base units a transaction of `wei` comes to at the Chainlink price, margin included (the relayer's rule). */
   async #amountFor(wei: bigint): Promise<bigint> {
     return weiToTokenUnits(withMargin(wei), await this.#ethUsd(), TOKEN_DECIMALS);
@@ -628,9 +728,7 @@ export class RelayerClient implements Sender {
   }
 
   async reserve(gas: bigint, openChannel?: OpenRelayerChannel, keep = 0n, extraWei = 0n): Promise<Reservation | null> {
-    // The relayer's rule: the gas with its margin, plus the ETH the transaction sends (no margin on that).
-    const wei = withMargin(gas * (await this.#client.getGasPrice())) + extraWei;
-    const amount = maxAcceptedQuote(weiToTokenUnits(wei, await this.#ethUsd(), TOKEN_DECIMALS));
+    const amount = await this.#reserveAmount(gas, extraWei);
     for (let attempt = 0; attempt < 2; attempt++) {
       const c = await this.#serial(async () => {
         const found = await this.#channelFor(amount, null);
@@ -859,6 +957,8 @@ export class RelayerClient implements Sender {
 
   async send(calls: RelayCall[], options: SendOptions = {}): Promise<Hash> {
     await this.facts();
+    // Why the relayer did not send the request the last time it said so: named in the error once the resends run out.
+    let notSent = "";
     for (let resend = 0; resend < MAX_RESENDS; resend++) {
       let answer = await this.#post(calls, { prepay: options.prepay === true, payer: await this.#payer(), allowFailedSwaps: options.allowFailedSwaps === true });
       let again = false;
@@ -886,6 +986,7 @@ export class RelayerClient implements Sender {
         }
         if (answer.status === 409 && error === "not_sent") {
           // Not landed: any payment for it is credit of the vault; the same request is sent again.
+          notSent = typeof b?.message === "string" ? b.message : "";
           again = true;
           continue;
         }
@@ -905,7 +1006,7 @@ export class RelayerClient implements Sender {
       }
       if (!again) throw new Error(`the relayer did not relay the request after ${MAX_STEPS} answers`);
     }
-    throw new Error(`the relayer could not land the request in ${MAX_RESENDS} attempts`);
+    throw notLandedError(MAX_RESENDS, notSent);
   }
 
   /**

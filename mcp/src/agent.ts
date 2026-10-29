@@ -252,6 +252,7 @@ export class Agent {
               return typeof p.profile === "object" && p.profile !== null && !Array.isArray(p.profile) ? (p.profile as Record<string, unknown>) : null;
             },
             publishFile: (file) => lp.publishRegistrationFile(file),
+            publishShortfall: () => lp.publishShortfall(),
             upload: (file) => uploadJson(config.relayerUrl, file),
             indexerUrl: config.padIndexerUrl,
           });

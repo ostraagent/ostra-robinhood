@@ -11,19 +11,24 @@
 //     waits, cancelled;
 //   * a recovery under the lock, while the old key spends on: the new seed's first operation finishes it with
 //     finishRecovery first and signs with the key supported at the earlier nonce; the approvals given before stop
-//     counting.
+//     counting;
+//   * Raeto's fundFromYield with the carry's USDG (a Borro loan) in the same cash vault: what it counts as earned is
+//     the shares' rise less the loan's interest, both read from the chain (nothing is sent: the minimum is far above
+//     it, so Raeto's API is not asked).
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { formatUnits, keccak256, stringToHex, type Address, type Hex, type PublicClient } from "viem";
+import { formatUnits, keccak256, parseAbi, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   BORRO_USDG_VAULT,
   DEFAULT_RECOVERY_DELAY,
   FileWotsStore,
+  MORPHO_BLUE,
+  STEAKHOUSE_USDG,
   USDG,
   borroStock,
   ostraVaultAbi,
@@ -31,12 +36,13 @@ import {
   readVault,
   readVaultGuard,
   retryingHttp,
+  toAssetsUp,
   usdgAbi,
   vaultV2Abi,
   type Deployment,
 } from "@ostraagent/sdk";
 import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
-import { BorroService, Keys, LocalSender, VaultService, X402_NETWORK, type Config } from "../src/index.ts";
+import { BorroService, Keys, LocalSender, RaetoService, VaultService, X402_NETWORK, type Config, type YieldMark } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
 
 let fork: Fork;
@@ -239,4 +245,72 @@ test("the withdrawal lock: own vault refused, limit and guardian change refused 
   // The approval given before the recovery no longer counts.
   assert.notEqual(await valid(), ERC1271_MAGIC);
   await assert.rejects(owner.buyer.withdraw(payee, "1"), /does not match the expected key root/);
+});
+
+test("fundFromYield counts the cash vault shares' rise less the Borro loan's interest, the carry's USDG in the same cash vault", { timeout: 900_000 }, async () => {
+  const client = fork.client as PublicClient;
+  const a = device("carry", 63);
+  const nvda = borroStock("NVDA");
+  const buyer = (await a.buyer.open()).vault;
+  await fork.dealUsdg(buyer, 1_000_000_000n);
+  const stockVault = (await a.tokenVault(nvda.token).open()).vault;
+  await fork.dealToken(stockVault, nvda.token, 10n * 10n ** 18n);
+  assert.equal((await a.borro.lend("NVDA", "10")).status, "sent");
+  assert.equal((await a.borro.postCollateral("NVDA", "all")).status, "sent");
+  let p = await readBorroPosition(client, stockVault, nvda);
+  let loan = p.maxDebt / 4n < p.available / 2n ? p.maxDebt / 4n : p.available / 2n;
+  loan -= loan % 1_000n;
+  assert.ok(loan > 0n, `the NVDA market lends ${p.available} now`);
+  assert.equal((await a.borro.borrow("NVDA", formatUnits(loan, 6))).status, "sent");
+  // The carry: the borrowed USDG goes into the cash vault with the vault's own.
+  const cash = await usdg(buyer);
+  assert.equal((await a.borro.lendCash(STEAKHOUSE_USDG, cash)).status, "sent");
+
+  // Morpho itself brings the market's interest up to date (anyone may) before each fundFromYield, so the totals both
+  // ends of the interval use are the ones Morpho stored, read raw below, not the SDK's projection of them.
+  const morpho = parseAbi([
+    "function accrueInterest((address loanToken, address collateralToken, address oracle, address irm, uint256 lltv) marketParams)",
+    "function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)",
+  ]);
+  const caller = fork.wallet(fork.accounts[0] as never);
+  const accrue = async () => {
+    const h = await caller.writeContract({ address: MORPHO_BLUE, abi: morpho, functionName: "accrueInterest", args: [nvda.market], account: fork.accounts[0] as never, chain: undefined });
+    assert.equal((await client.waitForTransactionReceipt({ hash: h })).status, "success");
+  };
+  const owes = async (shares: bigint) => {
+    const m = await client.readContract({ address: MORPHO_BLUE, abi: morpho, functionName: "market", args: [nvda.marketId] });
+    // SharesMathLib.toAssetsUp written out: 1 virtual asset, 1e6 virtual shares, rounded up.
+    return (shares * (BigInt(m[2]) + 1n) + (BigInt(m[3]) + 1_000_000n) - 1n) / (BigInt(m[3]) + 1_000_000n);
+  };
+  await accrue();
+  const folder = a.keys.folder.folder("raeto");
+  const raeto = new RaetoService({ client, buyer: a.buyer, borro: a.borro, folder });
+  const NEVER = "1000000"; // far above what 60 days earn: nothing is redeemed or sent, Raeto's API is not asked
+  const first = await raeto.fundFromYield(NEVER);
+  assert.match(first.note ?? "", /the mark is set now/);
+  const mark = JSON.parse((await folder.read("yield.json")) as string) as YieldMark;
+  assert.equal(mark.debts?.length, 1);
+  assert.equal(mark.debts?.[0]?.marketId.toLowerCase(), nvda.marketId.toLowerCase());
+  p = await readBorroPosition(client, stockVault, nvda);
+  assert.equal(mark.debts?.[0]?.borrowShares, p.borrowShares.toString());
+  assert.equal(mark.debts?.[0]?.debt, p.debt.toString());
+  assert.equal(BigInt(mark.debts?.[0]?.debt as string), await owes(p.borrowShares), "the debt at the mark as Morpho's stored totals give it");
+
+  await fork.increaseTime(60 * 86_400);
+  await accrue();
+  const second = await raeto.fundFromYield(NEVER);
+  const unit = 10n ** BigInt(await client.readContract({ address: STEAKHOUSE_USDG, abi: parseAbi(["function decimals() view returns (uint8)"]), functionName: "decimals" }));
+  const price = await client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "convertToAssets", args: [unit] });
+  const now = await readBorroPosition(client, stockVault, nvda);
+  const earned = price > BigInt(mark.price) ? (BigInt(mark.shares) * (price - BigInt(mark.price))) / unit : 0n;
+  const interest = toAssetsUp(BigInt(mark.debts?.[0]?.borrowShares as string), now.borrowed, now.borrowedShares) - BigInt(mark.debts?.[0]?.debt as string);
+  // The same interest from Morpho's stored totals: what the marked borrow shares owe now, less what they owed then.
+  assert.equal((await owes(BigInt(mark.debts?.[0]?.borrowShares as string))) - BigInt(mark.debts?.[0]?.debt as string), interest, "the interest as Morpho's own stored totals give it");
+  const kept = JSON.parse((await folder.read("yield.json")) as string) as YieldMark;
+  console.log(`60 days: the shares earned ${earned}, the loan's interest ${interest}, owed ${kept.owed} (USDG base units); answer ${JSON.stringify(second)}`);
+  assert.ok(earned > 0n, "the cash vault's price rose");
+  assert.ok(interest > 0n, "the loan accrued interest");
+  assert.equal(BigInt(kept.owed), earned - interest, "owed is the shares' rise less the interest");
+  assert.equal(second.sent, "0");
+  assert.equal(second.owed, formatUnits(earned - interest > 0n ? earned - interest : 0n, 6));
 });
