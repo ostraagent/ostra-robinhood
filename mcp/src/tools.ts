@@ -472,10 +472,11 @@ export function registerTools(server: McpServer, agent: Agent): void {
   // --- the withdrawal lock (vault version 3) ---------------------------------------------------------------
   tool(
     "vault_lock",
-    "The withdrawal lock of the vault (USDG) or of the agent's vault of a Borro stock. status: the lock, the daily limit left, the linked vault and the changes waiting. set: turns the lock on or changes it (withdrawal: a wallet whose key is not on this device, or another seed's Ostra vault in the same token that is locked already; never one of this agent's vaults; delaySeconds 129600 to 1209600; dailyLimit in the vault's token): turning it on and tightening are at once, loosening waits the delay. off: turns it off after the delay. cancel: drops the changes still waiting.",
+    "The withdrawal lock of the vault (USDG) or of the agent's vault of a Borro stock. status: the lock, the daily limit left, the linked vault, the changes waiting, and the hashes the vault approves for EIP-1271 (approvals: each hash, from when it counts and whether that time has come; a hash can be a permit or a transfer authorization of the vault's funds; under the lock no flow of this server approves anything, so every hash listed then came from elsewhere and should go; without the lock the list also holds this server's own approvals, such as Ostrapad's, which look alike: vault_revoke_hash withdraws one, a guardian of a locked vault revokes it with guard_vault); with vault, the same for any Ostra vault (a guardian watching the vault it guards). set: turns the lock on or changes it (withdrawal: a wallet whose key is not on this device, or another seed's Ostra vault in the same token that is locked already; never one of this agent's vaults; delaySeconds 129600 to 1209600; dailyLimit in the vault's token): turning it on and tightening are at once, loosening waits the delay. off: turns it off after the delay. cancel: drops the changes still waiting.",
     {
       action: z.enum(["status", "set", "off", "cancel"]),
       asset: borroAsset.optional().describe("USDG (default) or a Borro stock's ticker"),
+      vault: address.optional().describe("status only: another Ostra vault to read"),
       withdrawal: address.optional(),
       delaySeconds: z.number().int().min(129_600).max(1_209_600).optional(),
       dailyLimit: units.optional(),
@@ -483,7 +484,8 @@ export function registerTools(server: McpServer, agent: Agent): void {
     },
     async (a) => {
       const asset = a.asset ?? "USDG";
-      if (a.action === "status") return agent.borro.guard(asset);
+      if (a.vault !== undefined && a.action !== "status") throw new RangeError("vault is for status only: set, off and cancel act on this agent's own vaults");
+      if (a.action === "status") return agent.borro.lockStatus(asset, a.vault);
       if (a.action === "cancel") return agent.borro.cancelPending(asset);
       if (a.action === "off") return agent.borro.setLock(asset, "off", 0, "0");
       if (a.withdrawal === undefined || a.delaySeconds === undefined || a.dailyLimit === undefined) throw new RangeError("set takes withdrawal, delaySeconds and dailyLimit");
@@ -510,10 +512,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
     (a) => agent.borro.setLink(a.asset ?? "USDG", a.vault),
   );
   tool(
-    "vault_approve_hash",
-    "Approves a 32-byte hash for EIP-1271 on the vault (isValidSignature answers for it), or withdraws an approval. Under the lock an approval waits the lock's delay; a new lock and every recovery end all approvals.",
-    { hash: bytes32, approved: z.boolean() },
-    (a) => agent.borro.approveHash(a.hash as `0x${string}`, a.approved),
+    "vault_revoke_hash",
+    "Withdraws the EIP-1271 approval of a 32-byte hash by the vault (USDG) or by the agent's vault of a Borro stock (vault_lock status lists them); at once, under the lock too; lands as done when there is none. No tool approves a hash it is given: USDG takes the vault's EIP-1271 answer as a permit or a transfer authorization of its funds, so the vault only approves digests this server builds and checks itself (Raeto's login message, OstraBreaker's limits, Ostrapad's actions).",
+    { hash: bytes32, asset: borroAsset.optional().describe("USDG (default) or a Borro stock's ticker") },
+    (a) => agent.borro.withdrawApproval(a.asset ?? "USDG", a.hash as `0x${string}`),
   );
   tool(
     "guard_vault",

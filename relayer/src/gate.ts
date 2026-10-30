@@ -300,7 +300,7 @@ function fromInstructions(r: HTTPResponseInstructions): Answer {
  * How far above the gas it is priced at a transaction's gas limit may go (sendGasCap): a refund is at most a fifth of
  * the gas used before it (EIP-3529), so the limit a refund needs is at most 1.25 times what the transaction uses, plus
  * what nested calls keep back (a sixty-fourth at each). The price stays on the gas used, which is what the agent
- * computes too (2% tolerance), so code that uses more when sent than quoted can make the relayer pay at most this
+ * computes too (within RELAYER_QUOTE_TOLERANCE_BPS), so code that uses more when sent than quoted can make the relayer pay at most this
  * share more than it was paid, at its own expense.
  */
 export const LIMIT_OVER_PRICED_BPS = 13_000n;

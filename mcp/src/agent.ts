@@ -174,7 +174,15 @@ export class Agent {
     this.shield = new ShieldService(client, config, keys, this.buyer, this.sender);
     this.creatorShield = new ShieldService(client, config, keys, this.creator, creatorSender);
     this.unshield = new UnshieldService(client, config, keys, this.shield, (index) => this.privateVault(index));
-    this.borro = new BorroService({ client, config, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), sender: this.sender, ownVaults: () => this.ownVaults() });
+    this.borro = new BorroService({
+      client,
+      config,
+      buyer: this.buyer,
+      tokenVault: (token) => this.vaultFor(token),
+      sender: this.sender,
+      ownVaults: () => this.ownVaults(),
+      logsClient: createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient,
+    });
     this.breaker = new BreakerService({ client, config, buyer: this.buyer, borro: this.borro, sender: this.sender, folder: keys.folder.folder("breaker") });
     this.raeto = config.raetoUrl === null ? null : new RaetoService({ client, buyer: this.buyer, borro: this.borro, folder: keys.folder.folder("raeto"), apiUrl: config.raetoUrl });
     if (config.swap === null) {

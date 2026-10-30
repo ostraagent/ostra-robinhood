@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { getAddress, type Address } from "viem";
+import { getAddress, parseAbi, type Address } from "viem";
 import { STEAKHOUSE_USDG, USDG, deployBreaker, usdgAbi, type Deployment } from "@ostraagent/sdk";
 import { OUT_DIR, deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { splitLogsClient } from "../../core/test/split-logs.ts";
@@ -35,6 +35,8 @@ let d: Deployment;
 let root: string;
 let logsServer: Server | undefined;
 let logsUrl: string;
+
+const erc1271Abi = parseAbi(["function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)"]);
 
 /** A JSON-RPC endpoint over `split` (single and batch requests); an error goes back as a JSON-RPC error, so the caller's chunked log search narrows its span. */
 async function serveLogs(split: ReturnType<typeof splitLogsClient>): Promise<{ server: Server; url: string }> {
@@ -215,12 +217,12 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
   }
 });
 
-test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to Borro and back, the lock on, an EIP-1271 approval", { timeout: 900_000 }, async () => {
+test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to Borro and back, the lock on, approvals listed and withdrawn, none approved from outside", { timeout: 900_000 }, async () => {
   const home = join(root, "home-borro");
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_approve_hash", "guard_vault", "strategy_plan", "strategy_apply", "strategy_check", "strategy_report", "trading", "breaker", "raeto"]) {
+    for (const name of ["borro_markets", "borro_position", "borro_lend", "borro_withdraw", "borro_collateral", "borro_borrow", "borro_repay", "vault_lock", "vault_link", "vault_revoke_hash", "guard_vault", "strategy_plan", "strategy_apply", "strategy_check", "strategy_report", "trading", "breaker", "raeto"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     const status = (await call(client, "balance")).json.vault as { feePayer: Address };
@@ -281,8 +283,52 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
     assert.ok(locked.ok && getAddress((locked.json.lock as { withdrawal: string }).withdrawal) === getAddress(withdrawal), locked.text);
     const over = await call(client, "withdraw", { destination: fork.accounts[2]!.address, amount: "10" });
     assert.ok(!over.ok && /nothing was signed/.test(over.text), over.text);
-    const approved = await call(client, "vault_approve_hash", { hash: `0x${"ab".repeat(32)}`, approved: true });
-    assert.ok(approved.ok && approved.json.status === "sent", approved.text);
+    // No tool approves a hash it is given (USDG takes the vault's EIP-1271 answer as a permit of its funds): the old
+    // approval tool is gone, and the lock's status lists the vault's approvals (none: turning the lock on ended the
+    // breaker's, which its configure had used), for the agent's own vault and read as another vault.
+    assert.ok(!tools.includes("vault_approve_hash"), "vault_approve_hash is gone");
+    assert.ok(locked.ok && Array.isArray(locked.json.approvals) && (locked.json.approvals as unknown[]).length === 0, locked.text);
+    const read = await call(client, "vault_lock", { action: "status", vault });
+    assert.ok(read.ok && getAddress(read.json.vault as string) === vault && Array.isArray(read.json.approvals), read.text);
+    const notStatus = await call(client, "vault_lock", { action: "cancel", vault });
+    assert.ok(!notStatus.ok && /status only/.test(notStatus.text), notStatus.text);
+    const revoked = await call(client, "vault_revoke_hash", { hash: `0x${"ab".repeat(32)}` });
+    assert.ok(revoked.ok && revoked.json.status === "sent", revoked.text);
+  } finally {
+    await client.close();
+  }
+});
+
+test("the MCP server lists a vault's live EIP-1271 approval and withdraws it: OstraBreaker's approval of its limits, before any lock", { timeout: 900_000 }, async () => {
+  const home = join(root, "home-approvals");
+  const client = await connect(home);
+  const valid = async (vault: Address, hash: `0x${string}`) =>
+    ((await fork.client.readContract({ address: vault, abi: erc1271Abi, functionName: "isValidSignature", args: [hash, "0x"] })) as string).toLowerCase() === "0x1626ba7e";
+  try {
+    const status = (await call(client, "balance")).json.vault as { feePayer: Address };
+    await fork.setBalance(status.feePayer, 10n ** 18n);
+    const opened = await call(client, "open_vault");
+    assert.ok(opened.ok, opened.text);
+    const vault = getAddress(opened.json.vault as string);
+    const none = await call(client, "vault_lock", { action: "status" });
+    assert.ok(none.ok && Array.isArray(none.json.approvals) && (none.json.approvals as unknown[]).length === 0, none.text);
+    // The breaker set up without the lock: its configure used the vault's approval of its limits, which stays approved.
+    const armed = await call(client, "breaker", { action: "arm" }, 600_000);
+    assert.ok(armed.ok, armed.text);
+    const listed = await call(client, "vault_lock", { action: "status" });
+    const approvals = listed.json.approvals as { hash: `0x${string}`; valid: boolean }[];
+    assert.ok(listed.ok && approvals.length === 1 && approvals[0]!.valid === true, listed.text);
+    const hash = approvals[0]!.hash;
+    assert.ok(await valid(vault, hash), "the listed hash is the one the vault approves");
+    // Read as another vault (a guardian's view): the same list.
+    const read = await call(client, "vault_lock", { action: "status", vault });
+    assert.deepEqual((read.json.approvals as { hash: string }[]).map((x) => x.hash), [hash], read.text);
+    // Withdrawn: the vault no longer approves it, and the status lists nothing.
+    const revoked = await call(client, "vault_revoke_hash", { hash });
+    assert.ok(revoked.ok && revoked.json.status === "sent", revoked.text);
+    assert.ok(!(await valid(vault, hash)), "the hash is no longer approved");
+    const after = await call(client, "vault_lock", { action: "status" });
+    assert.ok(after.ok && (after.json.approvals as unknown[]).length === 0, after.text);
   } finally {
     await client.close();
   }

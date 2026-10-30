@@ -34,6 +34,7 @@ import {
   ostraVaultAbi,
   readBorroPosition,
   readBorroUsdg,
+  readHashApprovals,
   readVault,
   readVaultGuard,
   redeemParams,
@@ -53,6 +54,7 @@ import {
   type BorroStock,
   type EthUsdSource,
   type GuardCall,
+  type HashApproval,
   type VaultGuardState,
 } from "@ostraagent/sdk";
 import { formatUnitsAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
@@ -85,6 +87,12 @@ export type BorroParts = {
    * charge (1.02 gwei on a fork against the chain's 0.0202, read 24 Oct 2026).
    */
   gasPrice?: () => Promise<bigint>;
+  /**
+   * Where event searches go (eth_getLogs over the vault's history: its EIP-1271 approvals); default `client`. The MCP
+   * passes OSTRA_LOGS_RPC_URL's (Robinhood Chain's public RPC by default), as for the launchpad and the swaps: an
+   * agent's own RPC may cap eth_getLogs at a few blocks.
+   */
+  logsClient?: PublicClient;
 };
 
 function isoTime(unix: bigint): string {
@@ -430,6 +438,27 @@ export class BorroService {
   }
 
   /**
+   * The lock's status (guard) with the hashes the vault approves for EIP-1271 now (sdk readHashApprovals): of the vault
+   * of `what`, or, given `otherText`, of any Ostra vault (a guardian watching the vault it guards). Read only.
+   */
+  async lockStatus(what: string, otherText?: string): Promise<VaultGuardState & { vault: Address; approvals: HashApproval[] }> {
+    let at: Address;
+    if (otherText === undefined) {
+      const { vault } = this.#vaultOf(what);
+      at = await this.#address(vault, what.toUpperCase());
+    } else {
+      if (!isAddress(otherText, { strict: false })) throw new RangeError(`${otherText} is not an address`);
+      at = getAddress(otherText);
+      if ((await readVault(this.#p.client, this.#p.config.deployment, at)) === null) throw new Error(`${at} is not an Ostra vault`);
+    }
+    const [g, approvals] = await Promise.all([
+      readVaultGuard(this.#p.client, at),
+      readHashApprovals(this.#p.client, this.#p.logsClient ?? this.#p.client, at, BigInt(this.#p.config.deployment.fromBlock)),
+    ]);
+    return { vault: at, ...g, approvals };
+  }
+
+  /**
    * Turns the withdrawal lock of the vault of `what` on (a withdrawal address, a delay, a daily limit in the vault's
    * token) or changes it; `withdrawal` "off" turns it off (that waits the delay). The withdrawal address must keep
    * what it gets: a wallet on another device, or an Ostra vault of another seed that is locked already. Never one of
@@ -518,9 +547,26 @@ export class BorroService {
     return this.#spend(this.#p.buyer, VAULT_ACTION.GUARD, guardParams(target, call), `guard (${names[call.op] ?? call.op}) of ${target}`);
   }
 
-  /** Approves (or withdraws) `hash` for EIP-1271 on the buyer vault: under the lock an approval waits its delay. */
+  /**
+   * Approves (or withdraws) `hash` for EIP-1271 on the buyer vault: under the lock an approval waits its delay. For this
+   * package's own digests only (Raeto's login message, OstraBreaker's limits), which it builds and checks itself: an
+   * approved hash makes the vault answer isValidSignature for it, and USDG takes such an answer for a permit and for a
+   * transfer authorization, so a hash from anywhere else could hand the vault's funds out. No tool approves a hash it is
+   * given (withdrawApproval only withdraws).
+   */
   async approveHash(hash: Hex, approved: boolean): Promise<VaultOperationResult> {
     if (!/^0x[0-9a-fA-F]{64}$/.test(hash) || /^0x0{64}$/.test(hash)) throw new RangeError("the hash is 32 bytes of 0x hex, not zero");
     return this.#spend(this.#p.buyer, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash, approved }), approved ? "EIP-1271 approval" : "EIP-1271 approval withdrawal");
+  }
+
+  /**
+   * Withdraws the EIP-1271 approval of `hash` by the vault of `what` ("USDG", the buyer vault, or a Borro stock's
+   * vault): lands when there is none (nothing to do). Withdrawing is at once, under the lock too.
+   */
+  async withdrawApproval(what: string, hash: Hex): Promise<VaultOperationResult> {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash) || /^0x0{64}$/.test(hash)) throw new RangeError("the hash is 32 bytes of 0x hex, not zero");
+    const { vault } = this.#vaultOf(what);
+    await this.#address(vault, what.toUpperCase());
+    return this.#spend(vault, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash, approved: false }), `EIP-1271 approval withdrawal (${what.toUpperCase()} vault)`);
   }
 }

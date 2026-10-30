@@ -2,7 +2,8 @@
 // 95,228,009 (as strategy-pinned.fork.test.ts: Thursday 22 Oct 2026 15:50:00 UTC, the NYSE open, before Steakhouse
 // USDG's curator submitted the caps of a new mGLO market). A fork of an older block needs an archive RPC as
 // OSTRA_FORK_RPC. Ostra and its launchpad are deployed fresh; Borro's live NVDA market, Steakhouse USDG, Morpho Blue
-// and the ERC-8004 Identity Registry are the deployed ones; USDe's price is Chainlink's on Ethereum (OSTRA_ETH_RPC):
+// and the ERC-8004 Identity Registry are the deployed ones; USDe's price is Chainlink's on Ethereum as it was at the fork
+// block's time (OSTRA_ETH_RPC, which must serve Ethereum's old state: eth-at.ts):
 //   * shared capacity: one agent lends Steakhouse all but 500 USDG of the room Ostra vaults have there (5% of what it
 //     can pay out, read here); a second agent then lends only what the room left, its USDG over the plan's keep
 //     staying in its vault, and all Ostra vaults together hold at most 5% of what Steakhouse can pay out;
@@ -19,9 +20,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { createPublicClient, createWalletClient, getAddress, http, keccak256, parseAbi, stringToHex, type Address, type PublicClient } from "viem";
+import { createWalletClient, getAddress, http, keccak256, parseAbi, stringToHex, type Address, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { mainnet } from "viem/chains";
 import {
   BORRO_BUILDERS,
   BORRO_CODE,
@@ -59,6 +59,7 @@ import {
   type Config,
 } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
+import { ethClientAt } from "./eth-at.ts";
 import { splitLogsClient } from "./split-logs.ts";
 
 const PINNED_BLOCK = 95_228_009n;
@@ -68,7 +69,7 @@ const skip =
   forkRpc === undefined || forkRpc === ""
     ? "needs an archive RPC as OSTRA_FORK_RPC (the fork is at block 95,228,009)"
     : ethRpc === undefined || ethRpc === ""
-      ? "needs OSTRA_ETH_RPC (Chainlink USDe / USD on Ethereum)"
+      ? "needs OSTRA_ETH_RPC (Chainlink USDe / USD on Ethereum, with its old state)"
       : false;
 
 let fork: Fork;
@@ -123,7 +124,7 @@ after(async () => {
 async function agent(name: string, seed: number) {
   const client = fork.client as PublicClient;
   const transport = retryingHttp(fork.url);
-  const eth = createPublicClient({ chain: mainnet, transport: retryingHttp(ethRpc as string) }) as PublicClient;
+  const eth = (await ethClientAt(ethRpc as string, (await client.getBlock({ blockNumber: forkBlock })).timestamp)).client;
   const keys = new Keys({ master: new Uint8Array(32).fill(seed), feePayer, store: new FileWotsStore(join(root, name)), folder: new MemoryFolder(), backupExported: async () => true });
   const creatorKeys = await keys.forCreatorVault(d.chainId, USDG);
   const sender = new LocalSender(client, transport, feePayer);

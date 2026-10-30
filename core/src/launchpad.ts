@@ -139,6 +139,8 @@ const PAIRS_READ_CONCURRENCY = 6;
 /** A simulated vault spend is reserved for its gas x 5/4 plus this, at least VAULT_SPEND_GAS. */
 const SPEND_GAS_HEADROOM = 100_000n;
 const DAY = 86_400;
+/** How long a read of the creator vault's ERC-8004 registration waits for the logs RPC to reach the chain RPC's head. */
+const LOGS_CATCH_UP_SECONDS = 30;
 /** Most tokens one page of the token list holds. */
 export const TOKEN_LIST_MAX = 50;
 /** How much of a metadata or profile file is read. */
@@ -1198,13 +1200,20 @@ export class LaunchpadService {
    * is never registered twice. An identity someone else registered and sent to the creator vault (an ERC-721 transfer
    * the vault accepts) is no registration of this agent: with no Registered event of the vault, this is null. A
    * registration sent again just now is read from its receipt instead (#recordFromReceipt), not from logs that may lag.
+   * The vault's identities are counted at the chain's head and the events read up to that same block, after the logs
+   * RPC has reached it: a registration the count holds is never missed because the logs RPC was behind (which would
+   * register the agent twice); when the logs RPC does not reach that block soon, this throws before anything is signed.
    */
   async #recoverAgentRecord(): Promise<AgentRecord | null> {
     const vault = getAddress(await this.#creator.vaultAddress());
-    const owned = (await this.#client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityRegistryAbi, functionName: "balanceOf", args: [vault] })) as bigint;
+    const head = await this.#client.getBlockNumber({ cacheTime: 0 });
+    const owned = (await this.#client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityRegistryAbi, functionName: "balanceOf", args: [vault], blockNumber: head })) as bigint;
     if (owned === 0n) return null;
-    const to = await this.#logsClient.getBlockNumber({ cacheTime: 0 });
-    const logs = await getLogsChunked(this.#logsClient, { address: ERC8004_IDENTITY_REGISTRY, event: agentRegisteredEvent, args: { owner: vault }, fromBlock: BigInt(this.#config.deployment.fromBlock), toBlock: to });
+    for (let waited = 0; (await this.#logsClient.getBlockNumber({ cacheTime: 0 })) < head; waited++) {
+      if (waited >= LOGS_CATCH_UP_SECONDS) throw new Error(`the logs RPC has not reached block ${head} of the chain RPC after ${LOGS_CATCH_UP_SECONDS} seconds, so the creator vault's ERC-8004 registration cannot be read yet: call again shortly; nothing was signed`);
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
+    const logs = await getLogsChunked(this.#logsClient, { address: ERC8004_IDENTITY_REGISTRY, event: agentRegisteredEvent, args: { owner: vault }, fromBlock: BigInt(this.#config.deployment.fromBlock), toBlock: head });
     for (const log of logs) {
       const { agentId, agentURI } = log.args as { agentId: bigint; agentURI: string };
       const who = await readAgentIdentity(this.#client, agentId);
@@ -1218,7 +1227,9 @@ export class LaunchpadService {
 
   /**
    * The registration transaction `txHash` of the creator vault, read from its receipt (the vault's AgentRegistered
-   * event) and written to agent.json; null when it registered nothing. `uri` is the file it registered with.
+   * event) and written to agent.json; null when it registered nothing. The file it registered with is the Identity
+   * Registry's Registered event's agentURI in that receipt (a registration signed by an earlier call carries that
+   * call's file); `uri` only when the receipt has no such event.
    */
   async #recordFromReceipt(txHash: Hash, uri: string): Promise<AgentRecord | null> {
     const vault = getAddress(await this.#creator.vaultAddress());
@@ -1234,7 +1245,18 @@ export class LaunchpadService {
       }
     }
     if (agentId === undefined) return null;
-    const record: AgentRecord = { agentId, uri, txHash, at: Math.floor(Date.now() / 1000) };
+    let registered: string | undefined;
+    for (const log of receipt.logs) {
+      if (getAddress(log.address) !== getAddress(ERC8004_IDENTITY_REGISTRY)) continue;
+      try {
+        const e = decodeEventLog({ abi: [agentRegisteredEvent], data: log.data, topics: log.topics });
+        const a = e.args as { agentId: bigint; agentURI: string; owner: Address };
+        if (a.agentId.toString() === agentId && getAddress(a.owner) === vault) registered = a.agentURI;
+      } catch {
+        // another event of the registry
+      }
+    }
+    const record: AgentRecord = { agentId, uri: registered ?? uri, txHash, at: Math.floor(Date.now() / 1000) };
     await this.#folder.write("agent.json", JSON.stringify(record, null, 2));
     return record;
   }
@@ -1322,13 +1344,16 @@ export class LaunchpadService {
     const first = await this.#publishProfileFile(null);
     const unnumbered = { uri: first.uri, profile: first.profile };
     if (first.profile.status !== "sent") {
-      // The profile's spend sent one signed earlier instead (resent_pending): when that was the kept registration, the
+      // The profile's spend sent one signed earlier instead (resent_pending). When that was the kept registration, the
       // agent is registered now (read from that transaction's receipt), and its numbered profile is published at once.
-      const resent = first.profile.status === "resent_pending" ? first.profile.resent : null;
-      const landed =
-        resent !== null && resent.operation === "vault_spend" && resent.action === VAULT_ACTION.REGISTER_AGENT ? await this.#recordFromReceipt(resent.txHash, first.uri) : null;
-      if (landed === null) return { agentId: null, registration: null, unnumbered, ...first };
-      return { agentId: landed.agentId, registration: null, unnumbered, ...(await this.#publishProfileFile(landed)) };
+      // Anything else it sent (a profile signed by a call that stopped, say) leaves the agent unregistered and the vault
+      // free to sign again: the registration goes on now with the profile just pinned (the same file, Ostra's profile
+      // without a number), so one call still ends registered with its numbered profile set.
+      const resent = first.profile.resent;
+      const landed = resent.operation === "vault_spend" && resent.action === VAULT_ACTION.REGISTER_AGENT ? await this.#recordFromReceipt(resent.txHash, first.uri) : null;
+      if (landed !== null) return { agentId: landed.agentId, registration: null, unnumbered, ...(await this.#publishProfileFile(landed)) };
+      const after = (await this.#agentRecord()) ?? (await this.#recoverAgentRecord());
+      if (after !== null) return { agentId: after.agentId, registration: null, unnumbered, ...(await this.#publishProfileFile(after)) };
     }
     const registration = await this.registerAgent(first.uri);
     const record = await this.#agentRecord();

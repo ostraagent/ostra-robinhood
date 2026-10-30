@@ -39,7 +39,7 @@ const price = { answer: 400_000_000_000n, roundId: 1n, updatedAt: 1_000n };
 
 test("decided numbers", () => {
   assert.equal(RELAYER_MARGIN_BPS, 1_000n);
-  assert.equal(RELAYER_QUOTE_TOLERANCE_BPS, 200n);
+  assert.equal(RELAYER_QUOTE_TOLERANCE_BPS, 1_000n);
   assert.equal(ETH_USD_DEVIATION_BPS, 50n);
   assert.equal(ETH_USD_MAX_AGE_SECONDS, 90_000n);
   assert.equal(MAX_RELAY_CALLS, 8);
@@ -63,8 +63,9 @@ test("wei to token units: at the answer + 0.5%, rounded up, at least 1", () => {
   assert.throws(() => weiToTokenUnits(1n, price, 19), RangeError);
 });
 
-test("an agent pays a quote at most 2% above its own price", () => {
-  assert.equal(maxAcceptedQuote(1_000n), 1_020n);
+test("an agent pays a quote at most 10% above its own price", () => {
+  assert.equal(maxAcceptedQuote(1_000n), 1_100n);
+  assert.equal(maxAcceptedQuote(1_001n), 1_102n);
   assert.equal(maxAcceptedQuote(1n), 2n);
   assert.throws(() => maxAcceptedQuote(-1n), RangeError);
 });

@@ -30,25 +30,30 @@ import {
   MORPHO_BLUE,
   STEAKHOUSE_USDG,
   USDG,
+  VAULT_ACTION,
+  approveHashParams,
   borroStock,
   ostraVaultAbi,
   readBorroPosition,
   readVault,
   readVaultGuard,
   retryingHttp,
+  signVaultSpend,
   toAssetsUp,
   usdgAbi,
   vaultV2Abi,
   type Deployment,
 } from "@ostraagent/sdk";
 import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
-import { BorroService, Keys, LocalSender, RaetoService, VaultService, X402_NETWORK, type Config, type YieldMark } from "../src/index.ts";
+import { BorroService, Keys, LocalSender, RaetoService, VAULT_SPEND_GAS, VaultService, X402_NETWORK, spendCall, type Config, type YieldMark } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
+import { splitLogsClient } from "./split-logs.ts";
 
 let fork: Fork;
 let d: Deployment;
 let root: string;
 let config: Config;
+let forkBlock: bigint;
 
 const feePayer = privateKeyToAccount(keccak256(stringToHex("OSTRA/CORE/BORRO-FORK/fee-payer")));
 const someone = (name: string): Address => privateKeyToAccount(keccak256(stringToHex(`OSTRA/CORE/BORRO-FORK/${name}`))).address;
@@ -71,13 +76,14 @@ function device(name: string, seed: number) {
     return v;
   };
   const ownVaults = async () => [await buyer.vaultAddress(), ...(await Promise.all([...tokenVaults.values()].map((v) => v.vaultAddress())))];
-  const borro = new BorroService({ client, config, buyer, tokenVault, sender, ownVaults });
+  const borro = new BorroService({ client, logsClient: splitLogsClient(fork.url, forkBlock), config, buyer, tokenVault, sender, ownVaults });
   return { keys, buyer, tokenVault, borro };
 }
 
 before(async () => {
   root = await mkdtemp(join(tmpdir(), "ostra-core-borro-"));
   fork = await startFork();
+  forkBlock = await fork.client.getBlockNumber({ cacheTime: 0 });
   d = await deployOnFork(fork);
   config = { chainId: d.chainId, rpcUrl: fork.url, deployment: d, x402Network: X402_NETWORK, keeperUrl: null, relayerUrl: null, aggregatorUrl: null, aiUrl: null };
   await fork.setBalance(feePayer.address, 10n ** 19n);
@@ -209,6 +215,39 @@ test("the withdrawal lock: own vault refused, limit and guardian change refused 
   assert.equal((await owner.borro.approveHash(hash, true)).status, "sent");
   const valid = () => client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "isValidSignature", args: [hash, "0x"] }) as Promise<Hex>;
   assert.notEqual(await valid(), ERC1271_MAGIC);
+  // The lock's status lists it, waiting the delay, for the owner and for anyone reading this vault (a guardian); an
+  // approval withdrawn is not listed, and withdrawing a hash never approved lands too (nothing to do).
+  const other = keccak256(stringToHex("OSTRA/CORE/BORRO-FORK/other")) as Hex;
+  assert.equal((await owner.borro.approveHash(other, true)).status, "sent");
+  assert.equal((await owner.borro.withdrawApproval("USDG", other)).status, "sent");
+  assert.equal((await owner.borro.withdrawApproval("USDG", keccak256(stringToHex("OSTRA/CORE/BORRO-FORK/never")) as Hex)).status, "sent");
+  // On the NVDA vault (not locked): an approval the vault's own key signed (no tool approves a hash it is given, so the
+  // test signs the spend itself) counts at once and is listed; withdrawing it is that vault's own spend (the USDG
+  // vault's nonce does not move), and after it the vault no longer approves the hash nor lists it.
+  const stockHash = keccak256(stringToHex("OSTRA/CORE/BORRO-FORK/stock-order")) as Hex;
+  const stockApproval = await owner.tokenVault(borroStock("NVDA").token).operate({
+    gas: VAULT_SPEND_GAS,
+    moves: 0n,
+    what: "test approval on the NVDA vault",
+    build: async ({ v, vault: at, keychain, chainId }) => [spendCall(at, await signVaultSpend(keychain, v, { chainId, action: VAULT_ACTION.APPROVE_HASH, params: approveHashParams({ hash: stockHash, approved: true }) }))],
+  });
+  assert.equal(stockApproval.status, "sent");
+  const stockValid = async () => ((await client.readContract({ address: stockVault, abi: ostraVaultAbi, functionName: "isValidSignature", args: [stockHash, "0x"] })) as Hex) === ERC1271_MAGIC;
+  assert.ok(await stockValid());
+  assert.deepEqual((await owner.borro.lockStatus("NVDA")).approvals.map((x) => [x.hash, x.valid]), [[stockHash, true]]);
+  const usdgNonce = await nonceOf(vault);
+  assert.equal((await owner.borro.withdrawApproval("NVDA", stockHash)).status, "sent");
+  assert.ok(!(await stockValid()));
+  assert.deepEqual((await owner.borro.lockStatus("NVDA")).approvals, []);
+  assert.equal(await nonceOf(vault), usdgNonce);
+  // An agent with no vault of a stock: refused before anything is signed.
+  await assert.rejects(owner.borro.withdrawApproval("TSLA", stockHash), /has no TSLA vault yet/);
+  const listed = await owner.borro.lockStatus("USDG");
+  assert.deepEqual(listed.approvals.map((x) => [x.hash, x.valid]), [[hash, false]]);
+  const at = (await client.getBlock()).timestamp;
+  assert.ok((listed.approvals[0]?.validFrom ?? 0n) > at && (listed.approvals[0]?.validFrom ?? 0n) <= at + 129_600n, `validFrom ${listed.approvals[0]?.validFrom} is not within the lock's delay of ${at}`);
+  assert.deepEqual((await guardian.borro.lockStatus("USDG", vault)).approvals.map((x) => x.hash), [hash]);
+  await assert.rejects(guardian.borro.lockStatus("USDG", someone("not-a-vault")), /is not an Ostra vault/);
 
   // A loosening waits the delay; cancelled.
   assert.equal((await owner.borro.setLock("USDG", wallet, 129_600, "200")).status, "sent");
@@ -220,6 +259,7 @@ test("the withdrawal lock: own vault refused, limit and guardian change refused 
 
   await fork.increaseTime(129_600 + 1);
   assert.equal(await valid(), ERC1271_MAGIC);
+  assert.deepEqual((await owner.borro.lockStatus("USDG")).approvals.map((x) => [x.hash, x.valid]), [[hash, true]]);
 
   // A recovery under the lock: the guardian supports a new seed; after the delay its first operation sends
   // finishRecovery first (the new key's own spend does not finish a recovery under the lock), then lands.
@@ -242,8 +282,9 @@ test("the withdrawal lock: own vault refused, limit and guardian change refused 
   assert.equal((await fresh.buyer.requestRecovery(vault)).status, "recovered");
   assert.equal((await fresh.buyer.withdraw(payee, "1")).status, "sent");
   assert.equal(await usdg(payee), 2_000_000n);
-  // The approval given before the recovery no longer counts.
+  // The approval given before the recovery no longer counts, nor is it listed.
   assert.notEqual(await valid(), ERC1271_MAGIC);
+  assert.deepEqual((await guardian.borro.lockStatus("USDG", vault)).approvals, []);
   await assert.rejects(owner.buyer.withdraw(payee, "1"), /does not match the expected key root/);
 });
 

@@ -201,7 +201,7 @@ export class RaetoService {
       await this.#keepApprovals((await this.#keptApprovals()).filter((h) => h !== hash));
       return { done: true, note };
     }
-    return { done: false, note: `${note}; the approval may still read or land: call raeto login again to withdraw it, or vault_approve_hash ${hash} approved false` };
+    return { done: false, note: `${note}; the approval may still read or land: call raeto login again to withdraw it, or vault_revoke_hash ${hash}` };
   }
 
   /**

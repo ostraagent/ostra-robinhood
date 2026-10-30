@@ -107,8 +107,14 @@ import { chainlinkAggregatorAbi, multicall3Abi, nodeInterfaceAbi } from "./exter
 
 /** Relayer margin: gas cost + 10% (design v0.3, "Margin fee relayer"). */
 export const RELAYER_MARGIN_BPS = 1_000n;
-/** How far above its own price an agent still pays a relayer quote (decided 15 Oct 2026): 2%. */
-export const RELAYER_QUOTE_TOLERANCE_BPS = 200n;
+/**
+ * How far above its own price an agent still pays a relayer quote: 10% (2% decided 15 Oct 2026, raised 30 Oct 2026).
+ * The agent prices at the gas price it reads, the relayer at the one it reads moments later, and Robinhood Chain's
+ * base fee moves faster than 2%: on 29 Oct 2026 (15:45 UTC) an agent refused a correct quote 4% above its own price,
+ * and over 7,168 blocks read on 30 Oct (base fee 0.02000 to 0.02108 gwei) it rose by up to 5.40% within 30 seconds.
+ * 10% covers that with room and keeps an agent's worst overpayment to a tenth of a spend's price.
+ */
+export const RELAYER_QUOTE_TOLERANCE_BPS = 1_000n;
 /** ETH/USD is priced 0.5% high, Chainlink's deviation threshold for the feed (decided 17 Oct 2026). */
 export const ETH_USD_DEVIATION_BPS = 50n;
 /**

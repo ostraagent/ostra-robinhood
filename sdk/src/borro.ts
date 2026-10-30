@@ -8,11 +8,11 @@
 // market is touched, so stored totals leave a debt unchanged for as long as nobody interacts. Every read here is
 // taken at one block.
 
-import { getAddress, parseAbi, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
-import { ostraVaultAbi } from "./abi.ts";
+import { getAbiItem, getAddress, parseAbi, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
+import { ostraVaultAbi, ostraVaultModuleAbi } from "./abi.ts";
 import { BORRO_IRM, BORRO_ROUTER, BORRO_STOCKS, BORRO_USDG_VAULT, MORPHO_BLUE, USDG, VAULT_MAX_LTV_OF_LLTV_BPS, VAULT_V3 } from "./constants.ts";
 import { marketId, type MarketParams, type WithdrawalLock } from "./messages.ts";
-import { blockTime, readMorphoMarket } from "./morpho.ts";
+import { blockTime, getLogsChunked, readMorphoMarket } from "./morpho.ts";
 
 /** What the reads call on Morpho Blue (morpho-blue src/interfaces/IMorpho.sol). */
 export const morphoBlueAbi = parseAbi([
@@ -89,6 +89,42 @@ export type VaultGuardState = {
   pendingLock: { lock: WithdrawalLock; at: bigint } | null;
   pendingLink: { vault: Address | null; at: bigint } | null;
 };
+
+/** A hash a vault approves for EIP-1271 now: from when it counts (unix seconds), and whether that time has come. */
+export type HashApproval = { hash: Hex; validFrom: bigint; valid: boolean };
+
+/**
+ * The hashes `vault` approves for EIP-1271 in its current approval epoch, valid already or waiting the lock's delay:
+ * each hash of the vault's HashApproved events since `fromBlock` (the module's event, emitted at the vault's address;
+ * searched through `logsClient`, read through `client`)
+ * whose hashValidFrom still reads (an approval withdrawn, revoked by a guardian, or ended by a lock turned on or a
+ * recovery reads 0), in the order first approved. A hash is all the chain holds of what was approved: one the owner
+ * does not recognize may be a token permit or a transfer authorization of the vault's own funds, which an approval
+ * lets anyone spend outside the vault's rules, so it is withdrawn (vault_revoke_hash) or, by a guardian of a locked
+ * vault, revoked (guard op 1) before its time comes. Empty before version 3.
+ */
+export async function readHashApprovals(client: PublicClient, logsClient: PublicClient, vault: Address, fromBlock: bigint): Promise<HashApproval[]> {
+  const version = Number(await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }));
+  if (version < VAULT_V3) return [];
+  // The events from `logsClient` up to its own head (it may lag `client`: the head is not taken from the other RPC,
+  // which could name a block it does not serve yet); what reads now, from `client` at its head.
+  const event = getAbiItem({ abi: ostraVaultModuleAbi, name: "HashApproved" });
+  const logs = await getLogsChunked(logsClient, { address: vault, event, fromBlock, toBlock: await logsClient.getBlockNumber({ cacheTime: 0 }) });
+  const head = await blockTime(client);
+  const hashes: Hex[] = [];
+  for (const l of logs) {
+    const h = (l.args as { hash: Hex }).hash.toLowerCase() as Hex;
+    if (!hashes.includes(h)) hashes.push(h);
+  }
+  const out: HashApproval[] = [];
+  for (const hash of hashes) {
+    const validFrom = BigInt(
+      await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "hashValidFrom", args: [hash], blockNumber: head.blockNumber }),
+    );
+    if (validFrom !== 0n) out.push({ hash, validFrom, valid: head.timestamp >= validFrom });
+  }
+  return out;
+}
 
 export async function readVaultGuard(client: PublicClient, vault: Address): Promise<VaultGuardState> {
   const version = Number(await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }));
