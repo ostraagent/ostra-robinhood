@@ -17,6 +17,10 @@
 //                             https://sourcify.dev/server; "off": none; sourcify.ts)
 //   OSTRA_PAD_INDEXER_STATE   Ostrapad's index state file (default: pad-state.json next to OSTRA_INDEXER_STATE;
 //                             "off": no Ostrapad index; pad.ts)
+//   OSTRA_PAD_HIDE            files of accounts the Ostrapad board leaves out, comma-separated, one address at the
+//                             start of a line (Ostra's own vaults; they live on the server). Unset, or a file that
+//                             cannot be read: the board is not served (pad.ts); the other Ostrapad routes are not
+//                             filtered
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
@@ -25,7 +29,7 @@ import { dirname, join } from "node:path";
 import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
-import { PadIndexer } from "./pad.ts";
+import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
@@ -90,7 +94,11 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   log("ipfs", { uploader: uploader === null ? null : new URL(uploader).host, gateways: gateways.map((g) => new URL(g).host) });
   log("logs_rpc", { host: new URL(logsUrl).host === new URL(rpcUrl).host ? "<rpc>" : new URL(logsUrl).host });
   const padStatePath = process.env.OSTRA_PAD_INDEXER_STATE || join(dirname(statePath), "pad-state.json");
-  const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri) });
+  const hideText = process.env.OSTRA_PAD_HIDE;
+  const hideFiles = hideText === undefined || hideText.trim() === "" ? [] : hideText.split(",").map((f) => f.trim()).filter((f) => f !== "");
+  const hidden = hideFiles.length === 0 ? () => null : hiddenListFromFiles(hideFiles, log);
+  const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri), hidden });
+  log("pad_board", { hiddenFiles: hideFiles.length });
   const server = createIndexerServer(indexer, log, pad);
   server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString(), pad: pad === null ? "off" : padStatePath }));
   indexer.start(everyMs);

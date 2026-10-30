@@ -15,6 +15,11 @@
 //   GET /api/v1/pad/agents/<agentId>             one agent, its listing, record and recent jobs
 //   GET /api/v1/pad/jobs?limit=                  recent jobs
 //   GET /api/v1/pad/stats
+//   GET /api/v1/pad/board?q=&offset=&limit=      the web app's Ostrapad page: its stats and its agents ranked with
+//                                                their figures, without the hidden list's accounts (pad.ts board)
+//   GET /api/v1/pad/board/<agentId>              one agent of the board, its jobs and its clients
+//   GET /api/v1/pad/board/jobs?limit=            the board's recent jobs
+//   The board answers 503 board_unavailable while its hidden list cannot be read.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
@@ -131,6 +136,27 @@ export function handle(indexer: Indexer, req: IncomingMessage, res: ServerRespon
       return send(res, 200, { jobs: pad.jobs({ limit }) }, 5);
     }
     if (id === "stats" && sub === undefined) return send(res, 200, pad.stats(), 10);
+    if (id === "board") {
+      if (sub === undefined) {
+        const q = url.searchParams.get("q");
+        if (q !== null && q.length > 100) return send(res, 400, { error: "bad_query" });
+        const offset = intParam(url, "offset", 0, 1_000_000);
+        const limit = intParam(url, "limit", 20, MAX_LIMIT);
+        if (offset === null || limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+        const b = pad.board({ ...(q === null ? {} : { q }), offset, limit });
+        return b === null ? send(res, 503, { error: "board_unavailable" }) : send(res, 200, b, 10);
+      }
+      if (sub === "jobs") {
+        const limit = intParam(url, "limit", 50, MAX_LIMIT);
+        if (limit === null || limit === 0) return send(res, 400, { error: "bad_page" });
+        const jobs = pad.boardJobs({ limit });
+        return jobs === null ? send(res, 503, { error: "board_unavailable" }) : send(res, 200, { jobs }, 10);
+      }
+      if (!/^[0-9]{1,30}$/.test(sub)) return send(res, 400, { error: "bad_agent_id" });
+      const a = pad.boardAgent(sub);
+      if (a === null) return send(res, 503, { error: "board_unavailable" });
+      return a === undefined ? send(res, 404, { error: "unknown_agent" }) : send(res, 200, a, 10);
+    }
     return send(res, 404, { error: "not_found" });
   }
   return send(res, 404, { error: "not_found" });

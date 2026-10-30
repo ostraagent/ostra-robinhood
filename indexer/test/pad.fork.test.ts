@@ -5,7 +5,9 @@
 // listed agent with its record, the job with its status and pay, and its stats. Files are kept in memory under the
 // CID the uploader gives them (CIDv1 raw sha2-256 of the bytes), as core's pad.fork.test.ts does. Mainnet holds
 // agents and jobs of its own (Ostrapad's first jobs, 28 Oct 2026), which the fork carries: an index read before the
-// test's own steps is the baseline, and the counts are checked against it.
+// test's own steps is the baseline, and the counts are checked against it. The board (the web app's Ostrapad page)
+// is checked on the same index: the agent's figures from its job, and the hidden list leaving out a client's job, then
+// the agent itself, and the board refused without a list.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -152,7 +154,8 @@ test("the index serves listed agents ranked with their record, jobs with status 
   await provider.pad.deliver({ jobId: id, output: "A report." });
   await client.pad.decide({ jobId: id, approve: true });
 
-  const index = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
+  let hidden: Set<string> | null = new Set();
+  const index = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson, hidden: () => hidden });
   await index.sync();
   const l = index.listings({ limit: 50 });
   assert.equal(l.total, base.listed + 1, JSON.stringify(l));
@@ -181,6 +184,49 @@ test("the index serves listed agents ranked with their record, jobs with status 
   assert.equal(s.agents, base.agents + 1, "only the Ostra vault's registration is kept");
   assert.equal(s.completed, base.completed + 1);
   assert.equal(units(s.valueCompleted), units(base.valueCompleted) + 1_990_000n);
+
+  // The board: the agent with the figures of its one job.
+  const job0 = index.boardJobs({ limit: 100 })!.find((j) => j.id === id)!;
+  assert.equal(job0.agentId, agentId.toString());
+  assert.equal(job0.judgedBy, "client");
+  assert.equal("evaluator" in job0, false, "the board names no judge's account");
+  assert.ok(job0.acceptedAt !== null && job0.submittedAt !== null && job0.closedAt !== null && job0.acceptedAt >= job0.createdAt && job0.submittedAt >= job0.acceptedAt && job0.closedAt >= job0.submittedAt, JSON.stringify(job0));
+  const board = index.board({ limit: 100 })!;
+  assert.equal(board.total, base.listed + 1);
+  const row = board.agents.find((x) => x.agentId === agentId.toString())!;
+  assert.equal(row.completed, 1);
+  assert.equal(row.clients, 1);
+  assert.equal(row.earned, "1.99");
+  assert.equal(row.priceFrom, "2");
+  assert.equal(row.successRate, 1);
+  assert.equal(row.rejectionRate, 0);
+  assert.equal(row.inProgress, 0);
+  assert.equal(row.deliverySeconds, (job0.submittedAt as number) - (job0.acceptedAt as number));
+  assert.equal(typeof row.providerSince, "number", "the provider vault's creation was read");
+  const detail = index.boardAgent(agentId.toString())!;
+  assert.equal(detail.jobs.length, 1);
+  assert.deepEqual(detail.clientsOf, [{ client: client.vault, orders: 1, completed: 1, rejected: 0, judged: 1, rejectionRate: 0 }]);
+  assert.ok(board.stats.completed >= 1 && board.stats.listed === board.total);
+  // A hidden client: its job leaves the board, the agent stays with no figures.
+  hidden = new Set([client.vault.toLowerCase()]);
+  assert.equal(index.boardJobs({ limit: 100 })!.some((j) => j.id === id), false);
+  const quiet = index.board({ limit: 100 })!.agents.find((x) => x.agentId === agentId.toString())!;
+  assert.equal(quiet.completed, 0);
+  assert.equal(quiet.successRate, null);
+  // A hidden owner (the creator vault): the agent leaves the board, and so do its jobs.
+  hidden = new Set([provider.creatorVault.toLowerCase()]);
+  assert.equal(index.board({ limit: 100 })!.agents.some((x) => x.agentId === agentId.toString()), false);
+  assert.equal(index.boardAgent(agentId.toString()), undefined);
+  assert.equal(index.boardJobs({ limit: 100 })!.some((j) => j.id === id), false, "the job of an agent left out leaves too");
+  // No list configured: no board.
+  assert.equal(new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson }).board(), null);
+  // No readable list: no board.
+  hidden = null;
+  assert.equal(index.board(), null);
+  assert.equal(index.boardAgent(agentId.toString()), null);
+  assert.equal(index.boardJobs(), null);
+  // The listings (MCP's pad_search, the evaluator bot) do not use the list.
+  assert.equal(index.listings({ provider: provider.vault }).total, 1);
 
   // A state written and read back: the same listing.
   const again = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
