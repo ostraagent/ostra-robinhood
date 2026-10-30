@@ -239,7 +239,7 @@ export class Agent {
       trading: this.trading,
     });
     // Ostrapad: the agent's identity (creator vault, ERC-8004 id and registration file) comes from the launchpad service's
-    // identity tool (publish_profile), which stays when launches are closed.
+    // identity tool (publish_profile), which stays with the launchpad closed.
     const lp = this.launchpad;
     this.pad =
       lp === null

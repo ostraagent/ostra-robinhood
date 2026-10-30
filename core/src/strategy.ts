@@ -425,7 +425,7 @@ export class StrategyService {
         price ??= await this.usde();
         if ("error" in price) usdeProblem = `its caps reach a USDe market and USDe's price is not known: ${price.error}`;
         else if (price.stale) usdeProblem = `its caps reach a USDe market and Chainlink's USDe / USD answer is ${price.age} s old`;
-        else if (price.price < USDE_EXIT_PRICE) usdeProblem = `its caps reach a USDe market and USDe is at ${formatUnitsAmount(price.price, 18)} US dollars, under 0.995`;
+        else if (price.price < USDE_EXIT_PRICE) usdeProblem = `its caps reach a USDe market and USDe is at ${formatUnitsAmount(price.price, 18)} US dollars, under ${formatUnitsAmount(USDE_EXIT_PRICE, 18)}`;
       }
       // What makes each run leave it (design), so a plan does not enter what the next run would leave: USDe's price read
       // under the line while it lends against USDe (a price that cannot be read is not a reason to leave: a failing
@@ -434,7 +434,7 @@ export class StrategyService {
       const st = c.state;
       if (st.adapters.some((x) => x.kind === "market" && x.markets.some((m) => getAddress(m.params.collateralToken) === USDE && m.supplyAssets > 0n))) {
         price ??= await this.usde();
-        if (!("error" in price) && price.price < USDE_EXIT_PRICE) exitReasons.push(`it lends against USDe, which is at ${formatUnitsAmount(price.price, 18)} US dollars, under 0.995`);
+        if (!("error" in price) && price.price < USDE_EXIT_PRICE) exitReasons.push(`it lends against USDe, which is at ${formatUnitsAmount(price.price, 18)} US dollars, under ${formatUnitsAmount(USDE_EXIT_PRICE, 18)}`);
       }
       const lm = st.liquidityMarket;
       if (lm !== null && lm.expected !== null && utilization(lm.expected) >= LIQUIDITY_EXIT_UTILIZATION) exitReasons.push("its liquidity market is 99% used or more");
@@ -596,7 +596,7 @@ export class StrategyService {
     const risks = ["Ostra and Borro are not audited; Morpho Blue and Vault V2 are.", "A cash vault pays out only up to its free liquidity; its curator can move funds within its caps without a timelock."];
     for (const c of checks) if (!c.ok) risks.push(`${c.vault} is not used now: ${whyNot(c)}`);
     const stopWhen = [
-      "a cash vault fails a check (sdk checkCashVault), a change to it is submitted, its share price grows less than half of its model over 3 days, it lends against USDe while Chainlink's USDe / USD price is under 0.995, or its liquidity market is 99% used: it is redeemed (an emergency redeem of what it can pay out); all Ostra vaults holding more than 5% of what it can pay out: the excess is redeemed",
+      `a cash vault fails a check (sdk checkCashVault), a change to it is submitted, its share price grows less than half of its model over 3 days, it lends against USDe while Chainlink's USDe / USD price is under ${formatUnitsAmount(USDE_EXIT_PRICE, 18)}, or its liquidity market is 99% used: it is redeemed (an emergency redeem of what it can pay out); all Ostra vaults holding more than 5% of what it can pay out: the excess is redeemed`,
       "a carry reaches 70% of the LLTV (60% for NVDA around a closure or earnings): back to its opening level; 85%: repaid in full; its rate averaged over two runs above the cash yield less 1 point: repaid in full; its market past 90% use: the excess repaid",
     ];
     const breaker = await this.#breakerNote();

@@ -5,10 +5,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ERC8004_IDENTITY_REGISTRY } from "@ostraagent/sdk";
-import { AGENT_DESCRIPTION, AGENT_NAME, imageType, profileFile, tokenMetadataFile, uploaderUrl } from "../src/publish.ts";
+import { AGENT_DESCRIPTION, AGENT_NAME, imageType, profileFile, uploaderUrl } from "../src/publish.ts";
 
 const VAULT = "0x00000000000000000000000000000000000000Aa";
-const TOKEN = "0x00000000000000000000000000000000000000bB";
 
 test("a profile is Ostra's ERC-8004 registration file: its name and number, Ostra's description, its card, its vault as agentWallet", () => {
   const f = profileFile({ vault: VAULT, agentId: "8853", image: "ipfs://bafkreiimage" });
@@ -31,12 +30,6 @@ test("a profile is Ostra's ERC-8004 registration file: its name and number, Ostr
 test("bad fields are refused before anything is uploaded", () => {
   assert.throws(() => profileFile({ vault: VAULT, agentId: "12a" }), RangeError);
   assert.throws(() => profileFile({ vault: VAULT, image: "javascript:alert(1)" }), RangeError);
-  assert.throws(() => tokenMetadataFile({ token: TOKEN, name: "T", symbol: "T", creatorVault: VAULT, description: "x".repeat(1_001) }), RangeError);
-});
-
-test("a token's metadata carries its name, symbol, links and where it lives", () => {
-  const m = tokenMetadataFile({ token: TOKEN, name: "Ostra Test", symbol: "OTST", creatorVault: VAULT, telegram: "https://t.me/ostra" });
-  assert.deepEqual(m, { name: "Ostra Test", symbol: "OTST", telegram: "https://t.me/ostra", token: `eip155:4663:${TOKEN}`, creatorVault: `eip155:4663:${VAULT}` });
 });
 
 test("images by their first bytes, and the uploader on the relayer's host", () => {

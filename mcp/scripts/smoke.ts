@@ -1,5 +1,5 @@
 // Runs the npm package as an MCP client does, through npx, in a fresh
-// OSTRA_HOME and npm cache: the tools are listed (the launchpad's closed ones
+// OSTRA_HOME and npm cache: the tools are listed (the launchpad's removed ones
 // absent), `pad_search` reads Ostra's Ostrapad index, `balance` answers, `ostra_ai_credit` reaches Ostra
 // AI (no payment), `private_recover` reads the private pool's whole history
 // (its events against its trees: a fresh seed holds no notes), `borro_markets`
@@ -31,10 +31,11 @@ if (arg === undefined) throw new Error("usage: node scripts/smoke.ts <tarball | 
 // npx runs a tarball's command by name (--package); a published version as an MCP client's config does.
 const npx = arg.endsWith(".tgz") ? ["-y", `--package=${resolve(arg)}`, "ostra-mcp"] : ["-y", arg];
 const source = await readFile(new URL("../src/tools.ts", import.meta.url), "utf8");
-const closedList = /CLOSED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
-if (closedList === null) throw new Error("src/tools.ts has no CLOSED_LAUNCHPAD_TOOLS list");
-const closed = new Set([...(closedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string));
-const expected = new Set([...source.matchAll(/tool\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string).filter((n) => !closed.has(n)));
+const removedList = /REMOVED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
+if (removedList === null) throw new Error("src/tools.ts has no REMOVED_LAUNCHPAD_TOOLS list");
+const removed = new Set([...(removedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string));
+const expected = new Set([...source.matchAll(/tool\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string));
+for (const n of removed) if (expected.has(n)) throw new Error(`src/tools.ts still registers the removed tool ${n}`);
 
 const root = await mkdtemp(join(tmpdir(), "ostra-mcp-smoke-"));
 const env: Record<string, string> = {};
@@ -56,8 +57,8 @@ try {
   const info = client.getServerVersion();
   const { tools } = await client.listTools();
   const names = new Set(tools.map((t) => t.name));
-  assert.deepEqual([...names].sort(), [...expected].sort(), "the tools listed are the open tools in src/tools.ts");
-  for (const n of closed) assert.ok(!names.has(n), `the closed launchpad tool ${n} is not listed`);
+  assert.deepEqual([...names].sort(), [...expected].sort(), "the tools listed are the tools in src/tools.ts");
+  for (const n of removed) assert.ok(!names.has(n), `the removed launchpad tool ${n} is not listed`);
   // Past the MCP client's default 60 s: borro_markets reads Borro's 12 markets, over 60 s through a busy RPC.
   const call = async (name: string, args: Record<string, unknown>) => {
     const r = (await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 })) as { isError?: boolean; content: { text: string }[] };

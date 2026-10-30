@@ -42,8 +42,6 @@
 //   airdrop-<pool>-<round>.json the round's entries and proofs, so claims
 //                              can be sent for any of its accounts
 //   agent.json                 the ERC-8004 identity the creator vault registered
-//   token-index.json           every Ostra launch read from the launchpad's
-//                              Launched events so far, and the block read up to
 //
 // The creator vault is also the agent's public identity (vault version 2): it
 // sets the agent's profile in OstraRegistry, registers the agent in the
@@ -51,7 +49,7 @@
 // agentWallet), and sets the metadata of the tokens it launched; a token's
 // page links to its creator's profile through the pool's creator vault.
 
-import { bytesToHex, decodeEventLog, encodeFunctionData, getAddress, isAddress, parseAbiItem, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type Transport } from "viem";
+import { bytesToHex, decodeEventLog, encodeFunctionData, getAddress, isAddress, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type Transport } from "viem";
 import {
   AIRDROP,
   CREATOR_SPLIT,
@@ -120,8 +118,7 @@ import { formatTokenAmount, formatUnitsAmount, parseTokenAmount, parseUnitsAmoun
 import { tokenBalance, tokenDecimals } from "./chain.ts";
 import { ipfsBytes } from "./ipfs.ts";
 import { quoteOfPool, readLaunchedPool, readPoolView, type LaunchedPool as Pool, type PoolView } from "./pools.ts";
-import { LOG_WINDOW_BLOCKS } from "./channels.ts";
-import { agentCardUri, profileFile, tokenMetadataFile, uploadJson, uploaderUrl, type PublicFields } from "./publish.ts";
+import { agentCardUri, profileFile, uploadJson, uploaderUrl } from "./publish.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
@@ -141,16 +138,9 @@ const SPEND_GAS_HEADROOM = 100_000n;
 const DAY = 86_400;
 /** How long a read of the creator vault's ERC-8004 registration waits for the logs RPC to reach the chain RPC's head. */
 const LOGS_CATCH_UP_SECONDS = 30;
-/** Most tokens one page of the token list holds. */
-export const TOKEN_LIST_MAX = 50;
 /** How much of a metadata or profile file is read. */
 const METADATA_MAX_BYTES = 65_536;
-const launchedEvent = parseAbiItem("event Launched(bytes32 indexed poolId, address indexed token, address indexed creatorVault, address quote)");
 
-/** One Ostra launch, as the launchpad's Launched event records it. */
-export type TokenListing = { token: Address; poolId: Hex; creatorVault: Address; quote: Address; block: string; txHash: Hash };
-
-type TokenIndex = { version: 1; launchpad: Address; scannedTo: string; launches: TokenListing[] };
 type AgentRecord = { agentId: string; uri: string; txHash: Hash; at: number };
 
 /**
@@ -1088,41 +1078,6 @@ export class LaunchpadService {
     return { txHash, referrer, amount: formatUnitsAmount(owed, pair.decimals), pair: pair.symbol };
   }
 
-  // ---------------------------------------------------------------------------
-  // The token list (every Ostra launch, for any buyer)
-  // ---------------------------------------------------------------------------
-
-  /** Reads the launchpad's Launched events past the indexed block into token-index.json and returns the index. */
-  async #tokenIndex(): Promise<TokenIndex> {
-    const lp = this.#lp();
-    await this.#folder.ensure();
-    const text = await this.#folder.read("token-index.json");
-    let index: TokenIndex = text === undefined ? { version: 1, launchpad: lp.launchpad, scannedTo: (BigInt(this.#config.deployment.fromBlock) - 1n).toString(), launches: [] } : (JSON.parse(text) as TokenIndex);
-    if (getAddress(index.launchpad) !== getAddress(lp.launchpad)) index = { version: 1, launchpad: lp.launchpad, scannedTo: (BigInt(this.#config.deployment.fromBlock) - 1n).toString(), launches: [] };
-    const latest = await this.#client.getBlockNumber();
-    let from = BigInt(index.scannedTo) + 1n;
-    if (from > latest) return index;
-    for (; from <= latest; from += LOG_WINDOW_BLOCKS) {
-      const to = from + LOG_WINDOW_BLOCKS - 1n < latest ? from + LOG_WINDOW_BLOCKS - 1n : latest;
-      const logs = await this.#client.getLogs({ address: lp.launchpad, event: launchedEvent, fromBlock: from, toBlock: to });
-      for (const l of logs) {
-        if (l.args.token === undefined || l.args.poolId === undefined || l.args.creatorVault === undefined || l.args.quote === undefined || l.transactionHash === null || l.blockNumber === null) continue;
-        index.launches.push({ token: getAddress(l.args.token), poolId: l.args.poolId, creatorVault: getAddress(l.args.creatorVault), quote: getAddress(l.args.quote), block: l.blockNumber.toString(), txHash: l.transactionHash });
-      }
-      index.scannedTo = to.toString();
-    }
-    await this.#folder.write("token-index.json", JSON.stringify(index, null, 2));
-    return index;
-  }
-
-  /** The metadata URI of `token` in OstraRegistry; null when none or before the registry exists. */
-  async #metadataUri(token: Address): Promise<string | null> {
-    const r = this.#config.deployment.registry;
-    if (r === undefined) return null;
-    const uri = (await this.#client.readContract({ address: r, abi: ostraRegistryAbi, functionName: "tokenMetadataOf", args: [token] })) as string;
-    return uri === "" ? null : uri;
-  }
-
   /** The profile URI `account` set in OstraRegistry; null when none or before the registry exists. */
   async #profileUri(account: Address): Promise<string | null> {
     const r = this.#config.deployment.registry;
@@ -1131,37 +1086,8 @@ export class LaunchpadService {
     return uri === "" ? null : uri;
   }
 
-  /** Every token the Ostra launchpad launched, newest first: name, symbol, creator vault, quote and metadata URI. */
-  async tokens(a: { offset?: number; limit?: number } = {}): Promise<{ total: number; offset: number; tokens: (TokenListing & { name: string; symbol: string; metadataUri: string | null })[] }> {
-    const offset = a.offset ?? 0;
-    const limit = a.limit ?? 20;
-    if (!Number.isInteger(offset) || offset < 0) throw new RangeError("offset must be a whole number");
-    if (!Number.isInteger(limit) || limit < 1 || limit > TOKEN_LIST_MAX) throw new RangeError(`limit must be 1 to ${TOKEN_LIST_MAX}`);
-    const index = await this.#tokenIndex();
-    const page = [...index.launches].reverse().slice(offset, offset + limit);
-    const tokens = await Promise.all(
-      page.map(async (l) => {
-        const [name, symbol, metadataUri] = await Promise.all([
-          this.#client.readContract({ address: l.token, abi: ostraTokenAbi, functionName: "name" }) as Promise<string>,
-          this.#client.readContract({ address: l.token, abi: ostraTokenAbi, functionName: "symbol" }) as Promise<string>,
-          this.#metadataUri(l.token),
-        ]);
-        return { ...l, name, symbol, metadataUri };
-      }),
-    );
-    return { total: index.launches.length, offset, tokens };
-  }
-
-  /** A launched token for a buyer: its pool (price, rules, airdrop, creator shares), its metadata and its creator's profile, read from IPFS as data. */
-  async tokenInfo(tokenText: string): Promise<PoolView & { metadata: { uri: string | null; content: unknown }; creator: { vault: Address; profileUri: string | null; profile: unknown } }> {
-    const view = await this.poolInfo(tokenText);
-    const [metadataUri, profileUri] = await Promise.all([this.#metadataUri(view.token), this.#profileUri(view.creatorVault)]);
-    const [metadata, profile] = await Promise.all([readIpfsJson(metadataUri), readIpfsJson(profileUri)]);
-    return { ...view, metadata: { uri: metadataUri, content: metadata }, creator: { vault: view.creatorVault, profileUri, profile } };
-  }
-
   // ---------------------------------------------------------------------------
-  // The agent's identity: profile, ERC-8004 registration, token metadata (vault version 2)
+  // The agent's identity: profile and ERC-8004 registration (vault version 2)
   // ---------------------------------------------------------------------------
 
   /** Throws before anything is signed when the deployment record has no OstraRegistry (vault version 2 not executed yet). */
@@ -1446,18 +1372,4 @@ export class LaunchpadService {
     return { uri, profile, agentUri: await this.setAgentUri(uri) };
   }
 
-  /** Publishes the metadata of a token this agent launched (description, image, links), pins it and sets it in OstraRegistry. */
-  async publishTokenMetadata(a: PublicFields & { token: string }): Promise<{ uri: string; result: VaultOperationResult }> {
-    this.#requireRegistry();
-    const { pool, creator } = await this.#ownPool(a.token);
-    await this.#registryVersion(creator);
-    const vault = await creator.vaultAddress();
-    const [name, symbol] = await Promise.all([
-      this.#client.readContract({ address: pool.token, abi: ostraTokenAbi, functionName: "name" }) as Promise<string>,
-      this.#client.readContract({ address: pool.token, abi: ostraTokenAbi, functionName: "symbol" }) as Promise<string>,
-    ]);
-    const { token: _token, ...fields } = a;
-    const uri = await uploadJson(this.#config.relayerUrl, tokenMetadataFile({ ...fields, token: pool.token, name, symbol, creatorVault: vault }));
-    return { uri, result: await this.setTokenMetadata({ token: pool.token, uri }) };
-  }
 }

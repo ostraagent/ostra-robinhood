@@ -1,7 +1,7 @@
 // An Ethereum mainnet client that reads Ethereum as it was at a given time, for the fork tests pinned to an older
 // Robinhood Chain block (strategy-pinned and strategy-shared): the planner reads USDe's price from Chainlink's USDe / USD
 // feed on Ethereum, and a fork of 22 Oct 2026 read against today's price is a test of today's market, not of that
-// day's (on 30 Oct 2026 USDe stood at 0.9944482, under the planner's 0.995, and both tests failed for it). Every read
+// day's (on 30 Oct 2026 USDe stood at 0.9944482, under the planner's line then, 0.995, and both tests failed for it). Every read
 // that names no block (or latest, pending, safe or finalized) is sent for the Ethereum block of that time instead: the
 // last one at or before it. The answers are the node's own: url must serve Ethereum's old state (an archive RPC).
 

@@ -6,7 +6,7 @@
 // and the job is a real job of the smallest budget (0.1 USDG) with the client as its evaluator (no pool, no
 // evaluator fee). A wait for a file on IPFS stops at once when the first gateway refuses (ipfsRefusal).
 //
-//   1. Both servers list the Ostrapad and identity tools and none of the closed launchpad tools, and send through the
+//   1. Both servers list the Ostrapad and identity tools and none of the removed launchpad tools, and send through the
 //      relayer; Ostra's Ostrapad index answers.
 //   2. open_vault for both (created before payment); the vaults are printed (`VAULTS ...`). A quote of 1 USDG to WETH
 //      and the gas price give the run's amounts (amounts()); the script prints `FUND <vault> <base units> <USDG>` for
@@ -320,9 +320,9 @@ async function main(): Promise<void> {
   if (Object.keys(progress).length > 0) console.log(`CARRIED ON from ${toJson(progress)}`);
 
   const source = await readFile(new URL("../src/tools.ts", import.meta.url), "utf8");
-  const closedList = /CLOSED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
-  if (closedList === null) throw new Error("src/tools.ts has no CLOSED_LAUNCHPAD_TOOLS list");
-  const closed = [...(closedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string);
+  const removedList = /REMOVED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
+  if (removedList === null) throw new Error("src/tools.ts has no REMOVED_LAUNCHPAD_TOOLS list");
+  const closed = [...(removedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string);
 
   const p = await connect(entry, homes.provider, "provider");
   const c = await connect(entry, homes.client, "client");
@@ -341,7 +341,7 @@ async function main(): Promise<void> {
     for (const [who, s] of [["provider", p], ["client", c]] as const) {
       const tools = (await s.client.listTools()).tools.map((t) => t.name);
       const needed = ["open_vault", "balance", "withdraw", "ostra_swap_quote", "fund_creator_vault", "publish_profile", "profile", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"];
-      check(needed.every((n) => tools.includes(n)) && closed.length > 0 && closed.every((n) => !tools.includes(n)), `the ${who}'s server lists the Ostrapad and identity tools and none of the ${closed.length} closed launchpad tools`, `${tools.length} tools`);
+      check(needed.every((n) => tools.includes(n)) && closed.length > 0 && closed.every((n) => !tools.includes(n)), `the ${who}'s server lists the Ostrapad and identity tools and none of the ${closed.length} removed launchpad tools`, `${tools.length} tools`);
       const status = await call(s.client, "balance");
       check(status.ok && status.json.relayer === true, `the ${who}'s server sends through the Ostra relayer`, status.ok ? "" : status.text);
     }

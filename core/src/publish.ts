@@ -1,18 +1,14 @@
 // Publishing to IPFS through the Ostra uploader, served on the relayer's host (<relayer>/v1/ipfs/): the files
-// an agent publishes about itself (an ERC-8004 registration file, which is also its Ostra profile) and about the
-// tokens it launched (their metadata), and the images they show. An agent's profile is Ostra's own, the same for
-// every Ostra agent (its name and number, one description, the Ostra agent card as its image, its vault), so anyone
-// reading the ERC-8004 registry sees an Ostra agent; a token's metadata is built from fields its creator gives,
-// checked first, so what lands on IPFS has one shape.
+// an agent publishes about itself (an ERC-8004 registration file, which is also its Ostra profile), and the images
+// and files of Ostrapad orders and deliveries. An agent's profile is Ostra's own, the same for every Ostra agent (its
+// name and number, one description, the Ostra agent card as its image, its vault), so anyone reading the ERC-8004
+// registry sees an Ostra agent.
 
 import { ERC8004_IDENTITY_REGISTRY, ROBINHOOD_CHAIN_ID } from "@ostraagent/sdk";
 import type { Address } from "viem";
 
 /** The largest image the uploader takes. */
 export const MAX_UPLOAD_IMAGE_BYTES = 1_048_576;
-
-/** Links and texts an agent's profile or a token's metadata carries. */
-export type PublicFields = { description?: string; image?: string; website?: string; x?: string; telegram?: string };
 
 /** The image type the bytes start with, or null (PNG, JPEG, WebP, GIF: what the uploader takes). */
 export function imageType(b: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | "image/gif" | null {
@@ -22,27 +18,6 @@ export function imageType(b: Uint8Array): "image/png" | "image/jpeg" | "image/we
   if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
   if (at(0, 0x47, 0x49, 0x46, 0x38)) return "image/gif";
   return null;
-}
-
-function text(value: string | undefined, name: string, max: number): string | undefined {
-  if (value === undefined) return undefined;
-  const v = value.trim();
-  if (v === "" || v.length > max) throw new RangeError(`${name} must be 1 to ${max} characters`);
-  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(v)) throw new RangeError(`${name} must not hold control characters`);
-  return v;
-}
-
-function link(value: string | undefined, name: string): string | undefined {
-  if (value === undefined) return undefined;
-  const v = value.trim();
-  let u: URL;
-  try {
-    u = new URL(v);
-  } catch {
-    throw new RangeError(`${name} must be an https:// link`);
-  }
-  if (u.protocol !== "https:" || v.length > 200) throw new RangeError(`${name} must be an https:// link of at most 200 characters`);
-  return u.toString();
 }
 
 function imageUri(value: string | undefined): string | undefined {
@@ -74,26 +49,6 @@ export function profileFile(p: { vault: Address; agentId?: string | null; image?
     services: [{ name: "agentWallet", endpoint: `eip155:${ROBINHOOD_CHAIN_ID}:${p.vault}` }],
     active: true,
     registrations: id === null ? [] : [{ agentId: Number(id), agentRegistry: `eip155:${ROBINHOOD_CHAIN_ID}:${ERC8004_IDENTITY_REGISTRY}` }],
-  };
-}
-
-/** A launched token's metadata: its name and symbol as the token holds them, and what its creator tells buyers. */
-export function tokenMetadataFile(m: PublicFields & { token: Address; name: string; symbol: string; creatorVault: Address }): Record<string, unknown> {
-  const description = text(m.description, "description", 1_000);
-  const image = imageUri(m.image);
-  const website = link(m.website, "website");
-  const x = link(m.x, "x");
-  const telegram = link(m.telegram, "telegram");
-  return {
-    name: m.name,
-    symbol: m.symbol,
-    ...(description === undefined ? {} : { description }),
-    ...(image === undefined ? {} : { image }),
-    ...(website === undefined ? {} : { website }),
-    ...(x === undefined ? {} : { x }),
-    ...(telegram === undefined ? {} : { telegram }),
-    token: `eip155:${ROBINHOOD_CHAIN_ID}:${m.token}`,
-    creatorVault: `eip155:${ROBINHOOD_CHAIN_ID}:${m.creatorVault}`,
   };
 }
 

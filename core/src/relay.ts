@@ -57,6 +57,7 @@ import {
   channelId as computeChannelId,
   decodeOpenChannelParams,
   estimateRelay,
+  l1DataGas,
   relayPriceWei,
   relayValue,
   maxAcceptedQuote,
@@ -706,6 +707,32 @@ export class RelayerClient implements Sender {
     return maxAcceptedQuote(await this.#amountFor(VAULT_SPEND_GAS * (await this.#client.getGasPrice())));
   }
 
+  /**
+   * The most this agent pays for an open the relayer sent before payment (`openTx`, of the request `calls`), tolerance
+   * included: the largest of its own price for the open as it landed (its receipt's gas, which includes the L1 data
+   * part, at its effective gas price), of VAULT_SPEND_GAS plus the L1 data gas the open landed with at that price, and
+   * of a vault spend now (VAULT_SPEND_GAS plus the L1 data gas of the request's transaction at the L1 price now). The
+   * relayer prices an open with its L1 data part, which VAULT_SPEND_GAS alone leaves out: on 30 Oct 2026 an open used
+   * 742,965 gas, 478,114 of it L1 data, and its quote (796,869 gas) was refused against 400,000. The receipt's bounds
+   * keep it right when the open is paid later, at another L1 price: the relayer's L2 estimate can exceed what the open
+   * used (318,755 against 264,851 that day), which VAULT_SPEND_GAS covers.
+   */
+  async #openBound(calls: readonly RelayCall[], openTx: Hash): Promise<bigint> {
+    const receipt = await this.#client.getTransactionReceipt({ hash: openTx });
+    // Arbitrum's receipts carry gasUsedForL1 (viem keeps it as the node's hex); 0 on a chain without it.
+    const raw = (receipt as { gasUsedForL1?: unknown }).gasUsedForL1;
+    const landedL1 = typeof raw === "bigint" ? raw : typeof raw === "string" && /^0x[0-9a-fA-F]+$/.test(raw) ? BigInt(raw) : 0n;
+    const tx = relayTransaction(calls);
+    const l1 = await l1DataGas(this.#client, tx.to, tx.data);
+    const bounds = [
+      receipt.gasUsed * receipt.effectiveGasPrice,
+      (VAULT_SPEND_GAS + landedL1) * receipt.effectiveGasPrice,
+      (VAULT_SPEND_GAS + l1) * (await this.#client.getGasPrice()),
+    ];
+    const most = bounds.reduce((a, b) => (a > b ? a : b));
+    return maxAcceptedQuote(await this.#amountFor(most));
+  }
+
   /** The most this agent pays for `calls`: its own price for them (the gas they use, simulated from the relayer's account, plus the L1 data component; Chainlink) plus the tolerance. */
   async #maxAmount(calls: readonly RelayCall[]): Promise<bigint> {
     const facts = await this.facts();
@@ -879,7 +906,7 @@ export class RelayerClient implements Sender {
     if (voucherKey.address !== getAddress(config.payerAuthorizer)) throw new Error(`the voucher key of relayer channel ${channel} is not derived from this machine's master seed`);
     const ch = await this.#openedChannel(id, openTx);
     if (ch.balance !== found.amount || ch.pendingWithdrawal !== null) throw new Error(`relayer channel ${channel} does not hold its deposit of ${found.amount}`);
-    const most = debt + (await this.#spendBound());
+    const most = debt + (await this.#openBound(calls, openTx));
     if (paymentDue > most) throw new Error(`the relayer asks ${formatTokenAmount(paymentDue)} for the open of channel ${channel}, more than an open's price and the vault's debt (${formatTokenAmount(most)})`);
     if (paymentDue > found.amount) throw new Error(`the open of channel ${channel} owes more than its deposit`);
     return this.#serial(async () => {

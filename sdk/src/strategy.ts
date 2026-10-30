@@ -451,8 +451,11 @@ export const USDE: Address = "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34";
 /** Chainlink's ENS name of the USDe / USD feed on Ethereum mainnet, and the description it must answer. */
 export const USDE_USD_FEED_ENS = "usde-usd.data.eth";
 export const USDE_USD_FEED_DESCRIPTION = "USDe / USD";
-/** Below this USDe price (in US dollars, WAD) a cash vault lending against USDe is left (design: 0.995). */
-export const USDE_EXIT_PRICE = 995_000_000_000_000_000n;
+/**
+ * Below this USDe price (in US dollars, WAD) a cash vault lending against USDe is left: 0.99 (decided by Edu on
+ * 30 Oct 2026, with USDe at 0.9944482; 0.995 until MCP 0.1.14).
+ */
+export const USDE_EXIT_PRICE = 990_000_000_000_000_000n;
 /**
  * A USDe / USD answer older than this is stale. Measured on 24 Oct 2026 from the VPS: usde-usd.data.eth is
  * 0xa569d910839Ae8865Da8F8e70FfFb0cBA869F961 ("USDe / USD", 8 decimals); over its last 300 gaps (from 9 Jan 2026) the
