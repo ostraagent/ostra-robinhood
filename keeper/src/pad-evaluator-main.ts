@@ -13,7 +13,9 @@
 //   OSTRA_PAD_PANEL_JUDGE_MODEL   the appeal panel's model (default OSTRA_PAD_JUDGE_MODEL): a different model, best
 //                                 from another vendor, makes the panel's judgment less tied to the first evaluator's
 //   OSTRA_PAD_PANEL_JUDGE_URL, OSTRA_PAD_PANEL_JUDGE_KEY_FILE
-//                                 the panel's API and key when it is another provider (default the judge's)
+//                                 the panel's API and key when it is another provider (default the judge's). On one
+//                                 API with one key, each model is the other's fallback for a request its provider
+//                                 refuses under its usage policy (openAiJudge)
 //   OSTRA_PAD_INDEXER_URL         Ostra's index, for a provider's offers when a job's order cannot be read (default
 //                                 http://127.0.0.1:4900, the indexer on this host)
 //   OSTRA_PAD_UPLOADER_URL        the Ostra uploader, for the decisions' reasons (default http://127.0.0.1:4800)
@@ -64,6 +66,8 @@ async function main(): Promise<void> {
   const panelKeyFile = optional("OSTRA_PAD_PANEL_JUDGE_KEY_FILE");
   const panelKey = panelKeyFile === undefined ? judgeKey : secretFile(panelKeyFile);
   if (panelKey === "") throw new Error("OSTRA_PAD_PANEL_JUDGE_KEY_FILE is empty");
+  // The judge and the panel on one API with one key: each is the other's fallback when a provider refuses a request.
+  const sameApi = panelUrl === judgeUrl && panelKey === judgeKey && panelModel !== judgeModel;
   const scrub = (text: string) => redact(redact(text, rpcUrl), logsUrl).split(judgeKey).join("<judge key>").split(panelKey).join("<panel key>");
   const indexerUrl = (optional("OSTRA_PAD_INDEXER_URL") ?? "http://127.0.0.1:4900").replace(/\/+$/, "");
   const log = (event: string, fields: Record<string, unknown>) => console.log(scrub(JSON.stringify({ at: new Date().toISOString(), event, ...fields })));
@@ -95,8 +99,9 @@ async function main(): Promise<void> {
     evaluators,
     fromEvaluator: (account, call) => sender.fromCrank(account, call),
     fromFeePayer: (call) => sender.fromFeePayer(call),
-    judge: openAiJudge({ url: judgeUrl, model: judgeModel, apiKey: judgeKey }),
-    panelJudge: openAiJudge({ url: panelUrl, model: panelModel, apiKey: panelKey }),
+    // A request one model's provider refuses under its usage policy goes to the other model (both on one API).
+    judge: openAiJudge({ url: judgeUrl, model: judgeModel, apiKey: judgeKey, ...(sameApi ? { fallbackModel: panelModel } : {}) }),
+    panelJudge: openAiJudge({ url: panelUrl, model: panelModel, apiKey: panelKey, ...(sameApi ? { fallbackModel: judgeModel } : {}) }),
     findOffers: async (provider) => {
       try {
         const res = await fetch(`${indexerUrl}/api/v1/pad/listings?provider=${provider}&limit=5`, { signal: AbortSignal.timeout(15_000) });
@@ -124,8 +129,8 @@ async function main(): Promise<void> {
     chainId: robinhoodChain.id,
     feePayer: feePayer.address,
     evaluators: evaluators.map((a) => getAddress(a.address)),
-    judge: { host: new URL(judgeUrl).host, model: judgeModel },
-    panel: { host: new URL(panelUrl).host, model: panelModel },
+    judge: { host: new URL(judgeUrl).host, model: judgeModel, fallback: sameApi ? panelModel : null },
+    panel: { host: new URL(panelUrl).host, model: panelModel, fallback: sameApi ? judgeModel : null },
     jobs: bot.jobs.length,
   });
   bot.run();

@@ -21,6 +21,15 @@
 // client's rejection rate is the share of the jobs it judged itself that it rejected. Without a readable hidden list
 // the board is not served (it never shows what it should leave out).
 //
+// Content rules (design "Ostrapad", decided by Edu on 30 Oct 2026; sdk pad-rules.ts, moderation.ts): with a moderator
+// configured, each listing is checked by a model once, and again only when its name, description or offers change;
+// a listing is served (listings, the board, the stats' count) only once its current content was checked and found
+// allowed. One found to sell prohibited work stays out, its category and reason kept with the agent (agent() shows
+// them; the chain still serves it by its agentId). A listing with no answer yet is checked again RETRY_MODERATION_MS
+// later; answered checks are capped per content, per agent and for the index in 24 hours (the moderator spends the
+// evaluator bot's credits; a check with no answer is not paid and not counted). Without a moderator, listings are
+// served unchecked (as before the rules).
+//
 // The logs are read up to the logs RPC's own head (the other RPC's head can be ahead of the blocks the logs RPC has:
 // those blocks would be passed over for good), and the last RESCAN_BLOCKS are read again on the next pass, as the
 // evaluator bot does (keeper pad-evaluator.ts); reading a block again gives the same state. A state of version 1
@@ -28,6 +37,7 @@
 
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { getAddress, parseAbiItem, type Address, type Hex, type PublicClient } from "viem";
+import { moderationKey, type Moderator } from "./moderation.ts";
 import {
   ERC8004_IDENTITY_REGISTRY,
   OSTRAPAD,
@@ -41,6 +51,7 @@ import {
   readVault,
   type Deployment,
   type PadOffer,
+  type PadProhibitedId,
   vaultCreatedEvent,
 } from "@ostraagent/sdk";
 
@@ -59,6 +70,20 @@ const DETAILS_PER_SYNC = 20;
 /** The blocks read again on the next pass (5 minutes at 10 blocks a second). */
 export const RESCAN_BLOCKS = 3_000n;
 const MAX_JOBS = 20_000;
+/** Listings checked against the content rules in one sync, at most. */
+const MODERATIONS_PER_SYNC = 5;
+/** A listing with no answer from the moderator is checked again this long after. */
+export const RETRY_MODERATION_MS = 10 * 60_000;
+/**
+ * Answered calls to the moderator (it shares the evaluator bot's Raeto credits; a call with no answer is not paid and
+ * not counted): at most MODERATION_TRIES answers that are not verdicts for one content in 24 hours (then that content
+ * waits a day), at most MODERATIONS_PER_AGENT_DAY for one agent and MODERATIONS_PER_DAY in all in any 24 hours, so a
+ * listing changed over and over cannot spend the bot's credits.
+ */
+export const MODERATION_TRIES = 3;
+export const MODERATIONS_PER_AGENT_DAY = 4;
+export const MODERATIONS_PER_DAY = 100;
+const DAY_MS = 86_400_000;
 
 export type PadJobRow = {
   id: Hex;
@@ -97,6 +122,8 @@ export type PadAgent = {
   /** The provider vault's creation (the factory's VaultCreated): its block time (null: none found), for the vault it
    *  was read for. */
   providerCreated: { vault: Address; at: number | null } | null;
+  /** The content rules' verdict on the listing whose content has `key` (moderation.ts); absent until checked. */
+  moderation?: { key: Hex; prohibited: boolean; category: PadProhibitedId | null; reason: string; at: number };
   readAt: number;
 };
 
@@ -179,6 +206,13 @@ export class PadIndexer {
   readonly #readFile: (uri: string) => Promise<unknown>;
   readonly #pad: Address;
   readonly #hidden: () => ReadonlySet<string> | null;
+  readonly #moderate: Moderator | null;
+  readonly #nowMs: () => number;
+  /** When a listing the moderator gave no answer on is checked again (milliseconds), by agent. */
+  readonly #moderationRetry = new Map<string, number>();
+  /** Calls to the moderator: by agent (with the content and its calls with no answer), and all of them (milliseconds). */
+  readonly #moderationCalls = new Map<string, { key: Hex; misses: number[]; at: number[] }>();
+  #moderationAll: number[] = [];
   #state: PadIndexState;
   #window = WINDOW_START;
   #vaultWindow = WINDOW_START;
@@ -188,9 +222,22 @@ export class PadIndexer {
 
   /**
    * `hidden`: the accounts the board leaves out (lower case), read when the board is served; null while the list
-   * cannot be read. Without it, or while it is null, the board is not served.
+   * cannot be read. Without it, or while it is null, the board is not served. `moderate`: the content rules' check of
+   * each listing; without it listings are served unchecked.
    */
-  constructor(o: { client: PublicClient; logsClient?: PublicClient; deployment: () => Deployment; statePath: string; log: (event: string, fields?: Record<string, unknown>) => void; readFile: (uri: string) => Promise<unknown>; pad?: Address; hidden?: () => ReadonlySet<string> | null }) {
+  constructor(o: {
+    client: PublicClient;
+    logsClient?: PublicClient;
+    deployment: () => Deployment;
+    statePath: string;
+    log: (event: string, fields?: Record<string, unknown>) => void;
+    readFile: (uri: string) => Promise<unknown>;
+    pad?: Address;
+    hidden?: () => ReadonlySet<string> | null;
+    moderate?: Moderator | null;
+    /** The clock in milliseconds (when files are read again, when a check is retried); Date.now by default. */
+    nowMs?: () => number;
+  }) {
     this.#client = o.client;
     this.#logs = o.logsClient ?? o.client;
     this.#deployment = o.deployment;
@@ -199,6 +246,8 @@ export class PadIndexer {
     this.#readFile = o.readFile;
     this.#pad = getAddress(o.pad ?? OSTRAPAD);
     this.#hidden = o.hidden ?? (() => null);
+    this.#moderate = o.moderate ?? null;
+    this.#nowMs = o.nowMs ?? Date.now;
     const d = o.deployment();
     const fresh: PadIndexState = { version: 3, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {} };
     if (existsSync(this.#statePath)) {
@@ -281,7 +330,7 @@ export class PadIndexer {
     }
     // Agents' files, approvals and records, the oldest read first.
     const due = Object.values(this.#state.agents)
-      .filter((a) => Date.now() - a.readAt >= DETAILS_EVERY_MS)
+      .filter((a) => this.#nowMs() - a.readAt >= DETAILS_EVERY_MS)
       .sort((a, b) => a.readAt - b.readAt)
       .slice(0, DETAILS_PER_SYNC);
     for (const a of due) {
@@ -292,7 +341,74 @@ export class PadIndexer {
         this.#log("pad_agent_read_failed", { agentId: a.agentId, reason: (err as Error).message.slice(0, 200) });
       }
     }
+    changed = (await this.#moderateDue()) || changed;
     if (changed) this.#save();
+  }
+
+  /** An approved listing with offers (before the content rules). */
+  static #listed(a: PadAgent): boolean {
+    return a.approved && a.provider !== null && a.offers.length > 0;
+  }
+
+  /** What a listing's check depends on, as it is now. */
+  static #key(a: PadAgent): Hex {
+    return moderationKey({ name: a.name, description: a.description, offers: a.offers });
+  }
+
+  /** A listing served: listed and, with a moderator, its current content checked and allowed. */
+  #shown(a: PadAgent): boolean {
+    if (!PadIndexer.#listed(a)) return false;
+    if (this.#moderate === null) return true;
+    return a.moderation !== undefined && a.moderation.key === PadIndexer.#key(a) && !a.moderation.prohibited;
+  }
+
+  /** Listings whose current content has no verdict yet, checked (a few a sync); true when one was. */
+  async #moderateDue(): Promise<boolean> {
+    if (this.#moderate === null) return false;
+    const now = this.#nowMs();
+    this.#moderationAll = this.#moderationAll.filter((t) => now - t < DAY_MS);
+    const due = Object.values(this.#state.agents)
+      .filter((a) => PadIndexer.#listed(a) && a.moderation?.key !== PadIndexer.#key(a) && (this.#moderationRetry.get(a.agentId) ?? 0) <= now)
+      .sort((x, y) => Number(x.agentId) - Number(y.agentId))
+      .slice(0, MODERATIONS_PER_SYNC);
+    let changed = false;
+    for (const a of due) {
+      const key = PadIndexer.#key(a);
+      const mine = this.#moderationCalls.get(a.agentId);
+      const calls = { key, misses: mine !== undefined && mine.key === key ? mine.misses.filter((t) => now - t < DAY_MS) : [], at: (mine?.at ?? []).filter((t) => now - t < DAY_MS) };
+      this.#moderationCalls.set(a.agentId, calls);
+      const why = calls.misses.length >= MODERATION_TRIES ? "answers that were not verdicts for this content" : calls.at.length >= MODERATIONS_PER_AGENT_DAY ? "the agent's checks for 24 hours" : this.#moderationAll.length >= MODERATIONS_PER_DAY ? "the index's checks for 24 hours" : null;
+      if (why !== null) {
+        // Not served meanwhile; looked at again after the retry wait (a new content, or a day's room).
+        this.#moderationRetry.set(a.agentId, now + RETRY_MODERATION_MS);
+        this.#log("pad_moderation_held", { agentId: a.agentId, why });
+        continue;
+      }
+      let v: Awaited<ReturnType<Moderator>> = "unreached";
+      try {
+        v = await this.#moderate({ agentId: a.agentId, name: a.name, description: a.description, offers: a.offers.map((o) => ({ id: o.id, title: o.title, description: o.description, input: o.input, price: o.price })) });
+      } catch {
+        v = "unreached";
+      }
+      if (v === "unreached") {
+        this.#moderationRetry.set(a.agentId, now + RETRY_MODERATION_MS);
+        this.#log("pad_moderation_unavailable", { agentId: a.agentId, answered: false });
+        continue;
+      }
+      calls.at.push(now);
+      this.#moderationAll.push(now);
+      if (v === null) {
+        calls.misses.push(now);
+        this.#moderationRetry.set(a.agentId, now + RETRY_MODERATION_MS);
+        this.#log("pad_moderation_unavailable", { agentId: a.agentId, answered: true, misses: calls.misses.length });
+        continue;
+      }
+      this.#moderationRetry.delete(a.agentId);
+      a.moderation = { key, prohibited: v.prohibited, category: v.category, reason: v.reason, at: Math.floor(now / 1000) };
+      this.#log("pad_moderated", { agentId: a.agentId, prohibited: v.prohibited, category: v.category, reason: v.reason });
+      changed = true;
+    }
+    return changed;
   }
 
   async #scanJobs(from: bigint, to: bigint): Promise<boolean> {
@@ -372,7 +488,7 @@ export class PadIndexer {
   }
 
   async #readAgent(a: PadAgent): Promise<void> {
-    a.readAt = Date.now();
+    a.readAt = this.#nowMs();
     const id = BigInt(a.agentId);
     const owner = getAddress((await this.#client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: identityRegistryAbi, functionName: "ownerOf", args: [id] })) as Address);
     a.owner = owner;
@@ -449,7 +565,7 @@ export class PadIndexer {
   listings(o: { q?: string; provider?: Address; limit?: number; offset?: number } = {}): { total: number; agents: Omit<PadAgent, "problems" | "readAt">[] } {
     const q = (o.q ?? "").trim().toLowerCase();
     const provider = o.provider === undefined ? null : getAddress(o.provider);
-    const listed = Object.values(this.#state.agents).filter((a) => a.approved && a.provider !== null && a.offers.length > 0 && (provider === null || a.provider === provider));
+    const listed = Object.values(this.#state.agents).filter((a) => this.#shown(a) && (provider === null || a.provider === provider));
     const matched = q === "" ? listed : listed.filter((a) => [a.name, a.description, ...a.offers.flatMap((f) => [f.id, f.title, f.description])].some((t) => t !== null && t.toLowerCase().includes(q)));
     const ranked = matched.sort((x, y) => (y.record?.clients ?? 0) - (x.record?.clients ?? 0) || (y.record?.completed ?? 0) - (x.record?.completed ?? 0) || Number(y.record?.volume ?? 0) - Number(x.record?.volume ?? 0) || Number(x.agentId) - Number(y.agentId));
     const offset = o.offset ?? 0;
@@ -470,11 +586,18 @@ export class PadIndexer {
     return Object.values(this.#state.jobs).sort((x, y) => y.createdAt - x.createdAt).slice(0, o.limit ?? 50);
   }
 
-  stats(): { agents: number; listed: number; jobs: number; completed: number; valueCompleted: string; scannedTo: string } {
+  /**
+   * The index's counts; `moderation` (null without a moderator): listings left out under the content rules, and
+   * listings whose current content has no verdict yet.
+   */
+  stats(): { agents: number; listed: number; jobs: number; completed: number; valueCompleted: string; scannedTo: string; moderation: { prohibited: number; pending: number } | null } {
     const jobs = Object.values(this.#state.jobs);
     const completed = jobs.filter((j) => j.status === "Completed");
     const value = completed.reduce((s, j) => s + units(j.paid), 0n);
-    return { agents: Object.keys(this.#state.agents).length, listed: this.listings({ limit: 10_000 }).total, jobs: jobs.length, completed: completed.length, valueCompleted: usd(value), scannedTo: this.#state.scannedTo };
+    const listed = Object.values(this.#state.agents).filter((a) => PadIndexer.#listed(a));
+    const current = (a: PadAgent) => a.moderation !== undefined && a.moderation.key === PadIndexer.#key(a);
+    const moderation = this.#moderate === null ? null : { prohibited: listed.filter((a) => current(a) && a.moderation?.prohibited === true).length, pending: listed.filter((a) => !current(a)).length };
+    return { agents: Object.keys(this.#state.agents).length, listed: this.listings({ limit: 10_000 }).total, jobs: jobs.length, completed: completed.length, valueCompleted: usd(value), scannedTo: this.#state.scannedTo, moderation };
   }
 
   /** What the board shows: the listed agents and the jobs, without any account of the hidden list; null without it. */
@@ -484,7 +607,7 @@ export class PadIndexer {
     const seen = (a: string | null) => a === null || !hidden.has(lower(a));
     // An agent whose owner is hidden takes its provider vault's jobs with it.
     const away = new Set(Object.values(this.#state.agents).filter((a) => !seen(a.owner) && a.provider !== null).map((a) => lower(a.provider as string)));
-    const agents = Object.values(this.#state.agents).filter((a) => a.approved && a.provider !== null && a.offers.length > 0 && seen(a.owner) && seen(a.provider));
+    const agents = Object.values(this.#state.agents).filter((a) => this.#shown(a) && seen(a.owner) && seen(a.provider));
     const jobs = Object.values(this.#state.jobs).filter((j) => seen(j.client) && seen(j.provider) && !away.has(lower(j.provider)));
     return { agents, jobs };
   }

@@ -7,7 +7,11 @@
 // agents and jobs of its own (Ostrapad's first jobs, 28 Oct 2026), which the fork carries: an index read before the
 // test's own steps is the baseline, and the counts are checked against it. The board (the web app's Ostrapad page)
 // is checked on the same index: the agent's figures from its job, and the hidden list leaving out a client's job, then
-// the agent itself, and the board refused without a list.
+// the agent itself, and the board refused without a list. Ostrapad's content rules (moderation.ts) are checked on an
+// index with a moderator: no listing is served before its content has a verdict, an allowed one is served and not
+// checked again while it stays the same, and one changed to prohibited work leaves the listings and the board, its
+// reason kept with the agent. The model is not reached here (a rule stands in for it, as the evaluator bot's fork test
+// does for its judge): scripts/pad-moderation-check.ts checks the real API.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -33,7 +37,8 @@ import {
 import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { Keys, LocalSender, PadService, VaultService, X402_NETWORK, profileFile, spendCall, type Config } from "../../core/src/index.ts";
 import { MemoryFolder } from "../../core/test/memory-folder.ts";
-import { PadIndexer } from "../src/pad.ts";
+import type { Moderator } from "../src/moderation.ts";
+import { DETAILS_EVERY_MS, PadIndexer, RETRY_MODERATION_MS } from "../src/pad.ts";
 
 let fork: Fork;
 let d: Deployment;
@@ -227,6 +232,54 @@ test("the index serves listed agents ranked with their record, jobs with status 
   assert.equal(index.boardJobs(), null);
   // The listings (MCP's pad_search, the evaluator bot) do not use the list.
   assert.equal(index.listings({ provider: provider.vault }).total, 1);
+
+  // Ostrapad's content rules: an index with a moderator (a rule standing in for the model).
+  let up = false;
+  const calls: string[] = [];
+  const moderate: Moderator = async (l) => {
+    calls.push(l.agentId);
+    if (!up) return null;
+    return l.offers.some((x) => /login page/i.test(x.description)) ? { prohibited: true, category: "fraud", reason: "Sells copies of login pages that collect passwords." } : { prohibited: false, category: null, reason: "Reports." };
+  };
+  let clock = Date.now();
+  const logs: { event: string; fields?: Record<string, unknown> }[] = [];
+  const checked = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-moderated.json"), log: (event, fields) => logs.push({ event, fields }), readFile: readJson, hidden: () => new Set(), moderate, nowMs: () => clock });
+  await checked.sync();
+  const mine = () => checked.listings({ limit: 50 }).agents.some((x) => x.agentId === agentId.toString());
+  assert.equal(mine(), false, "not served before its content has a verdict");
+  assert.equal(checked.board({ limit: 100 })!.agents.some((x) => x.agentId === agentId.toString()), false);
+  assert.ok((checked.stats().moderation?.pending ?? 0) >= 1);
+  assert.ok(logs.some((l) => l.event === "pad_moderation_unavailable" && l.fields?.agentId === agentId.toString()));
+  up = true;
+  await checked.sync();
+  assert.equal(mine(), false, "a listing with no answer is checked again only after the retry wait");
+  clock += RETRY_MODERATION_MS;
+  await checked.sync();
+  assert.equal(mine(), true, "allowed: served");
+  assert.equal(checked.agent(agentId.toString())?.moderation?.prohibited, false);
+  assert.equal(checked.board({ limit: 100 })!.agents.some((x) => x.agentId === agentId.toString()), true);
+  assert.deepEqual(checked.stats().moderation, { prohibited: 0, pending: 0 });
+  // The same content read again: not checked again.
+  const before = calls.filter((c) => c === agentId.toString()).length;
+  clock += DETAILS_EVERY_MS;
+  await checked.sync();
+  assert.equal(calls.filter((c) => c === agentId.toString()).length, before);
+  // Its offers changed to prohibited work: checked again, and left out.
+  await provider.pad.publish([{ id: "login-copy", title: "Login copy", description: "A copy of a bank's login page that sends what is typed into it to the client.", input: "The bank's name.", price: "2", hours: 12, evaluator: "client" }]);
+  clock += DETAILS_EVERY_MS;
+  await checked.sync();
+  assert.equal(calls.filter((c) => c === agentId.toString()).length, before + 1);
+  assert.equal(mine(), false, "prohibited: not served");
+  assert.equal(checked.listings({ provider: provider.vault }).total, 0, "not found by its provider either (pad_search, the evaluator bot)");
+  assert.equal(checked.board({ limit: 100 })!.agents.some((x) => x.agentId === agentId.toString()), false);
+  assert.equal(checked.boardAgent(agentId.toString()), undefined);
+  const kept = checked.agent(agentId.toString())!;
+  assert.deepEqual([kept.moderation?.prohibited, kept.moderation?.category, kept.moderation?.reason], [true, "fraud", "Sells copies of login pages that collect passwords."]);
+  assert.equal(checked.stats().moderation?.prohibited, 1);
+  assert.ok(logs.some((l) => l.event === "pad_moderated" && l.fields?.agentId === agentId.toString() && l.fields?.category === "fraud"));
+  // Read back from its state: the verdict stays.
+  const reread = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-moderated.json"), log: () => {}, readFile: readJson, moderate, nowMs: () => clock });
+  assert.equal(reread.listings({ provider: provider.vault }).total, 0);
 
   // A state written and read back: the same listing.
   const again = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
