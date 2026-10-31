@@ -2,21 +2,24 @@
 // against the live OstraPad and USDG: with too little USDG in the funding account nothing is sent; the raeto phase
 // (and the check before it says so) gives the fee payer its ETH and the credits' USDG and sends that USDG to Raeto's payTo, then waits until Raeto's
 // account shows it; the pool phase gives four evaluator accounts their bonds and joins them to the pool (their gas
-// topped up from the fee payer); a run again of either phase sends nothing. Raeto's API is not reached from a fork: a
+// topped up from the fee payer); the topup phase brings each bond to 56 USDG (refused, sending nothing, while the
+// funding account holds too little), the added 6 USDG counting STAKE_DELAY later, finishing exactly once over runs
+// stopped after a step was mined and after a step was signed, and stopping (until its record is removed) on a step
+// whose nonce another transaction took; a run again of any phase sends nothing. Raeto's API is not reached from a fork: a
 // local server answers its two reads (GET /v1/agents and /v1/me, in the shapes Raeto's API gave on 31 Oct 2026), the
 // credits read from the fork's chain (what the fee payer sent to the payTo). The live run checks Raeto itself.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
-import { erc20Abi, keccak256, parseEther, stringToHex, type Address, type PublicClient } from "viem";
+import { createWalletClient, erc20Abi, http, keccak256, parseEther, stringToHex, type Address, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { OSTRAPAD, PAD, USDG, ostraPadAbi, readPadEvaluator } from "@ostraagent/sdk";
+import { OSTRAPAD, PAD, USDG, ostraPadAbi, readPadEvaluator, robinhoodChain } from "@ostraagent/sdk";
 import { startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { openFeePayer } from "../src/keys.ts";
 
@@ -74,9 +77,10 @@ after(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true });
 });
 
-async function fund(phase: "check" | "raeto" | "pool"): Promise<{ ok: boolean; out: string }> {
+async function fund(phase: "check" | "raeto" | "pool" | "topup", stopAt?: string): Promise<{ ok: boolean; out: string }> {
   const env = {
     ...process.env,
+    OSTRA_FUND_TEST_STOP: stopAt ?? "",
     OSTRA_RPC_URL_FILE: join(root, "rpc.url"),
     OSTRA_DEPLOYER_KEY_FILE: join(root, "funder.key"),
     OSTRA_SERVICES_DIR: join(root, "services"),
@@ -144,6 +148,58 @@ test("the bot is funded: ETH and Raeto credits, then four evaluator accounts bon
   r = await fund("pool");
   assert.ok(r.ok && r.out.includes("PAD_FUNDED_POOL") && (r.out.match(/in the pool already/g) ?? []).length === 4, r.out);
   assert.deepEqual([await nonce(funder.address), await nonce(feePayer), ...(await Promise.all(evaluators.map((a) => nonce(a.address))))], joined, "a run again sends nothing");
+
+  // topup: 6 USDG for each of the four bonds; with 0.169597 USDG in the funding account it sends nothing.
+  r = await fund("topup");
+  assert.equal(r.ok, false, r.out);
+  assert.match(r.out, /the top-ups need 24; nothing was sent/);
+  assert.deepEqual([await nonce(funder.address), await nonce(feePayer), ...(await Promise.all(evaluators.map((a) => nonce(a.address))))], joined, "nothing sent");
+  await fork.dealUsdg(funder.address, 24_169_597n);
+  const [e0, e1, e2] = evaluators.map((a) => a.address) as [Address, Address, Address];
+  // Stopped after the second account's USDG was mined, then after the first account's approve was signed (not sent).
+  r = await fund("topup", `topup:56:usdg:${e1}:mined`);
+  assert.ok(!r.ok && r.out.includes(`TEST STOP at topup:56:usdg:${e1}:mined`), r.out);
+  r = await fund("topup", `topup:56:approve:${e0}:signed`);
+  assert.ok(!r.ok && r.out.includes(`TEST STOP at topup:56:approve:${e0}:signed`), r.out);
+  // Stopped after the third account's join was signed; then another transaction of that account takes its nonce.
+  r = await fund("topup", `topup:56:join:${e2}:signed`);
+  assert.ok(!r.ok && r.out.includes(`TEST STOP at topup:56:join:${e2}:signed`), r.out);
+  const w2 = createWalletClient({ account: evaluators[2]!, chain: robinhoodChain, transport: http(fork.url) });
+  await c.waitForTransactionReceipt({ hash: await w2.sendTransaction({ to: e2, value: 0n }) });
+  r = await fund("topup");
+  assert.equal(r.ok, false, r.out);
+  assert.match(r.out, new RegExp(`topup:56:join:${e2}: its transaction 0x[0-9a-f]{64} \\(nonce \\d+ of ${e2}\\) is not on chain and that nonce was used by another transaction`));
+  assert.equal((await readPadEvaluator(c, e2)).bond, PAD.MIN_EVALUATOR_BOND, "the stuck join did not land");
+  // Its record removed, as the message says: the join is signed again, and the run finishes.
+  const keptFile = join(root, "services", "pad-evaluator", "data", "fund-pad-evaluator.json");
+  const kept = JSON.parse(await readFile(keptFile, "utf8")) as Record<string, string>;
+  delete kept[`topup:56:join:${e2}`];
+  delete kept[`topup:56:join:${e2}:raw`];
+  await writeFile(keptFile, JSON.stringify(kept), { mode: 0o600 });
+  r = await fund("topup");
+  assert.ok(r.ok && r.out.includes("PAD_TOPPED_UP"), r.out);
+  // Each transaction once: four USDG sends from the funding account, an approve and a join from each account (and
+  // the third account's own transaction).
+  assert.equal(await nonce(funder.address), joined[0]! + 4);
+  for (const [i, a] of evaluators.entries()) assert.equal(await nonce(a.address), joined[2 + i]! + (i === 2 ? 3 : 2), a.address);
+  const added = (await c.getBlock()).timestamp;
+  for (const a of evaluators) {
+    const e = await readPadEvaluator(c, a.address);
+    assert.equal(e.inPool, true);
+    assert.equal(e.bond, 56_000_000n);
+    assert.equal(await usdg(a.address), 0n, "the top-up is with OstraPad");
+    const stake = (t: bigint) => c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "stakeAt", args: [a.address, t] }) as Promise<bigint>;
+    // The join (just made here, so it counts from the second after joinedAt) counts 50 until the top-up takes effect.
+    assert.ok(e.joinedAt + 1n < added + PAD.STAKE_DELAY, "joined before the top-up");
+    assert.equal(await stake(e.joinedAt + 1n), PAD.MIN_EVALUATOR_BOND, "the bond it had keeps counting");
+    assert.equal(await stake(added + PAD.STAKE_DELAY + 600n), 56_000_000n, "the top-up counts STAKE_DELAY after it is added");
+  }
+  assert.equal(await usdg(funder.address), 169_597n, "24 USDG of top-ups from the funding account");
+  assert.equal((await c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "poolSize" })) as bigint, size + 4n);
+  const topped = [await nonce(funder.address), await nonce(feePayer), ...(await Promise.all(evaluators.map((a) => nonce(a.address))))];
+  r = await fund("topup");
+  assert.ok(r.ok && r.out.includes("PAD_TOPPED_UP") && (r.out.match(/bond 56 USDG already/g) ?? []).length === 4, r.out);
+  assert.deepEqual([await nonce(funder.address), await nonce(feePayer), ...(await Promise.all(evaluators.map((a) => nonce(a.address))))], topped, "a run again sends nothing");
   // Nothing secret printed.
   assert.equal(r.out.includes(fork.url), false);
   assert.equal(r.out.includes("raeto-test-key"), false);

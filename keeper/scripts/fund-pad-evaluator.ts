@@ -8,6 +8,14 @@
 //   pool    each evaluator account not in OstraPad's pool gets the bond's USDG from the funding account, approves
 //           OstraPad for it and joins the pool (msg.sender), its gas topped up from the fee payer. Its bond counts for
 //           draws STAKE_DELAY (2 days) after it joins.
+//   topup   (decided by Edu on 31 Oct 2026: 56 USDG each, so that one slash, 20% of a budget it can judge and at
+//           least 1 USDG, does not take a 50 USDG bond under the pool's minimum and remove the account) each evaluator
+//           account in the pool with a bond under OSTRA_PAD_TOPUP_BOND gets the difference's USDG from the funding
+//           account, approves OstraPad for it and adds it to its bond (joinPool while in the pool), its gas topped up
+//           from the fee payer. The bond is 56 at once, so the protection holds from the top-up's block (the removal
+//           reads the bond); the added stake counts for draws STAKE_DELAY after it is added, the bond it had keeps
+//           counting meanwhile. An account removed or leaving is left out, with a line saying so. The bot's service
+//           sends with the same keys: the run that calls this phase stops the service for it.
 //
 // Each send is recorded in the bot's data directory (fund-pad-evaluator.json) before its receipt is awaited, and a
 // step recorded is never sent again: a run stopped at any point is run again to finish. Before a phase sends
@@ -24,15 +32,19 @@
 //   OSTRA_RAETO_URL           Raeto's API (default https://api.raeto.cc)
 //   OSTRA_PAD_FUND_ETH        ETH for the fee payer (default 0.005)
 //   OSTRA_PAD_FUND_CREDITS    USDG of Raeto credits (default 10)
+//   OSTRA_PAD_TOPUP_BOND      the bond the topup phase brings each evaluator account to, in USDG (default 56)
 //
 //   check   sends nothing: whether the funding account holds what both phases still need (exit 1 when it does not)
 //
-//   node scripts/fund-pad-evaluator.ts check|raeto|pool
-// The last line is PAD_FUNDS_ENOUGH, PAD_FUNDED_RAETO or PAD_FUNDED_POOL.
+//   OSTRA_FUND_TEST_STOP      tests only: "<step>:signed" or "<step>:mined" ends the run (exit 3) there, as a run
+//                             stopped at that point
+//
+//   node scripts/fund-pad-evaluator.ts check|raeto|pool|topup
+// The last line is PAD_FUNDS_ENOUGH, PAD_FUNDED_RAETO, PAD_FUNDED_POOL or PAD_TOPPED_UP.
 
 import { readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createPublicClient, createWalletClient, encodeFunctionData, erc20Abi, formatEther, formatUnits, getAddress, keccak256, parseEther, parseUnits, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
+import { createPublicClient, createWalletClient, encodeFunctionData, erc20Abi, formatEther, formatUnits, getAddress, keccak256, parseEther, parseTransaction, parseUnits, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { OSTRAPAD, PAD, USDG, assertRobinhoodChain, ostraPadAbi, readPadEvaluator, redact, retryingHttp, robinhoodChain } from "@ostraagent/sdk";
 import { openFeePayer } from "../src/keys.ts";
@@ -44,6 +56,13 @@ const FUNDER_GAS_RESERVE = parseEther("0.0005");
 const CREDIT_WAIT_MS = 15 * 60_000;
 
 const secretsSeen: string[] = [];
+/** Tests only: ends the run at the named point, as a run stopped there (OSTRA_FUND_TEST_STOP). */
+const testStop = (at: string) => {
+  if (process.env.OSTRA_FUND_TEST_STOP === at) {
+    console.log(`TEST STOP at ${at}`);
+    process.exit(3);
+  }
+};
 const scrub = (text: string) => secretsSeen.reduce((t, s) => (s === "" ? t : redact(t, s).split(s).join("<secret>")), text);
 const say = (line: string) => console.log(scrub(line));
 
@@ -64,7 +83,7 @@ type Kept = Record<string, string>;
 
 async function main(): Promise<void> {
   const phase = process.argv[2];
-  if (phase !== "check" && phase !== "raeto" && phase !== "pool") throw new Error("usage: node scripts/fund-pad-evaluator.ts check|raeto|pool");
+  if (phase !== "check" && phase !== "raeto" && phase !== "pool" && phase !== "topup") throw new Error("usage: node scripts/fund-pad-evaluator.ts check|raeto|pool|topup");
   const rpcUrl = await privateText(process.env.OSTRA_RPC_URL_FILE || "/etc/ostra/robinhood-rpc.url", "the RPC URL file");
   secretsSeen.push(rpcUrl);
   const servicesDir = process.env.OSTRA_SERVICES_DIR || "/etc/ostra/robinhood";
@@ -121,19 +140,30 @@ async function main(): Promise<void> {
       hash = keccak256(raw);
       kept[`${name}:raw`] = raw;
       await record(name, hash);
+      testStop(`${name}:signed`);
     }
     const known = await client.getTransaction({ hash }).then(() => true, () => false);
     if (!known) {
       try {
         await client.sendRawTransaction({ serializedTransaction: raw });
       } catch (err) {
-        // Already known, or its nonce used by itself: the receipt below says which.
         say(`${name}: sending ${hash} again answered: ${((err as Error).message ?? String(err)).split("\n")[0]}`);
+        // Already known, or mined since the read above: its receipt is awaited below. Neither, with its nonce used by
+        // another transaction: it can never land, and waiting would only time out on every run again.
+        // The nonce read first, the transaction looked for after it: one mined meanwhile is found, not taken for lost.
+        const n = parseTransaction(raw).nonce ?? 0;
+        const used = (await client.getTransactionCount({ address: account.address, blockTag: "latest" })) > n;
+        const mined = await client.getTransactionReceipt({ hash }).then(() => true, () => false);
+        const inPool = mined || (await client.getTransaction({ hash }).then(() => true, () => false));
+        if (used && !inPool) {
+          throw new Error(`${name}: its transaction ${hash} (nonce ${n} of ${account.address}) is not on chain and that nonce was used by another transaction: nothing of this step was sent. Check ${hash} on the explorer first; if it is not there, remove "${name}" and "${name}:raw" from ${keptFile} to sign it again`);
+        }
       }
     }
     const r = await client.waitForTransactionReceipt({ hash, timeout: 300_000 });
     if (r.status !== "success") throw new Error(`${name}: transaction ${hash} reverted`);
     say(`SENT ${name}: ${hash}`);
+    testStop(`${name}:mined`);
   };
   const transfer = (to: Address, amount: bigint) => encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to, amount] });
 
@@ -228,6 +258,82 @@ async function main(): Promise<void> {
     say(`Raeto account ${feePayer.address}: credits shown (balance_usd ${kept["raeto:shown"]}), balance_usd now ${balance(await call("/v1/me", raetoKey))}`);
     say(`fee payer ${feePayer.address}: ETH ${formatEther(await eth(feePayer.address))} USDG ${formatUnits(await usdg(feePayer.address), 6)}`);
     say("PAD_FUNDED_RAETO");
+    return;
+  }
+
+  if (phase === "topup") {
+    const target = parseUnits(process.env.OSTRA_PAD_TOPUP_BOND || "56", 6);
+    if (target <= bond) throw new Error(`OSTRA_PAD_TOPUP_BOND must be more than the pool's minimum bond ${formatUnits(bond, 6)} USDG`);
+    // The steps are named after the target, so a later top-up to another target is its own run.
+    const tag = `topup:${formatUnits(target, 6)}`;
+    // Every account in the pool and staying (a removed or leaving one cannot add to its bond: joinPool is Busy).
+    const plan: { a: PrivateKeyAccount; add: bigint; need: bigint }[] = [];
+    const left = new Set<Address>();
+    for (const a of evaluators) {
+      const e = await readPadEvaluator(client, a.address);
+      if (!e.inPool || e.exitAt !== 0n || e.removed) {
+        say(`evaluator ${a.address}: LEFT OUT, not in the pool to stay (inPool ${e.inPool}, exitAt ${e.exitAt}, removed ${e.removed})`);
+        left.add(a.address);
+        continue;
+      }
+      if (e.bond >= target) {
+        say(`evaluator ${a.address}: bond ${formatUnits(e.bond, 6)} USDG already`);
+        continue;
+      }
+      const add = target - e.bond;
+      const held = await usdg(a.address);
+      plan.push({ a, add, need: kept[`${tag}:usdg:${a.address}`] === undefined && held < add ? add - held : 0n });
+    }
+    const needUsdg = plan.reduce((t, x) => t + x.need, 0n);
+    const fUsdg = await usdg(funder.address);
+    if (fUsdg < needUsdg) throw new Error(`the funding account ${funder.address} holds USDG ${formatUnits(fUsdg, 6)}; the top-ups need ${formatUnits(needUsdg, 6)}; nothing was sent`);
+    if (plan.length > 0 && (await eth(feePayer.address)) === 0n) throw new Error(`the fee payer ${feePayer.address} holds no ETH to top the evaluator accounts' gas up; nothing was sent`);
+    say(`top-ups to ${formatUnits(target, 6)} USDG: ${plan.length} accounts, ${formatUnits(needUsdg, 6)} USDG from the funding account`);
+    // A step recorded by a stopped run is awaited again (step() sends its own signed transaction, never a new one).
+    for (const { a, need } of plan) {
+      const name = `${tag}:usdg:${a.address}`;
+      if (need > 0n || kept[name] !== undefined) await step(name, funder, { to: USDG, data: transfer(a.address, need) });
+    }
+    // Each account's own sends: gas topped up from the fee payer as the pool phase does (twice the call's maximum cost).
+    const gasFor = async (a: PrivateKeyAccount, data: Hex, to: Address, what: "approve" | "join") => {
+      const gas = await client.estimateGas({ account: a.address, to, data, prepare: false } as Parameters<PublicClient["estimateGas"]>[0]);
+      const { maxFeePerGas } = await client.estimateFeesPerGas({ chain: robinhoodChain, type: "eip1559" });
+      const cost = (gas + gas / 5n) * maxFeePerGas;
+      if ((await eth(a.address)) < cost) await step(`${tag}:gas:${a.address}:${what}`, feePayer, { to: a.address, value: cost * 2n });
+    };
+    for (const { a, add } of plan) {
+      const allowance = (await client.readContract({ address: USDG, abi: erc20Abi, functionName: "allowance", args: [a.address, OSTRAPAD] })) as bigint;
+      if (kept[`${tag}:approve:${a.address}`] !== undefined) {
+        await step(`${tag}:approve:${a.address}`, a, { to: USDG });
+      } else if (allowance < add) {
+        const data = encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [OSTRAPAD, add] });
+        await gasFor(a, data, USDG, "approve");
+        await step(`${tag}:approve:${a.address}`, a, { to: USDG, data });
+      }
+      if (kept[`${tag}:join:${a.address}`] === undefined) {
+        // The bond read again: the amount added is exactly what brings it to the target (only another run of this
+        // phase could have changed it: joinPool takes only the account's own authorization).
+        const now = await readPadEvaluator(client, a.address);
+        if (now.bond + add !== target) throw new Error(`evaluator ${a.address}: its bond changed during this run (${formatUnits(now.bond, 6)} USDG, ${formatUnits(add, 6)} to add); nothing more was sent for it`);
+        const data = encodeFunctionData({ abi: ostraPadAbi, functionName: "joinPool", args: [a.address, add] });
+        await client.simulateContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "joinPool", args: [a.address, add], account: a });
+        await gasFor(a, data, OSTRAPAD, "join");
+        await step(`${tag}:join:${a.address}`, a, { to: OSTRAPAD, data });
+      } else {
+        // A join recorded and sent: step() awaits its receipt again (it never signs twice).
+        await step(`${tag}:join:${a.address}`, a, { to: OSTRAPAD });
+      }
+    }
+    for (const a of evaluators) {
+      if (left.has(a.address)) continue;
+      const e = await readPadEvaluator(client, a.address);
+      if (!e.inPool || e.bond < target) throw new Error(`evaluator ${a.address}: bond ${formatUnits(e.bond, 6)} USDG after this run, not ${formatUnits(target, 6)} (inPool ${e.inPool})`);
+      say(`evaluator ${a.address}: in the pool, bond ${formatUnits(e.bond, 6)} USDG, ETH ${formatEther(await eth(a.address))}`);
+    }
+    say(`funding account ${funder.address}: ETH ${formatEther(await eth(funder.address))} USDG ${formatUnits(await usdg(funder.address), 6)}`);
+    say(`fee payer ${feePayer.address}: ETH ${formatEther(await eth(feePayer.address))}`);
+    if (left.size > 0) say(`evaluators left out: ${left.size} (above)`);
+    say("PAD_TOPPED_UP");
     return;
   }
 
