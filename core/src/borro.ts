@@ -15,12 +15,10 @@
 import { encodeFunctionData, getAddress, isAddress, keccak256, toHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
   BORRO_USDG_VAULT,
-  VAULT_GUARD_MIN_GAS,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
   QuoteError,
   VAULT_ACTION,
-  VAULT_MORPHO_MIN_GAS,
   VAULT_V3,
   approveHashParams,
   borroStock,
@@ -43,6 +41,7 @@ import {
   setWithdrawalLockParams,
   signVaultSpend,
   simulateVaultSpend,
+  spendFloorGas,
   vaultV2Abi,
   withdrawCollateralParams,
   postCollateralParams,
@@ -110,11 +109,12 @@ function less(x: bigint, bps: bigint): bigint {
 }
 
 /**
- * The gas a Morpho spend and a Guard spend must have left to run (MORPHO_MIN_GAS, GUARD_MIN_GAS); the relayer prices
- * this floor on top of the gas the spend uses (sdk reservedSwapGas).
+ * The gas a spend must have left to run (a Morpho spend MORPHO_MIN_GAS, a Guard spend GUARD_MIN_GAS or with op 5
+ * GUARD_EXIT_MIN_GAS, an Enter or an Exit its venue kind's floor): sdk spendFloorGas, the floor the relayer prices on
+ * top of the gas the spend uses (sdk reservedSwapGas).
  */
-function gasFloor(action: number): bigint {
-  return action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY ? BigInt(VAULT_MORPHO_MIN_GAS) : action === VAULT_ACTION.GUARD ? BigInt(VAULT_GUARD_MIN_GAS) : 0n;
+function gasFloor(action: number, params: Hex): bigint {
+  return spendFloorGas(action, params);
 }
 
 /** A stand-in signature of a WOTS signature's length, for measuring a spend's L1 data (random-looking, as one is). */
@@ -165,7 +165,7 @@ export class BorroService {
     const address = await vault.vaultAddress();
     await this.#v3(address);
     const gasUsed = await this.#simulate(address, action, params, what);
-    const floor = gasFloor(action);
+    const floor = gasFloor(action, params);
     let gas = (gasUsed * 5n) / 4n + SPEND_GAS_HEADROOM + floor;
     if (gas < VAULT_SPEND_GAS + floor) gas = VAULT_SPEND_GAS + floor;
     return vault.operate({
@@ -327,7 +327,7 @@ export class BorroService {
     const at = await vault.vaultAddress();
     const data = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256(toHex("OSTRA/STRATEGY/NEXT-ROOT")), params, standInSignature()] });
     const [l1, gasPrice] = await Promise.all([l1DataGas(this.#p.client, at, data), this.#p.gasPrice === undefined ? this.#p.client.getGasPrice() : this.#p.gasPrice()]);
-    const gas = gasUsed + gasFloor(action) + l1;
+    const gas = gasUsed + gasFloor(action, params) + l1;
     const ethUsd = await (this.#p.ethUsd ?? chainlinkEthUsd(this.#p.client))();
     return { gas, usdg: weiToTokenUnits(withMargin(gas * gasPrice), ethUsd, TOKEN_DECIMALS) };
   }

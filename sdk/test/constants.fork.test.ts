@@ -127,3 +127,17 @@ test("Morpho and Borro: every Borro stock's vault and USDG market, as BORRO_STOC
     );
   }
 });
+
+test("venues: Spark Savings USDG and Raeto's USDG vault take USDG, each Raeto stock vault its Borro stock", async () => {
+  const { BORRO_STOCKS, RAETO_AAPL_VAULT, RAETO_GOOGL_VAULT, RAETO_NVDA_VAULT, RAETO_SPCX_VAULT, RAETO_TSLA_VAULT, RAETO_USDG_VAULT, SPARK_SAVINGS_USDG } = await import("../src/constants.ts");
+  const { parseAbi, getAddress } = await import("viem");
+  const venueAbi = parseAbi(["function asset() view returns (address)", "function stock() view returns (address)"]);
+  const read = fork.client.readContract.bind(fork.client);
+  assert.equal(getAddress(await read({ address: SPARK_SAVINGS_USDG, abi: venueAbi, functionName: "asset" })), USDG);
+  assert.equal(getAddress(await read({ address: RAETO_USDG_VAULT, abi: venueAbi, functionName: "asset" })), USDG);
+  const stocks: Record<string, Address> = { NVDA: RAETO_NVDA_VAULT, TSLA: RAETO_TSLA_VAULT, GOOGL: RAETO_GOOGL_VAULT, AAPL: RAETO_AAPL_VAULT, SPCX: RAETO_SPCX_VAULT };
+  for (const [symbol, vault] of Object.entries(stocks)) {
+    const token = BORRO_STOCKS.find((s) => s.symbol === symbol)?.token;
+    assert.equal(getAddress(await read({ address: vault, abi: venueAbi, functionName: "stock" })), token, symbol);
+  }
+});

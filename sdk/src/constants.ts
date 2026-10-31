@@ -142,7 +142,18 @@ export const VAULT_ACTION = {
   REPAY: 22,
   APPROVE_HASH: 23,
   GUARD: 24,
+  // Version 4 (OstraVault.sol notes; OstraVaultModuleV4 runs them, and CancelPendingChanges and a Guard spend with op 5).
+  SET_VENUE: 25,
+  ENTER: 26,
+  EXIT: 27,
+  FORWARD: 28,
 } as const;
+
+/**
+ * The live OstraVault beacon on chain 4663 (deployments/robinhood-mainnet.json vaultBeacon, owned by OstraUpgradeOwner):
+ * scripts/upgrade-owner.ts runs only on a record that names it, and schedules a call to it only through its checks.
+ */
+export const OSTRA_VAULT_BEACON: Address = "0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0";
 
 /** The first vault version with the withdrawal lock, linked vaults, the Morpho (Borro) spends, EIP-1271 and Guard. */
 export const VAULT_V3 = 3;
@@ -165,9 +176,45 @@ export const GUARD_OP = {
   REDEEM: 3,
   /** Take collateral back into the vault: abi.encode(bytes32 marketId, uint256 shares). */
   WITHDRAW_COLLATERAL: 4,
+  /** Version 4: bring a venue position back into the vault: abi.encode(uint8 kind, address venue, uint256 amount), amount 0 for all of it. */
+  EXIT: 5,
+  /** Version 4: EXIT, then SWEEP in the same call: abi.encode(uint8 kind, address venue, uint256 amount, address expected). */
+  EXIT_SWEEP: 6,
 } as const;
 /** The Guarded event's op for a SupportRecovery spend the other vault refused. */
 export const GUARD_OP_SUPPORT_RECOVERY = 255;
+
+/** The first vault version with the venues (SetVenue, Enter, Exit, Forward), guard ops 5 and 6 and the venue breaker. */
+export const VAULT_V4 = 4;
+/** OstraVaultV4's venue kinds: the code in OstraVaultModuleV4 a venue address is called with. */
+export const VENUE_KIND = {
+  /** A Raeto USDG vault (RaetoVault): Enter deposit(amount), Exit withdrawTo(principal); position principalOf(vault). */
+  RAETO_USDG: 1,
+  /** A Raeto stock vault (RaetoStockVault): Enter deposit(amount), Exit withdrawTo(shares) (amount 0: claimLiquidation()); position stockOf(vault). */
+  RAETO_STOCK: 2,
+  /** An ERC-4626 vault: Enter deposit(assets), Exit redeem(shares); position convertToAssets(balanceOf(vault)). */
+  ERC4626: 3,
+} as const;
+/**
+ * OstraVaultModuleV4.RAETO_USDG_MIN_GAS, RAETO_STOCK_MIN_GAS, ERC4626_MIN_GAS and GUARD_EXIT_MIN_GAS: gas an Enter or
+ * an Exit of each kind, and a Guard spend with op 5, must have left when it starts.
+ */
+export const VAULT_RAETO_USDG_MIN_GAS = 3_000_000;
+export const VAULT_RAETO_STOCK_MIN_GAS = 2_400_000;
+export const VAULT_ERC4626_MIN_GAS = 600_000;
+export const VAULT_GUARD_EXIT_MIN_GAS = 2_500_000;
+/**
+ * Venues on chain 4663 (read on chain 1 Nov 2026). Spark Savings USDG (spUSDG, an ERC4626 venue): asset() USDG, a UUPS
+ * proxy that names its implementation (getImplementation()). Raeto's USDG vault (RAETO_USDG): asset() USDG,
+ * SOURCE_DELAY 2 days. Raeto's stock vaults (RAETO_STOCK): stock() the BORRO_STOCKS token of the same symbol.
+ */
+export const SPARK_SAVINGS_USDG: Address = "0xde770c84FE66E063336b31737cFE9790f18c4087";
+export const RAETO_USDG_VAULT: Address = "0x6f9c9BD7F89D230Ec2ee34037e09b27848e4bd6B";
+export const RAETO_NVDA_VAULT: Address = "0xC9Bb4DdBb6E32C1C361A60840318798091Ec5082";
+export const RAETO_TSLA_VAULT: Address = "0x1510079e4ffB0Cf25Be5342DB784066fB16Ff5EB";
+export const RAETO_GOOGL_VAULT: Address = "0x12717098df80C8343517607A7f84F5E6599e2857";
+export const RAETO_AAPL_VAULT: Address = "0x2a60EeD21BBAA040183202EC9A00419fab8b8De2";
+export const RAETO_SPCX_VAULT: Address = "0x8e1885355a2883518F6337077a32DD4e78e6d3D4";
 
 /**
  * Morpho on chain 4663: Morpho Blue, and Morpho's VaultV2Factory (BorroLib.VAULT_FACTORY in

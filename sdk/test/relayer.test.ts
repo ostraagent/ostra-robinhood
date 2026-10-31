@@ -4,10 +4,27 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { concat, decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionData, getAddress, hexToBytes, keccak256, zeroAddress, type Hex, type Log } from "viem";
-import { ostraVaultAbi } from "../src/abi.ts";
-import { MULTICALL3, USDG, VAULT_ACTION, VAULT_SWAP_GAS, VAULT_SWAP_GAS_RESERVE } from "../src/constants.ts";
-import { swapParams, transferParams } from "../src/messages.ts";
+import { concat, decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionData, getAddress, hexToBytes, keccak256, toFunctionSelector, zeroAddress, type Hex, type Log } from "viem";
+import { ostraVaultAbi, ostraVaultModuleAbi, ostraVaultModuleV4Abi } from "../src/abi.ts";
+import {
+  GUARD_OP,
+  MULTICALL3,
+  RAETO_NVDA_VAULT,
+  RAETO_USDG_VAULT,
+  SPARK_SAVINGS_USDG,
+  USDG,
+  VAULT_ACTION,
+  VAULT_ERC4626_MIN_GAS,
+  VAULT_GUARD_EXIT_MIN_GAS,
+  VAULT_GUARD_MIN_GAS,
+  VAULT_MORPHO_MIN_GAS,
+  VAULT_RAETO_STOCK_MIN_GAS,
+  VAULT_RAETO_USDG_MIN_GAS,
+  VAULT_SWAP_GAS,
+  VAULT_SWAP_GAS_RESERVE,
+  VENUE_KIND,
+} from "../src/constants.ts";
+import { enterParams, exitParams, forwardParams, guardParams, lendParams, setVenueParams, supportRecoveryParams, swapParams, transferParams } from "../src/messages.ts";
 import { multicall3Abi } from "../src/external-abi.ts";
 import {
   ETH_USD_DEVIATION_BPS,
@@ -27,7 +44,11 @@ import {
   EXECUTE_ESCROW_SELECTOR,
   escrowCalls,
   escrowSwaps,
+  failedModuleSpends,
+  floorGasOf,
+  moduleFailureText,
   reservedSwapGas,
+  spendFloorGas,
   swapGasOf,
   weiToTokenUnits,
   withMargin,
@@ -124,6 +145,31 @@ test("failed vault Swaps are read from SwapFailed, only from the vaults named", 
   assert.deepEqual(failedSwaps([swapped], [at(1)]), []);
 });
 
+test("failed version 3 and 4 spends are read from MorphoFailed, Guarded (ok false) and VenueFailed, only from the vaults named", () => {
+  const notEnabled = toFunctionSelector("NotEnabled()");
+  const outOfGas = toFunctionSelector("OutOfGas()");
+  const log = (address: Hex, abi: typeof ostraVaultModuleAbi | typeof ostraVaultModuleV4Abi, eventName: string, args: Record<string, unknown>, data: Hex): Log =>
+    ({ address, topics: encodeEventTopics({ abi, eventName, args } as never), data }) as unknown as Log;
+  const venueFailed = (address: Hex, action: number) => log(address, ostraVaultModuleV4Abi, "VenueFailed", { action }, encodeAbiParameters([{ type: "bytes4" }], [notEnabled]));
+  const morphoFailed = log(at(1), ostraVaultModuleAbi, "MorphoFailed", { action: VAULT_ACTION.LEND }, encodeAbiParameters([{ type: "bytes4" }], [outOfGas]));
+  const guarded = (ok: boolean) => log(at(1), ostraVaultModuleAbi, "Guarded", { vault: at(5) }, encodeAbiParameters([{ type: "uint8" }, { type: "bool" }, { type: "bytes4" }], [6, ok, ok ? "0x00000000" : notEnabled]));
+  const logs = [morphoFailed, guarded(true), guarded(false), venueFailed(at(1), VAULT_ACTION.ENTER), venueFailed(at(2), VAULT_ACTION.EXIT)];
+  assert.deepEqual(failedModuleSpends(logs, [at(1)]), [
+    { vault: at(1), kind: "morpho", action: VAULT_ACTION.LEND, reason: outOfGas },
+    { vault: at(1), kind: "guard", action: 6, reason: notEnabled },
+    { vault: at(1), kind: "venue", action: VAULT_ACTION.ENTER, reason: notEnabled },
+  ]);
+  assert.deepEqual(failedModuleSpends(logs, [at(2)]), [{ vault: at(2), kind: "venue", action: VAULT_ACTION.EXIT, reason: notEnabled }]);
+  // Any contract can emit the topics: one not among the vaults does not count.
+  assert.deepEqual(failedModuleSpends(logs, [at(3)]), []);
+  // OstraVaultModuleV4's errors are named, those with arguments too.
+  assert.equal(moduleFailureText(notEnabled), "NotEnabled");
+  assert.equal(moduleFailureText(toFunctionSelector("VenueChanged(uint8)")), "VenueChanged");
+  assert.equal(moduleFailureText(toFunctionSelector("InLoss()")), "InLoss");
+  assert.ok(ostraVaultModuleV4Abi.some((x) => x.type === "error" && x.name === "VenueChanged" && x.inputs.length === 1));
+  assert.equal(moduleFailureText(outOfGas), "OutOfGas");
+});
+
 test("the gas the vault Swaps of a relay transaction reserve is added up (swapGas and its check's headroom); other calls reserve none", () => {
   const key = { currency0: zeroAddress, currency1: USDG, fee: 500, tickSpacing: 10, hooks: zeroAddress };
   const spend = (action: number, params: Hex) => encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256("0x02"), params, "0x00"] });
@@ -142,6 +188,43 @@ test("the gas the vault Swaps of a relay transaction reserve is added up (swapGa
   // The gas limit cap: the priced gas + the margin.
   assert.equal(relayGasCap(100_000n), 110_000n);
   assert.equal(relayGasCap(100_001n), withMargin(100_001n));
+});
+
+test("the gas floors of a relay transaction's vault spends: Morpho, Guard and SupportRecovery (version 3), Enter and Exit by kind and a Guard with op 5 or 6 (version 4)", () => {
+  const spend = (action: number, params: Hex) => ({ to: at(1), data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256("0x02"), params, "0x00"] }) });
+  const venue = (action: number, kind: number, v: Hex) =>
+    spend(action, action === VAULT_ACTION.ENTER ? enterParams({ kind: kind as never, venue: v, amount: 1n, minPosition: 0n }) : exitParams({ kind: kind as never, venue: v, amount: 1n, minOut: 0n }));
+  const floor = (call: { to: Hex; data: Hex }) => floorGasOf(relayTransaction([call]));
+  // Version 3.
+  assert.deepEqual(floor(spend(VAULT_ACTION.LEND, lendParams({ vault: at(5), assets: 1n, minShares: 0n }))), [BigInt(VAULT_MORPHO_MIN_GAS)]);
+  assert.deepEqual(floor(spend(VAULT_ACTION.SUPPORT_RECOVERY, supportRecoveryParams({ vault: at(5), newKeyRoot: keccak256("0x03") }))), [BigInt(VAULT_GUARD_MIN_GAS)]);
+  assert.deepEqual(floor(spend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.SWEEP, expected: at(6) }))), [BigInt(VAULT_GUARD_MIN_GAS)]);
+  // Version 4: a Guard with op 5 runs in OstraVaultModuleV4 with its own floor.
+  assert.deepEqual(floor(spend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT, kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, amount: 0n }))), [BigInt(VAULT_GUARD_EXIT_MIN_GAS)]);
+  assert.deepEqual(
+    floor(spend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT_SWEEP, kind: VENUE_KIND.RAETO_USDG, venue: RAETO_USDG_VAULT, amount: 0n, expected: at(6) }))),
+    [BigInt(VAULT_GUARD_EXIT_MIN_GAS)],
+  );
+  for (const action of [VAULT_ACTION.ENTER, VAULT_ACTION.EXIT]) {
+    assert.deepEqual(floor(venue(action, VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT)), [BigInt(VAULT_RAETO_USDG_MIN_GAS)]);
+    assert.deepEqual(floor(venue(action, VENUE_KIND.RAETO_STOCK, RAETO_NVDA_VAULT)), [BigInt(VAULT_RAETO_STOCK_MIN_GAS)]);
+    assert.deepEqual(floor(venue(action, VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG)), [BigInt(VAULT_ERC4626_MIN_GAS)]);
+  }
+  // Any other kind word starts with the ERC4626 floor, as OstraVaultModuleV4._minGas gives it.
+  assert.equal(spendFloorGas(VAULT_ACTION.ENTER, `0x${"00".repeat(31)}07${"00".repeat(96)}`), BigInt(VAULT_ERC4626_MIN_GAS));
+  // The op is the op word's last byte, the one OstraVault routes by: 5 and above go to OstraVaultModuleV4 (which
+  // refuses all but 5 and 6), below 5 to OstraVaultModule.
+  for (const op of ["05", "06", "07", "ff"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_EXIT_MIN_GAS), op);
+  for (const op of ["00", "04"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_MIN_GAS), op);
+  // No floor: SetVenue, Forward, Transfer, a call that is no spend.
+  assert.deepEqual(floor(spend(VAULT_ACTION.SET_VENUE, setVenueParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, enabled: true }))), []);
+  assert.deepEqual(floor(spend(VAULT_ACTION.FORWARD, forwardParams({ token: USDG, amount: 1n }))), []);
+  assert.deepEqual(floor(spend(VAULT_ACTION.TRANSFER, transferParams({ to: at(9), amount: 1n }))), []);
+  assert.deepEqual(floor({ to: at(3), data: "0xabcdef01" }), []);
+  // Several calls: one floor each, added to what the transaction reserves.
+  const both = relayTransaction([venue(VAULT_ACTION.ENTER, VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT), venue(VAULT_ACTION.EXIT, VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG)]);
+  assert.deepEqual(floorGasOf(both), [BigInt(VAULT_RAETO_USDG_MIN_GAS), BigInt(VAULT_ERC4626_MIN_GAS)]);
+  assert.equal(reservedSwapGas(both), BigInt(VAULT_RAETO_USDG_MIN_GAS + VAULT_ERC4626_MIN_GAS));
 });
 
 test("escrow executions: counted by selector in a relay transaction, and their swaps read from EscrowExecuted", () => {

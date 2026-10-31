@@ -282,11 +282,12 @@ contract OstraVaultModule {
     }
 
     /// @dev A failed spend may land (and use up its key) only when it was sent on its own, as a transaction's own
-    ///      call (msg.sender is tx.origin): inside another contract's call the failure could be one that call set up
-    ///      (a reentrancy lock held, a flash loan out), so the spend reverts instead and keeps its key, to be sent
-    ///      again on its own. `ret` is the failure, passed on as it is.
+    ///      call from an account with no code (msg.sender is tx.origin and has no code: an EIP-7702 account, whose code
+    ///      is its delegation, could set the failure up in the same transaction): otherwise the failure could be one
+    ///      the caller set up (a reentrancy lock held, a flash loan out), so the spend reverts instead and keeps its
+    ///      key, to be sent again on its own. `ret` is the failure, passed on as it is.
     function _landed(bytes memory ret) private view {
-        if (msg.sender != tx.origin) {
+        if (msg.sender != tx.origin || msg.sender.code.length != 0) {
             assembly ("memory-safe") {
                 revert(add(ret, 0x20), mload(ret))
             }

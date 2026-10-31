@@ -82,19 +82,26 @@ import {
   ostraVaultAbi,
   ostraVaultFactoryAbi,
   ostraVaultModuleAbi,
+  ostraVaultModuleV4Abi,
   ostraVestingAbi,
 } from "./abi.ts";
 import {
   ARBITRUM_NODE_INTERFACE,
   CHAINLINK_ETH_USD,
   CHAINLINK_ETH_USD_DECIMALS,
+  GUARD_OP,
   LAUNCHPAD,
   MULTICALL3,
   VAULT_ACTION,
+  VAULT_ERC4626_MIN_GAS,
+  VAULT_GUARD_EXIT_MIN_GAS,
   VAULT_GUARD_MIN_GAS,
   VAULT_MORPHO_MIN_GAS,
+  VAULT_RAETO_STOCK_MIN_GAS,
+  VAULT_RAETO_USDG_MIN_GAS,
   VAULT_SWAP_GAS,
   VAULT_SWAP_GAS_RESERVE,
+  VENUE_KIND,
 } from "./constants.ts";
 import type { Deployment } from "./deployment.ts";
 import { ostraPadAbi } from "./pad-abi.ts";
@@ -425,24 +432,45 @@ export function reservedSwapGas(tx: { to: Address; data: Hex }): bigint {
 }
 
 /**
- * The gas floor each vault spend of `tx` needs left when its call starts (version 3): a Morpho spend (17 to 22)
- * VAULT_MORPHO_MIN_GAS, a Guard or SupportRecovery spend VAULT_GUARD_MIN_GAS; with less the spend reverts. Added to
- * what the transaction is priced at (reservedSwapGas), so the gas limit cap leaves room for it.
+ * The gas floor each vault spend of `tx` needs left when its call starts (spendFloorGas): with less the spend
+ * reverts. Added to what the transaction is priced at (reservedSwapGas), so the gas limit cap leaves room for it.
  */
 export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
   const out: bigint[] = [];
   for (const c of relayedCalls(tx)) {
     if (c.data.slice(0, 10).toLowerCase() !== SPEND_SELECTOR) continue;
-    let action: number;
+    let args: readonly unknown[];
     try {
-      action = Number((decodeFunctionData({ abi: ostraVaultAbi, data: c.data }).args as readonly unknown[])[0]);
+      args = decodeFunctionData({ abi: ostraVaultAbi, data: c.data }).args as readonly unknown[];
     } catch {
       continue;
     }
-    if (action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY) out.push(BigInt(VAULT_MORPHO_MIN_GAS));
-    else if (action === VAULT_ACTION.GUARD || action === VAULT_ACTION.SUPPORT_RECOVERY) out.push(BigInt(VAULT_GUARD_MIN_GAS));
+    const floor = spendFloorGas(Number(args[0]), args[2] as Hex);
+    if (floor !== 0n) out.push(floor);
   }
   return out;
+}
+
+/**
+ * The gas floor a vault spend of `action` with `params` needs left when it starts, or 0 for a spend that has none.
+ * Version 3 (OstraVaultModule): a Morpho spend (17 to 22) VAULT_MORPHO_MIN_GAS, a Guard or SupportRecovery spend
+ * VAULT_GUARD_MIN_GAS. Version 4 (OstraVaultModuleV4): a Guard spend whose op word ends in 5 or above (the byte
+ * OstraVault sends it to OstraVaultModuleV4 by; the module runs ops 5 and 6 and refuses the rest)
+ * VAULT_GUARD_EXIT_MIN_GAS; an Enter or an Exit the floor of the kind in its first
+ * word (OstraVaultModuleV4._minGas: VAULT_RAETO_USDG_MIN_GAS, VAULT_RAETO_STOCK_MIN_GAS, any other kind
+ * VAULT_ERC4626_MIN_GAS). Params too short for the word read are priced as the vault would run them if they were
+ * zero: the vault refuses them anyway.
+ */
+export function spendFloorGas(action: number, params: Hex): bigint {
+  const word = (i: number) => (params.length >= 2 + 64 * (i + 1) ? BigInt(`0x${params.slice(2 + 64 * i, 2 + 64 * (i + 1))}`) : 0n);
+  if (action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY) return BigInt(VAULT_MORPHO_MIN_GAS);
+  if (action === VAULT_ACTION.GUARD) return BigInt((word(1) & 0xffn) >= BigInt(GUARD_OP.EXIT) ? VAULT_GUARD_EXIT_MIN_GAS : VAULT_GUARD_MIN_GAS);
+  if (action === VAULT_ACTION.SUPPORT_RECOVERY) return BigInt(VAULT_GUARD_MIN_GAS);
+  if (action === VAULT_ACTION.ENTER || action === VAULT_ACTION.EXIT) {
+    const kind = word(0);
+    return BigInt(kind === BigInt(VENUE_KIND.RAETO_USDG) ? VAULT_RAETO_USDG_MIN_GAS : kind === BigInt(VENUE_KIND.RAETO_STOCK) ? VAULT_RAETO_STOCK_MIN_GAS : VAULT_ERC4626_MIN_GAS);
+  }
+  return 0n;
 }
 
 /** The selector of OstraRouter.executeEscrow(Order, address, Leg, Leg) (ostra-swap src/OstraRouter.sol; checked against its ABI by the relayer's tests). */
@@ -605,17 +633,24 @@ export function failedSwaps(logs: readonly Log[], vaults: readonly Address[]): F
   return out;
 }
 
-/** A vault's version 3 spend that failed and moved nothing (OstraVaultModule's MorphoFailed, or Guarded with ok false). */
-export type FailedModuleSpend = { vault: Address; kind: "morpho" | "guard"; action: number; reason: Hex };
+/**
+ * A vault's version 3 or 4 spend that failed and moved nothing (OstraVaultModule's MorphoFailed, Guarded with ok false
+ * from either module, or OstraVaultModuleV4's VenueFailed for an Enter or an Exit).
+ */
+export type FailedModuleSpend = { vault: Address; kind: "morpho" | "guard" | "venue"; action: number; reason: Hex };
 
 const MORPHO_FAILED_TOPIC = toEventSelector(
   ostraVaultModuleAbi.find((x) => x.type === "event" && x.name === "MorphoFailed") as Parameters<typeof toEventSelector>[0],
 );
 const GUARDED_TOPIC = toEventSelector(ostraVaultModuleAbi.find((x) => x.type === "event" && x.name === "Guarded") as Parameters<typeof toEventSelector>[0]);
+const VENUE_FAILED_TOPIC = toEventSelector(
+  ostraVaultModuleV4Abi.find((x) => x.type === "event" && x.name === "VenueFailed") as Parameters<typeof toEventSelector>[0],
+);
 
 /**
- * The Morpho, Guard and SupportRecovery spends among `logs` that failed, by the emitting vault (the module's events
- * are a vault's, through delegatecall). Only events of addresses in `vaults` count.
+ * The Morpho, Guard, SupportRecovery, Enter and Exit spends among `logs` that failed, by the emitting vault (the
+ * modules' events are a vault's, through delegatecall; OstraVaultModuleV4 emits OstraVaultModule's Guarded). Only
+ * events of addresses in `vaults` count.
  */
 export function failedModuleSpends(logs: readonly Log[], vaults: readonly Address[]): FailedModuleSpend[] {
   const ours = new Set(vaults.map((v) => getAddress(v)));
@@ -631,21 +666,25 @@ export function failedModuleSpends(logs: readonly Log[], vaults: readonly Addres
       const e = decodeEventLog({ abi: ostraVaultModuleAbi, eventName: "Guarded", topics: log.topics as [Hex, ...Hex[]], data: log.data });
       const args = e.args as { op: number; ok: boolean; reason: Hex };
       if (!args.ok) out.push({ vault: getAddress(log.address), kind: "guard", action: Number(args.op), reason: args.reason });
+    } else if (topic === VENUE_FAILED_TOPIC.toLowerCase()) {
+      const e = decodeEventLog({ abi: ostraVaultModuleV4Abi, eventName: "VenueFailed", topics: log.topics as [Hex, ...Hex[]], data: log.data });
+      const args = e.args as { action: number; reason: Hex };
+      out.push({ vault: getAddress(log.address), kind: "venue", action: Number(args.action), reason: args.reason });
     }
   }
   return out;
 }
 
-/** The errors of OstraVault and OstraVaultModule by selector, and the two of Solidity itself. */
+/** The errors of OstraVault, OstraVaultModule and OstraVaultModuleV4 by selector, and the two of Solidity itself. */
 const VAULT_ERROR_NAMES = new Map<string, string>();
-for (const item of [...ostraVaultAbi, ...ostraVaultModuleAbi] as readonly { type: string; name?: string; inputs?: readonly { type: string }[] }[]) {
+for (const item of [...ostraVaultAbi, ...ostraVaultModuleAbi, ...ostraVaultModuleV4Abi] as readonly { type: string; name?: string; inputs?: readonly { type: string }[] }[]) {
   if (item.type !== "error" || item.name === undefined) continue;
   VAULT_ERROR_NAMES.set(toFunctionSelector(`${item.name}(${(item.inputs ?? []).map((i) => i.type).join(",")})`).toLowerCase(), item.name);
 }
-VAULT_ERROR_NAMES.set("0x08c379a0", "Error(string), a check of Morpho or of the Vault V2");
+VAULT_ERROR_NAMES.set("0x08c379a0", "Error(string), a check of Morpho, of the Vault V2 or of the venue");
 VAULT_ERROR_NAMES.set("0x4e487b71", "Panic");
 
-/** The reason a failed version 3 spend carries (FailedModuleSpend.reason, the revert's first 4 bytes), readable. */
+/** The reason a failed version 3 or 4 spend carries (FailedModuleSpend.reason, the revert's first 4 bytes), readable. */
 export function moduleFailureText(reason: Hex): string {
   if (reason === "0x" || /^0x0{8}$/.test(reason)) return "a revert without a reason (out of gas, or a call to code that is not there)";
   return VAULT_ERROR_NAMES.get(reason.slice(0, 10).toLowerCase()) ?? `a revert with ${reason.slice(0, 10)}`;

@@ -1,7 +1,9 @@
 // Sends relayed transactions from the relayer's account (on Solana, Kora
 // signed and send.ts resent the signed bytes while the blockhash lived).
 //
-// Sends run one at a time (one nonce sequence). Each send is simulated first
+// Sends run one at a time (one nonce sequence), only while the sending account
+// has no code (an EIP-7702 delegation would keep failed spends from landing;
+// checked at start and before every send). Each send is simulated first
 // at its own gas estimate (a request that reverts now is not sent and costs
 // nothing) and, when it holds vault Swaps that must not fail, simulated once
 // more for their SwapFailed (one that fails now is not sent). Its gas limit
@@ -123,6 +125,28 @@ async function bounded<T>(read: Promise<T>): Promise<T | null> {
 
 export type SendOptions = { refuseFailedSwaps?: readonly Address[]; maxGas?: bigint; value?: bigint; gasAtCap?: boolean; notAfter?: bigint };
 
+/**
+ * Why the sending account `address` with `code` must not send, or null when it has none. A failed Swap lands (and
+ * uses its key) from any caller, but OstraVault's modules land a failed Morpho, Guard, SupportRecovery, Enter or
+ * Exit spend only when it is a transaction's own call from an account with no code: from an account with code (an
+ * EIP-7702 delegation, code 0xef0100 || delegate) every such spend reverts and keeps its key, so one that can no
+ * longer succeed could never be used up through this relayer.
+ */
+function sendingAccountCode(address: Address, code: Hex | undefined): string | null {
+  if (code === undefined || code === "0x") return null;
+  const delegate = /^0xef0100[0-9a-fA-F]{40}$/.test(code) ? ` (an EIP-7702 delegation to 0x${code.slice(8)})` : "";
+  return (
+    `the relayer's sending account ${address} has code${delegate}: OstraVault's modules land a failed spend only for a sender without code, so a ` +
+    "Morpho, Guard or venue spend that fails could never be used up through this relayer; use a relayer.key whose account has no code"
+  );
+}
+
+/** Throws unless the sending account `address` has no code (sendingAccountCode): the relayer refuses to start with one. */
+export async function checkSendingAccount(client: PublicClient, address: Address): Promise<void> {
+  const refusal = sendingAccountCode(address, await client.getCode({ address }));
+  if (refusal !== null) throw new Error(refusal);
+}
+
 export class RelaySender {
   readonly #client: PublicClient;
   readonly #transport: Transport;
@@ -224,6 +248,15 @@ export class RelaySender {
 
   async #send(tx: { to: Address; data: Hex; value: bigint }, refuseFailedSwaps: readonly Address[], maxGas: bigint | undefined, o: SendOptions): Promise<Landed> {
     const account = this.#account;
+    // Checked at start and again before every send: the account gaining code (an EIP-7702 delegation) stops sending.
+    let code: Hex | undefined;
+    try {
+      code = await this.#client.getCode({ address: account.address });
+    } catch (err) {
+      throw new NotSentError(`the sending account's code could not be read, so it was not sent: ${errorText(err)}`);
+    }
+    const refusal = sendingAccountCode(account.address, code);
+    if (refusal !== null) throw new NotSentError(`${refusal}; nothing was sent`);
     let gas: bigint;
     try {
       gas = await this.#client.estimateGas({ account: account.address, to: tx.to, data: tx.data, value: tx.value });

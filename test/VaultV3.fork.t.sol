@@ -83,7 +83,7 @@ contract VaultV3ForkTest is Test {
         assertEq(address(module.MORPHO()), MORPHO);
         assertEq(module.BORRO_CODE(), CODE);
         OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
-        assertEq(implementation.VERSION(), 3);
+        assertEq(implementation.VERSION(), 4);
         assertEq(implementation.MODULE(), address(module));
     }
 
@@ -194,7 +194,7 @@ contract VaultV3ForkTest is Test {
         vm.expectRevert(OstraVault.BadParams.selector);
         v.spend(17, next, abi.encode(BUSDG, uint256(1)), sig);
         _spendReverts(v, OTHER, 15, abi.encode(uint256(0)), abi.encodeWithSelector(OstraVault.BadParams.selector));
-        _spendReverts(v, OTHER, 25, "", abi.encodeWithSelector(OstraVault.BadAction.selector));
+        _spendReverts(v, OTHER, 29, "", abi.encodeWithSelector(OstraVault.BadAction.selector));
     }
 
     // ---------------------------------------------------------------------------------------------

@@ -56,6 +56,7 @@ import {
   USDG_EIP712_DOMAIN,
   VAULT_ACTION,
   VAULT_MAX_URI_LENGTH,
+  VENUE_KIND,
   X402_BATCH_SETTLEMENT,
   X402_BATCH_SETTLEMENT_DOMAIN,
   X402_MAX_WITHDRAW_DELAY,
@@ -164,6 +165,10 @@ export const SPEND_PARAMS_LENGTHS: Readonly<Record<VaultAction, readonly number[
   [VAULT_ACTION.REPAY]: [288],
   [VAULT_ACTION.APPROVE_HASH]: [64],
   [VAULT_ACTION.GUARD]: [128],
+  [VAULT_ACTION.SET_VENUE]: [96],
+  [VAULT_ACTION.ENTER]: [128],
+  [VAULT_ACTION.EXIT]: [128],
+  [VAULT_ACTION.FORWARD]: [64],
 };
 
 /** Throws unless `params` (hex) has a length OstraVault accepts for `action`. */
@@ -730,7 +735,9 @@ export type GuardCall =
   | { op: typeof GUARD_OP.REVOKE_HASH; hash: Hex }
   | { op: typeof GUARD_OP.SWEEP; expected: Address }
   | { op: typeof GUARD_OP.REDEEM; vault: Address; shares: bigint }
-  | { op: typeof GUARD_OP.WITHDRAW_COLLATERAL; marketId: Hex; shares: bigint };
+  | { op: typeof GUARD_OP.WITHDRAW_COLLATERAL; marketId: Hex; shares: bigint }
+  | { op: typeof GUARD_OP.EXIT; kind: VenueKind; venue: Address; amount: bigint }
+  | { op: typeof GUARD_OP.EXIT_SWEEP; kind: VenueKind; venue: Address; amount: bigint; expected: Address };
 
 /** The params of OstraVault.guard for `c`. */
 export function guardCallParams(c: GuardCall): Hex {
@@ -745,10 +752,23 @@ export function guardCallParams(c: GuardCall): Hex {
       return encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [nonZeroAddr(c.vault, "vault"), positive(c.shares, U256_MAX, "shares")]);
     case GUARD_OP.WITHDRAW_COLLATERAL:
       return encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [bytes32(c.marketId, "marketId"), positive(c.shares, U256_MAX, "shares")]);
+    case GUARD_OP.EXIT:
+      return encodeAbiParameters([{ type: "uint8" }, { type: "address" }, { type: "uint256" }], [venueKind(c.kind), nonZeroAddr(c.venue, "venue"), uint(c.amount, U256_MAX, "amount")]);
+    case GUARD_OP.EXIT_SWEEP:
+      return encodeAbiParameters(
+        [{ type: "uint8" }, { type: "address" }, { type: "uint256" }, { type: "address" }],
+        [venueKind(c.kind), nonZeroAddr(c.venue, "venue"), uint(c.amount, U256_MAX, "amount"), nonZeroAddr(c.expected, "expected")],
+      );
   }
 }
 
-/** Guard spend params: abi.encode(address vault, uint8 op, bytes32 arg, uint256 amount): guard(op, ...) on `vault`, as its guardian or withdrawal address. */
+/**
+ * Guard spend params: abi.encode(address vault, uint8 op, bytes32 arg, uint256 amount): guard(op, ...) on `vault`, as
+ * its guardian or withdrawal address. Ops 5 and 6 (version 4, run in OstraVaultModuleV4): arg
+ * bytes32(uint256(kind) << 160 | uint160(venue)); op 5's amount is the amount (0 for all of the position), op 6's
+ * the expected withdrawal address as a uint160 (op 6 through a Guard spend always takes the whole position, so its
+ * GuardCall amount must be 0).
+ */
 export function guardParams(vault: Address, c: GuardCall): Hex {
   let arg: Hex = ZERO32;
   let amount = 0n;
@@ -756,6 +776,11 @@ export function guardParams(vault: Address, c: GuardCall): Hex {
   else if (c.op === GUARD_OP.SWEEP) arg = pad(nonZeroAddr(c.expected, "expected"), { size: 32 });
   else if (c.op === GUARD_OP.REDEEM) [arg, amount] = [pad(nonZeroAddr(c.vault, "vault"), { size: 32 }), positive(c.shares, U256_MAX, "shares")];
   else if (c.op === GUARD_OP.WITHDRAW_COLLATERAL) [arg, amount] = [bytes32(c.marketId, "marketId"), positive(c.shares, U256_MAX, "shares")];
+  else if (c.op === GUARD_OP.EXIT) [arg, amount] = [venueGuardArg(c.kind, c.venue), uint(c.amount, U256_MAX, "amount")];
+  else if (c.op === GUARD_OP.EXIT_SWEEP) {
+    if (c.amount !== 0n) throw new RangeError("a Guard spend with op 6 takes the whole position: amount must be 0");
+    [arg, amount] = [venueGuardArg(c.kind, c.venue), BigInt(nonZeroAddr(c.expected, "expected"))];
+  }
   return encodeAbiParameters([{ type: "address" }, { type: "uint8" }, { type: "bytes32" }, { type: "uint256" }], [nonZeroAddr(vault, "vault"), c.op, arg, amount]);
 }
 
@@ -765,6 +790,77 @@ export function decodeGuardParams(params: Hex): { vault: Address; op: number; ar
     paramsFor(VAULT_ACTION.GUARD, params),
   );
   return { vault, op, arg, amount };
+}
+
+export type VenueKind = (typeof VENUE_KIND)[keyof typeof VENUE_KIND];
+
+function venueKind(value: number, name = "kind"): VenueKind {
+  const kinds: readonly number[] = Object.values(VENUE_KIND);
+  if (!kinds.includes(value)) throw new RangeError(`${name} must be a venue kind (${kinds.join(", ")})`);
+  return value as VenueKind;
+}
+
+/** A Guard spend's arg for ops 5 and 6: bytes32(uint256(kind) << 160 | uint160(venue)). */
+function venueGuardArg(kind: VenueKind, venue: Address): Hex {
+  return pad(numberToHex((BigInt(venueKind(kind)) << 160n) | BigInt(nonZeroAddr(venue, "venue"))), { size: 32 });
+}
+
+const SET_VENUE_TYPES = [{ type: "uint8" }, { type: "address" }, { type: "bool" }] as const;
+const VENUE_AMOUNT_TYPES = [{ type: "uint8" }, { type: "address" }, { type: "uint256" }, { type: "uint256" }] as const;
+
+/**
+ * SetVenue params (version 4): abi.encode(uint8 kind, address venue, bool enabled). An enable takes effect at once, or
+ * under the withdrawal lock the lock's delay later; a disable at once (it stops only new Enters).
+ */
+export function setVenueParams(p: { kind: VenueKind; venue: Address; enabled: boolean }): Hex {
+  return encodeAbiParameters(SET_VENUE_TYPES, [venueKind(p.kind), nonZeroAddr(p.venue, "venue"), p.enabled]);
+}
+
+export function decodeSetVenueParams(params: Hex): { kind: number; venue: Address; enabled: boolean } {
+  const [kind, venue, enabled] = decodeAbiParameters(SET_VENUE_TYPES, paramsFor(VAULT_ACTION.SET_VENUE, params));
+  return { kind, venue, enabled };
+}
+
+/**
+ * Enter params (version 4): abi.encode(uint8 kind, address venue, uint256 amount, uint256 minPosition): `amount` of the
+ * vault's token into a venue enabled and in force, the position the vault reads rising by at least `minPosition`.
+ */
+export function enterParams(p: { kind: VenueKind; venue: Address; amount: bigint; minPosition: bigint }): Hex {
+  return encodeAbiParameters(VENUE_AMOUNT_TYPES, [venueKind(p.kind), nonZeroAddr(p.venue, "venue"), positive(p.amount, U256_MAX, "amount"), uint(p.minPosition, U256_MAX, "minPosition")]);
+}
+
+export function decodeEnterParams(params: Hex): { kind: number; venue: Address; amount: bigint; minPosition: bigint } {
+  const [kind, venue, amount, minPosition] = decodeAbiParameters(VENUE_AMOUNT_TYPES, paramsFor(VAULT_ACTION.ENTER, params));
+  return { kind, venue, amount, minPosition };
+}
+
+/**
+ * Exit params (version 4): abi.encode(uint8 kind, address venue, uint256 amount, uint256 minOut): `amount` back into
+ * the vault for at least `minOut` of its token (RAETO_USDG principal; RAETO_STOCK the venue's shares, or 0 to claim
+ * the USDG a liquidation left the vault; ERC4626 shares).
+ */
+export function exitParams(p: { kind: VenueKind; venue: Address; amount: bigint; minOut: bigint }): Hex {
+  const kind = venueKind(p.kind);
+  const amount = kind === VENUE_KIND.RAETO_STOCK ? uint(p.amount, U256_MAX, "amount") : positive(p.amount, U256_MAX, "amount");
+  return encodeAbiParameters(VENUE_AMOUNT_TYPES, [kind, nonZeroAddr(p.venue, "venue"), amount, uint(p.minOut, U256_MAX, "minOut")]);
+}
+
+export function decodeExitParams(params: Hex): { kind: number; venue: Address; amount: bigint; minOut: bigint } {
+  const [kind, venue, amount, minOut] = decodeAbiParameters(VENUE_AMOUNT_TYPES, paramsFor(VAULT_ACTION.EXIT, params));
+  return { kind, venue, amount, minOut };
+}
+
+/**
+ * Forward params (version 4): abi.encode(address foreign, uint256 amount): `amount` of a token that is not the vault's
+ * own (the USDG a liquidation left a stock vault) to the linked vault, whose token it must be.
+ */
+export function forwardParams(p: { token: Address; amount: bigint }): Hex {
+  return encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [nonZeroAddr(p.token, "token"), positive(p.amount, U256_MAX, "amount")]);
+}
+
+export function decodeForwardParams(params: Hex): { token: Address; amount: bigint } {
+  const [token, amount] = decodeAbiParameters([{ type: "address" }, { type: "uint256" }], paramsFor(VAULT_ACTION.FORWARD, params));
+  return { token, amount };
 }
 
 /** The key root a recovery moves a vault to: key `nonce` (the vault's current nonce) of the new seed's keychain. */

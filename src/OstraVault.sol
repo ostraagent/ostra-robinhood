@@ -18,6 +18,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {Wots} from "./Wots.sol";
 import {OstraVaultV3} from "./OstraVaultV3.sol";
+import {OstraVaultV4} from "./OstraVaultV4.sol";
 import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 
 /// @notice What a ConfigurePool spend calls (OstraHook.configure; PoolId is a bytes32).
@@ -101,7 +102,8 @@ interface IAgentIdentityRegistry {
 /// * 14 SetWithdrawalLock: params abi.encode(address withdrawal, uint32 delay, uint128 dailyLimit). Turns the
 ///                  withdrawal lock on (withdrawal not zero, MIN_RECOVERY_DELAY <= delay <= MAX_RECOVERY_DELAY) or off
 ///                  (all three zero). See "Withdrawal lock" below.
-/// * 15 CancelPendingChanges: params empty. Drops a lock change and a link change that are still waiting.
+/// * 15 CancelPendingChanges: params empty. Drops a lock change and a link change that are still waiting, and the venue
+///                  enables still waiting (version 4).
 /// * 16 SetLinkedVault: params abi.encode(address vault). The owner's other vault that Borrow pays and that
 ///                  repays this vault's debt (for a stock vault: its USDG vault), or address(0) for none. It must
 ///                  be a vault OstraVaultFactory made, not this one.
@@ -136,7 +138,17 @@ interface IAgentIdentityRegistry {
 /// * 24 Guard:      params abi.encode(address vault, uint8 op, bytes32 arg, uint256 amount). As a guardian or the
 ///                  withdrawal address of another Ostra vault, calls guard(op, ...) on it (see guard). A call the other
 ///                  vault refuses lands as Guarded(ok false), and so does a SupportRecovery it refuses (both only when
-///                  sent on its own, as a failed Morpho spend).
+///                  sent on its own, as a failed Morpho spend). With op 5 or 6 (venue exit, and exit and sweep; arg
+///                  bytes32(uint256(kind) << 160 | uint160(venue))) it runs in OstraVaultModuleV4.
+/// * 25 SetVenue:   params abi.encode(uint8 kind, address venue, bool enabled).
+/// * 26 Enter:      params abi.encode(uint8 kind, address venue, uint256 amount, uint256 minPosition).
+/// * 27 Exit:       params abi.encode(uint8 kind, address venue, uint256 amount, uint256 minOut).
+/// * 28 Forward:    params abi.encode(address foreign, uint256 amount).
+///                  The version 4 spends (25 to 28) put this vault's token to work in venues whose kinds the vault's
+///                  code speaks (RAETO_USDG, RAETO_STOCK, ERC4626): the receiver is always this vault and the vault reads
+///                  the position itself. Their rules, and the breaker (tripVenue) and guard op 5 that bring a position
+///                  home, are in OstraVaultModuleV4, where they run by delegatecall (as do CancelPendingChanges, which
+///                  also drops the venue enables still waiting, and guard op 0).
 ///
 /// Withdrawal lock (optional): a fixed withdrawal address, always reachable at once, and a daily limit on every
 /// other outflow, so that a stolen seed cannot empty the vault at once, and its owner can move everything to the
@@ -213,10 +225,15 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_REPAY = 22;
     uint8 public constant ACTION_APPROVE_HASH = 23;
     uint8 public constant ACTION_GUARD = 24;
+    uint8 public constant ACTION_SET_VENUE = 25;
+    uint8 public constant ACTION_ENTER = 26;
+    uint8 public constant ACTION_EXIT = 27;
+    uint8 public constant ACTION_FORWARD = 28;
 
     /// @notice The implementation version: 2 adds the profile, token metadata and agent identity spends; 3 adds the
-    ///         withdrawal lock, Morpho Vault V2 and Morpho Blue (Borro) spends and EIP-1271.
-    uint8 public constant VERSION = 3;
+    ///         withdrawal lock, Morpho Vault V2 and Morpho Blue (Borro) spends and EIP-1271; 4 adds the venues (SetVenue,
+    ///         Enter, Exit, Forward), guard op 5 and the venue breaker.
+    uint8 public constant VERSION = 4;
     /// @notice Longest URI a SetProfile, SetTokenMetadata, RegisterAgent or SetAgentUri spend may carry.
     uint256 public constant MAX_URI_LENGTH = 256;
 
@@ -241,8 +258,13 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     bytes4 private constant EIP1271_MAGIC = 0x1626ba7e;
     /// @dev OstraVaultModule.guard(uint8,bytes,address).
     bytes4 private constant MODULE_GUARD = bytes4(keccak256("guard(uint8,bytes,address)"));
-    /// @dev OstraVaultModule.run(uint8,bytes,address,bool).
+    /// @dev OstraVaultModule.run(uint8,bytes,address,bool), and OstraVaultModuleV4's of the same signature.
     bytes4 private constant MODULE_RUN = bytes4(keccak256("run(uint8,bytes,address,bool)"));
+    /// @dev OstraVaultModuleV4.trip(uint8,address,uint256,address).
+    bytes4 private constant MODULE_TRIP = bytes4(keccak256("trip(uint8,address,uint256,address)"));
+    /// @dev Guard op 0 (drop the waiting changes) and ops 5 and up (venue exit) run in OstraVaultModuleV4.
+    uint8 private constant GUARD_CANCEL = 0;
+    uint8 private constant GUARD_EXIT = 5;
 
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
@@ -259,6 +281,10 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     /// @notice OstraVaultModule, which this vault's version 3 spends (14 to 24) run in by delegatecall: apart only
     ///         for the code size limit.
     address public immutable MODULE;
+    /// @notice OstraVaultModuleV4, which this vault's version 4 spends (25 to 28), CancelPendingChanges, a Guard spend
+    ///         with op 5 or 6, guard ops 0, 5 and 6 and the breaker run in by delegatecall; OstraVaultModule runs the other
+    ///         spends from 5 to 24.
+    address public immutable MODULE_V4;
 
     IERC20 public token;
     bytes32 public initialKeyRoot;
@@ -341,17 +367,20 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         address registry;
         address identityRegistry;
         address module;
+        address moduleV4;
     }
 
     constructor(Externals memory e) EIP712("Ostra Vault", "1") {
         if (
             e.registry == address(0) || e.identityRegistry == address(0) || e.module.code.length == 0
+                || e.moduleV4.code.length == 0
         ) revert BadParams();
         BATCH_SETTLEMENT = IX402BatchSettlement(e.batchSettlement);
         POOL_MANAGER = IPoolManager(e.poolManager);
         REGISTRY = IOstraRegistry(e.registry);
         IDENTITY_REGISTRY = IAgentIdentityRegistry(e.identityRegistry);
         MODULE = e.module;
+        MODULE_V4 = e.moduleV4;
         _disableInitializers();
     }
 
@@ -452,7 +481,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             (uint256 agentId, string memory uri) = abi.decode(params, (uint256, string));
             IDENTITY_REGISTRY.setAgentURI(agentId, uri);
         } else {
-            // ClaimDividend (5), SupportRecovery (8) and the version 3 spends (14 to 24).
+            // ClaimDividend (5), SupportRecovery (8) and the version 3 and 4 spends (14 to 28).
             _moduleSpend(action, params);
         }
     }
@@ -496,8 +525,12 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 288) revert BadParams();
         } else if (action == ACTION_GUARD) {
             if (params.length != 128) revert BadParams();
-        } else if (action == ACTION_APPROVE_HASH) {
+        } else if (action == ACTION_APPROVE_HASH || action == ACTION_FORWARD) {
             if (params.length != 64) revert BadParams();
+        } else if (action == ACTION_SET_VENUE) {
+            if (params.length != 96) revert BadParams();
+        } else if (action == ACTION_ENTER || action == ACTION_EXIT) {
+            if (params.length != 128) revert BadParams();
         } else {
             revert BadAction();
         }
@@ -698,25 +731,46 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         return l.hashValidFrom[OstraVaultV3.approvalKey(l, hash)];
     }
 
-    /// @notice What a guardian or the withdrawal address may do while the lock is on (OstraVaultModule.guard): op 0
-    ///         drop the waiting lock and link changes; 1 withdraw a hash approval, abi.encode(bytes32 hash); 2 send
-    ///         the whole balance of the token to the withdrawal address, abi.encode(address expected), which must be
-    ///         the one in force; 3 redeem Vault V2 shares back here, abi.encode(address vault, uint256 shares); 4 take
-    ///         collateral back here, abi.encode(bytes32 marketId, uint256 shares), within the same LTV cap. So the
-    ///         owner's way out survives a key a thief has taken over. Changes whose wait is over are made first.
+    /// @notice What a guardian or the withdrawal address may do while the lock is on (OstraVaultModule.guard; ops 0, 5
+    ///         and 6 in OstraVaultModuleV4): op 0 drop the waiting lock and link changes and venue enables; 1 withdraw a
+    ///         hash approval, abi.encode(bytes32 hash); 2 send the whole balance of the token to the withdrawal address,
+    ///         abi.encode(address expected), which must be the one in force; 3 redeem Vault V2 shares back here,
+    ///         abi.encode(address vault, uint256 shares); 4 take collateral back here, abi.encode(bytes32 marketId,
+    ///         uint256 shares), within the same LTV cap; 5 bring a venue position back here, abi.encode(uint8 kind,
+    ///         address venue, uint256 amount); 6 op 5 then op 2 in one call, abi.encode(uint8 kind, address venue,
+    ///         uint256 amount, address expected). So the owner's way out survives a key a thief has taken over.
+    ///         Changes whose wait is over are made first.
     function guard(uint8 op, bytes calldata params) external nonReentrant {
         OstraVaultV3.Layout storage l = OstraVaultV3.layout();
         OstraVaultV3.applyPendingChanges(l);
         address withdrawal = l.lock.withdrawal;
         if (withdrawal == address(0)) revert Locked();
         if (!isGuardian[msg.sender] && msg.sender != withdrawal) revert NotGuardian();
-        (bool ok, bytes memory ret) =
-            MODULE.delegatecall(abi.encodeWithSelector(MODULE_GUARD, op, params, address(token)));
-        if (!ok) {
-            assembly ("memory-safe") {
-                revert(add(ret, 0x20), mload(ret))
-            }
-        }
+        _delegate(
+            op == GUARD_CANCEL || op >= GUARD_EXIT ? MODULE_V4 : MODULE,
+            abi.encodeWithSelector(MODULE_GUARD, op, params, address(token))
+        );
+    }
+
+    /// @notice The venue breaker (OstraVaultModuleV4.trip): anyone may bring this vault's position in `venue` home
+    ///         when its code or implementation is no longer what the vault pinned or its source change is queued or
+    ///         made (RAETO_USDG); `amount` 0 for all of it. Never while the venue reports a loss. The value only ever
+    ///         comes back into this vault. When a RAETO_STOCK venue's LTV is above its max, it calls the venue's own
+    ///         deleverage() instead.
+    function tripVenue(uint8 kind, address venue, uint256 amount) external nonReentrant {
+        _delegate(MODULE_V4, abi.encodeWithSelector(MODULE_TRIP, kind, venue, amount, address(token)));
+    }
+
+    /// @notice A venue as this vault keeps it: enabled (the owner's last SetVenue), entered once, in force now, and
+    ///         from when its enable takes effect.
+    function venueOf(uint8 kind, address venue)
+        external
+        view
+        returns (bool enabled, bool entered, bool inForce, uint64 from)
+    {
+        OstraVaultV4.Layout storage l = OstraVaultV4.layout();
+        OstraVaultV4.Venue storage s = l.venues[OstraVaultV4.key(kind, venue)];
+        return (s.enabled, s.entered, OstraVaultV4.inForce(l, s), s.from);
     }
 
     function _outflow(uint256 amount) private {
@@ -737,16 +791,24 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Version 3 spends
+    // Version 3 and 4 spends
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev Runs a version 3 spend (14 to 24) in OstraVaultModule by delegatecall, and passes on its revert as it is;
-    ///      the module also learns whether a recovery is under way.
+    /// @dev Runs a version 3 or 4 spend in its module by delegatecall, and passes on its revert as it is; the module also
+    ///      learns whether a recovery is under way. OstraVaultModuleV4 runs 25 to 28, CancelPendingChanges (it drops
+    ///      the venue enables waiting too) and a Guard spend with op 5 or 6 (its op word's last byte; the module's
+    ///      decode refuses a dirty word); OstraVaultModule runs the rest.
     function _moduleSpend(uint8 action, bytes calldata params) private {
         PendingRecovery memory p = pendingRecovery;
         bool recovering = p.executableAt != 0 && p.round == recoveryRound;
-        (bool ok, bytes memory ret) =
-            MODULE.delegatecall(abi.encodeWithSelector(MODULE_RUN, action, params, address(token), recovering));
+        bool v4 = action >= ACTION_SET_VENUE || action == ACTION_CANCEL_PENDING_CHANGES
+            || (action == ACTION_GUARD && uint8(params[63]) >= GUARD_EXIT);
+        _delegate(v4 ? MODULE_V4 : MODULE, abi.encodeWithSelector(MODULE_RUN, action, params, address(token), recovering));
+    }
+
+    /// @dev Calls `module` by delegatecall and passes on its revert as it is.
+    function _delegate(address module, bytes memory data) private {
+        (bool ok, bytes memory ret) = module.delegatecall(data);
         if (!ok) {
             assembly ("memory-safe") {
                 revert(add(ret, 0x20), mload(ret))
@@ -811,6 +873,9 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             OstraVaultV3.applyPendingChanges(l);
             if (l.pendingLockAt != 0 || l.pendingLinkedAt != 0) OstraVaultV3.cancelPendingChanges(l, msg.sender);
             ++l.approvalsEpoch;
+            // And the venue enables still waiting.
+            OstraVaultV4.Layout storage l4 = OstraVaultV4.layout();
+            if (OstraVaultV4.waiting(l4)) OstraVaultV4.cancelWaiting(l4, address(this));
         }
     }
 

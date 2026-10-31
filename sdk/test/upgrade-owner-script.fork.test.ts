@@ -3,8 +3,11 @@
 // key on the fork (their owner is impersonated), then the script makes an
 // encrypted owner seed, deploys OstraUpgradeOwner and hands both beacons to
 // it, schedules an upgrade of the pool that cannot run before the 72-hour
-// delay and runs after it, and cancels a second one. The SDK's owner message
-// is checked byte for byte against the contract's.
+// delay and runs after it, and cancels a second one. An upgrade of the vault
+// beacon is scheduled only to the implementation upgrade-vault.ts prepared and
+// checked; a call waiting already is not signed twice, and an upgrade to the
+// implementation the beacon points at is refused. The SDK's owner message is
+// checked byte for byte against the contract's.
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -16,12 +19,14 @@ import { fileURLToPath } from "node:url";
 import { bytesToHex, encodeFunctionData, getAddress, type Address, type Hex } from "viem";
 import { ostraPoolAbi, ostraUpgradeOwnerAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
+import { OSTRA_VAULT_BEACON } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
 import { UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload } from "../src/messages.ts";
 import { OUT_DIR, handBeaconsTo, startFork, vaultBeaconAtRecord, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/upgrade-owner.ts", import.meta.url));
+const vaultScript = fileURLToPath(new URL("../scripts/upgrade-vault.ts", import.meta.url));
 const live = parseDeployment(JSON.parse(readFileSync(fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url)), "utf8")));
 /** anvil's development account 3 (a public test key, used on the fork only). */
 const DEV_KEY_3 = "0x7c852118294e51e653712a81e05800f5f2b2a8ae56a8a0b82e3d9e0a6c0ce58b";
@@ -43,6 +48,7 @@ after(async () => {
 test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyone runs it; a scheduled call can be cancelled", async () => {
   const testOwner = fork.accounts[3]?.address;
   if (testOwner === undefined) throw new Error("no fork account 3");
+  assert.equal(live.vaultBeacon, OSTRA_VAULT_BEACON, "the live record names the live vault beacon");
   // The vault beacon at the record's implementation (a scheduled upgrade mainnet has not run yet, run on the fork), and
   // the live beacons to the test key on the fork (whoever owns them on mainnet).
   await vaultBeaconAtRecord(fork, live);
@@ -57,8 +63,8 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   writeFileSync(key, `${DEV_KEY_3}\n`, { mode: 0o600 });
   writeFileSync(rpcFile, `${fork.url}\n`, { mode: 0o600 });
   const env = { OSTRA_DEPLOYER_KEY_FILE: key, OSTRA_RPC_URL_FILE: rpcFile, OSTRA_DEPLOYMENT: record, OSTRA_OWNER_SEED_FILE: seedFile, OSTRA_OWNER_STATE: join(dir, "owner-state") };
-  const run = (args: string[], input = `${PASSPHRASE}\n`) => {
-    const r = spawnSync(process.execPath, [script, ...args], { env: { PATH: process.env.PATH ?? "", ...env }, input, encoding: "utf8", timeout: 600_000 });
+  const run = (args: string[], input = `${PASSPHRASE}\n`, extra: Record<string, string> = {}) => {
+    const r = spawnSync(process.execPath, [script, ...args], { env: { PATH: process.env.PATH ?? "", ...env, ...extra }, input, encoding: "utf8", timeout: 600_000 });
     assert.ok(!r.stdout.includes(DEV_KEY_3.slice(2)) && !r.stderr.includes(DEV_KEY_3.slice(2)), "the key is never printed");
     assert.ok(!r.stdout.includes(fork.url) && !r.stderr.includes(fork.url), "the RPC URL is never printed");
     return r;
@@ -100,6 +106,22 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.ok(!resumed.stdout.includes('"event":"deployed"'), "a second run deploys nothing");
 
+  // A record naming another vault beacon is refused before anything else: the vault beacon's checks would not apply.
+  const otherRecord = join(dir, "other-deployment.json");
+  writeFileSync(otherRecord, `${JSON.stringify({ ...d, vaultBeacon: d.poolBeacon }, null, 2)}\n`, { mode: 0o644 });
+  const otherRun = run(["status"], "", { OSTRA_DEPLOYMENT: otherRecord });
+  assert.notEqual(otherRun.status, 0);
+  assert.match(otherRun.stderr, new RegExp(`names the vault beacon ${d.poolBeacon}, not the live one \\(${OSTRA_VAULT_BEACON}\\)`));
+
+  // No vault beacon upgrade before upgrade-vault.ts prepare has recorded one; then prepare (on this record, while it
+  // still matches the chain).
+  const unprepared = run(["schedule-upgrade", live.vaultBeacon, live.vaultImplementation]);
+  assert.notEqual(unprepared.status, 0);
+  assert.match(unprepared.stderr, /vault-v4\.json: run upgrade-vault\.ts prepare first/);
+  const prepare = spawnSync(process.execPath, [vaultScript, "prepare"], { env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8", timeout: 600_000 });
+  assert.equal(prepare.status, 0, prepare.stderr);
+  const prepared = (JSON.parse(readFileSync(`${record}.vault-v4.json`, "utf8")) as { implementation: { address: Address } }).implementation.address;
+
   // The SDK's owner message is the contract's.
   const someRoot = bytesToHex(new Uint8Array(32).fill(7));
   const data = encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [live.poolImplementation] });
@@ -132,9 +154,37 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   assert.equal(getAddress((await fork.client.readContract({ address: live.poolBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address), implementation);
   assert.equal(await fork.client.readContract({ address: live.pool, abi: ostraPoolAbi, functionName: "VERSION" }), 2);
 
+  // The vault beacon: only to the implementation upgrade-vault.ts prepared (and checked), whichever command builds
+  // the call.
+  const upgradeToLive = encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [live.vaultImplementation] });
+  for (const args of [
+    ["schedule-upgrade", live.vaultBeacon, live.vaultImplementation],
+    ["schedule", live.vaultBeacon, upgradeToLive],
+    // upgradeTo with a byte more: not exactly the call that was checked.
+    ["schedule", live.vaultBeacon, `${encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [prepared] })}00`],
+  ]) {
+    const refused = run(args);
+    assert.notEqual(refused.status, 0, args.join(" "));
+    assert.match(refused.stderr, /is not the vault implementation upgrade-vault\.ts prepared|not exactly upgradeTo/);
+  }
+  // A change of the vault beacon's owner only with OSTRA_ALLOW_BEACON_OWNERSHIP=1; any other call to it never.
+  for (const data of [
+    encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "transferOwnership", args: [testOwner] }),
+    encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "renounceOwnership" }),
+  ]) {
+    const refused = run(["schedule", live.vaultBeacon, data]);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /would change who owns the vault beacon .*OSTRA_ALLOW_BEACON_OWNERSHIP=1/);
+  }
+  const otherCall = run(["schedule", live.vaultBeacon, encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "implementation" })]);
+  assert.notEqual(otherCall.status, 0);
+  assert.match(otherCall.stderr, /is sent only upgradeTo/);
+  assert.equal(await read("nonce"), 1n, "nothing refused was signed");
+
   // A second call, cancelled: it can never run.
-  const second = run(["schedule-upgrade", live.vaultBeacon, live.vaultImplementation]);
+  const second = run(["schedule-upgrade", live.vaultBeacon, prepared]);
   assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /"event":"checked"/);
   const cancelled = run(["cancel", "1"]);
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.equal(await read("nonce"), 3n);
@@ -163,10 +213,38 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   assert.notEqual(broke.status, 0);
   assert.equal(await read("nonce"), 3n);
   await fork.setBalance(testOwner, 10n ** 18n);
-  const next = run(["schedule-upgrade", live.vaultBeacon, live.vaultImplementation]);
+  // Run again: the signed call goes out first, identical, and it is the call asked for: nothing new is signed.
+  const resent = run(["schedule-upgrade", live.poolBeacon, implementation]);
+  assert.equal(resent.status, 0, resent.stderr);
+  assert.match(resent.stdout, /"event":"resending","nonce":"3"/);
+  assert.match(resent.stdout, /"event":"scheduled_already","id":"3"/);
+  assert.match(resent.stdout, /UPGRADE_OWNER_OK/);
+  assert.equal(await read("nonce"), 4n);
+  const next = run(["schedule-upgrade", live.vaultBeacon, prepared]);
   assert.equal(next.status, 0, next.stderr);
-  assert.match(next.stdout, /"event":"resending","nonce":"3"/);
+  assert.ok(!next.stdout.includes('"event":"resending"'), "nothing was left to send again");
   assert.equal(await read("nonce"), 5n);
   assert.equal(getAddress(((await read("getCall", [3n])) as { target: Address }).target), live.poolBeacon);
   assert.equal(getAddress(((await read("getCall", [4n])) as { target: Address }).target), live.vaultBeacon);
+  // Asked again while it waits: it is scheduled already, nothing new is signed.
+  const twice = run(["schedule-upgrade", live.vaultBeacon, prepared]);
+  assert.equal(twice.status, 0, twice.stderr);
+  assert.match(twice.stdout, /"event":"scheduled_already","id":"4"/);
+  assert.match(twice.stdout, /UPGRADE_OWNER_OK/);
+  assert.equal(await read("nonce"), 5n);
+  // Once it has run (72 hours later, by anyone), an upgrade to the implementation the beacon points at is refused.
+  await fork.increaseTime(72 * 3600);
+  const upgraded = run(["execute", "4"], "");
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.equal(getAddress((await fork.client.readContract({ address: live.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address), getAddress(prepared));
+  const noop = run(["schedule-upgrade", live.vaultBeacon, prepared]);
+  assert.notEqual(noop.status, 0);
+  assert.match(noop.stderr, new RegExp(`points at ${getAddress(prepared)} already: nothing to schedule`));
+  assert.equal(await read("nonce"), 5n, "nothing refused was signed");
+
+  // With OSTRA_ALLOW_BEACON_OWNERSHIP=1 a change of the vault beacon's owner is scheduled (and waits its 72 hours).
+  const allowed = run(["schedule", live.vaultBeacon, encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "transferOwnership", args: [testOwner] })], `${PASSPHRASE}\n`, { OSTRA_ALLOW_BEACON_OWNERSHIP: "1" });
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.match(allowed.stdout, /"event":"allowed"/);
+  assert.equal(await read("nonce"), 6n);
 });

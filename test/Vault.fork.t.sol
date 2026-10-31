@@ -90,7 +90,7 @@ contract VaultForkTest is Test {
         (factory,) = VaultStack.deploy(address(registry));
         OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
         assertEq(address(implementation.POOL_MANAGER()), POOL_MANAGER);
-        assertEq(implementation.VERSION(), 3);
+        assertEq(implementation.VERSION(), 4);
         splitFactory = new OstraSplitFactory();
     }
 
@@ -249,7 +249,7 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(25, bytes32(0), "", signature);
+        vault.spend(29, bytes32(0), "", signature);
         // DevBuy: abi.encode(devBuy, launchHash, amount), 96 bytes.
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(9, bytes32(0), new bytes(64), signature);
@@ -1040,8 +1040,8 @@ contract VaultForkTest is Test {
         }
         // The longest URI passes; an action past the last one is refused.
         _spend(vault, BUYER, setProfile, abi.encode(string(new bytes(256))));
-        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 25, abi.encode("ipfs://x"));
+        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 29, abi.encode("ipfs://x"));
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(25, n2, abi.encode("ipfs://x"), s2);
+        vault.spend(29, n2, abi.encode("ipfs://x"), s2);
     }
 }

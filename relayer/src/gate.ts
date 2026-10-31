@@ -53,9 +53,9 @@
 //      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
 //      ETH/USD + 0.5% (@ostraagent/sdk relayer.ts, the same rules an agent
 //      checks the price with). A vault Swap the simulation shows failing
-//      (SwapFailed) is refused, 422 swap_fails, and so is a version 3 spend
-//      that fails without reverting (MorphoFailed, Guarded with ok false),
-//      422 spend_fails, unless the request asks for it with allowFailedSwaps: such a spend moves nothing and is only worth
+//      (SwapFailed) is refused, 422 swap_fails, and so is a version 3 or 4 spend
+//      that fails without reverting (MorphoFailed, Guarded with ok false,
+//      VenueFailed), 422 spend_fails, unless the request asks for it with allowFailedSwaps: such a spend moves nothing and is only worth
 //      sending to use the key up. A Swap quoted while it passed is simulated
 //      again when the request comes back to be paid, before the voucher is
 //      taken (one that reverts then is refused 422, a node that cannot
@@ -331,8 +331,8 @@ export class QuoteError extends Error {
 
 /**
  * The spends of a request that can fail without reverting, moving nothing and using the spend: a vault Swap
- * (SwapFailed) and, from version 3, a Morpho spend (Lend to Repay: MorphoFailed), a Guard and a SupportRecovery
- * (Guarded with ok false); the vaults they spend from.
+ * (SwapFailed), from version 3 a Morpho spend (Lend to Repay: MorphoFailed), a Guard and a SupportRecovery
+ * (Guarded with ok false), and from version 4 an Enter and an Exit (VenueFailed); the vaults they spend from.
  */
 const LANDING_ACTIONS: ReadonlySet<number> = new Set([
   VAULT_ACTION.SWAP,
@@ -344,12 +344,14 @@ const LANDING_ACTIONS: ReadonlySet<number> = new Set([
   VAULT_ACTION.BORROW,
   VAULT_ACTION.REPAY,
   VAULT_ACTION.GUARD,
+  VAULT_ACTION.ENTER,
+  VAULT_ACTION.EXIT,
 ]);
 function swapVaults(tx: RelayTx): Address[] {
   return tx.parsed.flatMap((c) => (c.fn === "spend" && LANDING_ACTIONS.has(c.action) ? [c.to] : []));
 }
 
-/** Throws swap_fails if a Swap of the vaults `swaps` fails among the simulated `logs`, spend_fails for a version 3 spend. */
+/** Throws swap_fails if a Swap of the vaults `swaps` fails among the simulated `logs`, spend_fails for a version 3 or 4 spend. */
 function refuseFailedSwaps(logs: RelayMeasure["logs"], swaps: readonly Address[]): void {
   if (swaps.length === 0) return;
   const failed = failedSwaps(logs, swaps);

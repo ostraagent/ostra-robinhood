@@ -4,8 +4,12 @@
 // (anvil holding it in its pool with automine off): it is replaced by a
 // zero-value transfer at the same nonce, which proves it never lands. A
 // transaction whose vault Swap fails now (SwapFailed) is not sent when the
-// gate asks the sender to refuse it, and none is sent with more gas than the
-// gate's cap: code that burns all the gas it gets when sent burns no more.
+// gate asks the sender to refuse it, nor one whose version 4 Enter fails now
+// (VenueFailed, from a real vault of a fresh Ostra deployment), and none is
+// sent with more gas than the gate's cap: code that burns all the gas it gets
+// when sent burns no more. The sending account must have no code: an
+// EIP-7702-delegated one (anvil's development account 0 on mainnet) is
+// refused at start, and an account that gains code later sends nothing more.
 // A send the RPC answers with a JSON-RPC error (through an RPC in front of
 // the fork) counts as refused only once the chain agrees: one the node took
 // all the same lands and is reported as landed, also when it is mined only
@@ -17,15 +21,54 @@
 // gas alone it is refused, within sendGasCap it lands.
 
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { concat, createPublicClient, encodeFunctionData, getAddress, http, keccak256, numberToHex, stringToHex, toEventSelector, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import {
+  bytesToHex,
+  concat,
+  createPublicClient,
+  encodeFunctionData,
+  getAddress,
+  http,
+  keccak256,
+  numberToHex,
+  stringToHex,
+  toEventSelector,
+  toFunctionSelector,
+  zeroAddress,
+  type Hex,
+  type PrivateKeyAccount,
+  type PublicClient,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { USDG, estimateRelay, failedSwaps, ostraVaultAbi, relayGasCap, retryingHttp, robinhoodChain, usdgAbi } from "@ostraagent/sdk";
-import { startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import {
+  FileWotsStore,
+  ROBINHOOD_CHAIN_ID,
+  SPARK_SAVINGS_USDG,
+  USDG,
+  VAULT_ACTION,
+  VENUE_KIND,
+  WotsKeychain,
+  enterParams,
+  estimateRelay,
+  failedModuleSpends,
+  failedSwaps,
+  ostraVaultAbi,
+  ostraVaultFactoryAbi,
+  relayGasCap,
+  retryingHttp,
+  robinhoodChain,
+  signVaultSpend,
+  usdgAbi,
+  vaultAddress,
+} from "@ostraagent/sdk";
+import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { sendGasCap } from "../src/gate.ts";
-import { NotSentError, RelaySender } from "../src/send.ts";
+import { NotSentError, RelaySender, checkSendingAccount } from "../src/send.ts";
 
 let fork: Fork;
 let account: PrivateKeyAccount;
@@ -63,6 +106,19 @@ before(async () => {
 });
 after(async () => {
   await fork?.stop();
+});
+
+test("the relayer's sending account must have no code: an EIP-7702-delegated one is refused at start", async () => {
+  await checkSendingAccount(fork.client, account.address);
+  // anvil's development account 0 is EIP-7702-delegated on Robinhood Chain mainnet (code 0xef0100 || delegate).
+  const delegated = fork.accounts[0]!.address;
+  const code = await fork.client.getCode({ address: delegated });
+  assert.match(code ?? "0x", /^0xef0100[0-9a-f]{40}$/i, "account 0 is delegated on mainnet");
+  await assert.rejects(checkSendingAccount(fork.client, delegated), new RegExp(`${delegated} has code \\(an EIP-7702 delegation to 0x${(code ?? "").slice(8)}\\)`, "i"));
+  // Any other code too.
+  const contract = getAddress("0x00000000000000000000000000000000c0de0001");
+  await rpc("anvil_setCode", [contract, "0x00"]);
+  await assert.rejects(checkSendingAccount(fork.client, contract), /has code: OstraVault's modules land a failed spend only for a sender without code/);
 });
 
 test("a transaction lands: its hash, gas used and price", async () => {
@@ -122,6 +178,38 @@ test("a transaction whose vault Swap fails now is not sent when the sender is as
   const receipt = await fork.client.getTransactionReceipt({ hash: other.txHash });
   assert.deepEqual(failedSwaps(receipt.logs, [vault]), [{ vault, poolId, reason: "0x356680b7" }]);
   await sender.send({ to: vault, data: "0x" });
+});
+
+test("a transaction whose vault Enter fails now (VenueFailed) is not sent when the sender is asked to refuse it; sent, it lands as failed", async () => {
+  // A version 4 vault of a fresh deployment, its first spend an Enter into Spark Savings USDG, which it never enabled:
+  // the module refuses it (NotEnabled), and the spend lands as VenueFailed when the relayer's account sends it alone.
+  const d = await deployOnFork(fork);
+  const dir = await mkdtemp(join(tmpdir(), "ostra-relayer-venue-"));
+  try {
+    const keychain = new WotsKeychain(new Uint8Array(32).fill(5), keccak256(stringToHex("OSTRA/EVM/RELAYER-SEND-TEST/venue-vault"), "bytes"), new FileWotsStore(join(dir, "wots")));
+    const root0 = bytesToHex(keychain.keyRoot(0n));
+    const deployer = fork.accounts[0]!;
+    const created = await fork.wallet(deployer).writeContract({ address: d.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "createVault", args: [USDG, root0, zeroAddress], account: deployer, chain: fork.client.chain });
+    assert.equal((await fork.client.waitForTransactionReceipt({ hash: created })).status, "success");
+    const vault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root0, initialCrank: zeroAddress });
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 4);
+    const params = enterParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, amount: 1n, minPosition: 0n });
+    const signed = await signVaultSpend(keychain, { vault, nonce: 0n, keyRoot: root0 }, { chainId: ROBINHOOD_CHAIN_ID, action: VAULT_ACTION.ENTER, params });
+    const call = { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, signed.signature] }) };
+    const notEnabled = toFunctionSelector("NotEnabled()");
+
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    await assert.rejects(sender.send(call, { refuseFailedSwaps: [vault] }), (err: unknown) => err instanceof NotSentError && err.txHash === null && /venue 26: NotEnabled\) fails now, so it was not sent/.test(err.message));
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce);
+    // Without the refusal (allowFailedSwaps) it is sent: it lands, uses the key and moves nothing.
+    const landed = await sender.send(call);
+    const receipt = await fork.client.getTransactionReceipt({ hash: landed.txHash });
+    assert.equal(receipt.status, "success");
+    assert.deepEqual(failedModuleSpends(receipt.logs, [vault]), [{ vault, kind: "venue", action: VAULT_ACTION.ENTER, reason: notEnabled }]);
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "nonce" }), 1n, "the spend used its key");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("the gas limit is at most the gate's cap: one that needs more now is not sent; code that burns what it gets burns no more", async () => {
@@ -327,4 +415,20 @@ test("a transaction that earns a gas refund needs a limit above what it is price
   assert.equal(receipt.status, "success");
   assert.ok(receipt.gasUsed < limit, `used ${receipt.gasUsed}, limit ${limit}`);
   for (let i = 0; i < 10; i++) assert.equal(await fork.client.getStorageAt({ address: clearer, slot: numberToHex(i, { size: 32 }) }), numberToHex(0, { size: 32 }));
+});
+
+test("an account that gains code after start (an EIP-7702 delegation) sends nothing more", async () => {
+  // The sender's own account delegated as anvil's account 0 is on mainnet: refused before anything is signed.
+  const delegation = (await fork.client.getCode({ address: fork.accounts[0]!.address })) as Hex;
+  const nonce = await fork.client.getTransactionCount({ address: account.address });
+  await rpc("anvil_setCode", [account.address, delegation]);
+  try {
+    await assert.rejects(sender.send(transfer(1n)), (err: unknown) => err instanceof NotSentError && err.txHash === null && /has code \(an EIP-7702 delegation to 0x[0-9a-f]{40}\).*nothing was sent/.test(err.message));
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce);
+  } finally {
+    await rpc("anvil_setCode", [account.address, "0x"]);
+  }
+  // Without code again, it sends.
+  const landed = await sender.send(transfer(1n));
+  assert.equal((await fork.client.getTransactionReceipt({ hash: landed.txHash })).status, "success");
 });

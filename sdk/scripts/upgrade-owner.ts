@@ -9,6 +9,12 @@
 //                                                               hands both beacons to it (ECDSA owner);
 //                                                               run again, it resumes or only checks
 //   node scripts/upgrade-owner.ts schedule-upgrade <beacon> <implementation>
+//                                                               for the vault beacon, only the implementation
+//                                                               upgrade-vault.ts prepare recorded in
+//                                                               <record>.vault-v4.json, and only when it passes
+//                                                               that script's checks (the reviewed code, exactly);
+//                                                               any call to the vault beacon goes through the same
+//                                                               checks (see checkVaultBeaconCall)
 //   node scripts/upgrade-owner.ts schedule <target> <calldata>  any other call (renounceOwnership, ...)
 //   node scripts/upgrade-owner.ts cancel <id>
 //   node scripts/upgrade-owner.ts execute <id>                  once DELAY has passed (anyone may)
@@ -23,6 +29,11 @@
 //   OSTRA_OWNER_STATE         directory (0700) of the WOTS signature records and the signed calls (default
 //                             /etc/ostra/owner-state); no secrets, but it is what keeps a key from ever
 //                             signing two messages: keep it, and back it up with the seed after every call
+//   OSTRA_ALLOW_BEACON_OWNERSHIP  1 to let schedule send transferOwnership or renounceOwnership to the vault
+//                             beacon (refused otherwise)
+//
+// The record must name the live vault beacon (OSTRA_VAULT_BEACON): with another record the vault beacon's checks
+// would not apply, so the script refuses to run.
 //
 // The passphrase is read from the terminal without echo (or a line from stdin when stdin is not a
 // terminal). The seed is never printed and never written unencrypted. The keychain is bound to the chain
@@ -41,6 +52,7 @@ import {
   bytesToHex,
   createPublicClient,
   createWalletClient,
+  decodeFunctionData,
   encodeFunctionData,
   encodePacked,
   formatEther,
@@ -59,12 +71,13 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { ostraUpgradeOwnerAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { redact, robinhoodChain } from "../src/chain.ts";
-import { ROBINHOOD_CHAIN_ID } from "../src/constants.ts";
+import { OSTRA_VAULT_BEACON, ROBINHOOD_CHAIN_ID } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload, type UpgradeOwnerAction } from "../src/messages.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
 import { WotsKeychain } from "../src/wots.ts";
+import { checkPrepared, readPrepared } from "./upgrade-vault.ts";
 
 /** OstraUpgradeOwner.DELAY on mainnet: 72 hours, so every vault owner has three days to withdraw before an upgrade. */
 export const UPGRADE_DELAY_SECONDS = 72n * 3600n;
@@ -188,11 +201,22 @@ class OwnerTool {
   readonly state: string;
   readonly seedFile: string;
   readonly log: (event: string, fields?: Record<string, unknown>) => void;
+  /** OSTRA_ALLOW_BEACON_OWNERSHIP=1: transferOwnership and renounceOwnership of the vault beacon may be scheduled. */
+  readonly allowBeaconOwnership: boolean;
   readonly passphrases = new Passphrases();
   #seed: Uint8Array | undefined;
   #lock: string | undefined;
 
-  constructor(o: { client: PublicClient; wallet: WalletClient; payer: PrivateKeyAccount; recordPath: string; state: string; seedFile: string; log: OwnerTool["log"] }) {
+  constructor(o: {
+    client: PublicClient;
+    wallet: WalletClient;
+    payer: PrivateKeyAccount;
+    recordPath: string;
+    state: string;
+    seedFile: string;
+    log: OwnerTool["log"];
+    allowBeaconOwnership: boolean;
+  }) {
     this.client = o.client;
     this.wallet = o.wallet;
     this.payer = o.payer;
@@ -200,6 +224,7 @@ class OwnerTool {
     this.state = o.state;
     this.seedFile = o.seedFile;
     this.log = o.log;
+    this.allowBeaconOwnership = o.allowBeaconOwnership;
   }
 
   /** One run at a time: an exclusive lock file in the state directory, removed when the run ends. */
@@ -330,17 +355,76 @@ class OwnerTool {
     }
   }
 
-  async schedule(target: Address, data: Hex): Promise<void> {
+  /**
+   * The checks of a call to the vault beacon (the record's, which main holds to OSTRA_VAULT_BEACON, or that one by
+   * address): upgradeTo(address), exactly, only to the implementation upgrade-vault.ts prepare recorded next to the
+   * record and only when it passes that script's checks (checkPrepared: the build of this checkout's sources, the code
+   * exactly the build's); transferOwnership and renounceOwnership only with OSTRA_ALLOW_BEACON_OWNERSHIP=1; any other
+   * call is refused. Calls to anything else (the pool beacon among them) are not checked here.
+   */
+  async checkVaultBeaconCall(target: Address, data: Hex, outDir: string): Promise<void> {
+    const d = this.record();
+    if (getAddress(target) !== d.vaultBeacon && getAddress(target) !== OSTRA_VAULT_BEACON) return;
+    const selector = (functionName: "upgradeTo" | "transferOwnership" | "renounceOwnership") =>
+      (functionName === "renounceOwnership"
+        ? encodeFunctionData({ abi: upgradeableBeaconAbi, functionName })
+        : encodeFunctionData({ abi: upgradeableBeaconAbi, functionName, args: [d.vaultBeacon] })
+      ).slice(0, 10);
+    const called = data.slice(0, 10).toLowerCase();
+    if (called === selector("transferOwnership") || called === selector("renounceOwnership")) {
+      if (!this.allowBeaconOwnership) throw new Error(`${data.slice(0, 10)} would change who owns the vault beacon ${target}: set OSTRA_ALLOW_BEACON_OWNERSHIP=1 to schedule it`);
+      this.log("allowed", { target, selector: called });
+      return;
+    }
+    if (called !== selector("upgradeTo")) throw new Error(`the vault beacon ${target} is sent only upgradeTo (or, with OSTRA_ALLOW_BEACON_OWNERSHIP=1, a change of its owner), not ${data.slice(0, 10)}`);
+    // Exactly upgradeTo(address), nothing more: what the beacon would run is what is checked.
+    const call = decodeFunctionData({ abi: upgradeableBeaconAbi, data });
+    const implementation = getAddress(call.args?.[0] as Address);
+    if (encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [implementation] }) !== data.toLowerCase()) throw new Error("the vault beacon upgrade's calldata is not exactly upgradeTo(address)");
+    const p = readPrepared(this.recordPath);
+    if (implementation !== getAddress(p.implementation.address)) {
+      throw new Error(`${implementation} is not the vault implementation upgrade-vault.ts prepared (${p.implementation.address} in ${this.recordPath}.vault-v4.json)`);
+    }
+    const current = getAddress(await this.read<Address>(target, upgradeableBeaconAbi, "implementation"));
+    if (implementation === current) throw new Error(`the vault beacon ${target} points at ${implementation} already: nothing to schedule`);
+    await checkPrepared(this.client, outDir, p, d);
+    this.log("checked", { vaultImplementation: implementation, module: p.module.address, moduleV4: p.moduleV4.address });
+  }
+
+  async schedule(target: Address, data: Hex, outDir: string): Promise<void> {
     if (!WHOLE_BYTES.test(data) || data.length < 10) throw new Error("the calldata must be 0x hex of whole bytes, at least a selector");
+    await this.checkVaultBeaconCall(target, data, outDir);
     const owner = await this.owner();
     await this.flushPending(owner);
     if ((await this.client.getCode({ address: target })) === undefined) throw new Error(`${target} is not a contract`);
     const nonce = await this.read<bigint>(owner, ostraUpgradeOwnerAbi, "nonce");
+    // The same call already waiting or executable (sent again just now by flushPending, or by an earlier run): nothing
+    // new is signed.
+    const waiting = await this.#scheduledAlready(owner, nonce, target, data);
+    if (waiting !== null) {
+      this.log("scheduled_already", { id: waiting.id, target, data, executableFrom: new Date(Number(waiting.eta) * 1000).toISOString() });
+      return;
+    }
     const keychain = await this.keychain(owner);
     const intent: Intent = { version: 1, nonce: nonce.toString(), action: UPGRADE_OWNER_ACTION.schedule, target: getAddress(target), data: data.toLowerCase() as Hex, nextKeyRoot: bytesToHex(keychain.keyRoot(nonce + 1n)), createdAt: new Date().toISOString() };
     await this.#signAndSend(owner, intent);
     const call = await this.read<{ target: Address; eta: bigint }>(owner, ostraUpgradeOwnerAbi, "getCall", [nonce]);
     this.log("scheduled", { id: nonce, target, data, executableFrom: new Date(Number(call.eta) * 1000).toISOString() });
+  }
+
+  /**
+   * The call with `target` and `data` among the owner's calls 0 to `nonce` - 1 that is still waiting or executable
+   * (scheduled, not executed, cancelled or past its GRACE), read on chain; null when there is none.
+   */
+  async #scheduledAlready(owner: Address, nonce: bigint, target: Address, data: Hex): Promise<{ id: bigint; eta: bigint } | null> {
+    const now = (await this.client.getBlock({ blockTag: "latest" })).timestamp;
+    const grace = await this.read<bigint>(owner, ostraUpgradeOwnerAbi, "GRACE");
+    const dataHash = keccak256(data.toLowerCase() as Hex);
+    for (let id = nonce - 1n; id >= 0n; id--) {
+      const c = await this.read<{ target: Address; eta: bigint; dataHash: Hex }>(owner, ostraUpgradeOwnerAbi, "getCall", [id]);
+      if (c.eta !== 0n && now <= c.eta + grace && getAddress(c.target) === getAddress(target) && c.dataHash.toLowerCase() === dataHash) return { id, eta: c.eta };
+    }
+    return null;
   }
 
   async cancel(id: bigint): Promise<void> {
@@ -493,10 +577,13 @@ async function main(): Promise<void> {
     console.log(redact(JSON.stringify({ event, ...fields }, (_, v) => (typeof v === "bigint" ? v.toString() : v)), rpcUrl));
   const client = createPublicClient({ chain: robinhoodChain, transport: http(rpcUrl) }) as PublicClient;
   const wallet = createWalletClient({ account: payer, chain: robinhoodChain, transport: http(rpcUrl) });
-  const tool = new OwnerTool({ client, wallet, payer, recordPath, state, seedFile, log });
+  const tool = new OwnerTool({ client, wallet, payer, recordPath, state, seedFile, log, allowBeaconOwnership: process.env.OSTRA_ALLOW_BEACON_OWNERSHIP === "1" });
   try {
     const chainId = await client.getChainId();
     if (chainId !== ROBINHOOD_CHAIN_ID) throw new Error(`the RPC is chain ${chainId}, not Robinhood Chain (${ROBINHOOD_CHAIN_ID})`);
+    // On Robinhood Chain the record must be the live one's: another record's vault beacon would skip its checks.
+    const vaultBeacon = tool.record().vaultBeacon;
+    if (vaultBeacon !== OSTRA_VAULT_BEACON) throw new Error(`${recordPath} names the vault beacon ${vaultBeacon}, not the live one (${OSTRA_VAULT_BEACON})`);
     log("payer", { address: payer.address, eth: formatEther(await client.getBalance({ address: payer.address })) });
     const address = (v: string | undefined, what: string): Address => {
       if (v === undefined || !isAddress(v, { strict: false })) throw new Error(`${what} must be an address`);
@@ -512,10 +599,10 @@ async function main(): Promise<void> {
       tool.lock();
       try {
         if (command === "deploy") await tool.deploy(outDir);
-        else if (command === "schedule-upgrade") await tool.schedule(address(a1, "the beacon"), encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [address(a2, "the implementation")] }));
+        else if (command === "schedule-upgrade") await tool.schedule(address(a1, "the beacon"), encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [address(a2, "the implementation")] }), outDir);
         else if (command === "schedule") {
           if (a2 === undefined || !WHOLE_BYTES.test(a2) || a2.length < 10) throw new Error("the calldata must be 0x hex of whole bytes, at least a selector");
-          await tool.schedule(address(a1, "the target"), a2.toLowerCase() as Hex);
+          await tool.schedule(address(a1, "the target"), a2.toLowerCase() as Hex, outDir);
         } else await tool.cancel(id(a1));
       } finally {
         tool.unlock();

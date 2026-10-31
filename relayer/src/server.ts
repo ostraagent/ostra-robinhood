@@ -58,7 +58,7 @@ import { openRelayerAccount } from "./keys.ts";
 import { Ledger } from "./ledger.ts";
 import { PrivateRelay } from "./private.ts";
 import { FeeSweeper } from "./sweep.ts";
-import { RelaySender } from "./send.ts";
+import { RelaySender, checkSendingAccount } from "./send.ts";
 import { SignatureEscrow, SignaturePruner } from "./signatures.ts";
 
 /** Retries of a transient RPC failure (1, 2 and 4 s apart) and the time each attempt is given: at most about 67 s. */
@@ -82,6 +82,8 @@ async function main(): Promise<void> {
 
   const keys = await MerchantKeys.open(config.secretsDir);
   const account = await openRelayerAccount(config.secretsDir);
+  // A sending account with code (an EIP-7702 delegation) could never land a failed spend: refuse to start.
+  await checkSendingAccount(client, account.address);
   await ensurePrivateDir(config.dataDir);
   const storage = await FileChannelStorage.open(config.dataDir);
   const ledger = await Ledger.open(config.dataDir);

@@ -7,10 +7,12 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {OstraVault} from "../../src/OstraVault.sol";
 import {OstraVaultFactory} from "../../src/OstraVaultFactory.sol";
 import {OstraVaultModule} from "../../src/OstraVaultModule.sol";
+import {OstraVaultModuleV4} from "../../src/OstraVaultModuleV4.sol";
 
-/// @notice A fresh vault stack on a fork of Robinhood Chain mainnet, for tests: OstraVaultModule (naming the
-///         factory about to be made, and the live Morpho and Borro contracts), the OstraVault implementation, its
-///         beacon (owned by the caller) and OstraVaultFactory, all created by the calling test contract.
+/// @notice A fresh vault stack on a fork of Robinhood Chain mainnet, for tests: OstraVaultModule and OstraVaultModuleV4
+///         (naming the factory about to be made, and the live Morpho, Borro and ERC-8004 contracts), the OstraVault
+///         implementation, its beacon (owned by the caller) and OstraVaultFactory, all created by the calling test
+///         contract.
 library VaultStack {
     address internal constant BATCH = 0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003;
     address internal constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
@@ -27,19 +29,24 @@ library VaultStack {
         return new OstraVaultModule(factory, MORPHO, VAULT_V2_FACTORY, BORRO_BUILDERS, BORRO_ROUTER, BORRO_CODE);
     }
 
-    function implementation(address registry, address module_) internal returns (OstraVault) {
+    function moduleV4(address factory) internal returns (OstraVaultModuleV4) {
+        return new OstraVaultModuleV4(factory, VAULT_V2_FACTORY, IDENTITY_REGISTRY);
+    }
+
+    function implementation(address registry, address module_, address moduleV4_) internal returns (OstraVault) {
         return new OstraVault(
             OstraVault.Externals({
                 batchSettlement: BATCH,
                 poolManager: POOL_MANAGER,
                 registry: registry,
                 identityRegistry: IDENTITY_REGISTRY,
-                module: module_
+                module: module_,
+                moduleV4: moduleV4_
             })
         );
     }
 
-    /// @dev Address the module is created from, so that the caller makes the same three creations as before version
+    /// @dev Address the modules are created from, so that the caller makes the same three creations as before version
     ///      3 (implementation, beacon, factory) and every later address in its test stays where it was.
     address internal constant MODULE_DEPLOYER = address(uint160(uint256(keccak256("OSTRA/EVM/TEST/module-deployer"))));
 
@@ -47,7 +54,9 @@ library VaultStack {
         address predicted = VM.computeCreateAddress(address(this), VM.getNonce(address(this)) + 2);
         VM.prank(MODULE_DEPLOYER);
         m = module(predicted);
-        OstraVault impl = implementation(registry, address(m));
+        VM.prank(MODULE_DEPLOYER);
+        OstraVaultModuleV4 m4 = moduleV4(predicted);
+        OstraVault impl = implementation(registry, address(m), address(m4));
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
         factory = new OstraVaultFactory(address(beacon));
         require(address(factory) == predicted, "factory address");
