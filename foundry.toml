@@ -16,5 +16,14 @@ remappings = [
     "@uniswap/v4-core/=lib/v4-core/",
 ]
 
+# Ostra Tide is built with a metadata hash (Foundry's default, ipfs), so that Sourcify can verify it as an exact
+# match; nothing else depends on its bytecode. FOUNDRY_PROFILE=tide forge build / forge test.
+[profile.tide]
+src = "src/tide"
+test = "test/tide"
+out = "out-tide"
+cache_path = "cache-tide"
+bytecode_hash = "ipfs"
+
 [rpc_endpoints]
 robinhood = "https://rpc.mainnet.chain.robinhood.com"

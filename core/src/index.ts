@@ -31,6 +31,7 @@ export * from "./storage.ts";
 export * from "./strategy-rules.ts";
 export * from "./strategy.ts";
 export * from "./swap.ts";
+export * from "./tide.ts";
 export * from "./trading.ts";
 export * from "./unshield.ts";
 export * from "./vault.ts";

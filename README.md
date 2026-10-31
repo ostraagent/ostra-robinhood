@@ -245,6 +245,8 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   within its 30-second watch) or a seller's signed close request it claims the last voucher, refunds
   the rest and pays the seller's split out (settle, distribute, release). `scripts/chain-check.ts`
   runs the keeper process end to end against a chain; its fork test runs it on a mainnet fork.
+  `scripts/tide-score.ts` and `scripts/tide-pay.ts` score and pay Ostra Tide, the weekly OSTRA
+  rewards for agents (`keeper/TIDE.md` sets out how a week is scored).
 - `merchant/`: the seller server (`@ostraagent/merchant`) and the library the relayer sells
   through. Paid routes are batch-settlement payment channels paid to
   the seller's OstraSplit with the seller's Ostra vault as receiverAuthorizer; vouchers are checked

@@ -27,6 +27,9 @@
 //                             (moderation.ts); all three or none. Unset: listings are served unchecked
 //   OSTRA_PAD_MODERATION_FALLBACK_MODEL  another provider's model on the same API, asked when the first model's
 //                             provider refuses a listing under its usage policy (optional)
+//   OSTRA_TIDE_LINKS          Ostra Tide's links (tide.ts), 0600 (default: tide-links.json next to
+//                             OSTRA_INDEXER_STATE; off: no Tide routes)
+//   OSTRA_TIDE_RESULTS        the directory of the Tide score's results (default /var/lib/ostra-tide)
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
@@ -37,6 +40,7 @@ import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { openAiModerator, type Moderator } from "./moderation.ts";
 import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
+import { TideApi, tideLinkVerifier } from "./tide.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
@@ -119,7 +123,14 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   }
   const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri), hidden, moderate });
   log("pad_board", { hiddenFiles: hideFiles.length });
-  const server = createIndexerServer(indexer, log, pad);
+  const tideLinks = process.env.OSTRA_TIDE_LINKS || join(dirname(statePath), "tide-links.json");
+  let tide: TideApi | null = null;
+  if (tideLinks !== "off") {
+    tide = new TideApi({ linksPath: tideLinks, resultsDir: process.env.OSTRA_TIDE_RESULTS || "/var/lib/ostra-tide", verify: tideLinkVerifier(client, record.chainId, record.vaultBeacon) });
+    await tide.load();
+  }
+  log("tide", { links: tide === null ? "off" : tideLinks });
+  const server = createIndexerServer(indexer, log, pad, tide);
   server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString(), pad: pad === null ? "off" : padStatePath }));
   indexer.start(everyMs);
   // Ostrapad's index: its own scans, a few seconds apart (its files and records are read again every few minutes).

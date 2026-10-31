@@ -340,7 +340,7 @@ async function main(): Promise<void> {
     // 1. The tools, the relayer, the index.
     for (const [who, s] of [["provider", p], ["client", c]] as const) {
       const tools = (await s.client.listTools()).tools.map((t) => t.name);
-      const needed = ["open_vault", "balance", "withdraw", "ostra_swap_quote", "fund_creator_vault", "publish_profile", "profile", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"];
+      const needed = ["open_vault", "balance", "withdraw", "ostra_swap_quote", "fund_creator_vault", "publish_profile", "profile", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings", "tide"];
       check(needed.every((n) => tools.includes(n)) && closed.length > 0 && closed.every((n) => !tools.includes(n)), `the ${who}'s server lists the Ostrapad and identity tools and none of the ${closed.length} removed launchpad tools`, `${tools.length} tools`);
       const status = await call(s.client, "balance");
       check(status.ok && status.json.relayer === true, `the ${who}'s server sends through the Ostra relayer`, status.ok ? "" : status.text);

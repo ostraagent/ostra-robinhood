@@ -1,4 +1,6 @@
 out/
 cache/
+out-tide/
+cache-tide/
 node_modules/
 mcp/release/

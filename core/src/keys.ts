@@ -51,6 +51,7 @@ const SHIELD_LEAF_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/SHIELD-LEAF/EVM/v1");
 const PRIVATE_VAULT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/PRIVATE-VAULT/EVM/v1");
 const CREATOR_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/CREATOR-VAULT/EVM/v1");
 const NOTE_SECRET_DOMAIN = utf8("OSTRA/MCP/SWAP-NOTE/EVM/v1");
+const TIDE_LINK_DOMAIN = utf8("OSTRA/MCP/TIDE-LINK/EVM/v1");
 
 /** secp256k1 group order: a private key must be in 1..n-1. */
 const SECP256K1_N = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141n;
@@ -301,6 +302,14 @@ export class Keys<S extends WotsStore = WotsStore> {
   spendNoteSecret(chainId: number, pool: Address, purpose: "change" | "out", spent: Hex, block = 0n): Uint8Array {
     if (!/^0x[0-9a-fA-F]{64}$/.test(spent)) throw new RangeError("the note spent is a 32-byte commitment");
     return sha256([NOTE_SECRET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(pool), utf8(purpose), hexToBytes(spent), u64Be(block)]);
+  }
+
+  /**
+   * The agent's Ostra Tide link secret for OstraTide `tide` on `chainId` (core tide.ts): what makes its vault link's
+   * approvals hashes nobody else can match to the agent; its hash is the agent's view key of its own points.
+   */
+  tideSecret(chainId: number, tide: Address): Hex {
+    return bytesToHex(sha256([TIDE_LINK_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(tide)]));
   }
 
   /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */

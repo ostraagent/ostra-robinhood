@@ -43,6 +43,8 @@ import {
   SWAP_DIR,
   StrategyService,
   SwapService,
+  TIDE_DIR,
+  TideService,
   ShieldService,
   TradingService,
   SignatureEscrowClient,
@@ -134,6 +136,8 @@ export class Agent {
   readonly raeto: RaetoService | null;
   /** Ostrapad from the USDG vault: hired, hiring and judging work through OstraPad (null without the launchpad's identity tools). */
   readonly pad: PadService | null;
+  /** Ostra Tide: the agent's vault link for the score and its own points (null without the launchpad's identity tools). */
+  readonly tide: TideService | null;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -263,6 +267,34 @@ export class Agent {
             publishShortfall: () => lp.publishShortfall(),
             upload: (file) => uploadJson(config.relayerUrl, file),
             indexerUrl: config.padIndexerUrl,
+          });
+    // Ostra Tide: the identity is Ostrapad's (the creator vault and its ERC-8004 id); the vaults linked are every
+    // vault of this seed but the private ones (ownVaults' list without them).
+    this.tide =
+      lp === null
+        ? null
+        : new TideService({
+            client,
+            config,
+            keys,
+            identity: async () => {
+              const p = await lp.profile();
+              return { agentId: p.agentId === null ? null : BigInt(p.agentId), vault: getAddress(p.account) };
+            },
+            identityVault: this.creator,
+            vaults: async () => {
+              const out: VaultService[] = [this.buyer, this.seller];
+              for (const p of LAUNCH_PAIRS) {
+                if (p.kind === "usdg") continue;
+                out.push(this.vaultFor(p.kind === "eth" ? WETH : p.address));
+                out.push((await lp.pairCreator(p.symbol)).vault);
+              }
+              for (const b of borroStocks()) out.push(this.vaultFor(b.token));
+              return out;
+            },
+            payer: () => this.sender.payer(),
+            indexerUrl: config.padIndexerUrl,
+            folder: keys.folder.folder(TIDE_DIR),
           });
   }
 

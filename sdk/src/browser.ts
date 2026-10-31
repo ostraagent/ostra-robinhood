@@ -20,6 +20,7 @@ export * from "./messages.ts";
 export * from "./morpho.ts";
 export * from "./pad.ts";
 export * from "./pad-rules.ts";
+export * from "./tide.ts";
 export * from "./quote.ts";
 export * from "./pairs.ts";
 export * from "./reads.ts";

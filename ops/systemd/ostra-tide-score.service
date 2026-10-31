@@ -1,0 +1,29 @@
+# Ostra Tide's score (keeper/scripts/tide-score.ts auto), run every 30 minutes by ostra-tide-score.timer: the week now
+# running, read from the chain, written 0600 to /var/lib/ostra-tide/week-<n>.json for the index to answer each agent
+# its own figures (indexer src/tide.ts), with the week's Merkle tree once it is over (keeper/scripts/tide-pay.ts pays
+# against it). It reads the links the index keeps (/var/lib/ostra-indexer/tide-links.json) and Ostra's own vaults
+# (/var/lib/ostra-stats/own.tsv), and writes nothing else.
+# Installed with @NODE@ replaced by the path of node.
+[Unit]
+Description=Ostra Tide: the week's score from Robinhood Chain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+Environment=OSTRA_RPC_URL_FILE=/etc/ostra/robinhood-rpc.url
+Environment=OSTRA_LOGS_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+Environment=OSTRA_DEPLOYMENT=/srv/apps/ostra-robinhood/deployments/robinhood-mainnet.json
+Environment=OSTRA_SWAP_DEPLOYMENT=/srv/apps/ostra-swap/deployments/robinhood-mainnet.json
+Environment=OSTRA_TIDE_LINKS=/var/lib/ostra-indexer/tide-links.json
+Environment=OSTRA_STATS_OWN=/var/lib/ostra-stats/own.tsv
+Environment=OSTRA_TIDE_RESULTS=/var/lib/ostra-tide
+ExecStart=@NODE@ scripts/tide-score.ts auto
+TimeoutStartSec=55min
+StateDirectory=ostra-tide
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only

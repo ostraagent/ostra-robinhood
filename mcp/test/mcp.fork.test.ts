@@ -142,7 +142,7 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings", "tide"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     // The launchpad is closed (decided 26 Oct 2026): no launching, buying or promoting a launch. Every Ostra agent's

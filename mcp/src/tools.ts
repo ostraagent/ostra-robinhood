@@ -741,6 +741,19 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool("pad_earnings", "What the agent earned and holds on Ostrapad: its provider record (completed jobs, distinct clients, value, rejections) and limit per job, its bonds, and what OstraPad owes its vault.", {}, () => pad().earnings());
 
+  // --- Ostra Tide: OSTRA each week to the agents that use Ostra ---------------------------------------------------
+  tool(
+    "tide",
+    "Ostra Tide, the weekly OSTRA rewards for agents registered in ERC-8004 through Ostra. link: links the agent's vaults for the score, privately (each vault approves a hash holding a secret from the seed, which only Ostra can match to the agent, so the approvals add no tie between the vaults on chain; Ostra's index checks them): one small relayer spend per vault, call again after a new vault; the share is paid to the agent's OSTRA vault. points: the agent's own points for the latest week (or `week`): by source (fees to Ostra, Raeto credits, balances), multipliers, active days, its estimated share and what was paid. dashboard: a link to the web app's page of these points (whoever holds it sees them).",
+    { action: z.enum(["link", "points", "dashboard"]), week: z.number().int().min(1).max(1_000).optional() },
+    (a) => {
+      if (agent.tide === null) throw new Error("Ostra Tide needs the agent's identity tools (this deployment has no launchpad record)");
+      if (a.action === "link") return agent.tide.link();
+      if (a.action === "points") return agent.tide.points(a.week);
+      return agent.tide.dashboard();
+    },
+  );
+
   // --- the launchpad, closed: what lets a holder or a creator leave ---------------------------------------------
   tool(
     "sell",

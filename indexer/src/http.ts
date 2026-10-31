@@ -20,11 +20,14 @@
 //   GET /api/v1/pad/board/<agentId>              one agent of the board, its jobs and its clients
 //   GET /api/v1/pad/board/jobs?limit=            the board's recent jobs
 //   The board answers 503 board_unavailable while its hidden list cannot be read.
+//   POST /api/v1/tide/link, POST /api/v1/tide/points, GET /api/v1/tide/summary   Ostra Tide (tide.ts): an agent's
+//                                                vault link, and its own points to the holder of its view key
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
 import { CANDLE_INTERVALS, type Indexer } from "./indexer.ts";
 import type { PadIndexer } from "./pad.ts";
+import { TIDE_BODY_MAX, TideBadRequest, type TideApi } from "./tide.ts";
 
 const MAX_LIMIT = 100;
 const SORTS = new Set(["new", "marketcap", "volume", "active"]);
@@ -162,8 +165,59 @@ export function handle(indexer: Indexer, req: IncomingMessage, res: ServerRespon
   return send(res, 404, { error: "not_found" });
 }
 
-export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null): Server {
+/** A request body of at most `max` bytes, as JSON; null when it is longer or not JSON. */
+async function jsonBody(req: IncomingMessage, max: number): Promise<{ ok: true; value: unknown } | { ok: false; error: "too_large" | "bad_json" }> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > max) return { ok: false, error: "too_large" };
+    chunks.push(chunk as Buffer);
+  }
+  try {
+    return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown };
+  } catch {
+    return { ok: false, error: "bad_json" };
+  }
+}
+
+/** Ostra Tide's routes (tide.ts); never cached, as they answer one agent alone or change with each score. */
+export async function handleTide(tide: TideApi, req: IncomingMessage, res: ServerResponse, route: string): Promise<void> {
+  const reply = (status: number, body: unknown) => {
+    res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+    res.end(JSON.stringify(body));
+  };
+  if (route === "summary") {
+    if (req.method !== "GET" && req.method !== "HEAD") return reply(405, { error: "method_not_allowed" });
+    return reply(200, await tide.summary());
+  }
+  if (route !== "link" && route !== "points") return reply(404, { error: "not_found" });
+  if (req.method !== "POST") return reply(405, { error: "method_not_allowed" });
+  const body = await jsonBody(req, TIDE_BODY_MAX);
+  if (!body.ok) return reply(body.error === "too_large" ? 413 : 400, { error: body.error });
+  try {
+    if (route === "link") return reply(200, await tide.link(body.value));
+    const r = await tide.points(body.value);
+    return reply(r.status, r.body);
+  } catch (err) {
+    if (err instanceof TideBadRequest) return reply(400, { error: "bad_request", message: err.message });
+    throw err;
+  }
+}
+
+export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null, tide: TideApi | null = null): Server {
   return createServer((req, res) => {
+    const path = (req.url ?? "/").split("?")[0] ?? "/";
+    const m = /^\/api\/v1\/tide\/([a-z]{1,16})$/.exec(path);
+    if (m !== null) {
+      if (tide === null) return send(res, 404, { error: "not_found" });
+      handleTide(tide, req, res, m[1] as string).catch((err: unknown) => {
+        log("request_failed", { path: path.slice(0, 200), reason: (err as Error).message.slice(0, 200) });
+        if (!res.headersSent) send(res, 500, { error: "internal" });
+        else res.end();
+      });
+      return;
+    }
     try {
       handle(indexer, req, res, pad);
     } catch (err) {

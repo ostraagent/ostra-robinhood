@@ -1,0 +1,14 @@
+# Runs ostra-tide-score.service every 30 minutes (at minutes 7 and 37, apart from the hour's other jobs); a run missed
+# while the VPS was down runs once it is up again (Persistent). A run still going when the next is due is not started
+# twice (the service may run up to 55 minutes). A week's link deadline is at 23:00 UTC and its root at 00:00: the run at
+# 23:07 ends before the root, and when it fails, the one at 23:37 tries again.
+[Unit]
+Description=Ostra Tide's score every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:07,37:00
+Persistent=true
+Unit=ostra-tide-score.service
+
+[Install]
+WantedBy=timers.target
