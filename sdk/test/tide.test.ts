@@ -1,16 +1,23 @@
-// Ostra Tide's shared rules (src/tide.ts): the link digests and view key, week 1's score (fees netted per pair and
-// capped, Raeto credits, average balances under the combined cap, active days and multipliers), the pot's shares
-// under the 20% cap, and the Merkle tree's proofs. The leaf against the deployed OstraTide is checked in keeper's
-// fork test (test/tide-pay.fork.test.ts).
+// Ostra Tide's shared rules (src/tide.ts): the link digests and view key, an OSTRA vault named as payee by its
+// creation params, week 1's score (fees netted per pair and capped, Raeto credits, average balances under the combined
+// cap, active days and multipliers), the pot's shares under the 20% cap, and the Merkle tree's proofs. The leaf against
+// the deployed OstraTide, and a payee's address against the live factory's createVault, are checked in keeper's fork
+// test (test/tide-pay.fork.test.ts).
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { getAddress, type Address, type Hex } from "viem";
+import { OSTRA, USDG } from "../src/constants.ts";
+import { parseDeployment } from "../src/deployment.ts";
+import { vaultAddress } from "../src/messages.ts";
 import {
   TIDE_START,
   tideLeaf,
   tideFeePair,
   tideMemberDigest,
+  tidePayeeCreation,
+  tidePayeeVault,
   tideScore,
   tideSetDigest,
   tideShares,
@@ -53,11 +60,30 @@ test("link digests: fixed, distinct per secret, vault and order-free list; the p
   assert.notEqual(s, tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A, B], payee: B, secret: S1 }));
   assert.notEqual(s, tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A], payee: null, secret: S1 }));
   assert.throws(() => tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A], payee: B, secret: S1 }), /payee/);
+  // A payee outside the list (an OSTRA vault created at payout) only when said so, and then never one of the list.
+  const outside = tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A], payee: B, secret: S1, outsidePayee: true });
+  assert.notEqual(outside, tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A], payee: null, secret: S1 }));
+  assert.notEqual(outside, tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A, B], payee: B, secret: S1 }));
+  assert.throws(() => tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A, B], payee: B, secret: S1, outsidePayee: true }), /not one of the linked vaults/);
+  assert.throws(() => tideSetDigest({ chainId: 4663, agentId: "19802", vaults: [A], payee: null, secret: S1, outsidePayee: true }), /not one of the linked vaults/);
   assert.throws(() => tideMemberDigest({ chainId: 4663, agentId: "19802", vault: A, secret: `0x${"00".repeat(32)}` }), /secret/);
   assert.throws(() => tideMemberDigest({ chainId: 4663, agentId: "-1", vault: A, secret: S1 }), /agent id/);
   assert.deepEqual(tideSortVaults([B, A.toLowerCase()]), [A, B]);
   assert.notEqual(tideViewKey(S1), tideViewKey(S2));
   assert.notEqual(tideViewKey(S1), S1);
+});
+
+test("payee created at payout: its creation params name exactly the vault the deployment's factory creates, in OSTRA only", () => {
+  const d = parseDeployment(JSON.parse(readFileSync(new URL("../../deployments/robinhood-mainnet.json", import.meta.url), "utf8")));
+  const root: Hex = `0x${"5a".repeat(32)}`;
+  const c = tidePayeeCreation({ token: OSTRA.toLowerCase(), initialKeyRoot: root.toUpperCase().replace("0X", "0x"), initialCrank: "0x0000000000000000000000000000000000000000" });
+  assert.deepEqual(c, { token: OSTRA, initialKeyRoot: root, initialCrank: getAddress("0x0000000000000000000000000000000000000000") });
+  assert.equal(tidePayeeVault(d, c), vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: OSTRA, initialKeyRoot: root, initialCrank: c.initialCrank }));
+  assert.notEqual(tidePayeeVault(d, c), tidePayeeVault(d, { ...c, initialKeyRoot: `0x${"5b".repeat(32)}` }));
+  assert.throws(() => tidePayeeVault(d, { ...c, token: USDG }), /OSTRA vault/);
+  for (const bad of [null, [], "x", { ...c, token: USDG }, { ...c, initialKeyRoot: `0x${"00".repeat(32)}` }, { ...c, initialKeyRoot: "0x12" }, { ...c, initialCrank: "nope" }, { token: OSTRA, initialKeyRoot: root }]) {
+    assert.throws(() => tidePayeeCreation(bad), RangeError, JSON.stringify(bad));
+  }
 });
 
 const agent = (over: Partial<TideAgentInput>): TideAgentInput => ({ agentId: "1", registeredAt: TIDE_START + 10, fees: [], raeto: [], days: zeroDays, ...over });

@@ -7,8 +7,11 @@
 //                                       `IDENTITY <vault> <agentId>`, for the score run that follows); tide dashboard
 //                                       answers the web app's page with the view key in the fragment; tide link links
 //                                       every existing vault of the agent (each approval sent, the index verifies the
-//                                       set), and a second call sends nothing; tide points answers that the link is
-//                                       kept and not scored yet
+//                                       set) and names a payee: its OSTRA vault among them, or, for an agent without
+//                                       one, the OSTRA vault its seed creates, which has no code yet and which
+//                                       OstraTide's factory computes from the createVault params the link sent; a
+//                                       second call sends nothing; tide points answers that the link is kept and not
+//                                       scored yet
 //   node scripts/tide-check.ts points   after a score that read the link with the link's vaults left out of Ostra's
 //                                       own list (an Ostra test agent's are in it): tide points answers the agent's
 //                                       own week, its link verified on chain, every vault of it counted, and no key
@@ -23,8 +26,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createPublicClient, getAddress, http, parseAbi } from "viem";
-import { ERC8004_IDENTITY_REGISTRY, ROBINHOOD_PUBLIC_RPC, redact, robinhoodChain } from "@ostraagent/sdk";
+import { createPublicClient, getAddress, http, parseAbi, type Address, type Hex } from "viem";
+import { ERC8004_IDENTITY_REGISTRY, OSTRA, OSTRA_TIDE, ROBINHOOD_PUBLIC_RPC, ostraVaultFactoryAbi, redact, robinhoodChain } from "@ostraagent/sdk";
 
 const TOOL_TIMEOUT_MS = 30 * 60_000;
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
@@ -98,12 +101,30 @@ async function main(): Promise<void> {
       check(link.ok, "tide link answers", link.ok ? "" : link.text.slice(0, 500));
       const vaults = (link.json.vaults as string[] | undefined) ?? [];
       const approvals = (link.json.approvals as { vault: string; tx: string; status: string }[] | undefined) ?? [];
-      console.log(`link: ${vaults.length} vaults, payee ${link.json.payee === null ? "none (no OSTRA vault)" : "its OSTRA vault"}, approvals ${toJson(approvals.map((a) => a.status))}`);
+      const payee = typeof link.json.payee === "string" ? getAddress(link.json.payee) : null;
+      const outside = payee !== null && !vaults.includes(payee);
+      console.log(`link: ${vaults.length} vaults, payee ${payee === null ? "none" : outside ? "its OSTRA vault, created by Ostra at payout" : "its OSTRA vault"}, approvals ${toJson(approvals.map((a) => a.status))}`);
       check(link.json.linked === true && vaults.includes(identity) && approvals.length === vaults.length, "the set approved by the identity vault, one approval per vault", { linked: link.json.linked, left: link.json.leftOut ?? [] });
       check(approvals.every((a) => a.status === "sent" || a.status === "approved before"), "every approval sent or made before");
       check(link.json.verifiedByIndex === true, "the index verified the link on chain", link.json.verifyNote ?? "");
+      check(payee !== null, "the link names a payee (its OSTRA vault, existing or to be created)", link.json.note ?? "");
+      if (outside) {
+        // Not a vault of the link: the OSTRA vault the agent's seed creates, not created by link, at the address
+        // OstraTide's own factory gives the params the link sent.
+        const c = link.json.payeeCreation as { token: Address; initialKeyRoot: Hex; initialCrank: Address } | undefined;
+        check(c !== undefined && getAddress(c.token) === OSTRA, "the payee outside the vaults comes with its createVault params, in OSTRA", toJson(c ?? null));
+        const factory = getAddress((await chain.readContract({ address: OSTRA_TIDE, abi: parseAbi(["function FACTORY() view returns (address)"]), functionName: "FACTORY" })) as string);
+        const at = getAddress((await chain.readContract({ address: factory, abi: ostraVaultFactoryAbi, functionName: "vaultAddress", args: [OSTRA, c!.initialKeyRoot, c!.initialCrank] })) as string);
+        check(at === payee, "OstraTide's factory creates exactly the payee from those params", at);
+        const code = await chain.getCode({ address: payee });
+        check(code === undefined || code === "0x", "the payee has no code yet: Ostra creates it at payout");
+      }
       const again = await call(client, "tide", { action: "link" });
-      check(again.ok && ((again.json.approvals as { status: string }[] | undefined) ?? []).every((a) => a.status === "approved before") && toJson(again.json.vaults) === toJson(vaults), "a second link sends nothing", again.ok ? "" : again.text.slice(0, 300));
+      check(
+        again.ok && ((again.json.approvals as { status: string }[] | undefined) ?? []).every((a) => a.status === "approved before") && toJson(again.json.vaults) === toJson(vaults) && again.json.payee === link.json.payee,
+        "a second link sends nothing",
+        again.ok ? "" : again.text.slice(0, 300),
+      );
       const pts = await call(client, "tide", { action: "points" });
       check(pts.ok && typeof pts.json.note === "string" && /kept/.test(pts.json.note), "tide points: the link is kept, not scored yet", pts.ok ? pts.json.note ?? toJson(pts.json).slice(0, 200) : pts.text.slice(0, 300));
       await writeFile(record, JSON.stringify({ agentId, identity, vaults }), { mode: 0o600 });

@@ -15,6 +15,12 @@
 //              approval is valid from the latest time counts. A vault that is another agent's identity vault, or
 //              Ostra's own, counts for none; a vault two links claim counts for the agent whose member approval is
 //              valid from the earlier time (the lower agent id on a tie).
+//   Payee      the OSTRA vault the counted link's set approval names: a vault counted for the agent whose token is
+//              OSTRA, or one outside the list named with its creation params (an agent's OSTRA vault not created
+//              yet; decided by Edu on 1 Nov 2026), which must create it with Ostra's factory and beacon in OSTRA and,
+//              if it has code by the state block, answer token() OSTRA there. Its params are in the result, and
+//              scripts/tide-pay.ts creates the vault before paying it. The leaf names the payee alone, as OstraTide
+//              checks it.
 //   Fees       OstraRouter Swapped events in the week whose recipient is one of the agent's vaults (a vault's swap is
 //              paid out to it; the fee is the hub's, USDG or WETH, WETH at Chainlink ETH/USD at the swap's block); the
 //              volume, for the netting, is the fee over its rate. Private swaps name no vault and are not counted.
@@ -53,6 +59,8 @@ import {
   readMorphoMarket,
   tideFeePair,
   tideMemberDigest,
+  tidePayeeCreation,
+  tidePayeeVault,
   tideScore,
   tideSetDigest,
   tideShares,
@@ -66,6 +74,7 @@ import {
   type TideBreakdown,
   type TideDay,
   type TideFee,
+  type TidePayeeCreation,
   type TideRaeto,
 } from "@ostraagent/sdk";
 
@@ -73,8 +82,11 @@ import {
 export const RAETO_PAY_TO: Address = "0xF0Cc2FE5A90a3BB784De818f6E2061fd99c236Bf";
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 
-/** An agent's link as the index keeps it: what the agent sent (its secret never leaves Ostra's records). */
-export type TideLinkRecord = { agentId: string; secret: Hex; vaults: Address[]; payee: Address | null; at: number };
+/**
+ * An agent's link as the index keeps it: what the agent sent (its secret never leaves Ostra's records), with the
+ * creation params of a payee outside its vaults.
+ */
+export type TideLinkRecord = { agentId: string; secret: Hex; vaults: Address[]; payee: Address | null; payeeCreation?: TidePayeeCreation; at: number };
 
 export type TideLinkStatus =
   | { status: "none" }
@@ -89,6 +101,8 @@ export type TideAgentResult = {
   /** The vaults counted: the identity vault and the link's verified ones. */
   vaults: Address[];
   payee: Address | null;
+  /** The payee's createVault params when it is named by them (null otherwise): tide-pay creates it if it has no code. */
+  payeeCreation: TidePayeeCreation | null;
   breakdown: TideBreakdown;
   /** Its share of the pot, in OSTRA base units. */
   share: string;
@@ -281,6 +295,8 @@ export type TideReadOptions = {
   /** A client of an RPC serving wide eth_getLogs windows (Robinhood Chain's public RPC). */
   logsClient: PublicClient;
   factory: Address;
+  /** The deployment's vault beacon: with the factory, what a payee's creation params are checked against. */
+  beacon: Address;
   router: Address;
   fromBlock: bigint;
   week: number;
@@ -377,7 +393,7 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
     return t !== 0 && t <= o.linkDeadline && t <= stateTime ? t : null;
   };
   const deadlineText = new Date(o.linkDeadline * 1000).toISOString();
-  type Verified = { agentId: string; vaults: Address[]; payee: Address | null; viewKey: Hex; setFrom: number; at: number; memberFrom: Map<Address, number> };
+  type Verified = { agentId: string; vaults: Address[]; payee: Address | null; payeeCreation: unknown; viewKey: Hex; setFrom: number; at: number; memberFrom: Map<Address, number> };
   const verified = new Map<string, Verified>();
   const pending = new Map<string, { viewKey: Hex; missing: string[] }[]>();
   for (const a of agents) {
@@ -385,7 +401,8 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
     for (const r of o.links.filter((x) => x.agentId === a.agentId)) {
       const viewKey = tideViewKey(r.secret);
       const list = tideSortVaults([...r.vaults, a.vault]);
-      const setFrom = await validFrom(a.vault, tideSetDigest({ chainId: o.chainId, agentId: a.agentId, vaults: list, payee: r.payee, secret: r.secret }));
+      const payeeOutside = r.payee !== null && !list.includes(getAddress(r.payee));
+      const setFrom = await validFrom(a.vault, tideSetDigest({ chainId: o.chainId, agentId: a.agentId, vaults: list, payee: r.payee, secret: r.secret, outsidePayee: payeeOutside }));
       // Without the identity vault's approval nothing else is read: a link anyone may post costs one read.
       if (setFrom === null) {
         tried.push({ viewKey, missing: [`the identity vault ${a.vault} has no approval of this link's set digest in force by ${deadlineText}`] });
@@ -408,7 +425,7 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
         continue;
       }
       const prev = verified.get(a.agentId);
-      const next: Verified = { agentId: a.agentId, vaults: list, payee: r.payee, viewKey, setFrom, at: r.at, memberFrom };
+      const next: Verified = { agentId: a.agentId, vaults: list, payee: r.payee, payeeCreation: r.payeeCreation, viewKey, setFrom, at: r.at, memberFrom };
       if (prev === undefined || setFrom > prev.setFrom || (setFrom === prev.setFrom && r.at > prev.at)) {
         if (prev !== undefined) tried.push({ viewKey: prev.viewKey, missing: ["a later link of this agent counts in its place"] });
         verified.set(a.agentId, next);
@@ -425,7 +442,7 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
       if (c === undefined || from < c.from || (from === c.from && BigInt(v.agentId) < BigInt(c.agentId))) claimedBy.set(vault, { agentId: v.agentId, from });
     }
   }
-  const vaultsOf = new Map<string, { vaults: Address[]; dropped: { vault: Address; reason: string }[]; payee: Address | null }>();
+  const vaultsOf = new Map<string, { vaults: Address[]; dropped: { vault: Address; reason: string }[]; payee: Address | null; payeeCreation: TidePayeeCreation | null }>();
   for (const a of agents) {
     const v = verified.get(a.agentId);
     const countedVaults: Address[] = [a.vault];
@@ -440,12 +457,41 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
       }
     }
     let payee: Address | null = null;
+    let payeeCreation: TidePayeeCreation | null = null;
     if (v !== undefined && v.payee !== null && countedVaults.includes(getAddress(v.payee))) {
       const token = getAddress((await o.client.readContract({ address: v.payee, abi: tokenAbi, functionName: "token", blockNumber: stateBlock })) as Address);
       if (token === OSTRA) payee = getAddress(v.payee);
       else dropped.push({ vault: v.payee, reason: "the payee is not an OSTRA vault" });
+    } else if (v !== undefined && v.payee !== null && !v.vaults.includes(getAddress(v.payee))) {
+      // A payee outside the list: an OSTRA vault named by the params that create it.
+      const to = getAddress(v.payee);
+      let c: TidePayeeCreation | null = null;
+      try {
+        c = tidePayeeCreation(v.payeeCreation);
+      } catch {
+        c = null;
+      }
+      if (c === null || tidePayeeVault({ vaultFactory: o.factory, vaultBeacon: o.beacon }, c) !== to) {
+        dropped.push({ vault: to, reason: "the payee is not a vault of the link, and no OSTRA vault's creation params create it" });
+      } else {
+        const code = await o.client.getCode({ address: to, blockNumber: stateBlock });
+        let ostra = code === undefined || code === "0x";
+        if (!ostra) {
+          try {
+            ostra = getAddress((await o.client.readContract({ address: to, abi: tokenAbi, functionName: "token", blockNumber: stateBlock })) as Address) === OSTRA;
+          } catch (err) {
+            // Code without token() is no vault; anything else (a timeout, the node) stops the score.
+            if (!(err instanceof BaseError && err.walk((e) => e instanceof ContractFunctionRevertedError || e instanceof ContractFunctionZeroDataError) !== null)) throw err;
+            ostra = false;
+          }
+        }
+        if (ostra) {
+          payee = to;
+          payeeCreation = c;
+        } else dropped.push({ vault: to, reason: "the payee is not an OSTRA vault" });
+      }
     }
-    vaultsOf.set(a.agentId, { vaults: tideSortVaults(countedVaults), dropped, payee });
+    vaultsOf.set(a.agentId, { vaults: tideSortVaults(countedVaults), dropped, payee, payeeCreation });
   }
 
   // The week's swaps and Raeto credits, of every vault counted.
@@ -502,6 +548,7 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
       link,
       vaults: x.vaults,
       payee: x.payee,
+      payeeCreation: x.payeeCreation,
       breakdown: scores[i]!,
       share: (shares.get(a.agentId) ?? 0n).toString(),
       dropped: x.dropped,

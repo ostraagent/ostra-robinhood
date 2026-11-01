@@ -484,6 +484,16 @@ export class VaultService {
     return { to: d.vaultFactory, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [this.token, this.#keyRoot(0n), this.#initCrank] }) };
   }
 
+  /**
+   * The parameters createCall creates this vault with: its token, key 0 of its keychain and its initial crank (the
+   * ones vaultAddress computes it from, unless this seed recovered another vault). Anyone may send them to the factory:
+   * the vault they create answers to this seed's keys alone (Ostra Tide creates an agent's OSTRA vault with them).
+   */
+  creationParams(): { token: Address; initialKeyRoot: Hex; initialCrank: Address } {
+    if (this.#initCrank === null) throw new Error(this.#missing());
+    return { token: this.token, initialKeyRoot: this.#keyRoot(0n), initialCrank: this.#initCrank };
+  }
+
   /** Gas the local fee payer needs to create this vault. */
   createGas(): bigint {
     return CREATE_VAULT_GAS;

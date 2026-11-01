@@ -45,6 +45,26 @@ Both digests contain the secret, so on chain they are hashes that nobody else ca
 agent or to each other: the approvals add no tie between the vaults. (A vault's own swaps name the
 vault they pay, so those vaults are tied already, link or not.)
 
+## The payee
+
+The set digest names the vault the agent's share is paid to. It is the agent's OSTRA vault when it
+has one among its linked vaults. Most agents have no OSTRA vault, and an agent is never asked to
+swap or to open one for its share. Its link then names the OSTRA vault its seed would create (MCP
+0.1.16 and later): the address `OstraVaultFactory.createVault` gives for OSTRA, the vault's key 0
+and no crank, sent to the index with those three parameters. That vault is not in the list of
+linked vaults, since it has no code and cannot approve anything. The index keeps the link only if
+the parameters create exactly that address with Ostra's factory and beacon, in OSTRA, and, when
+something is at that address already, only if it answers `token()` with OSTRA.
+
+The score accepts a payee that is a counted vault of the link in OSTRA, or one named by such
+parameters (deployed or not; if it has code at the state block, its token must be OSTRA), and
+writes the parameters into the agent's result. The leaf is the same either way:
+`(week, agentId, payee, amount)`.
+
+An agent that linked with MCP 0.1.15 named no payee. It runs `link` once more: its vaults'
+approvals are already on chain and are not sent again, only the identity vault's new set approval
+naming the payee.
+
 Anyone can send the index a link for any agent, so a link is only kept, never trusted. The score
 reads each approval as the vault itself holds it (`hashValidFrom`) at the last block before the
 link deadline (the week's end plus 23 hours; week 1: 4 Nov 2026 23:00 UTC). An approval counts if
@@ -93,10 +113,20 @@ it. `scripts/tide-pay.ts check` checks the tree against the contract, `root` pos
 `setRoot`, and `pay` pays each share to the agent's OSTRA vault. Week 1's root and payout are due on
 5 Nov 2026 00:00 UTC.
 
-A share whose link names no OSTRA vault goes into the tree with no payee. OstraTide lets only its
-owner pay such a share, to an OSTRA vault the owner names, within 14 days of the root. After those
-14 days, whatever is left in the week's pot moves to the pot of the week then running
-(`OstraTide.rollover`).
+OstraTide pays only an existing OSTRA vault of Ostra's factory. So before it pays a share whose
+payee has no code, `pay` creates that vault: `createVault` with the parameters from the result,
+sent from Ostra's account, which pays its gas. Only agents with a share get a vault this way.
+`check` refuses a payee with no code whose parameters are missing or give another address with
+OstraTide's own factory, and says how many vaults `pay` will create and about how much gas that
+takes. Each creation is recorded before it is sent and never sent twice; afterwards the vault at
+the payee must answer `token()` with OSTRA. Anyone may create a vault, and the vault answers to the
+keys its parameters name, which are the agent's. If someone else created it first, the factory
+leaves it as it is and the share is paid to it.
+
+A share whose link names no payee (a link made before MCP 0.1.16, not linked again) goes into the
+tree with no payee. OstraTide lets only its owner pay such a share, to an OSTRA vault the owner
+names, within 14 days of the root. After those 14 days, whatever is left in the week's pot moves to
+the pot of the week then running (`OstraTide.rollover`).
 
 ## Who sees what
 

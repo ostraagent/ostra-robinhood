@@ -2,7 +2,9 @@
 // link is verified here; keeper's tide-score.fork.test.ts verifies them on a fork): a link is kept (0600, at most 8
 // unverified per agent), malformed ones refused, bodies over 8 KiB refused; an agent's figures are answered only to
 // the view key of the link its result names, another kept link's key gets only what that link lacks, a link someone
-// else posted for the agent gets nothing of it, any other key 404; the summary names no agent.
+// else posted for the agent gets nothing of it, any other key 404; the summary names no agent. A payee outside the
+// vaults is refused unless its creation params create it, in OSTRA, with the live deployment's factory and beacon (the
+// refusals come before any chain read; keeper's fork test has the index accept one and the score pay it).
 
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -11,10 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { getAddress, type Hex } from "viem";
-import { TIDE_START, tideLinkDeadline, tideViewKey } from "@ostraagent/sdk";
+import { OSTRA, ROBINHOOD_PUBLIC_RPC, TIDE_START, USDG, parseDeployment, robinhoodClient, tideLinkDeadline, tidePayeeVault, tideViewKey } from "@ostraagent/sdk";
 import { createIndexerServer } from "../src/http.ts";
 import type { Indexer } from "../src/indexer.ts";
-import { TideApi } from "../src/tide.ts";
+import { TideApi, TideBadRequest, tidePayeeChecker } from "../src/tide.ts";
 
 let root: string;
 let base: string;
@@ -127,4 +129,34 @@ test("points: only to the view key the result names; another kept link's key get
   assert.equal(s.root, `0x${"ab".repeat(32)}`);
   assert.equal(JSON.stringify(s).includes("19802"), false);
   assert.equal((await post("points", { agentId: "19802", viewKey: "0x12" })).status, 400);
+});
+
+test("a payee outside the vaults: only with creation params that create exactly it, in OSTRA, with Ostra's factory", async () => {
+  const live = parseDeployment(JSON.parse(await readFile(new URL("../../deployments/robinhood-mainnet.json", import.meta.url), "utf8")));
+  // The chain is never read below: every link here is refused before.
+  const checked = new TideApi({ linksPath: join(root, "links-payee.json"), resultsDir: join(root, "results"), now: () => TIDE_START + 3 * 86_400, factory: live, payee: tidePayeeChecker(robinhoodClient(ROBINHOOD_PUBLIC_RPC)) });
+  await checked.load();
+  const creation = { token: OSTRA, initialKeyRoot: `0x${"5a".repeat(32)}` as Hex, initialCrank: getAddress("0x0000000000000000000000000000000000000000") };
+  const payee = tidePayeeVault(live, creation);
+  const base = { agentId: "19802", secret: secret(30), vaults: [V1] };
+  const refused = async (body: unknown, why: RegExp, api = checked) => {
+    await assert.rejects(api.link(body), (err: unknown) => err instanceof TideBadRequest && why.test(err.message), JSON.stringify(body).slice(0, 120));
+  };
+  await refused({ ...base, payee }, /creation params \(payeeCreation\)/);
+  await refused({ ...base, payee, payeeCreation: { ...creation, token: USDG } }, /OSTRA vault/);
+  await refused({ ...base, payee, payeeCreation: { ...creation, initialKeyRoot: `0x${"00".repeat(32)}` } }, /initialKeyRoot/);
+  await refused({ ...base, payee, payeeCreation: "x" }, /payeeCreation/);
+  await refused({ ...base, payee: V2, payeeCreation: creation }, /does not create the payee/);
+  await refused({ ...base, payee, payeeCreation: { ...creation, initialKeyRoot: `0x${"5b".repeat(32)}` } }, /does not create the payee/);
+  await refused({ ...base, payee: V1, payeeCreation: creation }, /only a payee outside the vaults/);
+  await refused({ ...base, payee: null, payeeCreation: creation }, /only a payee outside the vaults/);
+  // The index served above has no factory: such a payee is refused there whatever its params.
+  await refused({ ...base, payee, payeeCreation: creation }, /not checked here/, tide);
+  const http = await post("link", { ...base, payee, payeeCreation: creation });
+  assert.equal(http.status, 400);
+  assert.equal(http.json.error, "bad_request");
+  // Neither index kept any of them: the one served (which got the post) nor the one called directly.
+  const served = JSON.parse(await readFile(join(root, "links.json"), "utf8")) as { secret: string }[];
+  assert.equal(served.some((x) => BigInt(x.secret) === 30n), false, "the served index kept nothing of it");
+  assert.equal(await readFile(join(root, "links-payee.json"), "utf8").catch(() => null), null, "the checked index kept nothing");
 });

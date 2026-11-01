@@ -2,8 +2,12 @@
 // where they came from; no list of everyone's points is published). Served by the indexer under /api/v1/tide on the
 // web app's host:
 //
-//   POST /api/v1/tide/link    {agentId, secret, vaults, payee}: an agent's vault link (sdk tide.ts), kept so the
-//                             score (keeper scripts/tide-score.ts) can check its approvals on chain. The secret is
+//   POST /api/v1/tide/link    {agentId, secret, vaults, payee, payeeCreation?}: an agent's vault link (sdk tide.ts),
+//                             kept so the score (keeper scripts/tide-score.ts) can check its approvals on chain. The
+//                             payee is one of the vaults, or, with payeeCreation (the createVault params of an OSTRA
+//                             vault not created yet, which Ostra creates at payout), the address those params create
+//                             with the deployment's factory and beacon, in OSTRA; if that address has code already, it
+//                             must answer token() OSTRA. The params are kept with the link. The secret is
 //                             what makes the link private: it is written only to OSTRA_TIDE_LINKS (0600) and never
 //                             answered back. Anyone may post a link for any agent id, so a link is only kept, never
 //                             trusted: it counts once the agent's identity vault approved its set digest on chain,
@@ -28,7 +32,20 @@
 import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getAddress, isAddress, keccak256, parseAbi, stringToHex, toHex, type Address, type Hex, type PublicClient } from "viem";
-import { ERC8004_IDENTITY_REGISTRY, TIDE_MAX_LINKED_VAULTS, tideLinkDeadline, tideSetDigest, tideSortVaults, tideViewKey, tideWeekAt, tideWeekSpan } from "@ostraagent/sdk";
+import {
+  ERC8004_IDENTITY_REGISTRY,
+  OSTRA,
+  TIDE_MAX_LINKED_VAULTS,
+  tideLinkDeadline,
+  tidePayeeCreation,
+  tidePayeeVault,
+  tideSetDigest,
+  tideSortVaults,
+  tideViewKey,
+  tideWeekAt,
+  tideWeekSpan,
+  type TidePayeeCreation,
+} from "@ostraagent/sdk";
 
 export const TIDE_BODY_MAX = 8_192;
 /** Links of one agent kept unverified at most. */
@@ -38,7 +55,7 @@ export const TIDE_VERIFIED_PER_AGENT = 2;
 /** Links kept unverified at most, all agents together. */
 export const TIDE_LINKS_MAX = 10_000;
 
-export type TideLink = { agentId: string; secret: Hex; vaults: Address[]; payee: Address | null; at: number; verified?: boolean };
+export type TideLink = { agentId: string; secret: Hex; vaults: Address[]; payee: Address | null; payeeCreation?: TidePayeeCreation; at: number; verified?: boolean };
 
 type AgentResult = { agentId: string; breakdown: { points: string }; viewKey?: Hex | null; pending?: { viewKey: Hex; missing: string[] }[] };
 type Result = { week: number; start: number; end: number; at: number; final: boolean; pot: string; agents: AgentResult[]; tree: { root: Hex } | null };
@@ -46,7 +63,7 @@ type Paid = { root: Hex; rootTx: Hex | null; paid: Record<string, { tx: Hex; amo
 
 export class TideBadRequest extends Error {}
 
-const verifyAbi = parseAbi(["function ownerOf(uint256 tokenId) view returns (address)", "function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)"]);
+const verifyAbi = parseAbi(["function ownerOf(uint256 tokenId) view returns (address)", "function isValidSignature(bytes32 hash, bytes signature) view returns (bytes4)", "function token() view returns (address)"]);
 
 /** EIP-1967's beacon slot: where a beacon proxy (each Ostra vault) keeps its beacon. */
 const BEACON_SLOT = toHex(BigInt(keccak256(stringToHex("eip1967.proxy.beacon"))) - 1n, { size: 32 });
@@ -61,9 +78,28 @@ export function tideLinkVerifier(client: PublicClient, chainId: number, vaultBea
     const owner = getAddress((await client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: verifyAbi, functionName: "ownerOf", args: [BigInt(link.agentId)] })) as Address);
     const beacon = await client.getStorageAt({ address: owner, slot: BEACON_SLOT });
     if (beacon === undefined || BigInt(beacon) !== BigInt(vaultBeacon)) return false;
-    const digest = tideSetDigest({ chainId, agentId: link.agentId, vaults: tideSortVaults([...link.vaults, owner]), payee: link.payee, secret: link.secret });
+    const vaults = tideSortVaults([...link.vaults, owner]);
+    const outsidePayee = link.payee !== null && !vaults.includes(link.payee);
+    const digest = tideSetDigest({ chainId, agentId: link.agentId, vaults, payee: link.payee, secret: link.secret, outsidePayee });
     try {
       return ((await client.readContract({ address: owner, abi: verifyAbi, functionName: "isValidSignature", args: [digest, "0x"] })) as Hex).toLowerCase() === "0x1626ba7e";
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
+ * TideApi's check of a payee named by its creation params: true when nothing is at its address yet, or what is there
+ * answers token() OSTRA (an OSTRA vault someone created since). A chain that cannot be read throws (the link is not
+ * kept: the agent posts it again).
+ */
+export function tidePayeeChecker(client: PublicClient): (payee: Address) => Promise<boolean> {
+  return async (payee) => {
+    const code = await client.getCode({ address: payee });
+    if (code === undefined || code === "0x") return true;
+    try {
+      return getAddress((await client.readContract({ address: payee, abi: verifyAbi, functionName: "token" })) as Address) === OSTRA;
     } catch {
       return false;
     }
@@ -75,19 +111,32 @@ export class TideApi {
   readonly #resultsDir: string;
   readonly #now: () => number;
   readonly #verify: ((link: TideLink) => Promise<boolean>) | null;
+  readonly #factory: { vaultFactory: Address; vaultBeacon: Address } | null;
+  readonly #payee: ((payee: Address) => Promise<boolean>) | null;
   #links: TideLink[] = [];
   #queue: Promise<unknown> = Promise.resolve();
   readonly #cache = new Map<string, { mtimeMs: number; value: unknown }>();
 
   /**
    * `verify`: whether the agent's identity vault approved `link`'s set digest on chain (main.ts: ownerOf and the
-   * vault's isValidSignature); null: no link is verified here (each is kept as unverified).
+   * vault's isValidSignature); null: no link is verified here (each is kept as unverified). `factory`: the
+   * deployment's vault factory and beacon, which a payee named by its creation params is computed with; `payee`: the
+   * check of what is at that address now (tidePayeeChecker). Without both, a payee outside the vaults is refused.
    */
-  constructor(o: { linksPath: string; resultsDir: string; now?: () => number; verify?: ((link: TideLink) => Promise<boolean>) | null }) {
+  constructor(o: {
+    linksPath: string;
+    resultsDir: string;
+    now?: () => number;
+    verify?: ((link: TideLink) => Promise<boolean>) | null;
+    factory?: { vaultFactory: Address; vaultBeacon: Address } | null;
+    payee?: ((payee: Address) => Promise<boolean>) | null;
+  }) {
     this.#linksPath = o.linksPath;
     this.#resultsDir = o.resultsDir;
     this.#now = o.now ?? (() => Math.floor(Date.now() / 1000));
     this.#verify = o.verify ?? null;
+    this.#factory = o.factory ?? null;
+    this.#payee = o.payee ?? null;
   }
 
   /** Reads the links kept before (none yet: an empty list). */
@@ -115,12 +164,25 @@ export class TideApi {
     }
     const vaults = tideSortVaults(b.vaults as string[]);
     let payee: Address | null = null;
+    let payeeCreation: TidePayeeCreation | null = null;
     if (b.payee !== null && b.payee !== undefined) {
       if (typeof b.payee !== "string" || !isAddress(b.payee)) throw new TideBadRequest("payee must be an address or null");
       payee = getAddress(b.payee);
-      if (!vaults.includes(payee)) throw new TideBadRequest("payee must be one of the vaults");
+      if (!vaults.includes(payee)) {
+        // An OSTRA vault not created yet (or created since): only by the params that create it at payout.
+        if (b.payeeCreation === null || b.payeeCreation === undefined) throw new TideBadRequest("payee must be one of the vaults, or an OSTRA vault named with its creation params (payeeCreation)");
+        if (this.#factory === null || this.#payee === null) throw new TideBadRequest("a payee outside the vaults is not checked here");
+        try {
+          payeeCreation = tidePayeeCreation(b.payeeCreation);
+        } catch (err) {
+          throw new TideBadRequest(`payeeCreation: ${(err as Error).message}`);
+        }
+        if (tidePayeeVault(this.#factory, payeeCreation) !== payee) throw new TideBadRequest("payeeCreation does not create the payee with Ostra's vault factory");
+        if (!(await this.#payee(payee))) throw new TideBadRequest("the payee has code that is not an OSTRA vault");
+      }
     }
-    const link: TideLink = { agentId, secret: secret.toLowerCase() as Hex, vaults, payee, at: this.#now() };
+    if (payeeCreation === null && b.payeeCreation !== null && b.payeeCreation !== undefined) throw new TideBadRequest("payeeCreation names only a payee outside the vaults");
+    const link: TideLink = { agentId, secret: secret.toLowerCase() as Hex, vaults, payee, ...(payeeCreation === null ? {} : { payeeCreation }), at: this.#now() };
     let verified = false;
     if (this.#verify !== null) {
       try {

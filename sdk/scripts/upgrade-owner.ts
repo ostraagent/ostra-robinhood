@@ -5,6 +5,9 @@
 //
 //   node scripts/upgrade-owner.ts init                          a new owner seed, encrypted under a
 //                                                               passphrase, in OSTRA_OWNER_SEED_FILE
+//   node scripts/upgrade-owner.ts rekey                         the same seed, encrypted again under a new
+//                                                               passphrase (asks the current one, then the new
+//                                                               one twice); the old file is kept beside it
 //   node scripts/upgrade-owner.ts deploy                        deploys OstraUpgradeOwner with key 0 and
 //                                                               hands both beacons to it (ECDSA owner);
 //                                                               run again, it resumes or only checks
@@ -36,15 +39,18 @@
 // would not apply, so the script refuses to run.
 //
 // The passphrase is read from the terminal without echo (or a line from stdin when stdin is not a
-// terminal). The seed is never printed and never written unencrypted. The keychain is bound to the chain
+// terminal). The seed is never printed and never written unencrypted. rekey replaces the seed file only
+// once the new one, written beside it, opens with the new passphrase to the same seed (and, when the state
+// records the owner's deployment, to the key 0 it was deployed with); the old file stays beside it as
+// <file>.before-rekey-<time> (0600), and it and any copy of it still open with the old passphrase. The keychain is bound to the chain
 // and to the owner contract's address, so one seed never signs for two owners. Key n signs the call at
 // the owner's nonce n and names key n + 1 as the next key. A call is recorded before it is signed, and
 // its transaction hash once sent; a signed call that did not land is sent again, identical, before
 // anything new is signed, so no key ever signs two messages. One run at a time (a lock file).
 
 import { randomBytes, createCipheriv, createDecipheriv, scrypt as scryptCb, type ScryptOptions } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -187,6 +193,40 @@ function ensureDir(path: string): void {
   if ((mode & 0o077) !== 0) throw new Error(`${path} must not be accessible by other users (mode ${mode.toString(8)})`);
 }
 
+/** One run at a time: an exclusive lock file in the state directory; its path, removed when the run ends. */
+function lockState(state: string): string {
+  ensureDir(state);
+  const path = join(state, "lock");
+  try {
+    closeSync(openSync(path, "wx", 0o600));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`another run holds ${path}; if none is running, remove that file and run again`);
+    throw err;
+  }
+  return path;
+}
+
+/** `text` in a new file at `path` (0600, never over another file), on disk before it returns. */
+function writeSynced(path: string, text: string): void {
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    writeFileSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** A directory's entries (a rename into it) on disk. */
+function syncDir(path: string): void {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeJson(path: string, value: unknown, mode: number): void {
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode, flag: "wx" });
@@ -229,15 +269,7 @@ class OwnerTool {
 
   /** One run at a time: an exclusive lock file in the state directory, removed when the run ends. */
   lock(): void {
-    ensureDir(this.state);
-    const path = join(this.state, "lock");
-    try {
-      closeSync(openSync(path, "wx", 0o600));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`another run holds ${path}; if none is running, remove that file and run again`);
-      throw err;
-    }
-    this.#lock = path;
+    this.#lock = lockState(this.state);
   }
 
   unlock(): void {
@@ -546,6 +578,63 @@ class OwnerTool {
   }
 }
 
+/**
+ * rekey: the owner seed in `seedFile` sealed again under a new passphrase. The current passphrase must open it; the
+ * new one (MIN_PASSPHRASE characters at least, not the current one) is asked twice. The new file is written beside the
+ * seed file (0600, never over another file) and opened again with the new passphrase: it must give the same seed, the
+ * old passphrase must not open it, and, when `state` records the owner's deployment, both must give the key 0 the
+ * owner was deployed with. Only then is the old file kept as <seedFile>.before-rekey-<time> (0600) and the new one
+ * renamed into place (the seed file unchanged since it was read): both files are on disk (fsync) before the rename,
+ * and the directory after it. A seed file that is a symbolic link is refused. Nothing secret is printed.
+ */
+async function rekey(seedFile: string, state: string): Promise<void> {
+  const lock = lockState(state);
+  try {
+    // The seed file itself, never a link to one: its new file and its backup are written beside the path named.
+    if (lstatSync(seedFile).isSymbolicLink()) throw new Error(`${seedFile} is a symbolic link: name the seed file itself; nothing was changed`);
+    const before = readFileSync(seedFile, "utf8");
+    const passphrases = new Passphrases();
+    const current = await passphrases.next("current passphrase: ");
+    const seed = await openSeed(before, current);
+    const p = await passphrases.next(`new passphrase (at least ${MIN_PASSPHRASE} characters): `);
+    if (p.length < MIN_PASSPHRASE) throw new Error(`the passphrase must be at least ${MIN_PASSPHRASE} characters`);
+    if ((await passphrases.next("the same passphrase again: ")) !== p) throw new Error("the passphrases differ");
+    if (p === current) throw new Error("the new passphrase is the current one; nothing was changed");
+    // Key 0 of the deployed owner's keychain, when the state records the deployment (deploy.json).
+    const deployPath = join(state, "deploy.json");
+    const deployed = existsSync(deployPath) ? (JSON.parse(readFileSync(deployPath, "utf8")) as DeployIntent) : undefined;
+    const keyRoot0 = (s: Uint8Array) => bytesToHex(new WotsKeychain(s, ownerKeychainId(deployed!.chainId, deployed!.owner), new FileWotsStore(join(state, "wots"))).keyRoot(0n));
+    if (deployed !== undefined && keyRoot0(seed) !== deployed.keyRoot0.toLowerCase()) throw new Error(`${seedFile} is not the seed of the owner ${deployed.owner} recorded in ${deployPath}; nothing was changed`);
+    const next = `${seedFile}.rekey-${process.pid}`;
+    writeSynced(next, await sealSeed(seed, p));
+    try {
+      const sealed = readFileSync(next, "utf8");
+      const again = await openSeed(sealed, p);
+      if (Buffer.compare(Buffer.from(again), Buffer.from(seed)) !== 0) throw new Error("the new file does not give the same seed; nothing was changed");
+      if (deployed !== undefined && keyRoot0(again) !== deployed.keyRoot0.toLowerCase()) throw new Error("the new file does not give the owner's key 0; nothing was changed");
+      const opensOld = await openSeed(sealed, current).then(
+        () => true,
+        () => false,
+      );
+      if (opensOld) throw new Error("the current passphrase still opens the new file; nothing was changed");
+      if (readFileSync(seedFile, "utf8") !== before) throw new Error(`${seedFile} changed while it was sealed again; nothing was changed`);
+      const backup = `${seedFile}.before-rekey-${Date.now()}`;
+      writeSynced(backup, before);
+      renameSync(next, seedFile);
+      syncDir(dirname(seedFile));
+      console.log(JSON.stringify({ event: "rekeyed", seedFile, backup, keyRoot0Checked: deployed !== undefined }));
+      console.log(
+        `${seedFile} now opens with the new passphrase only. ${backup}, and any copy of the old file, still opens with the old passphrase: ` +
+          "keep the new file and passphrase off this machine as before, then remove the old file and its copies",
+      );
+    } finally {
+      if (existsSync(next)) unlinkSync(next);
+    }
+  } finally {
+    unlinkSync(lock);
+  }
+}
+
 async function main(): Promise<void> {
   const [command, a1, a2] = process.argv.slice(2);
   const seedFile = process.env.OSTRA_OWNER_SEED_FILE || "/etc/ostra/owner-seed.json";
@@ -561,6 +650,10 @@ async function main(): Promise<void> {
       `keep a copy of ${seedFile} and its passphrase off this machine, and of the owner state directory after every call: ` +
         "without the seed and the passphrase the beacons can never be upgraded again; without the state a key could sign twice",
     );
+    return;
+  }
+  if (command === "rekey") {
+    await rekey(seedFile, process.env.OSTRA_OWNER_STATE || "/etc/ostra/owner-state");
     return;
   }
   const keyFile = process.env.OSTRA_DEPLOYER_KEY_FILE || "/etc/ostra/deployer.key";
@@ -607,7 +700,7 @@ async function main(): Promise<void> {
       } finally {
         tool.unlock();
       }
-    } else throw new Error("usage: upgrade-owner.ts init | deploy | schedule-upgrade <beacon> <implementation> | schedule <target> <calldata> | cancel <id> | execute <id> | status");
+    } else throw new Error("usage: upgrade-owner.ts init | rekey | deploy | schedule-upgrade <beacon> <implementation> | schedule <target> <calldata> | cancel <id> | execute <id> | status");
     console.log("UPGRADE_OWNER_OK");
   } catch (err) {
     throw new Error(redact(err instanceof Error ? err.message : String(err), rpcUrl));

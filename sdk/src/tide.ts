@@ -6,12 +6,17 @@
 //     week, agentId, payee, amount)))), OpenZeppelin's standard Merkle tree leaf;
 //   * the vault link: an agent's vaults are not linked on chain (each key comes from the agent's own seed), so for the
 //     score the agent links them itself, privately. From the vault holding its ERC-8004 identity it approves (an
-//     ApproveHash spend) the set digest, over its agent id, the sorted list of the vaults, the vault paid (its OSTRA
-//     vault, or none) and a secret of its own; from every other vault of the list, that vault's member digest. Only
-//     hashes appear on chain: without the secret nobody can tell which approvals belong together, so they add no tie
-//     between the vaults (a vault's own swaps name the vault they pay, which ties those already). The agent gives the
-//     secret and the list to Ostra's index, which checks every approval on chain. Adding a vault to an agent needs
-//     the key of the agent's identity vault, so the secret alone links nothing;
+//     ApproveHash spend) the set digest, over its agent id, the sorted list of the vaults, the vault paid and a secret
+//     of its own; from every other vault of the list, that vault's member digest. Only hashes appear on chain: without
+//     the secret nobody can tell which approvals belong together, so they add no tie between the vaults (a vault's own
+//     swaps name the vault they pay, which ties those already). The agent gives the secret and the list to Ostra's
+//     index, which checks every approval on chain. Adding a vault to an agent needs the key of the agent's identity
+//     vault, so the secret alone links nothing;
+//   * the vault paid (decided by Edu on 1 Nov 2026: an agent is never asked to swap or open a vault for its share): its
+//     OSTRA vault when it has one (a vault of the list), else the OSTRA vault its seed would create, named with the
+//     parameters OstraVaultFactory.createVault creates it with (tidePayeeVault). That one is not in the list (it has no
+//     code, so it approves nothing); the set approval names it, and Ostra creates it at payout, only for an agent
+//     with a share (createVault is open to anyone, and the vault answers to the agent's keys alone);
 //   * the view key, the secret's hash: what the index asks before it shows an agent its points;
 //   * the week's rules (tideScore, tideShares) and the Merkle tree of the shares (tideTree).
 //
@@ -19,8 +24,9 @@
 // points. Each digest names its own domain and the secret, so no digest is ever that of a permit, an authorization or
 // another contract's action: an approval of one moves nothing.
 
-import { encodeAbiParameters, getAddress, keccak256, type Address, type Hex } from "viem";
-import { WETH } from "./constants.ts";
+import { encodeAbiParameters, getAddress, isAddress, keccak256, type Address, type Hex } from "viem";
+import { OSTRA, WETH } from "./constants.ts";
+import { vaultAddress } from "./messages.ts";
 
 /** OstraTide on Robinhood Chain (deployed 26 Oct 2026, tx 0xd6230f69…0e13, Sourcify exact match). */
 export const OSTRA_TIDE: Address = "0xDdEA3123A9AA9a43228300A6D06E6E3252556Db9";
@@ -80,12 +86,14 @@ export function tideMemberDigest(p: { chainId: number; agentId: bigint | string;
 /**
  * The digest the agent's identity vault approves: keccak256(abi.encode("OSTRA/TIDE/SET/v1", chainId, tide, agentId,
  * keccak256(abi.encode(sorted vaults)), payee, secret)). `vaults` includes the identity vault; `payee` is one of them
- * (its OSTRA vault) or the zero address.
+ * (its OSTRA vault), the zero address, or, with `outsidePayee`, an OSTRA vault outside the list: one not created
+ * yet, named with its creation parameters (tidePayeeVault), which Ostra creates at payout.
  */
-export function tideSetDigest(p: { chainId: number; agentId: bigint | string; vaults: readonly string[]; payee: Address | null; secret: Hex; tide?: Address }): Hex {
+export function tideSetDigest(p: { chainId: number; agentId: bigint | string; vaults: readonly string[]; payee: Address | null; secret: Hex; tide?: Address; outsidePayee?: boolean }): Hex {
   const vaults = tideSortVaults(p.vaults);
   const payee = p.payee === null ? ("0x0000000000000000000000000000000000000000" as Address) : getAddress(p.payee);
-  if (p.payee !== null && !vaults.includes(payee)) throw new RangeError("the payee must be one of the linked vaults");
+  if (p.payee !== null && p.outsidePayee !== true && !vaults.includes(payee)) throw new RangeError("the payee must be one of the linked vaults");
+  if (p.outsidePayee === true && (p.payee === null || vaults.includes(payee))) throw new RangeError("a payee outside the list is an address that is not one of the linked vaults");
   const listHash = keccak256(encodeAbiParameters([{ type: "address[]" }], [vaults]));
   return keccak256(
     encodeAbiParameters(
@@ -98,6 +106,32 @@ export function tideSetDigest(p: { chainId: number; agentId: bigint | string; va
 /** The key that shows an agent its points: keccak256(abi.encode("OSTRA/TIDE/VIEW/v1", secret)). It reveals no link. */
 export function tideViewKey(secret: Hex): Hex {
   return keccak256(encodeAbiParameters([{ type: "string" }, { type: "bytes32" }], ["OSTRA/TIDE/VIEW/v1", secretWord(secret)]));
+}
+
+/**
+ * The parameters OstraVaultFactory.createVault(token, initialKeyRoot, initialCrank) creates an agent's OSTRA vault
+ * with, when a link names that vault as its payee before it exists: OSTRA, key 0 of the vault's keychain (from the
+ * agent's seed) and its crank (none). Its address is fixed by them (CREATE2), so they name it exactly.
+ */
+export type TidePayeeCreation = { token: Address; initialKeyRoot: Hex; initialCrank: Address };
+
+/** `raw` (as a link carries it) as an OSTRA vault's creation parameters: refused unless well formed and in OSTRA. */
+export function tidePayeeCreation(raw: unknown): TidePayeeCreation {
+  const c = raw as Record<string, unknown> | null;
+  if (c === null || typeof c !== "object" || Array.isArray(c)) throw new RangeError("a payee's creation params are {token, initialKeyRoot, initialCrank}");
+  if (typeof c.token !== "string" || !isAddress(c.token, { strict: false }) || getAddress(c.token) !== OSTRA) throw new RangeError(`a payee created at payout is an OSTRA vault: its token is ${OSTRA}`);
+  if (typeof c.initialKeyRoot !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(c.initialKeyRoot) || BigInt(c.initialKeyRoot) === 0n) throw new RangeError("a payee's initialKeyRoot is 32 bytes of hex, not zero");
+  if (typeof c.initialCrank !== "string" || !isAddress(c.initialCrank, { strict: false })) throw new RangeError("a payee's initialCrank is an address");
+  return { token: OSTRA, initialKeyRoot: c.initialKeyRoot.toLowerCase() as Hex, initialCrank: getAddress(c.initialCrank) };
+}
+
+/**
+ * The OSTRA vault `c` creates with the deployment's factory and beacon (sdk vaultAddress, OstraVaultFactory.vaultAddress
+ * off chain): the payee a link names with `c`. Refused for another token than OSTRA.
+ */
+export function tidePayeeVault(d: { vaultFactory: Address; vaultBeacon: Address }, c: TidePayeeCreation): Address {
+  const p = tidePayeeCreation(c);
+  return vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: p.token, initialKeyRoot: p.initialKeyRoot, initialCrank: p.initialCrank });
 }
 
 /**

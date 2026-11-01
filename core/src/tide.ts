@@ -13,6 +13,16 @@
 //              are the agent's. The approvals go out one by one with random gaps. A vault whose approval was sent before
 //              is not asked again (a record per digest); a vault whose approval could not be sent is left out of the set
 //              this time (calling link again adds it). Calls run one at a time.
+//              The OSTRA vault paid (decided by Edu on 1 Nov 2026: the agent only updates and links, it never swaps or
+//              opens a vault for its share): an existing OSTRA vault of the list (the OSTRA token vault before a pair's
+//              creator vault in OSTRA), which approved its member digest; when the list has none (the agent has no
+//              OSTRA vault, or its approval was not sent this time), its OSTRA token vault as its seed derives it,
+//              outside the list (the address, and the createVault params the index checks it against), which is not
+//              created here: Ostra creates it at payout, only when the agent has a share. The set digest names it as
+//              the payee either way, so a link never falls back to no payee while the agent has an OSTRA vault (one
+//              this seed recovered, at another address, is paid only from the list: without its approval no set is
+//              approved, and the link kept before stays). An agent that linked with no payee (0.1.15) links again: the
+//              members' approvals are not sent again, only the set approval naming the payee.
 //   points     The agent's figures from Ostra's index, asked with the view key (the secret's hash).
 //   dashboard  The web app's page with the view key in the URL's fragment (never sent to a server in the address).
 //
@@ -31,10 +41,12 @@ import {
   simulateVaultSpend,
   tideLinkDeadline,
   tideMemberDigest,
+  tidePayeeVault,
   tideSetDigest,
   tideSortVaults,
   tideViewKey,
   tideWeekAt,
+  type TidePayeeCreation,
 } from "@ostraagent/sdk";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
@@ -165,22 +177,46 @@ export class TideService {
   async #link(): Promise<Record<string, unknown>> {
     const { agentId, vault: identity } = await this.#agent();
     const chainId = this.#p.config.chainId;
+    const services = await this.#p.vaults();
     const members: { vs: VaultService; vault: Address; token: Address }[] = [];
-    for (const vs of await this.#p.vaults()) {
+    for (const vs of services) {
       const vault = await vs.vaultAddress().catch(() => null);
       if (vault === null || getAddress(vault) === identity || members.some((m) => m.vault === getAddress(vault))) continue;
       if (!(await vs.state()).exists) continue;
       members.push({ vs, vault: getAddress(vault), token: getAddress(vs.token) });
     }
     if (members.length + 1 > TIDE_MAX_LINKED_VAULTS) throw new Error(`the agent has ${members.length + 1} vaults, more than a link lists (${TIDE_MAX_LINKED_VAULTS}); nothing was signed`);
+    // The agent's OSTRA token vault as its seed creates it, created or not, and the params that create it: the payee,
+    // outside the list, whenever no OSTRA vault of the list can be (none exists, or its member approval was not sent
+    // this time), so a link never falls back to no payee while the agent has one.
+    let own: { payee: Address; creation: TidePayeeCreation } | null = null;
+    const ostraVs = services.find((v) => v.kind === "token" && getAddress(v.token) === OSTRA);
+    if (ostraVs !== undefined) {
+      const creation = ostraVs.creationParams();
+      const payee = tidePayeeVault(this.#p.config.deployment, creation);
+      // An address the vault service cannot give (as the members above skip it) names no payee here.
+      const read = await ostraVs.vaultAddress().catch(() => null);
+      const at = read === null ? null : getAddress(read);
+      if (at === payee) own = { payee, creation };
+      // A vault this seed recovered is at another address: it is paid only as a member of the list.
+      else if (at !== null && !members.some((m) => m.vault === at)) throw new Error(`the agent's OSTRA vault ${at} is not the one its seed creates (${payee}), and it does not exist; nothing was signed`);
+    }
+    // The payee of a list: its first OSTRA vault in the list's order (the same on every call), else the agent's OSTRA
+    // token vault outside it, named with its params; null without either.
+    type Payee = { payee: Address; creation: TidePayeeCreation | null };
+    const payeeOf = (listed: readonly { vault: Address }[]): Payee | null => {
+      const m = members.find((x) => x.token === OSTRA && listed.some((a) => a.vault === x.vault));
+      if (m !== undefined) return { payee: m.vault, creation: null };
+      return own === null ? null : { payee: own.payee, creation: own.creation };
+    };
     const secret = this.#secret();
-    const keep = async (vaults: Address[], payee: Address | null, when: string) => {
-      const r = await this.#post("/api/v1/tide/link", { agentId: agentId.toString(), secret, vaults, payee });
+    const keep = async (vaults: Address[], p: Payee | null, when: string) => {
+      const r = await this.#post("/api/v1/tide/link", { agentId: agentId.toString(), secret, vaults, payee: p?.payee ?? null, ...(p === null || p.creation === null ? {} : { payeeCreation: p.creation }) });
       if (r.status !== 200) throw new Error(`Ostra's index did not keep the link ${when} (${r.status} ${String(r.json.error ?? "")} ${String(r.json.message ?? "")})`);
       return r.json.verified === true;
     };
     const all = tideSortVaults([identity, ...members.map((m) => m.vault)]);
-    await keep(all, members.find((m) => m.token === OSTRA)?.vault ?? null, "before the approvals; nothing was signed");
+    await keep(all, payeeOf(members), "before the approvals; nothing was signed");
     const sent = await this.#sent();
     const steps: { vault: Address; tx: string; status: string }[] = [];
     const gap = this.#p.gap ?? (() => 4_000 + Math.floor(Math.random() * 16_000));
@@ -208,17 +244,22 @@ export class TideService {
       if (step.status === "sent") approved.push(m);
     }
     const vaults = tideSortVaults([identity, ...approved.map((m) => m.vault)]);
-    const payee = approved.find((m) => m.token === OSTRA)?.vault ?? null;
-    const setDigest = tideSetDigest({ chainId, agentId, vaults, payee, secret });
+    const chosen = payeeOf(approved);
+    const payee = chosen?.payee ?? null;
+    const setDigest = tideSetDigest({ chainId, agentId, vaults, payee, secret, outsidePayee: chosen !== null && chosen.creation !== null });
     let set: { vault: Address; tx: string; status: string };
-    if (sent[setDigest] !== undefined || (await this.#approved(identity, setDigest))) set = { vault: identity, tx: sent[setDigest]?.tx ?? "", status: "approved before" };
+    if (chosen === null && members.some((m) => m.token === OSTRA)) {
+      // The agent's OSTRA vault could be named neither in the list nor outside it: no set naming no payee is approved
+      // (it would replace a link that pays it), the link kept before stays.
+      set = { vault: identity, tx: "", status: "not sent: the agent's OSTRA vault is not in the list this time (its approval was not sent): call link again" };
+    } else if (sent[setDigest] !== undefined || (await this.#approved(identity, setDigest))) set = { vault: identity, tx: sent[setDigest]?.tx ?? "", status: "approved before" };
     else {
       if (!first) await sleep(gap());
       set = await this.#approve(this.#p.identityVault, identity, setDigest, "Ostra Tide link (the set of vaults)");
     }
     const linked = set.status === "sent" || set.status === "approved before";
     // Kept again with the set as approved: the index checks it on chain and never drops it.
-    const verified = linked ? await keep(vaults, payee, "after the approvals (call link again: nothing is signed twice)") : false;
+    const verified = linked ? await keep(vaults, chosen, "after the approvals (call link again: nothing is signed twice)") : false;
     const week = Math.max(1, tideWeekAt(Math.floor(Date.now() / 1000)));
     const left = steps.filter((s) => s.status.startsWith("not sent")).map((s) => s.vault);
     return {
@@ -232,10 +273,17 @@ export class TideService {
         ? { verifyNote: "Ostra's index could not confirm the set approval yet (a vault's lock delays when an approval takes effect, or the chain could not be read): call link again later; nothing is signed twice" }
         : {}),
       ...(left.length === 0 ? {} : { leftOut: left, leftOutNote: "these vaults' approvals were not sent: call link again to add them" }),
+      ...(chosen === null || chosen.creation === null ? {} : { payeeCreation: chosen.creation }),
       note:
         payee === null
-          ? "no OSTRA vault of this agent is in the link: its share is kept for it until it has one and links again"
-          : "the share is paid to the OSTRA vault named",
+          ? members.some((m) => m.token === OSTRA)
+            ? "the agent's OSTRA vault could not be named this time: the link kept before stays; call link again"
+            : "no OSTRA vault of this agent is in the link: its share is kept for it until it has one and links again"
+          : chosen === null || chosen.creation === null
+            ? "the share is paid to the OSTRA vault named"
+            : members.some((m) => m.vault === payee)
+              ? "the share is paid to the agent's OSTRA vault named (outside the list: its approval was not sent this time, so call link again to count what it holds and pays)"
+              : "the share is paid to the agent's OSTRA vault named, which does not exist yet: Ostra creates it at payout, only when the agent gets a share (nothing to swap or open)",
       countsFor: `week ${week} and on, for approvals in force by ${new Date(tideLinkDeadline(week) * 1000).toISOString()} (the score checks each on chain)`,
     };
   }

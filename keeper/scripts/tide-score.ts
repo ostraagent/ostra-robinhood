@@ -108,6 +108,7 @@ async function main(): Promise<void> {
     client,
     logsClient,
     factory: d.vaultFactory,
+    beacon: d.vaultBeacon,
     router: getAddress(sw.router),
     fromBlock: BigInt(d.fromBlock),
     week,

@@ -12,11 +12,21 @@
 //   * agent B is one of Ostra's own (OSTRA_STATS_OWN): left out; agent C has a link the index keeps that nobody
 //     approved on chain: unproven, only its identity vault counted, no points, and its poster is told only what it
 //     lacks; C's vault registers a second identity, which is left out (it would count the same vault again);
+//   * agent D has a buyer vault with USDG and no OSTRA vault. It linked as MCP 0.1.15 did (no payee: its buyer vault's
+//     member approval and the set approval naming no payee); linking again names the OSTRA vault its seed creates,
+//     which does not exist, with its createVault params: the member approval is not sent again, only the set
+//     approval naming that payee; the index checks the params and keeps them with the link, verified. The score pays
+//     D's share to that address (still without code) and carries its params for the payout;
+//   * agent E links with no OSTRA vault (its payee the vault its seed creates); then that vault is created (as the
+//     payout does) and E links again while that vault's approval cannot be sent (its fee payer has no ETH): the link
+//     still names that vault as the payee, outside the list, and never falls back to no payee; the score names it as E's payee;
+//   * the index's payee check, on the chain itself: an address without code or an OSTRA vault passes, a USDG vault and
+//     the USDG token do not;
 //   * the state is read at the last block before the link deadline (the week's end + 23 hours);
 //   * after the week: A's figures, read from the chain here apart from the score (the Swapped event's fee, the USDG
 //     sent to payTo, each vault's USDG and WETH at the week's last block at Chainlink ETH/USD), match its breakdown;
-//     A is the only one with points, so it gets the 20% cap of the pot and the rest stays; the tree's one leaf pays A's
-//     OSTRA vault and verifies against the root;
+//     A and D have points and each gets the 20% cap of the pot, the rest stays; the tree's leaves pay A's OSTRA vault
+//     and D's OSTRA vault to be created, and verify against the root;
 //   * the index answers A its figures with the view key, and nobody else's.
 // The week is the fork's own (readTideWeek's testStart): its blocks come after OstraTide's week 1 started.
 
@@ -39,6 +49,7 @@ import {
   USDG,
   VAULT_ACTION,
   WETH,
+  approveHashParams,
   chainlinkAggregatorAbi,
   ostraVaultAbi,
   padCidFromDigest,
@@ -48,6 +59,9 @@ import {
   signVaultSpend,
   simulateVaultSpend,
   tideLeaf,
+  tideMemberDigest,
+  tidePayeeVault,
+  tideSetDigest,
   tideSortVaults,
   tideVerify,
   tideViewKey,
@@ -63,7 +77,7 @@ import { MemoryFolder } from "../../core/test/memory-folder.ts";
 import { splitLogsClient } from "../../core/test/split-logs.ts";
 import { createIndexerServer } from "../../indexer/src/http.ts";
 import type { Indexer } from "../../indexer/src/indexer.ts";
-import { TideApi, tideLinkVerifier } from "../../indexer/src/tide.ts";
+import { TideApi, tideLinkVerifier, tidePayeeChecker } from "../../indexer/src/tide.ts";
 import { RAETO_PAY_TO, readTideWeek, type TideLinkRecord } from "../src/tide-score.ts";
 
 const SWAP: SwapDeployment = parseSwapDeployment(JSON.parse(readFileSync(new URL("../../../ostra-swap/deployments/robinhood-mainnet.json", import.meta.url), "utf8")));
@@ -89,7 +103,13 @@ before(async () => {
   config = { chainId: d.chainId, rpcUrl: fork.url, deployment: d, x402Network: X402_NETWORK, keeperUrl: null, relayerUrl: null, aggregatorUrl: null, aiUrl: null };
   await fork.setBalance(feePayer.address, 10n ** 19n);
   // The index's Tide API, its clock the fork's.
-  tideApi = new TideApi({ linksPath: join(root, "tide-links.json"), resultsDir: join(root, "results"), verify: tideLinkVerifier(fork.client as PublicClient, d.chainId, d.vaultBeacon) });
+  tideApi = new TideApi({
+    linksPath: join(root, "tide-links.json"),
+    resultsDir: join(root, "results"),
+    verify: tideLinkVerifier(fork.client as PublicClient, d.chainId, d.vaultBeacon),
+    factory: d,
+    payee: tidePayeeChecker(fork.client as PublicClient),
+  });
   await tideApi.load();
   const server = createIndexerServer({} as Indexer, () => {}, null, tideApi);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
@@ -172,11 +192,15 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   const a = await agent("A", 41);
   const b = await agent("B", 42);
   const c = await agent("C", 43);
+  const dd = await agent("D", 44);
   const idA = await a.register();
   await b.register();
   const idC = await c.register();
   const idC2 = await c.register();
   assert.notEqual(idC2, idC);
+  const idD = await dd.register();
+  const ee = await agent("E", 45);
+  const idE = await ee.register();
 
   // A's vaults: the buyer vault with 100 USDG, its WETH vault and OSTRA vault (where its share is paid).
   await a.buyer.open();
@@ -188,6 +212,12 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   const ostraA = getAddress(await a.tokenVault(OSTRA).vaultAddress());
   // 5 USDG in the identity vault, counted too.
   await fork.dealUsdg(a.creatorVault, 5_000_000n);
+  // D: a buyer vault with 50 USDG, no OSTRA vault.
+  await dd.buyer.open();
+  const buyerD = getAddress(await dd.buyer.vaultAddress());
+  await fork.dealUsdg(buyerD, 50_000_000n);
+  const ostraD = getAddress(await dd.tokenVault(OSTRA).vaultAddress());
+  assert.equal(await fork.client.getCode({ address: ostraD }), undefined, "D has no OSTRA vault");
 
   // The week starts after the registrations (none of them before OstraTide's week 1: not early).
   await fork.increaseTime(5);
@@ -228,6 +258,98 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   assert.ok((linked.approvals as { status: string }[]).every((s) => s.status === "sent"), JSON.stringify(linked.approvals));
   const again = await a.tide.link();
   assert.ok((again.approvals as { status: string }[]).every((s) => s.status === "approved before"), JSON.stringify(again.approvals));
+  // D linked with MCP 0.1.15: its buyer vault's member approval and the set approval naming no payee, kept verified.
+  const secretD = dd.keys.tideSecret(d.chainId, OSTRA_TIDE);
+  await spend(dd.buyer, dd.sender, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideMemberDigest({ chainId: d.chainId, agentId: idD, vault: buyerD, secret: secretD }), approved: true }));
+  const oldVaults = tideSortVaults([dd.creatorVault, buyerD]);
+  await spend(dd.creator, dd.sender, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideSetDigest({ chainId: d.chainId, agentId: idD, vaults: oldVaults, payee: null, secret: secretD }), approved: true }));
+  const oldLink = await fetch(`${indexerUrl}/api/v1/tide/link`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentId: idD.toString(), secret: secretD, vaults: oldVaults, payee: null }) });
+  assert.equal(((await oldLink.json()) as { verified: boolean }).verified, true);
+  // Linking again with 0.1.16: the OSTRA vault D's seed creates is the payee; only the new set approval is sent.
+  const relinked = await dd.tide.link();
+  assert.equal(relinked.linked, true, JSON.stringify(relinked));
+  assert.equal(relinked.verifiedByIndex, true, JSON.stringify(relinked));
+  assert.equal(relinked.payee, ostraD);
+  assert.deepEqual(relinked.vaults, oldVaults);
+  const creationD = dd.tokenVault(OSTRA).creationParams();
+  assert.deepEqual(relinked.payeeCreation, creationD);
+  assert.equal(tidePayeeVault(d, creationD), ostraD);
+  assert.match(String(relinked.note), /Ostra creates it at payout/);
+  assert.deepEqual(
+    (relinked.approvals as { vault: string; status: string }[]).map((s) => [s.vault, s.status]),
+    [
+      [buyerD, "approved before"],
+      [dd.creatorVault, "sent"],
+    ],
+  );
+  const relinkedAgain = await dd.tide.link();
+  assert.ok((relinkedAgain.approvals as { status: string }[]).every((s) => s.status === "approved before"), JSON.stringify(relinkedAgain.approvals));
+  assert.equal(relinkedAgain.payee, ostraD);
+  const keptD = (JSON.parse(await readFile(join(root, "tide-links.json"), "utf8")) as (TideLinkRecord & { verified?: boolean })[]).filter((x) => x.agentId === idD.toString());
+  assert.equal(keptD.length, 1, "the verified link with the payee replaced the one without");
+  assert.equal(keptD[0]!.verified, true);
+  assert.equal(keptD[0]!.payee, ostraD);
+  assert.deepEqual(keptD[0]!.payeeCreation, creationD);
+  assert.equal(await fork.client.getCode({ address: ostraD }), undefined, "link creates no vault");
+  // A link naming that payee with params that create another vault is refused.
+  const wrongParams = await fetch(`${indexerUrl}/api/v1/tide/link`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ agentId: idD.toString(), secret: secretD, vaults: oldVaults, payee: ostraD, payeeCreation: { ...creationD, initialKeyRoot: keccak256(stringToHex("not D's key")) } }),
+  });
+  assert.equal(wrongParams.status, 400);
+  // The index's payee check reads the chain: no code, or an OSTRA vault, passes; a USDG vault or the USDG token does not.
+  const payeeCheck = tidePayeeChecker(fork.client as PublicClient);
+  assert.equal(await payeeCheck(ostraD), true);
+  assert.equal(await payeeCheck(ostraA), true);
+  assert.equal(await payeeCheck(buyerA), false);
+  assert.equal(await payeeCheck(getAddress(USDG)), false);
+
+  // E: linked with no OSTRA vault, then its OSTRA vault created (as the payout creates it).
+  await ee.buyer.open();
+  const buyerE = getAddress(await ee.buyer.vaultAddress());
+  const ostraE = getAddress(await ee.tokenVault(OSTRA).vaultAddress());
+  const firstE = await ee.tide.link();
+  assert.equal(firstE.verifiedByIndex, true, JSON.stringify(firstE));
+  assert.equal(firstE.payee, ostraE);
+  assert.ok(firstE.payeeCreation !== undefined);
+  await ee.tokenVault(OSTRA).open();
+  assert.notEqual(await fork.client.getCode({ address: ostraE }), undefined);
+  // E links again with that vault's fee payer out of ETH (its own service: same seed and records, an empty fee payer).
+  const broke = privateKeyToAccount(keccak256(stringToHex("OSTRA/KEEPER/TIDE-SCORE-FORK/broke-fee-payer")));
+  const brokeKeys = new Keys({ master: new Uint8Array(32).fill(45), feePayer: broke, store: new FileWotsStore(join(root, "E")), folder: new MemoryFolder(), backupExported: async () => true });
+  const transportE = retryingHttp(fork.url);
+  const brokeOstraE = new VaultService(fork.client as PublicClient, transportE, config, brokeKeys, new LocalSender(fork.client as PublicClient, transportE, broke), "token", null, OSTRA);
+  assert.equal(getAddress(await brokeOstraE.vaultAddress()), ostraE);
+  const tideE = new TideService({
+    client: fork.client as PublicClient,
+    config,
+    keys: ee.keys,
+    identity: async () => ({ agentId: idE, vault: ee.creatorVault }),
+    identityVault: ee.creator,
+    vaults: async () => [ee.buyer, ee.tokenVault(WETH), brokeOstraE],
+    payer: () => ee.sender.payer(),
+    indexerUrl,
+    folder: ee.keys.folder.folder("tide"),
+    gap: () => 0,
+    sleep: async () => {},
+  });
+  const secondE = await tideE.link();
+  const stepsE = secondE.approvals as { vault: string; status: string }[];
+  assert.ok(stepsE.find((x) => x.vault === ostraE)?.status.startsWith("not sent:"), JSON.stringify(stepsE));
+  assert.deepEqual(secondE.leftOut, [ostraE]);
+  assert.equal(secondE.linked, true, JSON.stringify(secondE));
+  assert.equal(secondE.verifiedByIndex, true, JSON.stringify(secondE));
+  assert.equal(secondE.payee, ostraE, "the payee stays E's OSTRA vault, outside the list");
+  assert.deepEqual(secondE.vaults, tideSortVaults([ee.creatorVault, buyerE]));
+  assert.deepEqual(secondE.payeeCreation, ee.tokenVault(OSTRA).creationParams());
+  assert.match(String(secondE.note), /outside the list: its approval was not sent this time/);
+  const keptE = (JSON.parse(await readFile(join(root, "tide-links.json"), "utf8")) as (TideLinkRecord & { verified?: boolean })[]).filter((x) => x.agentId === idE.toString() && x.verified === true);
+  assert.deepEqual(
+    keptE.map((x) => x.payee),
+    [ostraE],
+  );
+
   // C's link names A's buyer vault: kept by the index, approved by nobody.
   const cLink = await fetch(`${indexerUrl}/api/v1/tide/link`, {
     method: "POST",
@@ -244,6 +366,14 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   assert.equal(((await partial.json()) as { verified: boolean }).verified, false);
   const both = (JSON.parse(await readFile(join(root, "tide-links.json"), "utf8")) as (TideLinkRecord & { verified?: boolean })[]).filter((x) => x.agentId === idA.toString());
   assert.deepEqual(both.map((x) => x.verified === true), [true, false]);
+  // A's OSTRA vault, which exists, named outside the vaults with its own params: accepted (the index reads its token).
+  const ostraOutside = await fetch(`${indexerUrl}/api/v1/tide/link`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ agentId: idA.toString(), secret: keccak256(stringToHex("OSTRA/KEEPER/TIDE-SCORE-FORK/outside")), vaults: [a.creatorVault], payee: ostraA, payeeCreation: a.tokenVault(OSTRA).creationParams() }),
+  });
+  assert.equal(ostraOutside.status, 200);
+  assert.equal(((await ostraOutside.json()) as { verified: boolean }).verified, false);
   // Nine links someone else posts for A: A's verified link stays.
   for (let i = 0; i < 9; i++) {
     const junk = await fetch(`${indexerUrl}/api/v1/tide/link`, {
@@ -255,7 +385,7 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
     assert.equal(((await junk.json()) as { verified: boolean }).verified, false);
   }
   const keptA = (JSON.parse(await readFile(join(root, "tide-links.json"), "utf8")) as TideLinkRecord[]).filter((x) => x.agentId === idA.toString());
-  assert.equal(keptA.length, 9, "the verified link and the 8 latest unverified ones (A's own partial one dropped first)");
+  assert.equal(keptA.length, 9, "the verified link and the 8 latest unverified ones (A's own partial one and the one naming its vault outside dropped first)");
   assert.equal(keptA.filter((x) => (x as { verified?: boolean }).verified === true).length, 1);
   // A's view before the score: the link is kept, no points yet.
   assert.equal((await a.tide.points()).note, "the link is kept; the points appear after the next score (every 30 minutes)");
@@ -274,6 +404,7 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
     client: createPublicClient({ chain: robinhoodChain, transport: http(fork.url, { timeout: 180_000 }) }) as PublicClient,
     logsClient: splitLogsClient(fork.url, forkBlock),
     factory: d.vaultFactory,
+    beacon: d.vaultBeacon,
     router: getAddress(SWAP.router),
     fromBlock: BigInt(d.fromBlock),
     week: 1,
@@ -290,13 +421,14 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   ]);
   // The state block: the last before the deadline (the chain moved past it in one block).
   assert.equal(r.stateBlock, last.toString());
-  assert.deepEqual(r.agents.map((x) => x.agentId), [idA.toString(), idC.toString()]);
+  assert.deepEqual(r.agents.map((x) => x.agentId), [idA.toString(), idC.toString(), idD.toString(), idE.toString()]);
 
   const ra = r.agents[0]!;
   assert.equal(ra.identityVault, a.creatorVault);
   assert.equal(ra.link.status, "verified", JSON.stringify(ra.link));
   assert.deepEqual(ra.vaults, tideSortVaults([a.creatorVault, buyerA, wethA, ostraA]));
   assert.equal(ra.payee, ostraA);
+  assert.equal(ra.payeeCreation, null);
   assert.deepEqual(ra.dropped, []);
   const bd = ra.breakdown;
   assert.equal(bd.fee.paidE6, feeE6.toString());
@@ -324,18 +456,44 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   assert.equal(rc.breakdown.points, "0");
   assert.equal(rc.share, "0");
 
-  // Shares: A alone has points, so it gets the cap (20% of the pot); the rest stays in the pot.
+  // D: its link verified with the payee to be created, its buyer vault counted, its params carried for the payout.
+  const rd = r.agents[2]!;
+  assert.equal(rd.link.status, "verified", JSON.stringify(rd.link));
+  assert.deepEqual(rd.vaults, oldVaults);
+  assert.equal(rd.payee, ostraD);
+  assert.deepEqual(rd.payeeCreation, creationD);
+  assert.deepEqual(rd.dropped, []);
+  assert.equal(rd.breakdown.balances.idleAvgE6, "50000000");
+  assert.equal(rd.pending.length, 0, "D's link without a payee was replaced");
+  // E: paid to its OSTRA vault (it exists now), named outside the list by its params; no points, so no share.
+  const re = r.agents[3]!;
+  assert.equal(re.link.status, "verified", JSON.stringify(re.link));
+  assert.deepEqual(re.vaults, tideSortVaults([ee.creatorVault, buyerE]));
+  assert.equal(re.payee, ostraE);
+  assert.deepEqual(re.payeeCreation, ee.tokenVault(OSTRA).creationParams());
+  assert.equal(re.share, "0");
+
+  // Shares: A and D have points; each gets the cap (20% of the pot); the rest stays in the pot.
   const pot = (await fork.client.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "potBalance", args: [1n] })) as bigint;
   assert.equal(r.pot, pot.toString());
   assert.ok(pot > 0n);
-  assert.equal(ra.share, ((pot * TIDE_RULES.shareCapBps) / 10_000n).toString());
-  assert.equal(r.shared, ra.share);
+  const cap = (pot * TIDE_RULES.shareCapBps) / 10_000n;
+  assert.equal(ra.share, cap.toString());
+  assert.equal(rd.share, cap.toString());
+  assert.equal(r.shared, (2n * cap).toString());
   assert.ok(r.tree !== null);
-  assert.equal(r.tree.leaves.length, 1);
-  const leaf = r.tree.leaves[0]!;
-  assert.deepEqual({ agentId: leaf.agentId, payee: leaf.payee, amount: leaf.amount }, { agentId: idA.toString(), payee: ostraA, amount: ra.share });
-  assert.equal(tideVerify(r.tree.root, tideLeaf({ week: 1, agentId: idA.toString(), payee: ostraA, amount: BigInt(ra.share) }), leaf.proof), true);
-  assert.equal(r.tree.total, ra.share);
+  assert.equal(r.tree.leaves.length, 2);
+  for (const [id, payee] of [
+    [idA.toString(), ostraA],
+    [idD.toString(), ostraD],
+  ] as const) {
+    const leaf: { agentId: string; payee: Address; amount: string; proof: Hex[] } = r.tree.leaves.find((l) => l.agentId === id)!;
+    assert.deepEqual({ agentId: leaf.agentId, payee: leaf.payee, amount: leaf.amount }, { agentId: id, payee, amount: cap.toString() });
+    // The leaf is OstraTide's (week, agentId, payee, amount): the params are not in it.
+    assert.equal(tideVerify(r.tree.root, tideLeaf({ week: 1, agentId: id, payee, amount: cap }), leaf.proof), true);
+  }
+  assert.equal(r.tree.total, r.shared);
+  assert.equal(await fork.client.getCode({ address: ostraD }), undefined, "the score creates no vault");
 
   // The index answers A its own figures with its view key, and nobody's to a wrong key.
   await mkdir(join(root, "results"), { recursive: true });

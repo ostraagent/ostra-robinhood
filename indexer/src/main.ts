@@ -40,7 +40,7 @@ import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { openAiModerator, type Moderator } from "./moderation.ts";
 import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
-import { TideApi, tideLinkVerifier } from "./tide.ts";
+import { TideApi, tideLinkVerifier, tidePayeeChecker } from "./tide.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
@@ -126,7 +126,13 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   const tideLinks = process.env.OSTRA_TIDE_LINKS || join(dirname(statePath), "tide-links.json");
   let tide: TideApi | null = null;
   if (tideLinks !== "off") {
-    tide = new TideApi({ linksPath: tideLinks, resultsDir: process.env.OSTRA_TIDE_RESULTS || "/var/lib/ostra-tide", verify: tideLinkVerifier(client, record.chainId, record.vaultBeacon) });
+    tide = new TideApi({
+      linksPath: tideLinks,
+      resultsDir: process.env.OSTRA_TIDE_RESULTS || "/var/lib/ostra-tide",
+      verify: tideLinkVerifier(client, record.chainId, record.vaultBeacon),
+      factory: { vaultFactory: record.vaultFactory, vaultBeacon: record.vaultBeacon },
+      payee: tidePayeeChecker(client),
+    });
     await tide.load();
   }
   log("tide", { links: tide === null ? "off" : tideLinks });

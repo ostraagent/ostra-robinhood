@@ -6,16 +6,26 @@
 //           approved until then count), and holds a tree; every leaf is OstraTide's own leaf (read from the
 //           contract), its proof verifies against the root, its amount is not zero and its agent's share; the amounts
 //           add up to the tree's total and the result's shared amount; the week is over, its root is not set yet (or
-//           set to this root and total), it has not rolled over, and the pot holds the total. Exit 1 on any problem.
+//           set to this root and total), it has not rolled over, and the pot holds the total. A payee with no code yet
+//           (an agent's OSTRA vault named by its creation params, decided by Edu on 1 Nov 2026: Ostra creates it at
+//           payout) must have its params in the result, in OSTRA, and OstraTide's factory must compute exactly that
+//           address from them; the check says how many vaults pay will create and about how much gas that takes.
+//           Exit 1 on any problem.
 //   root    after the checks: OstraTide.setRoot(week, root, total) from OSTRA_DEPLOYER_KEY_FILE's account, which must be
 //           OstraTide's owner. A root set already to this root and total is left as it is.
-//   pay     after the checks, with this root on chain: OstraTide.payMany in batches of OSTRA_TIDE_PAY_BATCH (default 20)
-//           for every share whose payee is an OSTRA vault and that is not paid yet (paid(week, agentId)); a share
-//           without a payee (the agent had no OSTRA vault) is listed, and only the owner can pay it once the vault
-//           exists (pay with the vault named), within HOLD of the root.
+//   pay     after the checks, with this root on chain: first, for every share not paid yet whose payee has no code,
+//           OstraVaultFactory.createVault with its params from OSTRA_DEPLOYER_KEY_FILE's account (createVault is open
+//           to anyone and gives the vault to the keys its params name: the agent's), and then the vault there must be
+//           the payee, in OSTRA; then OstraTide.payMany in batches of OSTRA_TIDE_PAY_BATCH (default 20) for every
+//           share whose payee is an OSTRA vault and that is not paid yet (paid(week, agentId)). A share without a
+//           payee (a link without one, made before MCP 0.1.16) is listed, and only the owner can pay it once the
+//           vault exists (pay with the vault named), within HOLD of the root.
 //
 // Each transaction is signed here and recorded (its hash and its signed bytes, in OSTRA_TIDE_RESULTS/tide-pay.json)
 // before it is sent; a step recorded is never signed again, and a run stopped at any point is run again to finish.
+// Before root or pay sends anything, the owner's account must hold what the run's transactions can cost (each at its
+// gas limit and the current maximum fee; one recorded and not mined at its own): otherwise it stops and says how much
+// more it needs, and run again once funded it goes on with what it recorded.
 // What was paid, by whom and in which transaction is kept in week-<n>.paid.json (0600), which the index serves to
 // each agent with its points. Nothing secret is printed: the RPC URL is redacted.
 //
@@ -50,7 +60,7 @@ import {
   type Transport,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { OSTRA, OSTRA_TIDE, assertRobinhoodChain, redact, retryingHttp, robinhoodChain, tideLeaf, tideLinkDeadline, tideVerify } from "@ostraagent/sdk";
+import { OSTRA, OSTRA_TIDE, assertRobinhoodChain, ostraVaultFactoryAbi, redact, retryingHttp, robinhoodChain, tideLeaf, tideLinkDeadline, tideVerify, type TidePayeeCreation } from "@ostraagent/sdk";
 import type { TideWeekResult } from "../src/tide-score.ts";
 
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
@@ -60,6 +70,7 @@ const ostraTideAbi = parseAbi([
   "struct Week { bytes32 root; uint128 total; uint128 paid; uint64 rootAt; bool rolled; }",
   "function owner() view returns (address)",
   "function TOKEN() view returns (address)",
+  "function FACTORY() view returns (address)",
   "function weekEnd(uint256 week) view returns (uint256)",
   "function potBalance(uint256 week) view returns (uint256)",
   "function weekInfo(uint256 week) view returns (Week)",
@@ -69,6 +80,14 @@ const ostraTideAbi = parseAbi([
   "function payMany(Share[] shares, bytes32[][] proofs, address[] vaults)",
   "event Paid(uint256 indexed week, uint256 indexed agentId, address indexed vault, uint256 amount)",
 ]);
+const vaultTokenAbi = parseAbi(["function token() view returns (address)"]);
+/**
+ * Gas one share of a payMany is counted at before it can be estimated (its root not set, or its payee not created
+ * yet). A batch of three shares, one into a vault just created, used 265,200 gas on the fork (1 Nov 2026; a fork has
+ * no L1 data gas); on Robinhood Chain calldata cost about 16.6 gas a byte then (eth_estimateGas, 1 Nov 2026), and a
+ * share is about 480 bytes of calldata with its proof: 200,000 a share leaves room for an L1 fee many times higher.
+ */
+const PAY_SHARE_GAS = 200_000n;
 
 /** What week-<n>.paid.json holds (design "Ostra Tide": the index serves each agent its own entry). */
 type TidePaidFile = { week: number; root: Hex; rootTx: Hex | null; paid: Record<string, { tx: Hex; amount: string; vault: Address }> };
@@ -165,7 +184,37 @@ async function main(): Promise<void> {
   const due = BigInt(tree.total) - (ours ? info.paid : 0n);
   if (pot < due) problems.push(`the pot holds ${formatUnits(pot, 18)} OSTRA, less than the ${formatUnits(due, 18)} still due`);
   const waiting = tree.leaves.filter((l) => getAddress(l.payee) === ZERO);
+  // Payees with no code yet: created at payout with OstraTide's own factory (the one it checks a vault against).
+  const factory = getAddress((await tide("FACTORY")) as Address);
+  const toCreate: { agentId: string; payee: Address; creation: TidePayeeCreation; data: Hex }[] = [];
+  for (const l of tree.leaves) {
+    const payee = getAddress(l.payee);
+    if (payee === ZERO) continue;
+    const code = await client.getCode({ address: payee });
+    if (code !== undefined && code !== "0x") continue;
+    const c = shareOf.get(l.agentId)?.payeeCreation ?? null;
+    if (c === null) {
+      problems.push(`agent ${l.agentId}'s payee ${payee} has no code and the result names no creation params for it`);
+      continue;
+    }
+    if (getAddress(c.token) !== OSTRA) {
+      problems.push(`agent ${l.agentId}'s payee would be created in ${c.token}, not OSTRA`);
+      continue;
+    }
+    const at = getAddress((await client.readContract({ address: factory, abi: ostraVaultFactoryAbi, functionName: "vaultAddress", args: [OSTRA, c.initialKeyRoot, c.initialCrank] })) as Address);
+    if (at !== payee) {
+      problems.push(`agent ${l.agentId}'s creation params create ${at} with OstraTide's factory, not its payee ${payee}`);
+      continue;
+    }
+    toCreate.push({ agentId: l.agentId, payee, creation: c, data: encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [OSTRA, c.initialKeyRoot, c.initialCrank] }) });
+  }
   say(`week ${week}: ${tree.leaves.length} shares, total ${formatUnits(BigInt(tree.total), 18)} OSTRA of a pot of ${formatUnits(pot, 18)}, root ${tree.root}${ours ? " (set on chain)" : zeroRoot ? " (not set yet)" : ""}; ${waiting.length} without an OSTRA vault`);
+  if (toCreate.length > 0) {
+    const from = getAddress((await tide("owner")) as Address);
+    let gas = 0n;
+    for (const x of toCreate) gas += await client.estimateGas({ account: from, to: factory, data: x.data });
+    say(`${toCreate.length} OSTRA vault(s) to create before their shares are paid: about ${gas} gas, ${formatEther(gas * (await client.getGasPrice()))} ETH at the current gas price, paid by the owner's account`);
+  }
   if (problems.length > 0) {
     for (const p of problems) say(`PROBLEM ${p}`);
     throw new Error(`${problems.length} problem(s) with week ${week}'s result; nothing was sent`);
@@ -222,7 +271,7 @@ async function main(): Promise<void> {
     }
     const r = await client.waitForTransactionReceipt({ hash, timeout: 300_000 });
     if (r.status !== "success") throw new Error(`${name}: transaction ${hash} reverted`);
-    say(`SENT ${name}: ${hash}`);
+    say(`SENT ${name}: ${hash} (${r.gasUsed} gas)`);
     testStop(`${name}:mined`);
     return r;
   };
@@ -232,8 +281,62 @@ async function main(): Promise<void> {
   if (paidFile.root.toLowerCase() !== tree.root.toLowerCase()) throw new Error(`${paidPath} records root ${paidFile.root}, not ${tree.root}; nothing was sent`);
 
   const rootStep = `root:${week}:${tree.root}`;
+  const rootData = encodeFunctionData({ abi: ostraTideAbi, functionName: "setRoot", args: [BigInt(week), tree.root, BigInt(tree.total)] });
+  const unpaid = [];
+  for (const l of tree.leaves) {
+    if (getAddress(l.payee) === ZERO) continue;
+    if ((await tide("paid", [BigInt(week), BigInt(l.agentId)])) as boolean) continue;
+    unpaid.push(l);
+  }
+  const creates = [];
+  for (const x of toCreate) if (unpaid.some((l) => l.agentId === x.agentId)) creates.push({ ...x, name: `create:${week}:${x.payee}` });
+  // The steps' names name their shares: a run again forms the same batch of the same unpaid shares, so it finds its
+  // recorded transaction; a batch whose share someone else paid meanwhile is a new batch (payMany skips a paid share).
+  const batches = [];
+  for (let i = 0; i < unpaid.length; i += batchSize) {
+    const batch = unpaid.slice(i, i + batchSize);
+    const name = `pay:${week}:${keccak256(`0x${Buffer.from(batch.map((l) => l.agentId).join(",")).toString("hex")}` as Hex).slice(0, 18)}`;
+    const shares = batch.map((l) => ({ week: BigInt(week), agentId: BigInt(l.agentId), payee: getAddress(l.payee), amount: BigInt(l.amount) }));
+    batches.push({ name, batch, data: encodeFunctionData({ abi: ostraTideAbi, functionName: "payMany", args: [shares, batch.map((l) => l.proof), batch.map(() => ZERO)] }) });
+  }
+
+  // Before anything is sent: the owner must hold what this run's transactions can cost, each at its gas limit (the
+  // estimate and a fifth, as step signs it) and the current maximum fee per gas (a step recorded and not mined, at
+  // its own signed limit and fee). A payMany that cannot be estimated yet (its root not set, or a payee still to be
+  // created) is counted at PAY_SHARE_GAS a share.
+  {
+    const { maxFeePerGas } = await client.estimateFeesPerGas({ chain: robinhoodChain, type: "eip1559" });
+    const steps: { name: string; to: Address; data: Hex; estimate: boolean }[] = [];
+    if (!ours) steps.push({ name: rootStep, to: OSTRA_TIDE, data: rootData, estimate: true });
+    if (phase === "pay") {
+      for (const c of creates) {
+        const code = await client.getCode({ address: c.payee });
+        if (code === undefined || code === "0x") steps.push({ name: c.name, to: factory, data: c.data, estimate: true });
+      }
+      const later = new Set(creates.map((c) => c.payee));
+      for (const b of batches) steps.push({ name: b.name, to: OSTRA_TIDE, data: b.data, estimate: ours && !b.batch.some((l) => later.has(getAddress(l.payee))) });
+    }
+    let need = 0n;
+    for (const x of steps) {
+      const raw = kept[`${x.name}:raw`] as Hex | undefined;
+      if (raw !== undefined) {
+        if (await client.getTransactionReceipt({ hash: keccak256(raw) }).then(() => true, () => false)) continue;
+        const t = parseTransaction(raw);
+        need += (t.gas ?? 0n) * (t.maxFeePerGas ?? t.gasPrice ?? 0n);
+        continue;
+      }
+      const shares = batches.find((b) => b.name === x.name)?.batch.length ?? 0;
+      const gas = x.estimate ? await client.estimateGas({ account: owner.address, to: x.to, data: x.data }) : PAY_SHARE_GAS * BigInt(shares);
+      need += (gas + gas / 5n) * maxFeePerGas;
+    }
+    const have = await client.getBalance({ address: owner.address });
+    if (have < need) {
+      throw new Error(`the owner ${owner.address} holds ETH ${formatEther(have)}; this run's ${steps.length} transaction(s) can cost up to ETH ${formatEther(need)}: send it ETH ${formatEther(need - have)} more first; nothing was sent`);
+    }
+  }
+
   if (!ours) {
-    const r = await step(rootStep, { to: OSTRA_TIDE, data: encodeFunctionData({ abi: ostraTideAbi, functionName: "setRoot", args: [BigInt(week), tree.root, BigInt(tree.total)] }) });
+    const r = await step(rootStep, { to: OSTRA_TIDE, data: rootData });
     paidFile.rootTx = r.transactionHash;
     await writePrivate(paidPath, paidFile);
   } else {
@@ -247,22 +350,33 @@ async function main(): Promise<void> {
   }
 
   // --- the shares ------------------------------------------------------------------------------------------------------
-  const unpaid = [];
-  for (const l of tree.leaves) {
-    if (getAddress(l.payee) === ZERO) continue;
-    if ((await tide("paid", [BigInt(week), BigInt(l.agentId)])) as boolean) continue;
-    unpaid.push(l);
+  // The OSTRA vaults of unpaid shares that do not exist yet, each created once (its step named by the vault): a run
+  // again finds the vault there, or sends the very transaction it recorded. Then the vault there must be the payee,
+  // in OSTRA (created by this run or anyone: createVault returns a vault that exists).
+  for (const x of creates) {
+    const code = await client.getCode({ address: x.payee });
+    if (code === undefined || code === "0x") {
+      const r = await step(x.name, { to: factory, data: x.data });
+      for (const log of r.logs) {
+        if (getAddress(log.address) !== factory) continue;
+        let vault: Address | null = null;
+        try {
+          const e = decodeEventLog({ abi: ostraVaultFactoryAbi, data: log.data, topics: log.topics });
+          if (e.eventName === "VaultCreated") vault = getAddress((e.args as { vault: Address }).vault);
+        } catch {
+          // another event of the factory's
+        }
+        if (vault !== null && vault !== x.payee) throw new Error(`the factory created ${vault}, not agent ${x.agentId}'s payee ${x.payee}`);
+      }
+    }
+    const made = await client.getCode({ address: x.payee });
+    if (made === undefined || made === "0x") throw new Error(`agent ${x.agentId}'s payee ${x.payee} has no code after its creation`);
+    const token = getAddress((await client.readContract({ address: x.payee, abi: vaultTokenAbi, functionName: "token" })) as Address);
+    if (token !== OSTRA) throw new Error(`agent ${x.agentId}'s payee ${x.payee} holds ${token}, not OSTRA`);
+    say(`agent ${x.agentId}: its OSTRA vault ${x.payee} exists`);
   }
-  // The steps' names name their shares: a run again forms the same batch of the same unpaid shares, so it finds its
-  // recorded transaction; a batch whose share someone else paid meanwhile is a new batch (payMany skips a paid share).
-  for (let i = 0; i < unpaid.length; i += batchSize) {
-    const batch = unpaid.slice(i, i + batchSize);
-    const name = `pay:${week}:${keccak256(`0x${Buffer.from(batch.map((l) => l.agentId).join(",")).toString("hex")}` as Hex).slice(0, 18)}`;
-    const shares = batch.map((l) => ({ week: BigInt(week), agentId: BigInt(l.agentId), payee: getAddress(l.payee), amount: BigInt(l.amount) }));
-    const r = await step(name, {
-      to: OSTRA_TIDE,
-      data: encodeFunctionData({ abi: ostraTideAbi, functionName: "payMany", args: [shares, batch.map((l) => l.proof), batch.map(() => ZERO)] }),
-    });
+  for (const { name, data } of batches) {
+    const r = await step(name, { to: OSTRA_TIDE, data });
     for (const log of r.logs) {
       if (getAddress(log.address) !== OSTRA_TIDE) continue;
       try {
