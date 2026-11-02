@@ -11,6 +11,25 @@
 //             expired, cancelled, paid and refunded
 //   records   each provider's record and limit as OstraPad holds it (provider(), limitOf)
 //
+// Every listing is shown with its provider vault's own OstraPad record as OstraPad holds it (`record`: provider()
+// and limitOf), public, no proof involved: a provider with a record of its own needs nothing more.
+//
+// Reputation proofs (specified by Edu on 2 Nov 2026, reworked after the stage-3 review; sdk pad-reputation.ts): a
+// listing's Ostrapad entry may carry a proof that it is "backed by an Ostra record meeting these thresholds that backs
+// no other listing this epoch" (not anonymous: the listing names its provider vault; the record backing it may be any
+// Ostra vault's). With OstraReputation in the deployment record, the index reads its parts by their CIDs, rebuilds the
+// proof's public inputs itself (the one listings scope ostrapad:listings:<epoch> of the current epoch, the provider
+// vault as recipient, the listing's own content as challenge) and verifies it with an eth_call to
+// OstraReputation.verify (repVerifyCallGas: under 12,000,000 of execution it reverts InsufficientGas). Verdicts are kept
+// for the epoch by proof, inputs, challenge and recipient (only a valid proof or RepVerifier's rejection: never a
+// refusal such as UnknownRoot, which heals as a lagging node catches up); an answer without a verdict (InsufficientGas,
+// VerifierHalted, a failed read) is never taken or kept as invalid, the view verified before for the same proof
+// staying. The index keeps pseudonym -> listings for the epoch: a pseudonym (one per record and epoch in that scope)
+// backing more than one listing shows its statements for none of them (`reputationWithheld` says why). Only a proof
+// that verifies is kept, with the statements it proves, the size of its root's tree and its anonymity set as the
+// chain's events give them (never the writer's figures). It is served with the listing only during the epoch it was
+// verified in (a proof holds only in its epoch), and is verified again whenever the listing is read again.
+//
 // Ranking (design "Dashboard"): distinct paying clients, then completed jobs, then value completed.
 //
 // The board (the web app's Ostrapad page, design "Dashboard", decided by Edu on 31 Oct 2026): the listed agents and
@@ -43,12 +62,24 @@ import {
   OSTRAPAD,
   OSTRAPAD_FROM_BLOCK,
   PAD_EVENTS,
+  REP_DAY_SECONDS,
   getLogsChunked,
   identityRegistryAbi,
+  ostraReputationAbi,
+  padListingChallenge,
   padListingDigest,
+  padListingEntry,
   padListingFromFile,
+  padListingScope,
+  padReputationFromEntry,
+  padReputationProofFromParts,
   readPadProvider,
+  readRepEpoch,
   readVault,
+  repAnonymitySet,
+  repEntriesAtRoot,
+  repEpochAt,
+  repVerify,
   type Deployment,
   type PadOffer,
   type PadProhibitedId,
@@ -124,7 +155,44 @@ export type PadAgent = {
   providerCreated: { vault: Address; at: number | null } | null;
   /** The content rules' verdict on the listing whose content has `key` (moderation.ts); absent until checked. */
   moderation?: { key: Hex; prohibited: boolean; category: PadProhibitedId | null; reason: string; at: number };
+  /**
+   * The listing's reputation proof, verified on chain when the listing was last read: the listing is backed by an Ostra
+   * record meeting its statements that backs no other listing this epoch. Null (or absent) without one that verifies.
+   */
+  reputation?: PadReputationView | null;
+  /** As served: why a verified proof is not shown (its record backs other listings this epoch). */
+  reputationWithheld?: string;
   readAt: number;
+};
+
+/**
+ * What a verified reputation proof of a listing shows: the listing is backed by an Ostra record meeting these
+ * statements that backs no other listing this epoch (the record of one vault of the root's tree, not necessarily the
+ * provider vault's; the provider vault's own record is the listing's `record`).
+ */
+export type PadReputationView = {
+  epoch: string;
+  contract: Address;
+  /** What it means, in words. */
+  backing: string;
+  /** The Ostra record backing the listing meets all of these. */
+  statements: {
+    completedAtLeast: number;
+    clientsAtLeast: number;
+    volumeAtLeast: string;
+    failPerMilleBelow: number;
+    tierAtLeast: number;
+    /** The vault's first snapshot was on this day of OstraReputation (and the time that day ends) or earlier. */
+    firstSnapshotByDay: number;
+    firstSnapshotBy: number;
+  };
+  /** Leaves of the tree under the proof's root, and how many of their vaults meet the statements (the chain's events). */
+  rootSize: number;
+  anonymitySet: number;
+  pseudonym: Hex;
+  /** sha256 of the proof verified. */
+  proofSha256: Hex;
+  verifiedAt: number;
 };
 
 export type PadIndexState = { version: 3; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow> };
@@ -197,6 +265,24 @@ function text(file: unknown, key: string, max: number): string | null {
 
 const lower = (a: string) => a.toLowerCase();
 
+/**
+ * Whether a verify answer is kept for the epoch: a valid proof, or RepVerifier's genuine rejection (both final for
+ * these exact inputs). Never a refusal of the inputs (UnknownRoot can heal as a lagging node catches up with the
+ * tree; NotCanonical and BadThresholds are cheap to ask again) nor an answer without a verdict (unverifiable).
+ */
+export function cacheableVerdict(a: { valid: boolean; reverted: string | null; unverifiable: string | null }): boolean {
+  if (a.unverifiable !== null) return false;
+  if (a.valid) return true;
+  return a.reverted === null;
+}
+
+/** OstraReputation gave no verdict on a listing's proof (pad.ts #reputation). */
+class RepUnverifiable extends Error {
+  constructor(why: string) {
+    super(`OstraReputation could not verify the listing's proof now: ${why}`);
+  }
+}
+
 export class PadIndexer {
   readonly #client: PublicClient;
   readonly #logs: PublicClient;
@@ -217,6 +303,14 @@ export class PadIndexer {
   #window = WINDOW_START;
   #vaultWindow = WINDOW_START;
   #ostraVault = new Map<Address, boolean>();
+  /** OstraReputation's BASE, once read. */
+  #repBase: bigint | null = null;
+  /** The chain's time as last read (a block's timestamp) and the clock's then: what the epoch now is reckoned from. */
+  #chainTime: { timestamp: bigint; atMs: number } | null = null;
+  /** Reputation proofs read from their parts, by sha256 (the newest few). */
+  #proofs = new Map<Hex, Hex>();
+  /** Verdicts of OstraReputation.verify for the epoch (cacheableVerdict: valid, or RepVerifier's rejection), by proof, inputs, challenge and recipient. */
+  #verdicts = new Map<string, { epoch: string; valid: boolean; reverted: string | null }>();
   #timer: ReturnType<typeof setTimeout> | null = null;
   #running = false;
 
@@ -499,6 +593,7 @@ export class PadIndexer {
       a.offers = [];
       a.problems = ["the identity's owner is not an Ostra vault"];
       a.record = null;
+      a.reputation = null;
       return;
     }
     a.uri = (await this.#client.readContract({ address: ERC8004_IDENTITY_REGISTRY, abi: tokenUriAbi, functionName: "tokenURI", args: [id] })) as string;
@@ -513,6 +608,7 @@ export class PadIndexer {
       a.offers = [];
       a.problems = [];
       a.record = null;
+      a.reputation = null;
       return;
     }
     a.provider = found.listing.provider;
@@ -530,6 +626,109 @@ export class PadIndexer {
     a.record = { completed: r.completed, rejected: r.rejected, expired: r.expired, clients: r.clients, volume: usd(r.volume), bond: usd(r.bond), active: r.active, fixedCompleted: r.fixedCompleted, limit: usd(r.limit) };
     // Read once per provider vault, found or not.
     if (a.providerCreated?.vault !== found.listing.provider) a.providerCreated = { vault: found.listing.provider, at: await this.#vaultCreatedAt(found.listing.provider) };
+    try {
+      a.reputation = await this.#reputation(id, file as Record<string, unknown>, found.listing.provider);
+    } catch (err) {
+      // No verdict (InsufficientGas, VerifierHalted, a failed read): never taken as invalid. The view verified before
+      // stays when the listing still carries that same proof (served only within its epoch); the next read asks again.
+      const d = this.#deployment();
+      const entry = d.reputation === undefined ? null : padListingEntry(file, this.#pad, d.chainId);
+      const now = entry === null || d.reputation === undefined ? null : padReputationFromEntry(entry, d.reputation.address, d.chainId);
+      const prev = a.reputation ?? null;
+      const same = prev !== null && now !== null && prev.pseudonym === now.pseudonym && prev.epoch === now.epoch && prev.proofSha256 === now.proofSha256;
+      if (!same) a.reputation = null;
+      this.#log("pad_reputation_unread", { agentId: a.agentId, reason: (err as Error).message.slice(0, 200), kept: same });
+    }
+  }
+
+  /**
+   * The listing's reputation proof, verified: its parts read by their CIDs, its public inputs rebuilt here (the
+   * listing's scope in the current epoch, its provider vault, its content), an eth_call to OstraReputation.verify;
+   * null without a proof, or with one that does not verify now.
+   */
+  async #reputation(agentId: bigint, file: Record<string, unknown>, provider: Address): Promise<PadReputationView | null> {
+    const d = this.#deployment();
+    const rep = d.reputation;
+    if (rep === undefined) return null;
+    const entry = padListingEntry(file, this.#pad, d.chainId);
+    const r = entry === null ? null : padReputationFromEntry(entry, rep.address, d.chainId);
+    if (r === null) return null;
+    const head = await this.#logs.getBlockNumber({ cacheTime: 0 });
+    const block = await this.#client.getBlock({ blockNumber: head }).catch(() => this.#logs.getBlock({ blockNumber: head }));
+    this.#chainTime = { timestamp: block.timestamp, atMs: this.#nowMs() };
+    this.#repBase ??= (await this.#client.readContract({ address: rep.address, abi: ostraReputationAbi, functionName: "BASE" })) as bigint;
+    const epoch = repEpochAt(this.#repBase, block.timestamp);
+    if (r.parsed.epoch !== epoch) {
+      this.#log("pad_reputation_unverified", { agentId: agentId.toString(), why: `made for epoch ${r.parsed.epoch}, the epoch is ${epoch}` });
+      return null;
+    }
+    let proof = this.#proofs.get(r.proofSha256) ?? null;
+    if (proof === null) {
+      const parts: unknown[] = [];
+      for (const uri of r.proofParts) parts.push(await this.#readFile(uri));
+      proof = padReputationProofFromParts(parts, r.proofSha256);
+      if (proof === null) {
+        this.#log("pad_reputation_unverified", { agentId: agentId.toString(), why: "its parts do not make the proof named" });
+        return null;
+      }
+      this.#proofs.set(r.proofSha256, proof);
+      if (this.#proofs.size > 64) this.#proofs.delete(this.#proofs.keys().next().value as Hex);
+    }
+    const t = r.parsed.thresholds;
+    const challenge = padListingChallenge(file, this.#pad, d.chainId);
+    const key = [r.proofSha256, epoch, challenge, provider.toLowerCase(), r.root, r.pseudonym, JSON.stringify(r.thresholds)].join(":");
+    let v = this.#verdicts.get(key);
+    if (v === undefined) {
+      const answer = await repVerify(this.#client, rep.address, { root: r.root, pseudonym: r.pseudonym, scope: padListingScope(epoch), recipient: provider, challenge, thresholds: t, proof }, head);
+      if (answer.unverifiable !== null) throw new RepUnverifiable(answer.unverifiable);
+      v = { epoch: epoch.toString(), valid: answer.valid, reverted: answer.reverted };
+      if (cacheableVerdict(answer)) {
+        for (const [k, x] of this.#verdicts) if (x.epoch !== v.epoch) this.#verdicts.delete(k);
+        this.#verdicts.set(key, v);
+      }
+    }
+    if (!v.valid) {
+      this.#log("pad_reputation_unverified", { agentId: agentId.toString(), why: v.reverted ?? "OstraReputation does not verify it for this listing" });
+      return null;
+    }
+    const entries = repEntriesAtRoot(await readRepEpoch(this.#client, this.#logs, rep, epoch, head), r.root);
+    return {
+      epoch: epoch.toString(),
+      contract: rep.address,
+      backing: "backed by an Ostra record meeting these statements that backs no other listing this epoch (not necessarily the provider vault's record, which is the listing's record)",
+      statements: {
+        completedAtLeast: t.minCompleted,
+        clientsAtLeast: t.minClients,
+        volumeAtLeast: usd(t.minVolume),
+        failPerMilleBelow: t.maxFailPermille,
+        tierAtLeast: t.minTier,
+        firstSnapshotByDay: t.maxFirstDay,
+        firstSnapshotBy: Number(this.#repBase + (BigInt(t.maxFirstDay) + 1n) * REP_DAY_SECONDS),
+      },
+      rootSize: entries.length,
+      anonymitySet: repAnonymitySet([{ entries, thresholds: t }]).length,
+      pseudonym: r.pseudonym,
+      proofSha256: r.proofSha256,
+      verifiedAt: Math.floor(this.#nowMs() / 1000),
+    };
+  }
+
+  /**
+   * An agent as served: its reputation only while the epoch it was verified in lasts, the epoch reckoned from the
+   * chain's time as last read (its block timestamp, moved on by the clock since).
+   */
+  #served<A extends PadAgent>(a: A): A {
+    const r = a.reputation;
+    if (r === undefined || r === null) return { ...a, reputation: null };
+    const base = this.#repBase;
+    const t = this.#chainTime;
+    if (base === null || t === null) return { ...a, reputation: null };
+    const chainNow = t.timestamp + BigInt(Math.max(0, Math.floor((this.#nowMs() - t.atMs) / 1000)));
+    if (chainNow < base || repEpochAt(base, chainNow).toString() !== r.epoch) return { ...a, reputation: null };
+    // One record backs one listing an epoch: a pseudonym behind several listings shows for none of them.
+    const backed = Object.values(this.#state.agents).filter((x) => x.reputation !== undefined && x.reputation !== null && x.reputation.epoch === r.epoch && x.reputation.pseudonym === r.pseudonym).length;
+    if (backed > 1) return { ...a, reputation: null, reputationWithheld: `the Ostra record behind this listing's reputation proof backs ${backed} listings in epoch ${r.epoch}: a record backs one listing an epoch, so none of them shows it` };
+    return a;
   }
 
   /** The block time of `vault`'s creation by the deployment's factory (VaultCreated, indexed by vault); null if none. */
@@ -570,7 +769,7 @@ export class PadIndexer {
     const ranked = matched.sort((x, y) => (y.record?.clients ?? 0) - (x.record?.clients ?? 0) || (y.record?.completed ?? 0) - (x.record?.completed ?? 0) || Number(y.record?.volume ?? 0) - Number(x.record?.volume ?? 0) || Number(x.agentId) - Number(y.agentId));
     const offset = o.offset ?? 0;
     const limit = o.limit ?? 20;
-    return { total: ranked.length, agents: ranked.slice(offset, offset + limit).map(({ problems: _p, readAt: _r, ...rest }) => rest) };
+    return { total: ranked.length, agents: ranked.slice(offset, offset + limit).map((a) => this.#served(a)).map(({ problems: _p, readAt: _r, ...rest }) => rest) };
   }
 
   /** One agent (listed or not) and its recent jobs as a provider. */
@@ -578,7 +777,7 @@ export class PadIndexer {
     const a = this.#state.agents[agentId];
     if (a === undefined) return null;
     const jobs = a.provider === null ? [] : Object.values(this.#state.jobs).filter((j) => j.provider === a.provider).sort((x, y) => y.createdAt - x.createdAt).slice(0, 50);
-    return { ...a, jobs };
+    return { ...this.#served(a), jobs };
   }
 
   /** Recent jobs, newest first. */

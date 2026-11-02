@@ -11,7 +11,11 @@
 //   GET /api/v1/images/<cid>   an image a token's metadata or a creator's profile names (ipfs://<cid>), as the
 //                              indexer keeps it (ipfs.ts): PNG, JPEG, WebP or GIF, by its first bytes
 //   GET /api/v1/pad/listings?q=&provider=&offset=&limit=   Ostrapad's listed agents, ranked (pad.ts); provider:
-//                                                one provider vault's listings only
+//                                                one provider vault's listings only; each with its provider
+//                                                vault's own `record` (public, no proof), and `reputation`: the
+//                                                statements of the Ostra record backing the listing (one that backs
+//                                                no other listing this epoch), verified on chain, or null
+//                                                (`reputationWithheld` says why when its record backs several)
 //   GET /api/v1/pad/agents/<agentId>             one agent, its listing, record and recent jobs
 //   GET /api/v1/pad/jobs?limit=                  recent jobs
 //   GET /api/v1/pad/stats

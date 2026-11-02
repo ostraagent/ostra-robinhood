@@ -136,6 +136,56 @@ test("OstraBreaker: configure and trip are relayed only on the deployment's brea
   }
 });
 
+test("OstraReputation: a snapshot is relayed only on the relayer's configured OstraReputation", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { encodeFunctionData } = await import("viem");
+  const { ostraReputationAbi, parseDeployment } = await import("@ostraagent/sdk");
+  const { Ledger } = await import("../src/ledger.ts");
+  const { RelayerGate } = await import("../src/gate.ts");
+  const dir = await mkdtemp(join(tmpdir(), "ostra-gate-rep-"));
+  try {
+    const at = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
+    const deployment = parseDeployment({
+      version: 1,
+      chainId: 4663,
+      token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      batchSettlement: "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
+      vaultImplementation: at(1),
+      vaultBeacon: at(2),
+      vaultFactory: at(3),
+      poolImplementation: at(4),
+      poolBeacon: at(5),
+      pool: at(6),
+      splitFactory: at(7),
+      beaconOwner: at(8),
+      fromBlock: "1",
+    });
+    const rep = at(0xce0de);
+    const snapshot = encodeFunctionData({ abi: ostraReputationAbi, functionName: "snapshot", args: [at(0xa1), `0x${"11".repeat(32)}`] });
+    const ask = async (reputation: string | undefined, to: string) => {
+      // The policy decides before anything is read from the chain or paid: nothing else of the gate is reached.
+      const gate = new RelayerGate({ deployment, ledger: await Ledger.open(dir), merchant: { token: deployment.token }, sender: { address: at(0xee) }, ...(reputation === undefined ? {} : { reputation }) } as never);
+      return (await gate.relay({ body: JSON.stringify({ calls: [{ to, data: snapshot }] }), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
+    };
+    for (const [reputation, to] of [[undefined, rep], [rep, at(0xce0df)]] as const) {
+      const r = await ask(reputation, to);
+      assert.equal(r.status, 422);
+      assert.equal(r.body.message, `calls[0]: snapshot on ${to} is not relayed: it is not this relayer's OstraReputation`);
+    }
+    // Its view (verify) and every other function: an unknown call.
+    const z = `0x${"00".repeat(32)}` as const;
+    const verify = encodeFunctionData({ abi: ostraReputationAbi, functionName: "verify", args: [z, z, z, at(0xa1), z, { minCompleted: 0n, minClients: 0n, minVolume: 0n, maxFailPermille: 0n, minTier: 0n, maxFirstDay: 0n }, "0x"] });
+    const gate = new RelayerGate({ deployment, ledger: await Ledger.open(dir), merchant: { token: deployment.token }, sender: { address: at(0xee) }, reputation: rep } as never);
+    const v = (await gate.relay({ body: JSON.stringify({ calls: [{ to: rep, data: verify }] }), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { message: string } };
+    assert.equal(v.status, 422);
+    assert.match(v.body.message, /is not relayed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("sendGasCap: the margin on the priced gas, or on the limit a refund needs when larger, up to 1.3 times the priced gas; escrows keep their priced cap", () => {
   const q = (gas: number, limit?: number) => ({ gas: String(gas), ...(limit === undefined ? {} : { limit: String(limit) }) });
   assert.equal(sendGasCap(q(100_000), false), relayGasCap(100_000n));

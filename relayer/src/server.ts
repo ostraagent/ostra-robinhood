@@ -125,6 +125,8 @@ async function main(): Promise<void> {
     ...(sc === null ? {} : { swap: { router: sc.router, ...(privateRelay === undefined ? {} : { private: privateRelay }) } }),
     // OstraPad on Robinhood Chain (Ostrapad, decided 27 Oct 2026): its calls are relayed under the gate's rules.
     ...(d.chainId === ROBINHOOD_CHAIN_ID ? { pad: OSTRAPAD } : {}),
+    // OstraReputation (reputation proofs), once the deployment record has it: its snapshots are relayed under the gate's rules.
+    ...(d.reputation === undefined ? {} : { reputation: d.reputation.address }),
     log,
   });
   const facts = { ...gate.facts(), merchant: keys.merchant, crank: merchant.crank, facilitator: keys.facilitator.address };

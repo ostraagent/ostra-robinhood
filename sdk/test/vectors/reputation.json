@@ -1,0 +1,285 @@
+{
+ "source": "OstraReputation (ostra-swap out/OstraReputation.sol, Foundry build) on a local anvil with chain id 4663, read by eth_call; records, leaves, scopes and public values from ostra-swap privacy/contracts/test/RepVectors.sol (privacy/tools rep.rs, checked against Reputation.sol by RepTest.t.sol). Written by sdk/scripts/reputation-vectors.ts.",
+ "chainId": 4663,
+ "reputation": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+ "snapshotDomain": "0x8fb161752a4136b244144fc0972666c00a9e75ec7872ec09a66c25d2509db241",
+ "base": "1793580222",
+ "epochs": [
+  {
+   "timestamp": "1795394621",
+   "epoch": "2"
+  },
+  {
+   "timestamp": "1795394622",
+   "epoch": "3"
+  }
+ ],
+ "digests": [
+  {
+   "vault": "0xb63673010Ab32eCd07A06ED5B7634d2306b7e069",
+   "idc": "0x5dd62f804ac40faf235e92e24e5a0bff585c64db555464e619a2a3837eded8a5",
+   "nonce": "0",
+   "epoch": "0",
+   "digest": "0x064344bf3b1cb18db9487387b3fc8119e2f8eaa3b1b3326f6a56df93df41833c"
+  },
+  {
+   "vault": "0x0A42C8254ABEaC3e36B3dACBa085520E46E9EcD1",
+   "idc": "0x39e0872a343298e40b676d8f5a57eb5026f3f4653a3b05b10b136e8b1548c8dd",
+   "nonce": "7",
+   "epoch": "3",
+   "digest": "0xf6eab524399a5ac113627ff4faaca1950d867c9208d5393ca8ee87ef810715fd"
+  },
+  {
+   "vault": "0x00000000000000000000000000000000000000A1",
+   "idc": "0x5c934cf90e6a4fac5aa51e886a107d7e47157e0b498d6a0f33a6555b2430a5a9",
+   "nonce": "18446744073709551621",
+   "epoch": "1073741823",
+   "digest": "0xf7cc31b3ed4437777b7338a09991b66f0e99449358564ff982b8a09032085005"
+  }
+ ],
+ "tiers": [
+  {
+   "completed": 0,
+   "clients": 0,
+   "volume": "0",
+   "rejected": 0,
+   "expired": 0,
+   "tier": 0
+  },
+  {
+   "completed": 10,
+   "clients": 5,
+   "volume": "100000000",
+   "rejected": 2,
+   "expired": 0,
+   "tier": 1
+  },
+  {
+   "completed": 10,
+   "clients": 5,
+   "volume": "100000000",
+   "rejected": 3,
+   "expired": 0,
+   "tier": 0
+  },
+  {
+   "completed": 9,
+   "clients": 5,
+   "volume": "100000000",
+   "rejected": 0,
+   "expired": 0,
+   "tier": 0
+  },
+  {
+   "completed": 10,
+   "clients": 4,
+   "volume": "100000000",
+   "rejected": 0,
+   "expired": 0,
+   "tier": 0
+  },
+  {
+   "completed": 10,
+   "clients": 5,
+   "volume": "99999999",
+   "rejected": 0,
+   "expired": 0,
+   "tier": 0
+  },
+  {
+   "completed": 50,
+   "clients": 20,
+   "volume": "1000000000",
+   "rejected": 5,
+   "expired": 9,
+   "tier": 2
+  },
+  {
+   "completed": 50,
+   "clients": 20,
+   "volume": "1000000000",
+   "rejected": 6,
+   "expired": 0,
+   "tier": 1
+  },
+  {
+   "completed": 200,
+   "clients": 50,
+   "volume": "10000000000",
+   "rejected": 10,
+   "expired": 0,
+   "tier": 3
+  },
+  {
+   "completed": 200,
+   "clients": 50,
+   "volume": "10000000000",
+   "rejected": 11,
+   "expired": 0,
+   "tier": 2
+  },
+  {
+   "completed": 4000000000,
+   "clients": 4000000000,
+   "volume": "340282366920938463463374607431768211455",
+   "rejected": 0,
+   "expired": 65535,
+   "tier": 3
+  }
+ ],
+ "bind": {
+  "scope": "0xce75a623472e4e94be4076c9bf0255782d4f926b412990676ddc96a03d074a7d",
+  "recipient": "0x7193B6d5Cfd29b80686Cdb3a7a6Bb255Bf37B29A",
+  "challenge": "0x0d33ddb9d4b2b7d7265d76ae14157a8b2ab70e06cfec88a24df5d39f27d0ea38",
+  "contract": "0x06b2a2e9f9350856e16e42ed2c380626db9dbcebed7826866203dcc2dd4c8915",
+  "vectors": "0x06b2a2e9f9350856e16e42ed2c380626db9dbcebed7826866203dcc2dd4c8915"
+ },
+ "records": [
+  {
+   "fields": [
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0"
+   ],
+   "idc": "0x5dd62f804ac40faf235e92e24e5a0bff585c64db555464e619a2a3837eded8a5",
+   "record": "0x3cc0e0f24fddb40b563fd02a78ccee7f15e8b0a921c7a5e71ea100cf33003777",
+   "leaf": "0x4ce5b6512b6afd1f3a037b25469eacf56209bdb43f29bbc6730ff56138e99de4"
+  },
+  {
+   "fields": [
+    "524287",
+    "524287",
+    "340282366920938463463374607431768211455",
+    "65535",
+    "65535",
+    "3",
+    "536870911",
+    "1073741823"
+   ],
+   "idc": "0x39e0872a343298e40b676d8f5a57eb5026f3f4653a3b05b10b136e8b1548c8dd",
+   "record": "0x5c4d71f616f951b7555962d428f0d24853ae79d970cef12d5e11839a00bac2a2",
+   "leaf": "0x746ba6aa646fac86263ba4e82295a7fd5922beeb4f875e5c16636a0d688fab8d"
+  },
+  {
+   "fields": [
+    "212",
+    "57",
+    "12345678901",
+    "4",
+    "2",
+    "2",
+    "31",
+    "6"
+   ],
+   "idc": "0x5c934cf90e6a4fac5aa51e886a107d7e47157e0b498d6a0f33a6555b2430a5a9",
+   "record": "0x62629fb42ef727554ecaad5961e8972105504cd02494171058a5b1045e2430af",
+   "leaf": "0x23996e1b192bbc4e3524da882778735a505f8acc5fc2a8d57899077264336bd5"
+  }
+ ],
+ "scopes": [
+  {
+   "scope": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "elements": [
+    "542327632",
+    "250864995",
+    "415124568",
+    "67145571",
+    "699344210",
+    "946849867",
+    "219588128",
+    "908758368"
+   ]
+  },
+  {
+   "scope": "0x69fca2e0bf3a3e89d3a41b84eb95ad12f09d66a9b6f68920bce2bf97919ddb82",
+   "elements": [
+    "542327632",
+    "272009173",
+    "422750577",
+    "873631687",
+    "956441829",
+    "240740672",
+    "270775497",
+    "386880214"
+   ]
+  },
+  {
+   "scope": "0x1a28e104c6d2c045b81935cf5cca5f7fad2f77339ffee00f243589299c41c457",
+   "elements": [
+    "542327632",
+    "812797317",
+    "167181021",
+    "954301432",
+    "767006776",
+    "392968507",
+    "1003516046",
+    "534602294"
+   ]
+  }
+ ],
+ "publicValues": {
+  "root": "0x2f381ef124b37b8875306f685e6a67db133994426148b2bd277ccc627c4d2240",
+  "pseudonym": "0x7089daaf64cacd7c4e4793cc62a7bd2a336faec6198c1ba414adc9b67b9ed7f8",
+  "scope": "0xce75a623472e4e94be4076c9bf0255782d4f926b412990676ddc96a03d074a7d",
+  "bindHash": "0x06b2a2e9f9350856e16e42ed2c380626db9dbcebed7826866203dcc2dd4c8915",
+  "epoch": "6",
+  "thresholds": [
+   "200",
+   "50",
+   "10000000000",
+   "50",
+   "2",
+   "40"
+  ],
+  "values": [
+   "2085429824",
+   "662490210",
+   "1632154301",
+   "322540610",
+   "1584031707",
+   "1966108520",
+   "615742344",
+   "792207089",
+   "2074007544",
+   "346933686",
+   "428612516",
+   "862957254",
+   "1655160106",
+   "1313313740",
+   "1691012476",
+   "1888082607",
+   "542327632",
+   "1064108677",
+   "793848027",
+   "487277322",
+   "583567289",
+   "780546321",
+   "870696024",
+   "1020363491",
+   "491555093",
+   "570678466",
+   "762848902",
+   "463322347",
+   "741869094",
+   "560874221",
+   "959776854",
+   "112370409",
+   "6",
+   "200",
+   "50",
+   "779264",
+   "149",
+   "0",
+   "0",
+   "0",
+   "50",
+   "2",
+   "40"
+  ]
+ }
+}

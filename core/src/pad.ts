@@ -119,6 +119,11 @@ export type PadParts = {
   publishShortfall?: () => Promise<string | null>;
   /** Pins a JSON file through the Ostra uploader; its ipfs:// URI. */
   upload: (file: Record<string, unknown>) => Promise<string>;
+  /**
+   * The reputation proof of a listing (core reputation.ts listingProof): the `reputation` field of the Ostrapad entry
+   * of `file`, proven for agent `agentId` with `thresholds`; absent where OstraReputation is not wired.
+   */
+  listingProof?: (a: { agentId: bigint; file: Record<string, unknown>; thresholds: Record<string, unknown> }) => Promise<Record<string, unknown>>;
   /** Ostra's Ostrapad index (GET <indexerUrl>/api/v1/pad/listings), for search; null: search is not available. */
   indexerUrl: string | null;
   /** Reads an ipfs:// URI's bytes (default: the IPFS gateways in order, ipfs.ts, at most PAD_READ_MAX_BYTES); null when it cannot. */
@@ -425,8 +430,14 @@ export class PadService {
     };
   }
 
-  /** Lists the agent's offers (or, with no offers, removes its listing): its registration file is published again. */
-  publish(offers: unknown[] | null): Promise<Record<string, unknown>> {
+  /**
+   * Lists the agent's offers (or, with no offers, removes its listing): its registration file is published again.
+   * With `reputation` (thresholds), the listing carries a reputation proof made for this very listing (the one
+   * listings scope of the epoch, its provider vault, its content): "backed by an Ostra record meeting these thresholds
+   * that backs no other listing this epoch" (not anonymous; the provider vault's own record is public anyway), which
+   * Ostra's index verifies on chain.
+   */
+  publish(offers: unknown[] | null, reputation?: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.#serial(async () => {
       const { agentId, creatorVault } = await this.#p.identity();
       if (agentId === null) throw new Error("this agent is not registered in ERC-8004 yet: publish_profile registers it; nothing was signed");
@@ -435,8 +446,16 @@ export class PadService {
       if (current === null) throw new Error("this agent has no published profile yet: publish_profile first; nothing was signed");
       const services = (Array.isArray(current.services) ? current.services : []).filter((s) => !(typeof s === "object" && s !== null && (s as { name?: unknown }).name === PAD_SERVICE_NAME));
       let approval: string | null = null;
+      let proven: Record<string, unknown> | null = null;
+      if (reputation !== undefined && offers === null) throw new RangeError("a reputation proof goes with a listing's offers; nothing was signed");
+      if (reputation !== undefined && this.#p.listingProof === undefined) throw new Error("reputation proofs are not available here (OstraReputation is not deployed on this chain, or no prover); nothing was signed");
       if (offers !== null) {
         const entry = padServiceEntry({ provider: vault, offers: offers as PadOffer[] }, this.#pad, this.#p.config.chainId);
+        // Proven before any approval: a statement that cannot be proven signs nothing.
+        if (reputation !== undefined && this.#p.listingProof !== undefined) {
+          proven = await this.#p.listingProof({ agentId, file: { ...current, services: [...services, entry] }, thresholds: reputation });
+          entry.reputation = proven;
+        }
         const digest = padListingDigest(agentId, creatorVault, this.#pad, this.#p.config.chainId);
         if (!(await this.#approved(vault, digest))) {
           // The approval goes first, from the USDG vault; the creator vault then publishes the file. Checked before the
@@ -448,7 +467,7 @@ export class PadService {
         services.push(entry);
       }
       const out = await this.#p.publishFile({ ...current, services });
-      return { agentId: agentId.toString(), provider: vault, listed: offers !== null, listingApproval: approval, ...out };
+      return { agentId: agentId.toString(), provider: vault, listed: offers !== null, listingApproval: approval, ...(proven === null ? {} : { reputation: { epoch: proven.epoch, thresholds: proven.thresholds, anonymitySet: proven.anonymitySet, proofParts: (proven.proofParts as unknown[]).length, note: "the listing is backed by an Ostra record meeting these thresholds that backs no other listing this epoch (not anonymous: the listing names its provider vault, whose own record clients see anyway); Ostra's index verifies it on chain and shows its statements during this epoch while that record backs this listing alone: publish again with reputation in the next epoch" } }), ...out };
     });
   }
 

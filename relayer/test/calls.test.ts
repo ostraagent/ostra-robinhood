@@ -246,3 +246,18 @@ test("onCredit: one vault spend alone is a spend on credit of its vault; an open
   // Without onCredit the same spend is an ordinary request.
   assert.deepEqual(classify(decodeRelayRequest({ calls: [transfer] }), d, relayerVault), { kind: "other", vaults: [vault] });
 });
+
+test("OstraReputation.snapshot is read with its vault and idc; its other functions are unknown calls; it acts for no vault", async () => {
+  const { ostraReputationAbi } = await import("@ostraagent/sdk");
+  const rep = getAddress("0x00000000000000000000000000000000000ce0de");
+  const vault = getAddress("0x00000000000000000000000000000000000000a1");
+  const idc = `0x${"1A".repeat(32)}` as Hex;
+  const s = parseCall({ to: rep, data: encodeFunctionData({ abi: ostraReputationAbi, functionName: "snapshot", args: [vault, idc] }) });
+  assert.deepEqual(s, { fn: "repSnapshot", to: rep, vault, idc: idc.toLowerCase() });
+  // verify is a view: never relayed.
+  const z = `0x${"00".repeat(32)}` as Hex;
+  const verify = encodeFunctionData({ abi: ostraReputationAbi, functionName: "verify", args: [z, z, z, vault, z, { minCompleted: 0n, minClients: 0n, minVolume: 0n, maxFailPermille: 0n, minTier: 0n, maxFirstDay: 0n }, "0x"] });
+  assert.equal(parseCall({ to: rep, data: verify }).fn, null);
+  const tx = decodeRelayRequest({ calls: [{ to: rep, data: encodeFunctionData({ abi: ostraReputationAbi, functionName: "snapshot", args: [vault, idc] }) }] });
+  assert.deepEqual(classify(tx, d, at(0xee)), { kind: "other", vaults: [] });
+});

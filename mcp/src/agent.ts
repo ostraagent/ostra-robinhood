@@ -40,6 +40,7 @@ import {
   PrivateBalanceService,
   RaetoService,
   RelayerClient,
+  ReputationService,
   SWAP_DIR,
   StrategyService,
   SwapService,
@@ -50,10 +51,12 @@ import {
   SignatureEscrowClient,
   UnshieldService,
   VaultService,
+  repProverOf,
   uploadJson,
   type Keys,
   type PrivateVaultContext,
   type Sender,
+  type ThresholdsInput,
 } from "@ostraagent/core";
 import { privateKeyToAccount } from "viem/accounts";
 import type { McpConfig } from "./config.ts";
@@ -138,6 +141,8 @@ export class Agent {
   readonly pad: PadService | null;
   /** Ostra Tide: the agent's vault link for the score and its own points (null without the launchpad's identity tools). */
   readonly tide: TideService | null;
+  /** Reputation proofs of the USDG vault's OstraPad record (OstraReputation; its tools say when it is not deployed). */
+  readonly reputation: ReputationService;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -189,6 +194,8 @@ export class Agent {
     });
     this.breaker = new BreakerService({ client, config, buyer: this.buyer, borro: this.borro, sender: this.sender, folder: keys.folder.folder("breaker") });
     this.raeto = config.raetoUrl === null ? null : new RaetoService({ client, buyer: this.buyer, borro: this.borro, folder: keys.folder.folder("raeto"), apiUrl: config.raetoUrl });
+    // One prover for the private notes and the reputation proofs (the WebAssembly build is loaded once).
+    const prover = proverOf(config.prover);
     if (config.swap === null) {
       this.swap = null;
       this.privateBalance = null;
@@ -203,7 +210,7 @@ export class Agent {
         config,
         swap: config.swap,
         keys,
-        prover: proverOf(config.prover),
+        prover,
         vaultFor,
         sender: this.sender,
         folder: keys.folder.folder(PRIVATE_SWAP_DIR),
@@ -242,6 +249,17 @@ export class Agent {
       breaker: this.breaker,
       trading: this.trading,
     });
+    // Reputation proofs: the USDG vault is the provider vault whose record is proven; the secret is kept in OSTRA_HOME.
+    // OSTRA_LOGS_RPC_URL serves the epoch trees' event searches.
+    this.reputation = new ReputationService({ client, logsClient: strategyLogs, config, buyer: this.buyer, sender: this.sender, folder: keys.folder, prover: prover === null ? null : repProverOf(prover) });
+    const reputation = this.reputation;
+    const listingProof =
+      config.deployment.reputation === undefined || prover === null
+        ? undefined
+        : (a: { agentId: bigint; file: Record<string, unknown>; thresholds: Record<string, unknown> }) =>
+            reputation.listingProof({ agentId: a.agentId, file: a.file, thresholds: a.thresholds as ThresholdsInput, upload: (f) => uploadJson(config.relayerUrl, f) }).then((r) => r.entry as unknown as Record<string, unknown>);
+    // publish_profile carries a listing's reputation proof into the new file (made again for it).
+    if (listingProof !== undefined) this.launchpad?.attachListingProof(listingProof);
     // Ostrapad: the agent's identity (creator vault, ERC-8004 id and registration file) comes from the launchpad service's
     // identity tool (publish_profile), which stays with the launchpad closed.
     const lp = this.launchpad;
@@ -267,6 +285,7 @@ export class Agent {
             publishShortfall: () => lp.publishShortfall(),
             upload: (file) => uploadJson(config.relayerUrl, file),
             indexerUrl: config.padIndexerUrl,
+            ...(listingProof === undefined ? {} : { listingProof }),
           });
     // Ostra Tide: the identity is Ostrapad's (the creator vault and its ERC-8004 id); the vaults linked are every
     // vault of this seed but the private ones (ownVaults' list without them).

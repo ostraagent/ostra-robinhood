@@ -122,6 +122,7 @@ import { agentCardUri, profileFile, uploadJson, uploaderUrl } from "./publish.ts
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
 import { randomBytes } from "./random.ts";
+import { carryListingReputation, type CarriedReputation } from "./reputation.ts";
 import { RelayerClient, VAULT_SPEND_GAS, type Sender } from "./relay.ts";
 import type { Folder } from "./storage.ts";
 import { spendCall, VaultService, type VaultOperationResult } from "./vault.ts";
@@ -287,6 +288,13 @@ export class LaunchpadService {
   readonly #tokenVaults = new Map<Address, VaultService>();
   /** A pair's creator vault (not USDG's), one per token: created once, so its operations share one queue. */
   readonly #pairCreators = new Map<Address, Promise<VaultService>>();
+  /** Makes a listing's reputation proof for a registration file (core reputation.ts listingProof); null: none here. */
+  #listingProof: ((a: { agentId: bigint; file: Record<string, unknown>; thresholds: Record<string, unknown> }) => Promise<Record<string, unknown>>) | null = null;
+
+  /** The reputation proofs of listings, so that publish_profile carries a listing's proof into the new file. */
+  attachListingProof(f: (a: { agentId: bigint; file: Record<string, unknown>; thresholds: Record<string, unknown> }) => Promise<Record<string, unknown>>): void {
+    this.#listingProof = f;
+  }
 
   constructor(p: LaunchpadParts) {
     if (p.creator.kind !== "creator" || p.buyer.kind !== "buyer") throw new Error("the launchpad takes the agent's buyer and creator vaults");
@@ -1264,6 +1272,8 @@ export class LaunchpadService {
     unnumbered: { uri: string; profile: VaultOperationResult } | null;
     agentUri: VaultOperationResult | null;
     pairCreators: { pair: string; vault: Address; result?: VaultOperationResult; error?: string }[];
+    /** What became of the listing's reputation proof (absent when the listing carries none). */
+    listingReputation?: CarriedReputation;
   }> {
     const before = (await this.#agentRecord()) ?? (await this.#recoverAgentRecord());
     if (before !== null) return { agentId: before.agentId, registration: null, unnumbered: null, ...(await this.#publishProfileFile(before)) };
@@ -1297,11 +1307,12 @@ export class LaunchpadService {
     profile: VaultOperationResult;
     agentUri: VaultOperationResult | null;
     pairCreators: { pair: string; vault: Address; result?: VaultOperationResult; error?: string }[];
+    listingReputation?: CarriedReputation;
   }> {
     const vault = await this.#identityVault();
     const agentId = record?.agentId ?? null;
     uploaderUrl(this.#config.relayerUrl); // no uploader: refused here, before anything is read
-    const file = profileFile({ vault, agentId, image: await agentCardUri(this.#config.relayerUrl, agentId) });
+    let file = profileFile({ vault, agentId, image: await agentCardUri(this.#config.relayerUrl, agentId) });
     // An Ostrapad listing in the profile published before is kept: pad_publish is what changes it. A profile published
     // before that cannot be read now is not replaced (its listing would be dropped without a word).
     const beforeUri = await this.#profileUri(vault);
@@ -1310,6 +1321,11 @@ export class LaunchpadService {
     const services = before !== null && typeof before === "object" ? (before as { services?: unknown }).services : undefined;
     const listings = Array.isArray(services) ? services.filter((s) => typeof s === "object" && s !== null && (s as { name?: unknown }).name === PAD_SERVICE_NAME) : [];
     if (listings.length > 0) (file.services as unknown[]).push(...listings);
+    // A reputation proof in the listing is bound to the file's content: made again for the new file when it still
+    // holds, else the file goes without it, and the answer says which.
+    const carried = await carryListingReputation({ file, agentId: agentId === null ? null : BigInt(agentId), config: this.#config, client: this.#client, prove: this.#listingProof });
+    file = carried.file;
+    const listingReputation = carried.reputation.status === "none" ? {} : { listingReputation: carried.reputation };
     const uri = await uploadJson(this.#config.relayerUrl, file);
     const profile = await this.setProfile(uri);
     // A token's page shows the profile of its pool's creator vault: the creator vaults of the other pairs this agent
@@ -1328,8 +1344,8 @@ export class LaunchpadService {
         }
       }
     }
-    if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null, pairCreators };
-    return { uri, profile, agentUri: await this.setAgentUri(uri), pairCreators };
+    if (profile.status !== "sent" || record === null) return { uri, profile, agentUri: null, pairCreators, ...listingReputation };
+    return { uri, profile, agentUri: await this.setAgentUri(uri), pairCreators, ...listingReputation };
   }
 
   /**

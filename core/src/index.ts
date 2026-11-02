@@ -24,6 +24,7 @@ export * from "./pools.ts";
 export * from "./private-balance.ts";
 export * from "./random.ts";
 export * from "./relay.ts";
+export * from "./reputation.ts";
 export * from "./seed-backup.ts";
 export * from "./sessions.ts";
 export * from "./shield.ts";

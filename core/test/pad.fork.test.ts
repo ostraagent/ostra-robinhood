@@ -22,7 +22,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { decodeEventLog, encodeFunctionData, getAddress, keccak256, sha256, stringToHex, type Address, type Hex, type PublicClient } from "viem";
+import { createWalletClient, decodeEventLog, encodeFunctionData, http, getAddress, keccak256, sha256, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   FileWotsStore,
@@ -38,7 +38,9 @@ import {
   padDigest,
   padProviderPay,
   readPadJob,
+  readPadEvaluator,
   readPadProvider,
+  robinhoodChain,
   registerAgentParams,
   retryingHttp,
   setAgentUriParams,
@@ -47,7 +49,7 @@ import {
   usdgAbi,
   type Deployment,
 } from "@ostraagent/sdk";
-import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { deployOnFork, rpc, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { Keys, LocalSender, PadService, VaultService, X402_NETWORK, profileFile, spendCall, type Config } from "../src/index.ts";
 import { MemoryFolder } from "./memory-folder.ts";
 
@@ -257,11 +259,25 @@ test("a pool-judged order: secrets revealed and the evaluator drawn by the sweep
   const drew = await client.pad.sweep();
   assert.ok(drew.sent.some((s) => s.call === "draw"), JSON.stringify(drew));
   job = await readPadJob(c, id);
-  const drawn = evaluators.find((e) => getAddress(e.address) === getAddress(job?.evaluator as Address));
-  assert.notEqual(drawn, undefined, "one of the pool's evaluators is drawn");
+  // The draw is OstraPad's own over its whole live pool: one of the five joined here, or a member that was in the pool
+  // before (Ostra's bootstrap evaluators). Either way a pool member, neither party; a live member is impersonated on
+  // the fork to decide (its key is not this test's).
+  const drawnAddress = getAddress(job?.evaluator as Address);
+  assert.ok(drawnAddress !== getAddress(client.vault) && drawnAddress !== getAddress(provider.vault), "the evaluator is neither party");
+  assert.equal((await readPadEvaluator(c, drawnAddress)).inPool, true, "a member of the pool is drawn");
+  const drawn = evaluators.find((e) => getAddress(e.address) === drawnAddress);
+  console.log(`drawn: ${drawn === undefined ? "a member already in the live pool" : "an evaluator joined here"}`);
   await provider.pad.deliver({ jobId: id, output: "A short report." });
-  const ew = fork.wallet(drawn as never);
-  await c.waitForTransactionReceipt({ hash: await ew.sendTransaction({ account: drawn as never, chain: null, to: OSTRAPAD, data: encodeFunctionData({ abi: ostraPadAbi, functionName: "decide", args: [id, true, `0x${"00".repeat(32)}`] }) }) });
+  const decide = encodeFunctionData({ abi: ostraPadAbi, functionName: "decide", args: [id, true, `0x${"00".repeat(32)}`] });
+  if (drawn !== undefined) {
+    await c.waitForTransactionReceipt({ hash: await fork.wallet(drawn).sendTransaction({ account: drawn, chain: null, to: OSTRAPAD, data: decide }) });
+  } else {
+    await rpc(fork.url, "anvil_impersonateAccount", [drawnAddress]);
+    await fork.setBalance(drawnAddress, 10n ** 18n);
+    const iw = createWalletClient({ chain: robinhoodChain, transport: http(fork.url) });
+    await c.waitForTransactionReceipt({ hash: await iw.sendTransaction({ account: drawnAddress, chain: null, to: OSTRAPAD, data: decide }) });
+    await rpc(fork.url, "anvil_stopImpersonatingAccount", [drawnAddress]);
+  }
   assert.equal((await readPadJob(c, id))?.status, "Decided");
   // Not settled before the appeal window closes; settled by the sweep after it.
   const early = await provider.pad.sweep();

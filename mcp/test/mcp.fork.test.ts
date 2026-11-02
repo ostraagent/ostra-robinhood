@@ -142,7 +142,7 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
   const client = await connect(home);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings", "tide"]) {
+    for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings", "tide", "reputation_snapshot", "reputation_prove", "reputation_verify"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
     // The launchpad is closed (decided 26 Oct 2026): no launching, buying or promoting a launch. Every Ostra agent's
@@ -195,6 +195,13 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
     assert.ok(!noIndex.ok && /OSTRA_PAD_INDEXER_URL/.test(noIndex.text), noIndex.text);
     const noOrder = await call(client, "pad_order", { action: "order", agentId: "20025", offer: "report", input: "x" });
     assert.ok(!noOrder.ok && /no Ostrapad listing/.test(noOrder.text), noOrder.text);
+    // Reputation proofs on a deployment without OstraReputation: said plainly, nothing signed.
+    const repStatus = await call(client, "reputation_snapshot", { action: "status" });
+    assert.ok(repStatus.ok && repStatus.json.deployed === false, repStatus.text);
+    const noRep = await call(client, "reputation_snapshot");
+    assert.ok(!noRep.ok && /OstraReputation is not deployed on this chain yet/.test(noRep.text), noRep.text);
+    const noRepProof = await call(client, "reputation_prove", { scope: "ostra:test", recipient: fork.accounts[3]!.address, challenge: `0x${"11".repeat(32)}` });
+    assert.ok(!noRepProof.ok && /not deployed/.test(noRepProof.text), noRepProof.text);
     const jobs = await call(client, "pad_jobs");
     assert.ok(jobs.ok && Array.isArray(jobs.json.jobs) && (jobs.json.jobs as unknown[]).length === 0, jobs.text);
     const earnings = await call(client, "pad_earnings");

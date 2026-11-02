@@ -30,7 +30,12 @@ export type Deployment = {
   breaker?: Address;
   /** The launchpad (deployLaunchpad), when it is deployed. */
   launchpad?: LaunchpadDeployment;
+  /** OstraReputation (ostra-swap src/OstraReputation.sol, reputation.ts); absent until it is deployed. */
+  reputation?: ReputationDeployment;
 };
+
+/** Where OstraReputation is: its address and the block it was deployed in (its Snapshot and Recorded logs start there). */
+export type ReputationDeployment = { address: Address; fromBlock: string };
 
 /** Where the Ostra launchpad's contracts are (src/launchpad/). */
 export type LaunchpadDeployment = {
@@ -106,7 +111,20 @@ export function parseDeployment(value: unknown): Deployment {
     }
     out.launchpad = launchpad;
   }
+  if (v.reputation !== undefined) {
+    if (typeof v.reputation !== "object" || v.reputation === null) throw new Error("deployment reputation must be an object");
+    const r = v.reputation as Record<string, unknown>;
+    if (typeof r.address !== "string" || !isAddress(r.address, { strict: false })) throw new Error("deployment reputation.address is not an address");
+    if (typeof r.fromBlock !== "string" || !/^(0|[1-9][0-9]*)$/.test(r.fromBlock)) throw new Error("deployment reputation.fromBlock must be a block number");
+    out.reputation = { address: getAddress(r.address), fromBlock: r.fromBlock };
+  }
   return out as Deployment;
+}
+
+/** The OstraReputation of `d`; throws when the deployment has none (it is not deployed on that chain yet). */
+export function reputationOf(d: Deployment): ReputationDeployment {
+  if (d.reputation === undefined) throw new Error("OstraReputation is not deployed on this chain yet (the deployment record has no reputation): reputation proofs are not available here; nothing was signed");
+  return d.reputation;
 }
 
 /** The launchpad of `d`; throws when the deployment has none. */

@@ -26,5 +26,9 @@
     "airdrop": "0xBC798D956aF4c2B104FFC6106d5322294Bc103bb",
     "owner": "0x6569E27A95a6A3E92A311B4Cc6600fed56aA50A2"
   },
-  "breaker": "0x2E33244dE6A64007204f763e9ef81FC33F1a8e01"
+  "breaker": "0x2E33244dE6A64007204f763e9ef81FC33F1a8e01",
+  "reputation": {
+    "address": "0xFBe507eCEa16ca64eDf2CB60bad1084DdA804294",
+    "fromBlock": "103949539"
+  }
 }

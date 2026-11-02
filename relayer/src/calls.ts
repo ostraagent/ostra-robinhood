@@ -28,6 +28,10 @@
 //                 Oct 2026): every function that changes state; a role acts
 //                 by its vault's EIP-1271 approval of the action's digest
 //                 (an ApproveHash spend in the same request, or earlier)
+//   OstraReputation.snapshot(vault, idc) (reputation proofs, specified on 2 Nov
+//                 2026): a vault's snapshot, which its EIP-1271 approval of
+//                 the snapshot digest authorizes (an ApproveHash spend in the
+//                 same request, or earlier)
 //
 // and of Ostra Swap (ostra-swap src/*.sol, decided 21 Oct 2026):
 //
@@ -59,6 +63,7 @@ import {
   ostraDispatcherAbi,
   ostraPadAbi,
   ostraPoolAbi,
+  ostraReputationAbi,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
   ostraVestingAbi,
@@ -106,6 +111,8 @@ export type ParsedCall =
   | { fn: "shieldFromEscrow"; to: Address; token: Address; tag: Hex }
   /** OstraPad: `name` is the function, `args` its decoded arguments (gate.ts reads the roles they name). */
   | { fn: "pad"; to: Address; name: string; args: readonly unknown[] }
+  /** OstraReputation.snapshot: the vault whose record it appends, and its identity commitment. */
+  | { fn: "repSnapshot"; to: Address; vault: Address; idc: Hex }
   | { fn: null; to: Address; selector: Hex };
 
 export type RelayTx = {
@@ -133,6 +140,7 @@ for (const [abi, names] of [
   [ostraRouterAbi, [["executeEscrow", "executeEscrow"], ["announce", "announce"], ["closeEscrow", "closeEscrow"]]],
   [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"], ["shieldFromEscrow", "shieldFromEscrow"]]],
   [ostraPadAbi, PAD_RELAYED_FUNCTIONS.map((n) => [n, "pad"] as const)],
+  [ostraReputationAbi, [["snapshot", "repSnapshot"]]],
 ] as const) {
   for (const [name, as] of names) {
     const item = (abi as readonly { type: string; name?: string }[]).find((x) => x.type === "function" && x.name === name);
@@ -171,6 +179,8 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
   switch (known.as) {
     case "pad":
       return { fn: "pad", to, name: decoded.functionName, args: a };
+    case "repSnapshot":
+      return { fn: "repSnapshot", to, vault: getAddress(a[0] as Address), idc: (a[1] as Hex).toLowerCase() as Hex };
     case "launchFromVault": {
       const launch = a[0] as LaunchParams;
       return { fn: "launchFromVault", to, launch, dev: a[1] as DevBuyTerms, nextKeyRoot: a[2] as Hex, signature: a[3] as Hex, vault: getAddress(launch.creatorVault) };

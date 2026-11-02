@@ -15,7 +15,11 @@
 //      claim and close, OstraDispatcher.claimReferral,
 //      OstraCreatorSplit.release, and release and claimDividends of an
 //      OstraVesting OstraDevBuy made (vestingPool); OstraBreaker.configure and
-//      trip on the deployment's breaker (Strategy 3, decided 25 Oct 2026). Vaults in another token
+//      trip on the deployment's breaker (Strategy 3, decided 25 Oct 2026); OstraReputation.snapshot on the
+//      configured OstraReputation, for an Ostra vault in the relayer's token whose EIP-1271 approval of its snapshot
+//      digest (rebuilt here from the vault's nonce and the current epoch, read from the contract) holds on chain or is
+//      given by that vault's ApproveHash spend earlier in the request, without the withdrawal lock (reputation proofs,
+//      specified on 2 Nov 2026). Vaults in another token
 //      (a WETH or listed pair token vault: a pair's creator vault or the
 //      token vault trading its pools; a
 //      vault holding a token the launchpad launched, launchpad.poolOf) spend
@@ -172,6 +176,10 @@ import {
   type EthUsd,
   type EthUsdSource,
   type RelayMeasure,
+  decodeApproveHashParams,
+  ostraReputationAbi,
+  readVaultGuard,
+  repSnapshotDigest,
 } from "@ostraagent/sdk";
 import { decodePaymentSignatureHeader, type HTTPResponseInstructions } from "@x402/core/http";
 import type { OstraMerchant } from "../../merchant/src/merchant.ts";
@@ -227,6 +235,8 @@ export type GateOptions = {
   swap?: { router: Address; private?: PrivateRelay };
   /** OstraPad (Ostrapad): its calls are relayed, none naming the relayer's account or Multicall3 in a role (#padProblem). */
   pad?: Address;
+  /** OstraReputation: its snapshots are relayed for vaults whose approval is in place (#repSnapshotProblem); none without it. */
+  reputation?: Address;
   log: Log;
   /** How long a quote may take (QUOTE_DEADLINE_MS; shorter in tests). */
   quoteDeadlineMs?: number;
@@ -862,6 +872,12 @@ export class RelayerGate {
         if (p !== null) return p;
         continue;
       }
+      // OstraReputation: a vault's snapshot, once its approval is in place; only on the configured contract.
+      if (c.fn === "repSnapshot") {
+        const p = await this.#repSnapshotProblem(i, c, tx);
+        if (p !== null) return p;
+        continue;
+      }
       // OstraBreaker (Strategy 3): the limits a vault approved (configure checks its EIP-1271 approval) and a trip
       // (anyone's, into the vault itself); no other function of it, and only the deployment's breaker.
       if (c.fn === "breakerConfigure" || c.fn === "breakerTrip") {
@@ -901,6 +917,46 @@ export class RelayerGate {
         const p = await dividendProblem(i, id);
         if (p !== null) return p;
       }
+    }
+    return null;
+  }
+
+  /**
+   * Why an OstraReputation.snapshot is not relayed, or null: only on the configured OstraReputation, for an Ostra vault
+   * in the relayer's token (an OstraPad provider vault), and only when the vault's approval of exactly this snapshot
+   * (snapshotDigest of its idc, its nonce and the current epoch, rebuilt here) holds on chain, or an ApproveHash spend
+   * of that vault earlier in the request gives it and takes effect at once (no withdrawal lock). The simulation then
+   * runs the contract's own checks.
+   */
+  async #repSnapshotProblem(i: number, c: { fn: "repSnapshot"; to: Address; vault: Address; idc: Hex }, tx: RelayTx): Promise<string | null> {
+    const rep = this.#o.reputation;
+    if (rep === undefined || c.to !== getAddress(rep)) return `calls[${i}]: snapshot on ${c.to} is not relayed: it is not this relayer's OstraReputation`;
+    const token = this.#o.merchant.token;
+    const v = await readVault(this.#o.client, this.#o.deployment, c.vault);
+    if (v === null) return `calls[${i}]: ${c.vault} is not an Ostra vault: its snapshot is not relayed`;
+    if (v.token !== token) return `calls[${i}]: a snapshot is relayed for an Ostra vault in ${token} (an OstraPad provider vault), not ${v.token}`;
+    const [nonce, epoch] = await Promise.all([
+      this.#o.client.readContract({ address: c.to, abi: ostraReputationAbi, functionName: "nonces", args: [c.vault] }) as Promise<bigint>,
+      this.#o.client.readContract({ address: c.to, abi: ostraReputationAbi, functionName: "currentEpoch" }) as Promise<bigint>,
+    ]);
+    const digest = repSnapshotDigest({ chainId: this.#o.deployment.chainId, reputation: c.to, vault: c.vault, idc: c.idc, nonce, epoch });
+    const magic = await this.#o.client
+      .readContract({ address: c.vault, abi: [{ type: "function", name: "isValidSignature", stateMutability: "view", inputs: [{ name: "hash", type: "bytes32" }, { name: "signature", type: "bytes" }], outputs: [{ name: "", type: "bytes4" }] }] as const, functionName: "isValidSignature", args: [digest, "0x"] })
+      .catch(() => "0x00000000");
+    if (magic.toLowerCase() === "0x1626ba7e") return null;
+    const given = tx.parsed.slice(0, i).some((x) => {
+      if (x.fn !== "spend" || x.to !== c.vault || x.action !== VAULT_ACTION.APPROVE_HASH) return false;
+      try {
+        const p = decodeApproveHashParams(x.params);
+        return p.approved && p.hash.toLowerCase() === digest.toLowerCase();
+      } catch {
+        return false;
+      }
+    });
+    if (!given) return `calls[${i}]: the vault ${c.vault} has not approved this snapshot (OstraReputation's snapshot digest of its idc, nonce ${nonce} and epoch ${epoch}): it is not relayed`;
+    const g = await readVaultGuard(this.#o.client, c.vault);
+    if (g.lock.withdrawal !== "0x0000000000000000000000000000000000000000" && g.lock.delay > 0) {
+      return `calls[${i}]: the vault ${c.vault} is under the withdrawal lock: its approval takes effect ${g.lock.delay} s after it lands, so the snapshot is relayed on its own once the approval holds`;
     }
     return null;
   }
