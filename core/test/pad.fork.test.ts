@@ -22,7 +22,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { createWalletClient, decodeEventLog, encodeFunctionData, http, getAddress, keccak256, sha256, stringToHex, type Address, type Hex, type PublicClient } from "viem";
+import { createWalletClient, decodeEventLog, encodeFunctionData, http, getAddress, keccak256, sha256, stringToHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   FileWotsStore,
@@ -242,8 +242,17 @@ test("a pool-judged order: secrets revealed and the evaluator drawn by the sweep
     ]) await c.waitForTransactionReceipt({ hash: await w.sendTransaction({ account: e, chain: null, to: USDG, data }) });
     await c.waitForTransactionReceipt({ hash: await w.sendTransaction({ account: e, chain: null, to: OSTRAPAD, data: encodeFunctionData({ abi: ostraPadAbi, functionName: "joinPool", args: [e.address, PAD.MIN_EVALUATOR_BOND] }) }) });
   }
-  // Refused while the joins have not taken effect.
-  await assert.rejects(client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "a topic" }), /pool evaluators can judge/);
+  // While the joins have not taken effect, the order is refused only if the live pool alone cannot judge it: since
+  // 2 Nov 2026 Ostra's four bootstrap evaluators are eligible on mainnet, so the refusal is checked only on a fork
+  // whose live pool has fewer than PAD.MIN_POOL_FOR_DRAW eligible members (counted as core counts them).
+  const now = (await c.getBlock({ blockTag: "latest" })).timestamp;
+  const live = (await c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "eligibleCount", args: [1_000_000n, now, client.vault, provider.vault, zeroAddress] })) as bigint;
+  for (const e of evaluators) assert.equal((await c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "eligibleCount", args: [1_000_000n, now, client.vault, provider.vault, e.address] })) as bigint, live, "a join not yet in effect is not counted");
+  if (live < PAD.MIN_POOL_FOR_DRAW) {
+    await assert.rejects(client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "a topic" }), /pool evaluators can judge/);
+  } else {
+    console.log(`the live pool already has ${live} eligible evaluators: the refusal before the joins take effect is not reachable on this block`);
+  }
   await fork.increaseTime(Number(PAD.STAKE_DELAY) + 60);
   const p0 = await usdg(provider.vault);
   const o = await client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "Robinhood Chain agents" });
