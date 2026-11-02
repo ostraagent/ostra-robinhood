@@ -7,7 +7,7 @@ import { getAddress } from "viem";
 import { encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentPayload } from "@x402/core/types";
 import { relayGasCap } from "@ostraagent/sdk";
-import { paymentChannel, sendGasCap } from "../src/gate.ts";
+import { creditVaultOf, paymentChannel, sendGasCap } from "../src/gate.ts";
 
 const payer = getAddress("0x00000000000000000000000000000000000aa001");
 const receiverAuthorizer = getAddress("0x00000000000000000000000000000000000ee001");
@@ -186,13 +186,21 @@ test("OstraReputation: a snapshot is relayed only on the relayer's configured Os
   }
 });
 
-test("sendGasCap: the margin on the priced gas, or on the limit a refund needs when larger, up to 1.3 times the priced gas; escrows keep their priced cap", () => {
+test("sendGasCap: the margin on the priced gas, or on the limit a refund needs when larger, up to 1.3 times the priced gas; escrows keep their priced cap; a catalog venue spend's floor counts as priced", () => {
   const q = (gas: number, limit?: number) => ({ gas: String(gas), ...(limit === undefined ? {} : { limit: String(limit) }) });
   assert.equal(sendGasCap(q(100_000), false), relayGasCap(100_000n));
   assert.equal(sendGasCap(q(100_000, 90_000), false), relayGasCap(100_000n));
   assert.equal(sendGasCap(q(97_335, 110_124), false), relayGasCap(110_124n));
   assert.equal(sendGasCap(q(100_000, 500_000), false), relayGasCap(130_000n));
   assert.equal(sendGasCap(q(100_000, 120_000), true), relayGasCap(100_000n));
+  // A catalog venue spend's floor (unpricedGas: not in the price) counts as priced in the cap, so its gas limit leaves
+  // it the floor: a Spark Enter priced at 350,000 gas with its 600,000 floor apart, whose estimate needs about both.
+  const v = (gas: number, unpriced: number, limit?: number) => ({ ...q(gas, limit), unpricedGas: String(unpriced) });
+  assert.equal(sendGasCap(v(350_000, 600_000), false), relayGasCap(950_000n));
+  assert.equal(sendGasCap(v(350_000, 600_000, 700_000), false), relayGasCap(950_000n));
+  assert.equal(sendGasCap(v(350_000, 600_000, 2_000_000), false), relayGasCap(1_235_000n));
+  assert.equal(sendGasCap(v(350_000, 600_000, 700_000), true), relayGasCap(950_000n));
+  assert.ok(sendGasCap(v(350_000, 600_000), false) > relayGasCap(350_000n) + 600_000n, "the floor is left above the priced gas's cap");
 });
 
 test("tokenFlow: what ERC-20 Transfer logs of the token move into an account less what they move out of it", async () => {
@@ -251,4 +259,18 @@ test("a quote whose reads do not answer within the quote deadline is answered 50
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a tripVenue never acts for the tripped vault: its credit is not used without the vault's voucher, nor anyone's with no payer", () => {
+  const vault = getAddress("0x00000000000000000000000000000000000bb001");
+  const venue = getAddress("0x00000000000000000000000000000000000bb002");
+  const trip = [{ fn: "tripVenue" as const, to: vault, kind: 3, venue, amount: 1n }];
+  assert.deepEqual(creditVaultOf(trip, [vault], null), { creditVault: null, actsFor: false });
+  // Named as the payer, the vault's credit pays only with a voucher of its own channel (actsFor false).
+  assert.deepEqual(creditVaultOf(trip, [vault], vault), { creditVault: vault, actsFor: false });
+  assert.deepEqual(creditVaultOf(trip, [vault], payer), { creditVault: payer, actsFor: false });
+  // Any other call of the vault alone acts for it, as before.
+  const finish = [{ fn: "finishRecovery" as const, to: vault }];
+  assert.deepEqual(creditVaultOf(finish, [vault], null), { creditVault: vault, actsFor: true });
+  assert.deepEqual(creditVaultOf(finish, [vault, venue], null), { creditVault: null, actsFor: false });
 });

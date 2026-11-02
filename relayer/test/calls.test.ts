@@ -79,6 +79,9 @@ test("every recognised Ostra function is read with its arguments", () => {
   const fr = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finishRecovery" }) });
   assert.deepEqual(fr, { fn: "finishRecovery", to: vault });
   assert.deepEqual(classify(decodeRelayRequest({ calls: [{ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "finishRecovery" }) }] }), d, relayerVault), { kind: "finish_recovery", ix: { vault } });
+  // tripVenue (version 4): anyone may trip the venue breaker; it is paid for as any other call.
+  const tv = parseCall({ to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "tripVenue", args: [3, at(0x5a), 0n] }) });
+  assert.deepEqual(tv, { fn: "tripVenue", to: vault, kind: 3, venue: at(0x5a), amount: 0n });
   const ab = parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "approveBatch", args: [root, 6n, next, root, sig] }) });
   assert.ok(ab.fn === "approveBatch" && ab.batchId === 6n && ab.key === root);
   assert.equal(parseCall({ to: d.pool, data: encodeFunctionData({ abi: ostraPoolAbi, functionName: "cancelDeposit", args: [root] }) }).fn, "cancelDeposit");

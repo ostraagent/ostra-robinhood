@@ -12,6 +12,8 @@
 //                 receiverAuthorizer, withdrawDelay, salt, amount)
 //   OstraVault.requestClose(config, amount, deadline, signature)
 //   OstraVault.finalizeWithdraw(config)
+//   OstraVault.tripVenue(kind, venue, amount)   the venue breaker (version 4):
+//                 anyone may send it; the value only comes back into the vault
 //   OstraPool.spendLeaf(batchId, leafIndex, destination, signature)  WOTS
 //   OstraPool.approveBatch(key, batchId, state, nextKeyRoot, signature)  WOTS
 //   OstraPool.depositWithAuthorization(...), cancelDeposit(key), closeDeposit(key)
@@ -87,6 +89,8 @@ export type ParsedCall =
   | { fn: "finalizeWithdraw"; to: Address; config: ChannelConfig }
   /** OstraVault.finishRecovery: anyone may finish a recovery past its delay. */
   | { fn: "finishRecovery"; to: Address }
+  /** OstraVault.tripVenue (version 4): the venue breaker, anyone's; a position only comes back into the vault. */
+  | { fn: "tripVenue"; to: Address; kind: number; venue: Address; amount: bigint }
   | { fn: "spendLeaf"; to: Address; batchId: bigint; leafIndex: number; destination: Address; signature: Hex }
   | { fn: "approveBatch"; to: Address; key: Hex; batchId: bigint; state: Hex; nextKeyRoot: Hex; signature: Hex }
   | { fn: "depositWithAuthorization"; to: Address }
@@ -129,7 +133,7 @@ export type RelayTx = {
 const KNOWN = new Map<Hex, { abi: readonly unknown[]; as: string }>();
 for (const [abi, names] of [
   [ostraVaultFactoryAbi, [["createVault", "createVault"]]],
-  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"], ["finishRecovery", "finishRecovery"]]],
+  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"], ["finishRecovery", "finishRecovery"], ["tripVenue", "tripVenue"]]],
   [ostraPoolAbi, [["spendLeaf", "spendLeaf"], ["approveBatch", "approveBatch"], ["depositWithAuthorization", "depositWithAuthorization"], ["cancelDeposit", "cancelDeposit"], ["closeDeposit", "closeDeposit"]]],
   [ostraDevBuyAbi, [["launchFromVault", "launchFromVault"]]],
   [ostraAirdropAbi, [["claim", "airdropClaim"], ["close", "airdropClose"]]],
@@ -219,6 +223,8 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
       return { fn: "finalizeWithdraw", to, config: toConfig(a[0] as never) };
     case "finishRecovery":
       return { fn: "finishRecovery", to };
+    case "tripVenue":
+      return { fn: "tripVenue", to, kind: Number(a[0]), venue: getAddress(a[1] as Address), amount: a[2] as bigint };
     case "spendLeaf":
       return { fn: "spendLeaf", to, batchId: a[0] as bigint, leafIndex: Number(a[1]), destination: getAddress(a[2] as Address), signature: a[3] as Hex };
     case "approveBatch":
@@ -281,7 +287,7 @@ function spendLeafCall(c: ParsedCall, d: Deployment): SpendLeafCall | null {
 export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
   const created = createVaultCall(c, d);
   if (created !== null) return created.vault;
-  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery") return c.to;
+  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery" || c.fn === "tripVenue") return c.to;
   if (c.fn === "launchFromVault") return c.vault;
   return null;
 }

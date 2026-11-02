@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, formatTokenAmount, raetoImages, uploadImage } from "@ostraagent/core";
+import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, uploadImage, venueByName } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { ensurePrivateDir } from "./disk.ts";
@@ -508,16 +508,18 @@ export function registerTools(server: McpServer, agent: Agent): void {
     { hash: bytes32, asset: borroAsset.optional().describe("USDG (default) or a Borro stock's ticker") },
     (a) => agent.borro.withdrawApproval(a.asset ?? "USDG", a.hash as `0x${string}`),
   );
+  const venueName = z.enum(VENUES.map((v) => v.name) as [string, ...string[]]);
   tool(
     "guard_vault",
-    "As a guardian of another, locked vault (from this vault): cancel its waiting changes, revoke one of its hash approvals, sweep its whole balance to its withdrawal address (expected: that address), or redeem its Borro shares or withdraw its Borro collateral back into it.",
+    "As a guardian of another, locked vault (from this vault): cancel its waiting changes, revoke one of its hash approvals, sweep its whole balance to its withdrawal address (expected: that address), redeem its Borro shares or withdraw its Borro collateral back into it, or (vault version 4) bring a venue position back into it (exit; shares: part of it in the venue's units, default all) or bring it back and sweep everything to its withdrawal address in one call (exit_sweep, expected: that address). A Raeto venue in loss is never exited.",
     {
       vault: address,
-      op: z.enum(["cancel", "revoke_hash", "sweep", "redeem", "withdraw_collateral"]),
+      op: z.enum(["cancel", "revoke_hash", "sweep", "redeem", "withdraw_collateral", "exit", "exit_sweep"]),
       hash: bytes32.optional(),
       expected: address.optional(),
       borroVault: address.optional().describe("redeem: the Borro (Vault V2) vault"),
       marketId: bytes32.optional().describe("withdraw_collateral: the market id"),
+      venue: venueName.optional().describe("exit, exit_sweep: the venue"),
       shares: z.string().regex(/^[1-9][0-9]*$/).optional(),
     },
     (a) => {
@@ -534,21 +536,71 @@ export function registerTools(server: McpServer, agent: Agent): void {
               ? { op: GUARD_OP.SWEEP, expected: need(a.expected, "expected") as `0x${string}` }
               : a.op === "redeem"
                 ? { op: GUARD_OP.REDEEM, vault: need(a.borroVault, "borroVault") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) }
-                : { op: GUARD_OP.WITHDRAW_COLLATERAL, marketId: need(a.marketId, "marketId") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) };
+                : a.op === "withdraw_collateral"
+                  ? { op: GUARD_OP.WITHDRAW_COLLATERAL, marketId: need(a.marketId, "marketId") as `0x${string}`, shares: BigInt(need(a.shares, "shares")) }
+                  : a.op === "exit"
+                    ? { op: GUARD_OP.EXIT, kind: venueByName(need(a.venue, "venue")).kind, venue: venueByName(need(a.venue, "venue")).address, amount: a.shares === undefined ? 0n : BigInt(a.shares) }
+                    : { op: GUARD_OP.EXIT_SWEEP, kind: venueByName(need(a.venue, "venue")).kind, venue: venueByName(need(a.venue, "venue")).address, amount: 0n, expected: need(a.expected, "expected") as `0x${string}` };
+      if (a.op === "exit_sweep" && a.shares !== undefined) throw new RangeError("exit_sweep takes the whole position: no shares");
       return agent.borro.guardOther(a.vault, call);
     },
+  );
+
+  // --- Venues (vault version 4): Spark, Raeto's USDG and stock vaults, and the venue breaker ------------------------------
+  tool(
+    "venues",
+    "The venues of the agent's version 4 vaults (Spark Savings USDG; Raeto's USDG vault; Raeto's stock vaults), or of another Ostra vault (vault: a guardian's view): enabled, in force and from when, the position, what the venue can pay out now, a loss, what the venue breaker finds, Raeto credits, and the realized rates (7 and 30 days; the lower is the one used). Nothing is signed.",
+    { vault: address.optional() },
+    (a) => agent.venues.states(a.vault),
+  );
+  tool(
+    "venue_set",
+    "Enables a venue for the agent's vault of its token (USDG, or the stock), or disables it (that stops only new Enters). An enable takes effect at once, or under the withdrawal lock after the lock's delay (the owner, a guardian or the withdrawal address can drop it meanwhile). Refused before the vault runs version 4.",
+    { venue: venueName, enabled: z.boolean() },
+    (a) => agent.venues.setVenue(a.venue, a.enabled),
+  );
+  tool(
+    "venue_enter",
+    "Puts an amount of the vault's token (USDG, or the stock for a Raeto stock vault) into a venue enabled and in force; the position stays the vault's. Under the withdrawal lock a Raeto Enter counts against the daily limit. Refused before signing what the vault would refuse.",
+    { venue: venueName, amount: units },
+    (a) => agent.venues.enter(a.venue, a.amount),
+  );
+  tool(
+    "venue_exit",
+    "Takes an amount (in the venue's token; all: the whole position) out of a venue back into the vault; for a Raeto stock vault, liquidation claims the USDG a liquidation left the stock vault (venue_forward then sends it on). Refused while the venue reports a loss unless acceptLoss (the owner's decision; under the withdrawal lock the vault refuses it).",
+    { venue: venueName, amount: z.union([units, z.literal("all"), z.literal("liquidation")]), acceptLoss: z.boolean().optional() },
+    (a) => agent.venues.exit(a.venue, a.amount, a.acceptLoss === true),
+  );
+  tool(
+    "venue_forward",
+    "Sends the USDG the agent's stock vault holds (a Raeto liquidation's, after venue_exit liquidation) to its linked vault, which must be the agent's USDG vault (vault_link with the stock's asset first).",
+    { stock: borroStock, amount: z.union([usdg, z.literal("all")]) },
+    (a) => agent.venues.forward(a.stock, a.amount),
+  );
+  tool(
+    "venue_trip",
+    "The venue breaker, anyone's (no key is used): when a venue's code, implementation or source is no longer what the vault pinned, or a Raeto source change is queued, the position comes home into the vault; a Raeto stock vault above its max LTV is deleveraged instead. Never while the venue reports a loss. vault: another vault's position (default: the agent's own).",
+    { venue: venueName, vault: address.optional() },
+    (a) => agent.venues.trip(a.venue, a.vault),
   );
 
   // --- Ostra's strategies (vault version 3; for agents registered in ERC-8004 through Ostra) -------------------
   const earnings = z.record(z.string().regex(/^[A-Z]{1,8}$/), z.number().int().min(0)).optional().describe("earnings dates the agent knows, unix seconds by stock ticker (without one NVDA stays at most 60% of its LLTV)");
   tool(
     "strategy_plan",
-    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). Every step earns over 3x its gas in 30 days or is left out. The trading capital's cash (trading) stays in the vault. Nothing is signed. Only for an agent registered in ERC-8004 (publish_profile).",
-    { buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days)"), earnings },
+    "Plans what the agent's vaults hold, computed from the chain now: a conservative plan (USDG into a cash vault that passes every check of Strategy 1; on a vault version 4 the treasury's tiers instead: cash idle for the next 3 days of payments, Spark the liquid tier for 30 days of them, Steakhouse the core, Raeto USDG the AI budget and the stock vaults opted in, at realized rates, each move only above its break-even of three round trips in 30 days, with its numbers) and, when a carry of the agent's SPY, QQQ or NVDA may open, a balanced one (Strategy 2: the stock lent to Borro as collateral, USDG borrowed into the cash vault), each with its steps, gas, what it earns in 30 days net of gas, risks, when it stops, and whether OstraBreaker watches (Strategy 3). The trading capital's cash (trading) stays in the vault. Nothing is signed. Only for an agent registered in ERC-8004 (publish_profile).",
+    {
+      buffer: usdg.optional().describe("USDG kept for payments (default: what the vault spent over 7 days; on version 4, 3 days of what it paid over 30)"),
+      earnings,
+      aiBudget: usdg.optional().describe("the owner's AI budget, USDG of Raeto credits a month: its principal goes into Raeto USDG (0 turns it off); kept for later plans and checks"),
+      stockVaults: z.array(borroStock).max(5).optional().describe("the stock vaults whose stock goes into Raeto's vault of it (NVDA, TSLA, GOOGL, AAPL, SPCX; [] turns them off); kept"),
+    },
     (a) =>
       agent.strategy.plan({
         ...(a.buffer === undefined ? {} : { buffer: parseUsdg(a.buffer) }),
         ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }),
+        ...(a.aiBudget === undefined ? {} : { aiBudget: parseUsdg(a.aiBudget) }),
+        ...(a.stockVaults === undefined ? {} : { stockVaults: a.stockVaults }),
       }),
   );
   tool(
@@ -559,7 +611,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "strategy_check",
-    "Each run's check: the cash vaults (their checks, settings and submitted changes, share price against the model, USDe's price), the carries' ladder; urgent actions (leaving a cash vault, repaying) run at once when execute (default true); the others are kept as a plan for strategy_apply. Never refused for the ERC-8004 gate: exits always run.",
+    "Each run's check: the cash vaults (their checks, settings and submitted changes, share price against the model, USDe's price), the carries' ladder, and on a vault version 4 the treasury (the venue breaker, a venue in loss, the cash tier refilled from Spark, the caps, a liquidation's USDG, new earnings placed once over their break-even); urgent actions (leaving a cash vault, repaying, a breaker trip, a refill) run at once when execute (default true); the others are kept as a plan for strategy_apply. Never refused for the ERC-8004 gate: exits always run.",
     { execute: z.boolean().default(true), earnings },
     (a) => agent.strategy.check({ execute: a.execute, ...(a.earnings === undefined ? {} : { earnings: earningsOf(a.earnings) }) }),
   );
@@ -603,7 +655,13 @@ export function registerTools(server: McpServer, agent: Agent): void {
       return boundedSwap({ what: "the trading sell", tokenIn: token, tokenOut: USDG, amount }, () => t.sell({ token, amount, ...opt("slippageBps", a.slippageBps) }));
     },
   );
-  tool("strategy_report", "What the strategies earn: yield per day by route at the rates now, the share growth since the first run that held each cash vault, and each carry's distance to liquidation.", {}, () => agent.strategy.report());
+  tool("strategy_report", "What the strategies earn: yield per day by route at the rates now, the share growth since the first run that held each cash vault, each carry's distance to liquidation, and on a vault version 4 the treasury's accounts per position (principal in and out, yield realized, Raeto credits apart from USDG, the spend fees paid, net).", {}, () => agent.strategy.report());
+  tool(
+    "strategy_refill",
+    "Brings the vault's idle USDG up to amount for a payment: what is missing comes out of Spark first, then Steakhouse (never the AI budget, never a venue in loss), each a spend of its own, with three times its fee on top (the relayer channel that pays it may take a deposit from the vault, which comes back when the channel closes).",
+    { amount: usdg },
+    (a) => agent.strategy.refill(parseUsdg(a.amount)),
+  );
   const raeto = () => {
     if (agent.raeto === null) throw new Error("Raeto is turned off here (OSTRA_RAETO_URL=off)");
     return agent.raeto;

@@ -21,6 +21,14 @@
 // Strategy 3 (the guardian breaker, OstraBreaker, breaker.ts): each plan says whether it watches the USDG vault's cash
 // vaults. It does only under the vault's withdrawal lock (decided by Edu on 25 Oct 2026: turning the lock on arms it);
 // without the lock the MCP's sweep runs exitCheck() each minute while it runs, and leaves a failing cash vault at once.
+//
+// The treasury of a version 4 vault (the design's "v4 off chain: the treasury engine in MCP", approved by Edu on 1 Nov
+// 2026): for a USDG vault that runs version 4 the conservative plan is the treasury's ("treasury", strategy-rules
+// treasuryMoves): cash idle in the vault, Spark the liquid tier, Steakhouse the core (Lend and Redeem, as before), Raeto
+// USDG the owner's AI budget (opt-in), and each stock vault the owner opted in in Raeto's vault of its stock. check()
+// also trips the venue breaker, refills the cash tier from Spark and places new earnings once they pay their
+// break-even; exitCheck() trips the breaker each minute; report() accounts each position. A vault below version 4 plans
+// as before: nothing of the venues runs before the upgrade executes.
 
 import { getAddress, parseAbi, parseAbiItem, type Address, type Hex, type PublicClient } from "viem";
 import {
@@ -28,10 +36,15 @@ import {
   BORRO_USDG_VAULT,
   CASH_VAULTS,
   MORPHO_BLUE,
+  RAETO_USDG_VAULT,
+  SPARK_SAVINGS_USDG,
+  STEAKHOUSE_USDG,
   USDE,
   USDE_EXIT_PRICE,
   USDG,
   VAULT_ACTION,
+  VAULT_V4,
+  VENUE_KIND,
   agentIdsRegisteredBy,
   blockTime,
   borroStocks,
@@ -41,6 +54,8 @@ import {
   cashCollateralHolds,
   cashVaultRoom,
   checkCashVault,
+  enterParams,
+  exitParams,
   getLogsChunked,
   halfLltvMaxDebt,
   isRevert,
@@ -57,10 +72,14 @@ import {
   readUsdeUsd,
   readVault,
   readVaultGuard,
+  readVaultV2,
   redeemParams,
   setLinkedVaultParams,
+  setVenueParams,
   utilization,
   vaultV2Abi,
+  venuePayableUnits,
+  withdrawableNow,
   worstCaseExposure,
   type BorroPosition,
   type BorroStock,
@@ -95,13 +114,25 @@ import {
   carryTarget,
   depositable,
   ofBps,
+  aiBudgetPrincipal,
+  breakEven,
+  cashTier,
+  payoutCap,
+  raetoCap,
+  raetoStockRoom,
   shareGrowthTooLow,
+  steakhouseCap,
+  treasuryMoves,
   worthIt,
   yieldOver,
   type CarryAction,
+  type TreasuryPlan,
+  type TreasuryVenue,
+  type TreasuryVenueName,
 } from "./strategy-rules.ts";
 import type { TradingService } from "./trading.ts";
 import type { VaultOperationResult, VaultService } from "./vault.ts";
+import { MEASURED_SET_VENUE_GAS, MEASURED_VENUE_GAS, TREASURY_LEDGER, VENUES, stockVenue, venueByName, type LedgerEntry, type RealizedRate, type VenueDef, type VenueService, type VenueState } from "./venues.ts";
 
 /**
  * The most gas a Morpho spend used on a fork with Borro's live markets (design, measured 24 Oct 2026: 246,600 to
@@ -114,6 +145,9 @@ export const OSTRA_FEES_MAINNET: Address = "0x8e79671DC9729476614C78aFcf2345D4c1
 const feesAbi = parseAbi(["function nyseClosed(uint256 time) view returns (bool)"]);
 const timelockAbi = parseAbi(["function executableAt(bytes data) view returns (uint256)", "function abdicated(bytes4 selector) view returns (bool)"]);
 const transferEvent = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
+/** Morpho Vault V2's Deposit and Withdraw (Steakhouse USDG's ABI, verified on Sourcify): the treasury's accounts of the core. */
+const vaultV2DepositEvent = parseAbiItem("event Deposit(address indexed sender, address indexed onBehalf, uint256 assets, uint256 shares)");
+const vaultV2WithdrawEvent = parseAbiItem("event Withdraw(address indexed sender, address indexed receiver, address indexed onBehalf, uint256 assets, uint256 shares)");
 const VAULTS_FILE = "ostra-vaults.json";
 const RUNS_FILE = "runs.jsonl";
 const PLANS_DIR = "plans";
@@ -150,6 +184,8 @@ export type StrategyParts = {
   breaker?: BreakerService | null;
   /** The trading capital (trading.ts): its cash stays in the USDG vault (null or absent: none). */
   trading?: TradingService | null;
+  /** The venues of version 4 vaults (venues.ts); null or absent: the treasury does not run. */
+  venues?: VenueService | null;
 };
 
 export type PlanOptions = {
@@ -157,14 +193,25 @@ export type PlanOptions = {
   buffer?: bigint;
   /** Earnings dates (unix seconds) the agent knows, by stock; without one NVDA stays at most 60% of its LLTV at all times. */
   earnings?: Readonly<Record<string, bigint>>;
+  /**
+   * The owner's opt-ins for the treasury, kept (TREASURY_FILE) for later plans and checks: the monthly AI budget (USDG
+   * base units of Raeto credits a month; 0 turns it off) and the stock vaults whose stock goes into Raeto's vault of it
+   * (tickers; an empty list turns them off).
+   */
+  aiBudget?: bigint;
+  stockVaults?: readonly string[];
 };
 
 export type Step = {
-  kind: "lend_cash" | "redeem_cash" | "lend_stock" | "post_collateral" | "link" | "borrow" | "repay" | "close_carry";
-  /** "USDG" or a stock symbol. */
+  kind: "lend_cash" | "redeem_cash" | "lend_stock" | "post_collateral" | "link" | "borrow" | "repay" | "close_carry" | "set_venue" | "enter_venue" | "exit_venue" | "trip_venue" | "claim_venue" | "forward";
+  /** "USDG" or a stock symbol; for a venue step the venue's name (spark, raeto_usdg, raeto_nvda, ...). */
   what: string;
-  /** A cash vault for lend_cash and redeem_cash. */
+  /** A cash vault for lend_cash and redeem_cash; the venue for a venue step. */
   vault?: Address;
+  /** enter_venue and lend_cash of the treasury: the least amount worth it when the step runs (its break-even at the plan's gas), base units. */
+  minAmount?: string;
+  /** A treasury redeem (a refill, a cap, the no-churn rule): never an emergency one, even when urgent. */
+  routine?: boolean;
   /**
    * Base units (USDG 6 decimals, stocks 18; shares for redeem_cash); "all": every share or the whole debt; "free"
    * (lend_cash): what the USDG vault holds over the plan's `keep` when the step runs, within the vault's room.
@@ -180,8 +227,8 @@ export type Step = {
 
 export type Plan = {
   id: string;
-  /** "check": the actions a run's check called for that are not urgent, kept as a plan for apply(). */
-  profile: "conservative" | "balanced" | "check";
+  /** "check": the actions a run's check called for that are not urgent, kept as a plan for apply(); "treasury": a version 4 vault's tiers. */
+  profile: "conservative" | "balanced" | "check" | "treasury";
   at: number;
   steps: Step[];
   /**
@@ -198,6 +245,20 @@ export type Plan = {
   stopWhen: string[];
   breaker: string;
   doneSteps?: number;
+  /** A version 4 USDG vault's treasury: its tiers, the rates, costs, break-evens and caps it was planned with, and the owner's opt-ins. */
+  treasury?: TreasuryView;
+};
+
+/** What a treasury plan was made from, in USDG unless named (base units as decimal text, rates as percentages). */
+export type TreasuryView = {
+  tiers: { total: string; cash: string; earning: string; liquid: string; aiBudget: string; core: string; coreVenue: TreasuryVenueName | null; coreReason: string };
+  paid30d: string;
+  venues: Record<TreasuryVenueName, { held: string; rate7d: string; rate30d: string; rateUsed: string; enterCost: string; exitCost: string; roundTrip: string; breakEven: string | null; cap: string; open: boolean; why: string | null }>;
+  stocks: { symbol: string; venue: string; held: string; idle: string; creditsRate: string; roundTrip: string; room: string; note: string }[];
+  /** USDG of Raeto credits the plan's positions earn in 30 days at the rates read now (apart from USDG). */
+  credits30d: string;
+  settings: { aiBudgetMonthly: string; stockVaults: string[] };
+  notes: string[];
 };
 
 type RunRecord = {
@@ -214,7 +275,10 @@ type RunRecord = {
   carry: { symbol: string; borrowRate: string; debt: string; ltvBps: string }[];
 };
 
-export type StepOutcome = { step: number; kind: Step["kind"]; what: string; landed: boolean; result?: VaultOperationResult; skipped?: string; note?: string };
+/** A step's result: a vault spend, or a breaker trip (anyone's call, no key). */
+export type StepResult = VaultOperationResult | { status: "sent"; txHash: Hex; vault: Address; venue: string; reasons: string[]; amount: string };
+
+export type StepOutcome = { step: number; kind: Step["kind"]; what: string; landed: boolean; result?: StepResult; skipped?: string; note?: string };
 
 const usd = (x: bigint) => formatUnitsAmount(x < 0n ? 0n : x, TOKEN_DECIMALS);
 const pct = (wad: bigint) => `${wad < 0n ? "-" : ""}${formatUnitsAmount((wad < 0n ? -wad : wad) * 100n, 18)}%`;
@@ -222,12 +286,37 @@ const min = (a: bigint, b: bigint) => (a < b ? a : b);
 const isPlanId = (id: string) => /^[0-9]+-[0-9]+$/.test(id);
 
 /** The steps that open or add to a position: the ERC-8004 gate is checked before them (exits never wait for it). */
-const OPENING_STEPS = new Set<Step["kind"]>(["lend_cash", "lend_stock", "post_collateral", "link", "borrow"]);
+const OPENING_STEPS = new Set<Step["kind"]>(["lend_cash", "lend_stock", "post_collateral", "link", "borrow", "set_venue", "enter_venue"]);
+/** The steps that take something out: what #measure reads goes down when they take effect. */
+const FALLING_STEPS = new Set<Step["kind"]>(["redeem_cash", "repay", "close_carry", "exit_venue", "trip_venue", "claim_venue", "forward"]);
 
 /** Whether a step took effect: what #measure reads went down for an exit or a repayment, up for the others. */
 function stepMoved(s: Step, before: bigint, after: bigint): boolean {
-  return s.kind === "redeem_cash" || s.kind === "repay" || s.kind === "close_carry" ? after < before : after > before;
+  return FALLING_STEPS.has(s.kind) ? after < before : after > before;
 }
+
+/** How far under its highest recorded share price Steakhouse may read before it counts as a loss (rounding). */
+const STEAK_LOSS_TOLERANCE_BPS = 1n;
+/** A cash vault's share price (the assets of one whole share), as checkCashVault reads it. */
+const sharePriceAbi = parseAbi(["function convertToAssets(uint256 shares) view returns (uint256)", "function decimals() view returns (uint8)"]);
+
+/** The owner's treasury opt-ins (PlanOptions aiBudget, stockVaults), kept in the strategy's folder. */
+const TREASURY_FILE = "treasury.json";
+/** The payments a vault's cash tier and liquid tier are read from: what it sent over this many days. */
+const PAYMENT_DAYS = 30n;
+/** A refill takes this many times its exit's fee at its whole gas limit beyond the payment (see refill). */
+const REFILL_FEE_MULTIPLE = 3n;
+/** What a treasury plan adds to the risks and to when it stops (the design's venues and their breaker). */
+const TREASURY_RISKS = [
+  "Spark Savings USDG is a UUPS proxy its admin can upgrade; it held 99.8% of its USDG idle on 30 Oct 2026. A change of its code or implementation trips the venue breaker, which brings the position home (anyone may send it; this server does each minute while it runs).",
+  "Raeto's vaults are their owner's code (verified on Sourcify, not audited by Ostra): Raeto USDG lends through Steakhouse and its source change waits 2 days, within which the breaker brings the position home; a Raeto stock vault borrows USDG against the pooled stock (a liquidation pays the vault's share in USDG, forwarded to the USDG vault).",
+  "No automatic exit ever happens while a venue reports a loss (Raeto inLoss(), a Spark share price under the vault's mark): the owner decides (venue_exit with acceptLoss).",
+  "Raeto credits are not USDG: they buy Raeto's AI models through the vault's own Raeto account (raeto login).",
+];
+const TREASURY_STOPS = [
+  "a venue's code, implementation or source changes, or a Raeto source change is queued: the breaker brings the position home; a Raeto stock vault above its max LTV: the breaker deleverages it; never while the venue reports a loss",
+  "the cash falls under the cash tier: Spark refills it (then Steakhouse); Raeto USDG over its cap (its principal shrank, or the AI budget was lowered or turned off): the excess comes back",
+];
 
 /** Why a cash vault takes no deposit now: its problems, USDe's price, its collateral limits and what makes a run leave it. */
 function whyNot(c: { problems: string[]; usdeProblem: string | null; collateralHolds: string[]; exitReasons: string[] }): string {
@@ -245,6 +334,8 @@ export const USDE_CACHE_MS = 5 * 60_000;
 export class StrategyService {
   readonly #p: StrategyParts;
   #usdeCache: { at: number; value: { price: bigint; stale: boolean; age: bigint; feed: Address } | { error: string } } | null = null;
+  /** Steakhouse's highest share price the runs recorded (and read since), and when runs.jsonl was read for it. */
+  #steakMark: { at: number; mark: bigint } | null = null;
 
   constructor(p: StrategyParts) {
     this.#p = p;
@@ -460,13 +551,14 @@ export class StrategyService {
   }
 
   /**
-   * USDG the USDG vault sent out over the last BUFFER_DAYS days: its Transfers to anything but where Ostra's strategies
-   * put money (cash vaults, Borro's vaults, BorroBuilders, Morpho Blue).
+   * USDG the USDG vault sent out over the last `days` days (default BUFFER_DAYS): its Transfers to anything but where
+   * Ostra's strategies put money (cash vaults, Borro's vaults, BorroBuilders, Morpho Blue, and from version 4 Spark and
+   * Raeto's USDG vault).
    */
-  async spentLastDays(): Promise<bigint> {
+  async spentLastDays(days: bigint = BUFFER_DAYS): Promise<bigint> {
     const vault = await this.#p.buyer.vaultAddress();
     const now = await this.#p.client.getBlock();
-    const since = now.timestamp - BUFFER_DAYS * DAY;
+    const since = now.timestamp - days * DAY;
     // The first block at or after `since`, by bisection over block timestamps.
     let lo = 0n;
     let hi = now.number;
@@ -477,7 +569,7 @@ export class StrategyService {
       else hi = mid;
     }
     const logs = await getLogsChunked(this.#p.logsClient, { address: USDG, event: transferEvent, args: { from: vault }, fromBlock: lo, toBlock: now.number });
-    const internal = new Set([...CASH_VAULTS, BORRO_USDG_VAULT, BORRO_BUILDERS, MORPHO_BLUE].map((a) => getAddress(a)));
+    const internal = new Set([...CASH_VAULTS, BORRO_USDG_VAULT, BORRO_BUILDERS, MORPHO_BLUE, SPARK_SAVINGS_USDG, RAETO_USDG_VAULT].map((a) => getAddress(a)));
     let spent = 0n;
     for (const l of logs) {
       const a = l.args as { to: Address; value: bigint };
@@ -774,10 +866,484 @@ export class StrategyService {
         );
       } else (plans[0] as Plan).risks.push(...notes);
     }
+    // A version 4 USDG vault: the conservative plan is the treasury's (its tiers hold the cash vault as the core). The
+    // owner's opt-ins are kept first, so they hold from the upgrade on for a vault still below version 4.
+    const settings = await this.#keepSettings(o);
+    if (await this.#treasuryOn()) {
+      const carryNotes = (plans[0] as Plan).risks.slice(risks.length + consNotes.length);
+      const tr = await this.#treasury({ now, usdg: h.usdg, cashHeld: h.cash, checks, keep: tradingCapital + carryIdleReserve(existingDebt), ...(o.buffer === undefined ? {} : { buffer: o.buffer }), settings, t0: tCons });
+      const p = make("treasury", tr.steps, tr.plan.cash, tr.earn30, tr.cost, []);
+      plans[0] = { ...p, risks: [...risks, ...TREASURY_RISKS, ...carryNotes], stopWhen: [...stopWhen, ...TREASURY_STOPS], treasury: tr.view };
+    }
     const dir = this.#p.folder.folder(PLANS_DIR);
     await dir.ensure();
     for (const p of plans) await dir.write(`${p.id}.json`, JSON.stringify(p));
     return plans;
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // The treasury (vault version 4)
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** The owner's treasury opt-ins, kept here: the monthly AI budget (USDG base units, 0: off) and the stock vaults (tickers). */
+  async treasurySettings(): Promise<{ aiBudget: bigint; stockVaults: string[] }> {
+    const kept = await this.#readJson<{ aiBudget?: unknown; stockVaults?: unknown }>(TREASURY_FILE);
+    const aiBudget = typeof kept?.aiBudget === "string" && /^[0-9]+$/.test(kept.aiBudget) ? BigInt(kept.aiBudget) : 0n;
+    const stockVaults = Array.isArray(kept?.stockVaults) ? kept.stockVaults.filter((x): x is string => typeof x === "string" && stockVenue(x) !== undefined) : [];
+    return { aiBudget, stockVaults };
+  }
+
+  /** Keeps the opt-ins `o` names (the others as they were) and returns them all. */
+  async #keepSettings(o: PlanOptions): Promise<{ aiBudget: bigint; stockVaults: string[] }> {
+    const was = await this.treasurySettings();
+    if (o.aiBudget === undefined && o.stockVaults === undefined) return was;
+    if (o.aiBudget !== undefined && o.aiBudget < 0n) throw new RangeError("the AI budget is USDG a month, 0 or more");
+    const stockVaults = o.stockVaults === undefined ? was.stockVaults : [...new Set(o.stockVaults.map((x) => x.toUpperCase()))];
+    for (const x of stockVaults) if (stockVenue(x) === undefined) throw new RangeError(`${x} has no Raeto stock vault (${VENUES.filter((v) => v.kind === VENUE_KIND.RAETO_STOCK).map((v) => v.symbol).join(", ")})`);
+    const next = { aiBudget: o.aiBudget ?? was.aiBudget, stockVaults };
+    await this.#p.folder.ensure();
+    await this.#p.folder.write(TREASURY_FILE, JSON.stringify({ aiBudget: next.aiBudget.toString(), stockVaults: next.stockVaults, at: Math.floor(Date.now() / 1000) }));
+    return next;
+  }
+
+  /**
+   * Whether Steakhouse reports a loss for the treasury's routine exits: its share price `price` (the assets of one
+   * whole share) under the highest one this server's runs recorded (the venues' rule for an ERC4626: a price under the
+   * vault's mark).
+   */
+  async #steakInLoss(price: bigint): Promise<boolean> {
+    // The highest share price the runs recorded, kept for 10 minutes (runs.jsonl grows by a line a run).
+    if (this.#steakMark === null || Date.now() - this.#steakMark.at > 600_000) {
+      let mark = 0n;
+      for (const r of await this.#runs()) for (const x of r.cash) if (getAddress(x.vault) === STEAKHOUSE_USDG && BigInt(x.sharePrice) > mark) mark = BigInt(x.sharePrice);
+      this.#steakMark = { at: Date.now(), mark };
+    }
+    const mark = price > this.#steakMark.mark ? price : this.#steakMark.mark;
+    if (price > this.#steakMark.mark) this.#steakMark = { at: this.#steakMark.at, mark: price };
+    // STEAK_LOSS_TOLERANCE_BPS under the mark is rounding, not a loss.
+    return price * BPS < mark * (BPS - STEAK_LOSS_TOLERANCE_BPS);
+  }
+
+  /**
+   * How much more `vault` may put into `def` now, by the venue's caps read again (the treasury's, when a plan's Enter
+   * runs): Spark half of what it can pay out; Raeto USDG its cap (the budget's principal at the realized rate, 5% of
+   * the others' principal, half of its payout); a Raeto stock vault its room. The share of the earning money (Spark at
+   * most half of it) was decided when the plan was made.
+   */
+  async #enterRoom(def: VenueDef, vault: Address): Promise<bigint> {
+    const venues = this.#venues();
+    const st = await venues.state(def, vault);
+    const less = (cap: bigint) => (cap > st.position ? cap - st.position : 0n);
+    if (def.kind === VENUE_KIND.ERC4626) return less(payoutCap(st.payout));
+    if (def.kind === VENUE_KIND.RAETO_USDG) {
+      const r = await venues.realized(def);
+      const settings = await this.treasurySettings();
+      return less(raetoCap({ budgetPrincipal: aiBudgetPrincipal(settings.aiBudget, r.rate), totalPrincipal: await venues.raetoPrincipal(), own: st.position, payout: st.payout }));
+    }
+    const book = await venues.stockBook(def);
+    return raetoStockRoom({ collateral: book.collateral, debt: book.debt, usdgPayout: st.payout, held: st.position, depositRoom: book.depositCap > book.collateral ? book.depositCap - book.collateral : 0n });
+  }
+
+  /** What the USDG vault can take out of Spark now (USDG): the assets of the shares it can redeem now (sdk venuePayableUnits). */
+  async #sparkPayable(buyer: Address): Promise<bigint> {
+    const shares = await venuePayableUnits(this.#p.client, VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG, buyer);
+    return shares === 0n ? 0n : ((await this.#p.client.readContract({ address: SPARK_SAVINGS_USDG, abi: sharePriceAbi, functionName: "convertToAssets", args: [shares] })) as bigint);
+  }
+
+  /** Whether the treasury runs: the venues are served here and the USDG vault runs version 4 on chain. */
+  async #treasuryOn(): Promise<boolean> {
+    const v = this.#p.venues ?? null;
+    if (v === null) return false;
+    const buyer = await this.#p.buyer.vaultAddress().catch(() => null);
+    return buyer !== null && (await v.version(getAddress(buyer))) >= VAULT_V4;
+  }
+
+  /**
+   * Each venue of the agent's version 4 vaults where it holds a position (the USDG vault's and each stock vault's): what
+   * the breaker finds there now and whether the venue reports a loss.
+   */
+  async #venueAlerts(): Promise<{ def: VenueDef; vault: Address; reasons: string[]; inLoss: boolean; position: bigint }[]> {
+    const venues = this.#venues();
+    const versions = new Map<Address, number>();
+    const out: { def: VenueDef; vault: Address; reasons: string[]; inLoss: boolean; position: bigint }[] = [];
+    for (const def of VENUES) {
+      const vault = getAddress(await venues.vaultFor(def).vaultAddress());
+      if (!versions.has(vault)) versions.set(vault, await venues.version(vault));
+      if ((versions.get(vault) ?? 0) < VAULT_V4) continue;
+      const b = await venues.breakerOf(def, vault);
+      if (!b.entered || b.position === 0n) continue;
+      out.push({ def, vault, reasons: b.reasons, inLoss: b.inLoss, position: b.position });
+    }
+    return out;
+  }
+
+  /**
+   * The payments' refill (VaultService.setRefill on the USDG vault): before a spend sends `need` USDG out of a vault
+   * that holds less, refill brings it in, on a version 4 vault only (on version 3 a payment never touches the cash
+   * vault by itself). Spark first, then Steakhouse, never from a venue in loss, with the exits' fees counted.
+   */
+  async autoRefill(need: bigint): Promise<void> {
+    if (!(await this.#treasuryOn().catch(() => false))) return;
+    const c = this.#p.client;
+    const buyer = getAddress(await this.#p.buyer.vaultAddress());
+    const idle = await tokenBalance(c, USDG, buyer);
+    if (idle >= need) return;
+    // Only when the cash and what can come in now (what Spark and Steakhouse can each pay out now, neither in loss) cover
+    // the payment and the exits' fees (REFILL_FEE_MULTIPLE times each, as refill takes them): otherwise nothing moves,
+    // and the payment's own check refuses it as it would have.
+    const venues = this.#venues();
+    const spark = venueByName("spark");
+    let sparkIn = 0n;
+    let sparkFee = 0n;
+    const sparkHeld = await venues.position(spark, buyer);
+    if (sparkHeld > 0n && !(await venues.inLoss(spark, buyer))) {
+      sparkIn = await this.#sparkPayable(buyer);
+      const st = await venues.state(spark, buyer);
+      sparkFee = await venues.cost(spark, VAULT_ACTION.EXIT, exitParams({ kind: spark.kind, venue: spark.address, amount: st.shares > 0n ? st.shares : 1n, minOut: 0n }), MEASURED_VENUE_GAS[spark.kind].exit, true).catch(() => 0n);
+    }
+    let steakIn = 0n;
+    let steakFee = 0n;
+    const shares = (await c.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "balanceOf", args: [buyer] })) as bigint;
+    if (shares > 0n) {
+      const unit = 10n ** BigInt((await c.readContract({ address: STEAKHOUSE_USDG, abi: sharePriceAbi, functionName: "decimals" })) as number);
+      const price = (await c.readContract({ address: STEAKHOUSE_USDG, abi: sharePriceAbi, functionName: "convertToAssets", args: [unit] })) as bigint;
+      if (!(await this.#steakInLoss(price))) {
+        const value = (await c.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
+        steakIn = min(value, withdrawableNow(await readVaultV2(c, STEAKHOUSE_USDG)));
+        steakFee = await this.#costOr(VAULT_ACTION.REDEEM, redeemParams({ vault: STEAKHOUSE_USDG, shares, minAssets: 0n }), "the Steakhouse redeem").catch(() => 0n);
+      }
+    }
+    const fromSpark = idle + sparkIn >= need + REFILL_FEE_MULTIPLE * sparkFee;
+    const fees = REFILL_FEE_MULTIPLE * (sparkFee + (fromSpark ? 0n : steakFee));
+    if (idle + sparkIn + steakIn < need + fees) return;
+    await this.refill(need);
+  }
+
+  /**
+   * Brings the USDG vault's idle USDG up to `need` (base units) for a payment: what is missing comes out of Spark first,
+   * then Steakhouse, never out of the AI budget nor from a venue in loss, with REFILL_FEE_MULTIPLE times each exit's
+   * fee at its whole gas limit on top (the relayer channels that pay the exit and the payment may take a deposit for
+   * them from the vault: the gas limit's price, floor included, which a Spark exit's relayer channel holds though the
+   * relayer prices it without its floor, VenueService.cost withFloor, and for a new channel the channel's open; what is
+   * left of it comes back when the channel closes). Not gated: a payment never waits on the ERC-8004 gate. Each exit is
+   * a spend of its own, checked and read back as a plan's step.
+   */
+  async refill(need: bigint): Promise<{ had: string; need: string; now: string; steps: StepOutcome[]; note?: string }> {
+    if (need <= 0n) throw new RangeError("the amount must be greater than zero");
+    const buyer = getAddress(await this.#p.buyer.vaultAddress());
+    const idle = () => tokenBalance(this.#p.client, USDG, buyer);
+    const had = await idle();
+    const steps: StepOutcome[] = [];
+    const out = async (note?: string) => ({ had: usd(had), need: usd(need), now: usd(await idle()), steps, ...(note === undefined ? {} : { note }) });
+    if (had >= need) return out("the vault's cash covers it: nothing was signed");
+    if (await this.#treasuryOn()) {
+      const venues = this.#venues();
+      const spark = venueByName("spark");
+      const held = await venues.position(spark, buyer);
+      if (held > 0n) {
+        const st = await venues.state(spark, buyer);
+        const fee = await venues.cost(spark, VAULT_ACTION.EXIT, exitParams({ kind: spark.kind, venue: spark.address, amount: st.shares > 0n ? st.shares : 1n, minOut: 0n }), MEASURED_VENUE_GAS[spark.kind].exit, true).catch(() => 0n);
+        // At most what Spark can pay out now (its maxRedeem for the vault), not the whole position.
+        const take = min(need - had + REFILL_FEE_MULTIPLE * fee, await this.#sparkPayable(buyer));
+        const s: Step = { kind: "exit_venue", what: spark.name, vault: spark.address, amount: take >= held ? "all" : take.toString(), urgent: true, notBefore: 0, cost: "0", reason: `${usd(take)} USDG from Spark for a payment of ${usd(need)}` };
+        steps.push({ step: steps.length, kind: s.kind, what: s.what, ...(await this.#runStep(s, held, 0n, {})) });
+      }
+    }
+    const left = await idle();
+    if (left < need) {
+      const shares = (await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "balanceOf", args: [buyer] })) as bigint;
+      const unit = 10n ** BigInt((await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: sharePriceAbi, functionName: "decimals" })) as number);
+      const price = shares === 0n ? 0n : ((await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: sharePriceAbi, functionName: "convertToAssets", args: [unit] })) as bigint);
+      if (shares > 0n && (await this.#steakInLoss(price))) {
+        steps.push({ step: steps.length, kind: "redeem_cash", what: "USDG", landed: false, note: "Steakhouse's share price is under the highest a run recorded (a loss): no refill from it without the owner" });
+      } else if (shares > 0n) {
+        const value = (await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
+        const fee = await this.#costOr(VAULT_ACTION.REDEEM, redeemParams({ vault: STEAKHOUSE_USDG, shares, minAssets: 0n }), "the Steakhouse redeem").catch(() => 0n);
+        // At most what Steakhouse can pay out now (its withdrawable), not the whole position.
+        const take = min(need - left + REFILL_FEE_MULTIPLE * fee, min(value, withdrawableNow(await readVaultV2(this.#p.client, STEAKHOUSE_USDG))));
+        const part = take >= value || value === 0n ? shares : min(shares, (shares * take + value - 1n) / value + 1n);
+        const s: Step = { kind: "redeem_cash", what: "USDG", vault: STEAKHOUSE_USDG, amount: part.toString(), urgent: false, routine: true, notBefore: 0, cost: "0", reason: `${usd(take)} USDG from Steakhouse for a payment of ${usd(need)}` };
+        steps.push({ step: steps.length, kind: s.kind, what: s.what, ...(await this.#runStep(s, shares, 0n, {})) });
+      }
+    }
+    const now = await idle();
+    return out(now >= need ? undefined : `the vault holds ${usd(now)} USDG, still under ${usd(need)}: Spark and Steakhouse hold no more it can take now (the AI budget stays; venue_exit takes from it)`);
+  }
+
+  /**
+   * The treasury's accounts (strategy_report): per position the principal put in and taken out (the vault's Entered and
+   * Exited events; Steakhouse's Deposit and Withdraw naming the vault), what it holds now, the yield realized (out + now -
+   * in, USDG positions), the Raeto credits earned (earned(), apart from USDG), the spend fees this server paid for it (the
+   * relayer's rule at each spend, kept in TREASURY_LEDGER), and net = yield - fees.
+   */
+  async #accounts(): Promise<{ positions: Record<string, string | null>[]; totals: { yield: string; fees: string; net: string; credits: string }; note: string }> {
+    const venues = this.#venues();
+    const ledger = await venues.ledger();
+    const feeOf = (name: string) => ledger.filter((e) => e.venue === name).reduce((s, e) => s + BigInt(e.cost), 0n);
+    const positions: Record<string, string | null>[] = [];
+    let totalYield = 0n;
+    let totalFees = 0n;
+    let totalCredits = 0n;
+    for (const def of VENUES) {
+      const vault = getAddress(await venues.vaultFor(def).vaultAddress());
+      if ((await venues.version(vault)) < VAULT_V4) continue;
+      if (!(await venues.venueOf(def, vault)).entered) continue;
+      const f = await venues.flows(def, vault);
+      const now = await venues.position(def, vault);
+      const credits = await venues.credits(def, vault);
+      const fees = feeOf(def.name);
+      const dec = def.token === USDG ? TOKEN_DECIMALS : 18;
+      // A USDG position's yield is what came back and is held beyond what went in; Raeto's principal earns credits, a
+      // stock position the stock it holds.
+      const realized = def.kind === VENUE_KIND.ERC4626 ? f.out + now - f.in : null;
+      if (realized !== null) totalYield += realized;
+      totalFees += fees;
+      totalCredits += credits;
+      positions.push({
+        venue: def.name,
+        vault,
+        in: formatUnitsAmount(f.in, dec),
+        out: formatUnitsAmount(f.out, dec),
+        now: formatUnitsAmount(now, dec),
+        unit: def.symbol,
+        yield: realized === null ? null : `${realized < 0n ? "-" : ""}${usd(realized < 0n ? -realized : realized)}`,
+        credits: def.kind === VENUE_KIND.ERC4626 ? null : usd(credits),
+        liquidationClaimed: def.kind === VENUE_KIND.RAETO_STOCK ? usd(f.claimed) : null,
+        fees: usd(fees),
+        net: realized === null ? `-${usd(fees)}` : `${realized - fees < 0n ? "-" : ""}${usd(realized - fees < 0n ? fees - realized : realized - fees)}`,
+      });
+    }
+    // Steakhouse, the core (version 3's Lend and Redeem): its own Deposit and Withdraw events naming the USDG vault.
+    const buyer = getAddress(await this.#p.buyer.vaultAddress());
+    const to = await this.#p.logsClient.getBlockNumber({ cacheTime: 0 });
+    const from = BigInt(this.#p.config.deployment.fromBlock);
+    const dep = await getLogsChunked(this.#p.logsClient, { address: STEAKHOUSE_USDG, event: vaultV2DepositEvent, args: { onBehalf: buyer }, fromBlock: from, toBlock: to });
+    const wd = await getLogsChunked(this.#p.logsClient, { address: STEAKHOUSE_USDG, event: vaultV2WithdrawEvent, args: { onBehalf: buyer }, fromBlock: from, toBlock: to });
+    if (dep.length > 0) {
+      const into = dep.reduce((s, l) => s + (l.args as { assets: bigint }).assets, 0n);
+      const out = wd.reduce((s, l) => s + (l.args as { assets: bigint }).assets, 0n);
+      const shares = (await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "balanceOf", args: [buyer] })) as bigint;
+      const now = shares === 0n ? 0n : ((await this.#p.client.readContract({ address: STEAKHOUSE_USDG, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint);
+      const realized = out + now - into;
+      const fees = feeOf("steakhouse");
+      totalYield += realized;
+      totalFees += fees;
+      positions.push({ venue: "steakhouse", vault: buyer, in: usd(into), out: usd(out), now: usd(now), unit: "USDG", yield: `${realized < 0n ? "-" : ""}${usd(realized < 0n ? -realized : realized)}`, credits: null, liquidationClaimed: null, fees: usd(fees), net: `${realized - fees < 0n ? "-" : ""}${usd(realized - fees < 0n ? fees - realized : realized - fees)}` });
+    }
+    const net = totalYield - totalFees;
+    return {
+      positions,
+      totals: { yield: `${totalYield < 0n ? "-" : ""}${usd(totalYield < 0n ? -totalYield : totalYield)}`, fees: usd(totalFees), net: `${net < 0n ? "-" : ""}${usd(net < 0n ? -net : net)}`, credits: usd(totalCredits) },
+      note: "fees are the spends this server sent for each position, at the relayer's price rule when each was sent; Raeto credits are apart from USDG (they buy Raeto's models); a stock position is counted in its stock",
+    };
+  }
+
+  /** A Lend or Redeem's price now: simulated when it can run, else at MEASURED_MORPHO_SPEND_GAS. */
+  async #costOr(action: number, params: Hex, label: string): Promise<bigint> {
+    try {
+      return await this.#cost("USDG", action, params, label, false);
+    } catch {
+      return this.#cost("USDG", action, params, label, true);
+    }
+  }
+
+  /**
+   * The treasury's steps for the USDG vault (strategy-rules treasuryMoves) and the opted-in stock vaults, with what they
+   * were made from. `keep`: what stays idle beyond the cash tier (the trading capital's cash, a carry's idle reserve);
+   * `buffer`: the owner's cash in place of the cash tier; `checks`: Strategy 1's checks (Steakhouse is the core).
+   */
+  async #treasury(a: {
+    now: bigint;
+    usdg: bigint;
+    cashHeld: { vault: Address; shares: bigint; value: bigint }[];
+    checks: Awaited<ReturnType<StrategyService["cashVaults"]>>;
+    keep: bigint;
+    buffer?: bigint;
+    settings: { aiBudget: bigint; stockVaults: string[] };
+    t0: number;
+  }): Promise<{ steps: Step[]; view: TreasuryView; plan: TreasuryPlan; earn30: bigint; credits30: bigint; cost: bigint }> {
+    const venues = this.#p.venues as VenueService;
+    const buyer = getAddress(await this.#p.buyer.vaultAddress());
+    const spark = venueByName("spark");
+    const raeto = venueByName("raeto_usdg");
+    const sSpark = await venues.state(spark, buyer);
+    const sRaeto = await venues.state(raeto, buyer);
+    const rSpark = await venues.realized(spark);
+    const rRaeto = await venues.realized(raeto);
+    const rSteak = await venues.realized("steakhouse");
+    const paid30 = await this.spentLastDays(PAYMENT_DAYS);
+    const sized = a.usdg > 0n ? a.usdg : 1_000_000n;
+    // Each spend's price now: simulated when it can run now, else at the gas measured for its kind.
+    const venueCosts = async (def: VenueDef, st: VenueState) => ({
+      enter: await venues.cost(def, VAULT_ACTION.ENTER, enterParams({ kind: def.kind, venue: def.address, amount: sized, minPosition: 0n }), MEASURED_VENUE_GAS[def.kind].enter),
+      exit: await venues.cost(def, VAULT_ACTION.EXIT, exitParams({ kind: def.kind, venue: def.address, amount: st.shares > 0n ? st.shares : 1n, minOut: 0n }), MEASURED_VENUE_GAS[def.kind].exit),
+      enable: st.inForce ? 0n : await venues.costAt(def, VAULT_ACTION.SET_VENUE, setVenueParams({ kind: def.kind, venue: def.address, enabled: true }), MEASURED_SET_VENUE_GAS),
+    });
+    const cSpark = await venueCosts(spark, sSpark);
+    const cRaeto = await venueCosts(raeto, sRaeto);
+    const steakHeld = a.cashHeld.find((c) => c.vault === STEAKHOUSE_USDG) ?? { vault: STEAKHOUSE_USDG, shares: 0n, value: 0n };
+    const steakCheck = a.checks.find((c) => c.vault === STEAKHOUSE_USDG);
+    const steakEnter = await this.#costOr(VAULT_ACTION.LEND, lendParams({ vault: STEAKHOUSE_USDG, assets: sized, minShares: 0n }), "the Steakhouse lend");
+    const steakExit = await this.#costOr(VAULT_ACTION.REDEEM, redeemParams({ vault: STEAKHOUSE_USDG, shares: steakHeld.shares > 0n ? steakHeld.shares : 1n, minAssets: 0n }), "the Steakhouse redeem");
+    // What the breaker finds for an enabled venue, with a position there or not (VenueService.state reads it only for a
+    // position): one whose code, implementation or source changed since the vault enabled it takes no Enter (the module
+    // refuses it, VenueChanged) until the owner enables it again.
+    const changed = async (def: VenueDef, st: VenueState): Promise<string[]> => (st.breaker.length === 0 && st.enabled ? venues.reasons(def, await venues.record(st.vault, def)) : st.breaker);
+    const closed = (st: VenueState, r: RealizedRate, breaker: string[]): string | null =>
+      st.inLoss ? "it reports a loss" : breaker.length > 0 ? `the breaker finds: ${breaker.join(", ")}` : r.rate === null ? `its realized rate is not known (${r.note ?? "no events"})` : r.rate <= 0n ? "its realized rate is not positive" : null;
+    const sparkWhy = closed(sSpark, rSpark, await changed(spark, sSpark));
+    const raetoWhy = a.settings.aiBudget === 0n ? "the AI budget is off (strategy_plan aiBudget)" : closed(sRaeto, rRaeto, await changed(raeto, sRaeto));
+    const raetoPrincipal = await venues.raetoPrincipal();
+    const venuesIn: Record<TreasuryVenueName, TreasuryVenue> = {
+      spark: { rate: rSpark.rate, rate7: rSpark.rate7, enterCost: cSpark.enter, exitCost: cSpark.exit, cap: payoutCap(sSpark.payout), held: sSpark.position, open: sparkWhy === null, why: sparkWhy, exitable: !sSpark.inLoss },
+      raeto_usdg: {
+        rate: rRaeto.rate,
+        rate7: rRaeto.rate7,
+        enterCost: cRaeto.enter,
+        exitCost: cRaeto.exit,
+        cap: raetoCap({ budgetPrincipal: aiBudgetPrincipal(a.settings.aiBudget, rRaeto.rate), totalPrincipal: raetoPrincipal, own: sRaeto.position, payout: sRaeto.payout }),
+        held: sRaeto.position,
+        open: raetoWhy === null,
+        why: raetoWhy,
+        exitable: !sRaeto.inLoss,
+      },
+      steakhouse: {
+        rate: rSteak.rate,
+        rate7: rSteak.rate7,
+        enterCost: steakEnter,
+        exitCost: steakExit,
+        cap: steakCheck === undefined ? 0n : steakhouseCap({ assets: steakCheck.state.accruedTotalAssets, withdrawable: steakCheck.withdrawable, room: steakCheck.room, held: steakHeld.value }),
+        held: steakHeld.value,
+        open: steakCheck !== undefined && steakCheck.ok && rSteak.rate !== null && rSteak.rate > 0n,
+        why: steakCheck === undefined ? "not checked" : !steakCheck.ok ? whyNot(steakCheck) : rSteak.rate === null ? `its realized rate is not known (${rSteak.note ?? "no events"})` : rSteak.rate <= 0n ? "its realized rate is not positive" : null,
+        // No routine exit (a cap, the no-churn rule, the cash tier) at a loss without the owner, as for the venues;
+        // the exit from a cash vault that fails its checks is check's, apart from the treasury.
+        exitable: steakCheck === undefined || !(await this.#steakInLoss(steakCheck.sharePrice)),
+      },
+    };
+    const cash = (a.buffer ?? cashTier(paid30)) + a.keep;
+    const plan = treasuryMoves({ idle: a.usdg, paid30, cash, aiBudget: a.settings.aiBudget, venues: venuesIn });
+    const steps: Step[] = [];
+    let cost = 0n;
+    // Two Enters into the same venue in one plan (Spark's liquid tier and the core) are one spend: one fee, one key.
+    const push = (x: Step) => {
+      const same = x.kind === "enter_venue" ? steps.find((y) => y.kind === "enter_venue" && y.what === x.what) : undefined;
+      if (same !== undefined) {
+        same.amount = (BigInt(same.amount) + BigInt(x.amount)).toString();
+        same.reason = `${same.reason}; and ${x.reason}`;
+        return;
+      }
+      steps.push(x);
+      cost += BigInt(x.cost);
+    };
+    const enabled = new Set<string>();
+    const enable = (def: VenueDef, st: VenueState, price: bigint, enter: string) => {
+      if (enabled.has(def.name) || st.inForce || (st.enabled && BigInt(st.from) > a.now)) return;
+      enabled.add(def.name);
+      push({ kind: "set_venue", what: def.name, vault: def.address, amount: "1", urgent: false, notBefore: a.t0, cost: price.toString(), reason: `enable ${def.title} for the ${def.symbol} vault, for the Enter of ${enter} after it, at ${usd(price)} USDG of gas (at once; under the withdrawal lock after the lock's delay, which the Enter waits for)` });
+    };
+    const finals = { spark: sSpark.position, steakhouse: steakHeld.value, raeto_usdg: sRaeto.position };
+    for (const m of plan.moves) {
+      const when = m.urgent ? 0 : a.t0;
+      finals[m.venue] += m.side === "enter" ? m.amount : -m.amount;
+      if (m.venue === "steakhouse") {
+        if (m.side === "exit") {
+          const shares = steakHeld.value === 0n || m.amount >= steakHeld.value ? steakHeld.shares : min(steakHeld.shares, (steakHeld.shares * m.amount + steakHeld.value - 1n) / steakHeld.value);
+          push({ kind: "redeem_cash", what: "USDG", vault: STEAKHOUSE_USDG, amount: shares.toString(), urgent: m.urgent, routine: true, notBefore: when, cost: steakExit.toString(), reason: m.reason });
+        } else {
+          const be = breakEven(venuesIn.steakhouse.rate, steakEnter + steakExit);
+          push({ kind: "lend_cash", what: "USDG", vault: STEAKHOUSE_USDG, amount: m.amount.toString(), ...(be === null ? {} : { minAmount: be.toString() }), urgent: false, notBefore: when, cost: steakEnter.toString(), reason: m.reason });
+        }
+        continue;
+      }
+      const def = m.venue === "spark" ? spark : raeto;
+      const st = m.venue === "spark" ? sSpark : sRaeto;
+      const c = m.venue === "spark" ? cSpark : cRaeto;
+      if (m.side === "exit") {
+        push({ kind: "exit_venue", what: def.name, vault: def.address, amount: m.amount >= st.position ? "all" : m.amount.toString(), urgent: m.urgent, notBefore: when, cost: c.exit.toString(), reason: m.reason });
+      } else {
+        enable(def, st, c.enable, `${usd(m.amount)} USDG`);
+        const be = breakEven(venuesIn[m.venue].rate, c.enter + c.exit);
+        push({ kind: "enter_venue", what: def.name, vault: def.address, amount: m.amount.toString(), ...(be === null ? {} : { minAmount: be.toString() }), urgent: false, notBefore: when, cost: c.enter.toString(), reason: m.reason });
+      }
+    }
+    const notes = [...plan.notes];
+    // The stock vaults: each opted-in one's free stock into Raeto's vault of it, once 30 days of its credits pay three
+    // round trips; a vault no longer opted in comes out (never at a loss); the USDG a liquidation left is claimed and
+    // forwarded to the USDG vault.
+    const stocks: TreasuryView["stocks"] = [];
+    let credits30 = yieldOver(finals.raeto_usdg, rRaeto.rate ?? 0n, STEP_HORIZON);
+    const traded = (await this.#p.trading?.heldTokens()) ?? new Map<Address, bigint>();
+    for (const def of VENUES) {
+      if (def.kind !== VENUE_KIND.RAETO_STOCK) continue;
+      const opted = a.settings.stockVaults.includes(def.symbol);
+      const vault = getAddress(await this.#p.tokenVault(def.token).vaultAddress());
+      if ((await venues.version(vault)) < VAULT_V4) {
+        if (opted) notes.push(`${def.symbol}: the agent's ${def.symbol} vault ${vault} ${(await venues.version(vault)) === 0 ? "does not exist yet" : "runs below version 4"}: nothing for Raeto's ${def.symbol} vault`);
+        continue;
+      }
+      const st = await venues.state(def, vault);
+      if (!opted && st.position === 0n && (st.liquidationOwed ?? 0n) === 0n) continue;
+      const r = await venues.realized(def);
+      const book = await venues.stockBook(def);
+      const sc = await venueCosts(def, st);
+      const held = await tokenBalance(this.#p.client, def.token, vault);
+      const capital = traded.get(getAddress(def.token)) ?? 0n;
+      const idle = held > capital ? held - capital : 0n;
+      const room = raetoStockRoom({ collateral: book.collateral, debt: book.debt, usdgPayout: st.payout, held: st.position, depositRoom: book.depositCap > book.collateral ? book.depositCap - book.collateral : 0n });
+      const value = (x: bigint) => (x * book.price) / 10n ** 36n;
+      const rt = sc.enter + sc.exit;
+      let note: string;
+      const breaker = await changed(def, st);
+      if ((st.liquidationOwed ?? 0n) > 0n) {
+        push({ kind: "claim_venue", what: def.name, vault: def.address, amount: "liquidation", urgent: false, notBefore: a.t0, cost: sc.exit.toString(), reason: `Raeto's ${def.symbol} vault owes ${usd(st.liquidationOwed ?? 0n)} USDG from a liquidation: claimed into the ${def.symbol} vault` });
+        if ((await readVaultGuard(this.#p.client, vault)).linkedVault !== buyer) push({ kind: "link", what: def.symbol, amount: "0", urgent: false, notBefore: a.t0, cost: "0", reason: `link the ${def.symbol} vault to the USDG vault ${buyer}: Forward pays the ${usd(st.liquidationOwed ?? 0n)} USDG claimed only to the linked vault` });
+        push({ kind: "forward", what: def.symbol, amount: "all", urgent: false, notBefore: a.t0, cost: sc.exit.toString(), reason: `the ${usd(st.liquidationOwed ?? 0n)} USDG claimed (and any USDG the ${def.symbol} vault holds) forwarded to the USDG vault ${buyer}` });
+      }
+      if (!opted) {
+        note = st.inLoss ? "no longer opted in, but it reports a loss: no automatic exit" : "no longer opted in: the stock comes back";
+        if (!st.inLoss && st.position > 0n) push({ kind: "exit_venue", what: def.name, vault: def.address, amount: "all", urgent: false, notBefore: a.t0, cost: sc.exit.toString(), reason: `${def.symbol} is no longer opted in (strategy_plan stockVaults): its ${formatUnitsAmount(st.position, 18)} ${def.symbol} come back into the ${def.symbol} vault` });
+      } else {
+        const amount = min(idle, room);
+        const be = breakEven(r.rate, rt);
+        const minStock = be === null || book.price === 0n ? null : (be * 10n ** 36n + book.price - 1n) / book.price;
+        if (idle === 0n) note = "no free stock in the vault";
+        else if (st.inLoss || breaker.length > 0) note = st.inLoss ? "it reports a loss: no deposit" : `the breaker finds: ${breaker.join(", ")}`;
+        else if (amount === 0n) note = `no room: the position may be at most half of what the venue can pay out now (${formatUnitsAmount(room, 18)} ${def.symbol} more)`;
+        else if (amount < book.minDeposit) note = `${formatUnitsAmount(amount, 18)} ${def.symbol} is under its minimum deposit of ${formatUnitsAmount(book.minDeposit, 18)}`;
+        else if (minStock === null || amount < minStock) note = `${formatUnitsAmount(amount, 18)} ${def.symbol} (${usd(value(amount))} USDG) is under its break-even${be === null ? " (its credits rate is not known or not positive)" : ` of ${usd(be)} USDG of stock`} at today's gas (a round trip ${usd(rt)} USDG): it stays in the vault`;
+        else {
+          enable(def, st, sc.enable, `${formatUnitsAmount(amount, 18)} ${def.symbol}`);
+          push({ kind: "enter_venue", what: def.name, vault: def.address, amount: amount.toString(), minAmount: minStock.toString(), urgent: false, notBefore: a.t0, cost: sc.enter.toString(), reason: `${formatUnitsAmount(amount, 18)} ${def.symbol} (${usd(value(amount))} USDG) into Raeto's ${def.symbol} vault: credits at ${pct(r.rate ?? 0n)} of its value a year, over its break-even of ${usd(be as bigint)} USDG; the stock stays the vault's` });
+          credits30 += yieldOver(value(amount), r.rate ?? 0n, STEP_HORIZON);
+          note = "entered";
+        }
+        credits30 += yieldOver(value(st.position), r.rate ?? 0n, STEP_HORIZON);
+      }
+      stocks.push({ symbol: def.symbol, venue: def.name, held: formatUnitsAmount(st.position, 18), idle: formatUnitsAmount(idle, 18), creditsRate: r.rate === null ? "not known" : pct(r.rate), roundTrip: usd(rt), room: formatUnitsAmount(room, 18), note });
+    }
+    const view = (name: TreasuryVenueName, r: RealizedRate) => {
+      const x = venuesIn[name];
+      const be = breakEven(x.rate, x.enterCost + x.exitCost);
+      return { held: usd(x.held), rate7d: r.rate7 === null ? "not known" : pct(r.rate7), rate30d: r.rate30 === null ? "not known" : pct(r.rate30), rateUsed: x.rate === null ? "not known" : pct(x.rate), enterCost: usd(x.enterCost), exitCost: usd(x.exitCost), roundTrip: usd(x.enterCost + x.exitCost), breakEven: be === null ? null : usd(be), cap: usd(x.cap), open: x.open, why: x.why };
+    };
+    const earn30 = yieldOver(finals.spark, rSpark.rate ?? 0n, STEP_HORIZON) + yieldOver(finals.steakhouse, rSteak.rate ?? 0n, STEP_HORIZON);
+    return {
+      steps,
+      plan,
+      earn30,
+      credits30,
+      cost,
+      view: {
+        tiers: { total: usd(plan.total), cash: usd(plan.cash), earning: usd(plan.earning), liquid: usd(plan.liquid), aiBudget: usd(plan.ai), core: usd(plan.core.amount), coreVenue: plan.core.venue, coreReason: plan.core.reason },
+        paid30d: usd(paid30),
+        venues: { spark: view("spark", rSpark), steakhouse: view("steakhouse", rSteak), raeto_usdg: view("raeto_usdg", rRaeto) },
+        stocks,
+        credits30d: usd(credits30),
+        settings: { aiBudgetMonthly: usd(a.settings.aiBudget), stockVaults: a.settings.stockVaults },
+        notes,
+      },
+    };
   }
 
   /** What a plan says of Strategy 3: whether OstraBreaker watches the USDG vault's cash vaults now, and what acts if not. */
@@ -839,7 +1405,7 @@ export class StrategyService {
         if (!out.landed) {
           delete plan.inFlight;
           await dir.write(file, JSON.stringify(plan));
-          return { done, next: { step: i, notBefore: now }, note: out.note ?? "the step did not take effect: call again" };
+          return { done, next: { step: i, notBefore: out.wait ?? now }, note: out.note ?? "the step did not take effect: call again" };
         }
       }
       delete plan.inFlight;
@@ -857,10 +1423,33 @@ export class StrategyService {
     return k > 0n ? k : 0n;
   }
 
-  /** What a step changes, read on-chain: cash vault shares, Borro shares, collateral, the link, or borrow shares. */
+  /**
+   * What a step changes, read on-chain: cash vault shares, Borro shares, collateral, the link, or borrow shares; for a
+   * venue step the venue's enable (1 or 0), the position, the LTV a deleverage lowers, a liquidation's USDG owed, or the
+   * USDG a stock vault holds to forward.
+   */
   async #measure(s: Step): Promise<bigint> {
     const buyer = getAddress(await this.#p.buyer.vaultAddress());
     if (s.kind === "lend_cash" || s.kind === "redeem_cash") return (await this.#p.client.readContract({ address: s.vault as Address, abi: vaultV2Abi, functionName: "balanceOf", args: [buyer] })) as bigint;
+    if (s.kind === "set_venue" || s.kind === "enter_venue" || s.kind === "exit_venue" || s.kind === "trip_venue" || s.kind === "claim_venue") {
+      const venues = this.#venues();
+      const def = venueByName(s.what);
+      const vault = getAddress(await venues.vaultFor(def).vaultAddress());
+      // An enable sets the time it takes effect (now, or after the lock's delay): a re-enable after a cancel moves it
+      // although the venue was enabled before.
+      if (s.kind === "set_venue") {
+        const vf = await venues.venueOf(def, vault);
+        return vf.enabled ? vf.from + 1n : 0n;
+      }
+      if (s.kind === "claim_venue") return venues.liquidationOwed(def, vault);
+      if (s.kind === "trip_venue" && s.amount === "deleverage") return venues.ltv(def);
+      return venues.position(def, vault);
+    }
+    if (s.kind === "forward") {
+      const def = stockVenue(s.what);
+      if (def === undefined) throw new RangeError(`${s.what} has no Raeto stock vault`);
+      return tokenBalance(this.#p.client, USDG, await this.#p.tokenVault(def.token).vaultAddress());
+    }
     const stock = borroStocks().find((x) => x.symbol === s.what);
     if (stock === undefined) throw new RangeError(`${s.what} is not a Borro stock`);
     const vault = await this.#p.tokenVault(stock.token).vaultAddress();
@@ -871,23 +1460,107 @@ export class StrategyService {
     return p.borrowShares;
   }
 
-  async #runStep(s: Step, before: bigint, keep: bigint, o: PlanOptions): Promise<{ landed: boolean; result?: VaultOperationResult; skipped?: string; note?: string }> {
-    let result: VaultOperationResult;
+  /** The venue service; a venue step of a plan made with it cannot run without it. */
+  #venues(): VenueService {
+    const v = this.#p.venues ?? null;
+    if (v === null) throw new Error("the venues are not served here (vault version 4): this step cannot run");
+    return v;
+  }
+
+  /** Keeps a Steakhouse spend the treasury sent in the strategy's ledger (venues.ts TREASURY_LEDGER), at its price. */
+  async #ledger(s: Step, result: StepResult, cost: bigint, amount: bigint): Promise<void> {
+    if (result.status !== "sent" || s.vault !== STEAKHOUSE_USDG) return;
+    const e: LedgerEntry = { at: Number(await chainTime(this.#p.client)), vault: getAddress(await this.#p.buyer.vaultAddress()), venue: "steakhouse", action: s.kind === "lend_cash" ? "lend" : "redeem", amount: amount.toString(), cost: cost.toString(), tx: result.txHash };
+    await this.#p.folder.ensure();
+    await this.#p.folder.append(TREASURY_LEDGER, `${JSON.stringify(e)}\n`);
+  }
+
+  async #runStep(s: Step, before: bigint, keep: bigint, o: PlanOptions): Promise<{ landed: boolean; result?: StepResult; skipped?: string; note?: string; wait?: number }> {
+    let result: StepResult;
     const buyer = await this.#p.buyer.vaultAddress();
     switch (s.kind) {
       case "lend_cash": {
         const usdg = await tokenBalance(this.#p.client, USDG, buyer);
-        const wanted = s.amount === "free" ? depositable(usdg, keep) : BigInt(s.amount);
+        // A treasury step (it names its break-even) takes at most what is over the cash it keeps and its own fee.
+        const wanted = s.amount === "free" ? depositable(usdg, keep) : s.minAmount !== undefined ? min(BigInt(s.amount), depositable(usdg, keep + BigInt(s.cost))) : BigInt(s.amount);
         const c = (await this.cashVaults(wanted)).find((x) => x.vault === s.vault);
         if (c === undefined || !c.ok) throw new Error(`${s.vault} does not pass Strategy 1's check now: ${c === undefined ? "not a cash vault" : whyNot(c)}; nothing was signed`);
         const amount = min(wanted, c.room);
         if (amount === 0n) return { landed: true, skipped: wanted === 0n ? "nothing to lend now" : "the cash vault has no room for more Ostra deposits now (5% of what it can pay out)" };
+        if (s.minAmount !== undefined && amount < BigInt(s.minAmount)) return { landed: true, skipped: `${usd(amount)} USDG is under the step's break-even of ${usd(BigInt(s.minAmount))} now: it stays idle` };
+        // Priced for the treasury's accounts (Steakhouse only); a price that cannot be read never stops the step.
+        const price = c.vault === STEAKHOUSE_USDG ? await this.#costOr(VAULT_ACTION.LEND, lendParams({ vault: c.vault, assets: amount, minShares: 0n }), "the cash lend").catch(() => 0n) : 0n;
         result = await this.#p.borro.lendCash(c.vault, amount);
+        await this.#ledger(s, result, price, amount);
         break;
       }
-      case "redeem_cash":
+      case "redeem_cash": {
         if (before === 0n) return { landed: true, skipped: "no shares held" };
-        result = await this.#p.borro.redeemCash(s.vault as Address, s.amount === "all" ? before : min(BigInt(s.amount), before), s.urgent);
+        const shares = s.amount === "all" ? before : min(BigInt(s.amount), before);
+        // Priced for the treasury's accounts (Steakhouse only); a price that cannot be read (a stale ETH/USD, the RPC)
+        // never stops an exit, an emergency one least of all.
+        const price = s.vault === STEAKHOUSE_USDG ? await this.#costOr(VAULT_ACTION.REDEEM, redeemParams({ vault: s.vault, shares, minAssets: 0n }), "the cash redeem").catch(() => 0n) : 0n;
+        // An urgent exit from a cash vault that fails its checks takes what it can (no minimum); the treasury's own
+        // redeems (a refill, a cap, the no-churn rule: Step.routine) keep the normal minimum against the preview.
+        result = await this.#p.borro.redeemCash(s.vault as Address, shares, s.urgent && s.routine !== true);
+        await this.#ledger(s, result, price, shares);
+        break;
+      }
+      case "set_venue": {
+        const venues = this.#venues();
+        const def = venueByName(s.what);
+        const vf = await venues.venueOf(def, getAddress(await venues.vaultFor(def).vaultAddress()));
+        const now = await chainTime(this.#p.client);
+        if (vf.inForce) return { landed: true, skipped: `${def.title} is in force already` };
+        if (vf.enabled && vf.from > now) return { landed: true, skipped: `${def.title} is enabled and takes effect at ${new Date(Number(vf.from) * 1000).toISOString()}` };
+        result = await venues.setVenue(s.what, true);
+        break;
+      }
+      case "enter_venue": {
+        const venues = this.#venues();
+        const def = venueByName(s.what);
+        const vault = getAddress(await venues.vaultFor(def).vaultAddress());
+        const vf = await venues.venueOf(def, vault);
+        if (!vf.inForce) {
+          if (vf.enabled && vf.from > (await chainTime(this.#p.client))) return { landed: false, wait: Number(vf.from), note: `${def.title}'s enable takes effect at ${new Date(Number(vf.from) * 1000).toISOString()} (the withdrawal lock's delay): call again then` };
+          return { landed: false, note: `${def.title} is not enabled for the vault (the enable before this step did not take effect): plan again` };
+        }
+        const held = await tokenBalance(this.#p.client, def.token, vault);
+        const capital = def.token === USDG ? 0n : ((await this.#p.trading?.heldTokens())?.get(getAddress(def.token)) ?? 0n);
+        // The USDG vault keeps the cash tier and this spend's own fee (the relayer is paid from the vault).
+        const free = def.token === USDG ? depositable(held, keep + BigInt(s.cost)) : held > capital ? held - capital : 0n;
+        // The venue's caps read again now (its payout, Raeto's principal and the budget's, a stock vault's room): the
+        // plan's amount is at most what they leave room for when the step runs.
+        const room = await this.#enterRoom(def, vault);
+        const amount = min(min(BigInt(s.amount), free), room);
+        if (amount === 0n) return { landed: true, skipped: room === 0n ? "the venue's caps leave no room for more now" : "nothing to put in now beyond what the vault keeps" };
+        if (s.minAmount !== undefined && amount < BigInt(s.minAmount)) return { landed: true, skipped: `${amount} base units are under the step's break-even of ${s.minAmount} now: they stay in the vault` };
+        result = await venues.enterUnits(def, amount);
+        break;
+      }
+      case "exit_venue": {
+        const venues = this.#venues();
+        const def = venueByName(s.what);
+        if (before === 0n) return { landed: true, skipped: "nothing held there" };
+        const vault = getAddress(await venues.vaultFor(def).vaultAddress());
+        // Never an automatic exit while the venue reports a loss: the owner decides (venue_exit acceptLoss).
+        if (await venues.inLoss(def, vault)) return { landed: false, note: `${def.title} reports a loss: no automatic exit (the owner decides, venue_exit with acceptLoss)` };
+        result = await venues.exitUnits(def, s.amount === "all" ? null : min(BigInt(s.amount), before), vault);
+        break;
+      }
+      case "trip_venue": {
+        const venues = this.#venues();
+        const def = venueByName(s.what);
+        result = await venues.trip(def.name, await venues.vaultFor(def).vaultAddress());
+        break;
+      }
+      case "claim_venue":
+        if (before === 0n) return { landed: true, skipped: "nothing owed from a liquidation" };
+        result = await this.#venues().exit(s.what, "liquidation");
+        break;
+      case "forward":
+        if (before === 0n) return { landed: true, skipped: "no USDG in the stock vault to forward" };
+        result = await this.#venues().forward(s.what, "all");
         break;
       case "lend_stock": {
         const stock = borroStocks().find((x) => x.symbol === s.what) as BorroStock;
@@ -951,7 +1624,7 @@ export class StrategyService {
         break;
       }
     }
-    if (result.status !== "sent") return { landed: false, result, note: `a spend signed earlier was sent first (${result.note}); call again` };
+    if (result.status !== "sent") return { landed: false, result, note: `a spend signed earlier was sent first (${"note" in result ? result.note : ""}); call again` };
     if (!stepMoved(s, before, await this.#measure(s))) return { landed: false, result, note: "the transaction landed but did not change the position (a Morpho spend that failed inside the vault, or a link that waits the lock's delay): call again" };
     return { landed: true, result };
   }
@@ -971,7 +1644,7 @@ export class StrategyService {
     findings: string[];
     actions: Step[];
     plan: string | null;
-    results: { kind: Step["kind"]; what: string; landed?: boolean; result?: VaultOperationResult; skipped?: string; note?: string; error?: string }[];
+    results: { kind: Step["kind"]; what: string; landed?: boolean; result?: StepResult; skipped?: string; note?: string; error?: string }[];
   }> {
     const now = await chainTime(this.#p.client);
     const block = await this.#p.client.getBlockNumber({ cacheTime: 0 });
@@ -986,9 +1659,11 @@ export class StrategyService {
     // (USDe's price unknown or the share limit stop new deposits, not the yield of what is held). Null: not known now.
     let cashApy: bigint | null = null;
     const withdrawable = new Map<Address, bigint>();
+    let cashChecks: Awaited<ReturnType<StrategyService["cashVaults"]>> | null = null;
     try {
       const usde = await this.usde();
       const checks = await this.cashVaults(0n, usde);
+      cashChecks = checks;
       if ("error" in usde) findings.push(`USDe's price is not known: ${usde.error}`);
       else findings.push(`USDe at ${formatUnitsAmount(usde.price, 18)} US dollars (Chainlink USDe / USD on Ethereum, ${usde.age} s old${usde.stale ? ", stale" : ""})`);
       cashApy = checks.filter((c) => c.problems.length === 0 && c.exitReasons.length === 0).reduce((a, c) => (c.modelApy > a ? c.modelApy : a), 0n);
@@ -1084,6 +1759,40 @@ export class StrategyService {
       }
       if (short > 0n) findings.push(`the repayments need ${usd(need)} USDG; the USDG vault and what the cash vaults can pay out now hold ${usd(need - short)}: what is there is repaid now, the rest at the next run`);
     }
+    // The treasury of a version 4 vault: the venue breaker (urgent: a trip, never at a loss), the cash tier refilled from
+    // Spark (urgent), the caps and the owner's settings, the USDG a stock vault's liquidation left, and new earnings placed
+    // once they pay their break-even (kept in the plan below, whose keep is the cash tier).
+    let treasuryKeep = 0n;
+    if (await this.#treasuryOn().catch(() => false)) {
+      try {
+        for (const x of await this.#venueAlerts()) {
+          if (x.inLoss) {
+            findings.push(`${x.def.title} reports a loss for ${x.vault}: no automatic exit (the owner decides, venue_exit with acceptLoss)`);
+            continue;
+          }
+          if (x.reasons.length === 0) continue;
+          const lever = x.reasons.length === 1 && x.reasons[0] === "ltv";
+          const reason = lever ? `${x.def.title} is above its max LTV: the breaker deleverages it (the position stays)` : `${x.def.title} changed since ${x.vault} enabled it (${x.reasons.join(", ")}): the breaker brings the position of ${formatUnitsAmount(x.position, x.def.token === USDG ? TOKEN_DECIMALS : 18)} ${x.def.symbol} home`;
+          actions.push({ kind: "trip_venue", what: x.def.name, vault: x.def.address, amount: lever ? "deleverage" : "all", urgent: true, notBefore: 0, cost: "0", reason });
+          findings.push(reason);
+        }
+        const tradingCash = this.#p.trading === undefined || this.#p.trading === null ? 0n : await this.#p.trading.reservedCash();
+        const debt = h.stocks.reduce((a, x) => a + (x.position?.debt ?? 0n), 0n);
+        const tr = await this.#treasury({ now, usdg: h.usdg, cashHeld: h.cash, checks: cashChecks ?? (await this.cashVaults(0n)), keep: tradingCash + carryIdleReserve(debt), ...(o.buffer === undefined ? {} : { buffer: o.buffer }), settings: await this.treasurySettings(), t0: 0 });
+        treasuryKeep = tr.plan.cash;
+        for (const st of tr.steps) {
+          // Not twice: a cash vault exit the cash checks called for, a venue the breaker trips.
+          if (st.kind === "redeem_cash" && actions.some((x) => x.kind === "redeem_cash" && x.vault === st.vault)) continue;
+          if (actions.some((x) => x.kind === "trip_venue" && x.what === st.what)) continue;
+          actions.push(st);
+        }
+        const t = tr.view.tiers;
+        findings.push(`treasury: ${t.total} USDG in all; cash tier ${t.cash} (paid ${tr.view.paid30d} over 30 days), liquid ${t.liquid} (Spark), AI budget ${t.aiBudget} (Raeto USDG), core ${t.core} (${t.coreVenue ?? "idle"})`);
+        for (const n of tr.view.notes) findings.push(`treasury: ${n}`);
+      } catch (e) {
+        findings.push(`the treasury could not be checked now: ${(e as Error).message.split("\n")[0]}`);
+      }
+    }
     // Urgent first; within each, the redemptions (leaving a vault, the cash for a repayment) before the repayments.
     actions.sort((x, y) => Number(y.urgent) - Number(x.urgent) || Number(x.kind !== "redeem_cash") - Number(y.kind !== "redeem_cash"));
     const results = [];
@@ -1105,7 +1814,7 @@ export class StrategyService {
         profile: "check",
         at: Number(now),
         steps: later.map((x) => ({ ...x, notBefore: t })),
-        keep: "0",
+        keep: treasuryKeep.toString(),
         expected30d: "0",
         cashApy: pct(cashApy ?? 0n),
         trading: null,
@@ -1137,9 +1846,23 @@ export class StrategyService {
       const value = (await this.#p.client.readContract({ address: v, abi: vaultV2Abi, functionName: "previewRedeem", args: [shares] })) as bigint;
       held.push({ vault: v, shares, value });
     }
-    if (held.length === 0) return { held: 0, left: [] };
-    const checks = await this.cashVaults(0n);
     const left = [];
+    // The venue breaker, each minute (version 4): a trip for each venue whose code, implementation or source changed (a
+    // stock vault above its max LTV: its deleverage), never while it reports a loss. No key is used.
+    if (await this.#treasuryOn().catch(() => false)) {
+      for (const x of await this.#venueAlerts().catch(() => [])) {
+        if (x.inLoss || x.reasons.length === 0) continue;
+        const lever = x.reasons.length === 1 && x.reasons[0] === "ltv";
+        const step: Step = { kind: "trip_venue", what: x.def.name, vault: x.def.address, amount: lever ? "deleverage" : "all", urgent: true, notBefore: 0, cost: "0", reason: `the breaker: ${x.reasons.join(", ")} (a position of ${formatUnitsAmount(x.position, x.def.token === USDG ? TOKEN_DECIMALS : 18)} ${x.def.symbol})` };
+        try {
+          left.push({ vault: x.def.address, reasons: x.reasons.map((r) => `${x.def.title}: the breaker finds ${r}`), ...(await this.#runStep(step, await this.#measure(step), 0n, {})) });
+        } catch (e) {
+          left.push({ vault: x.def.address, reasons: x.reasons, error: (e as Error).message });
+        }
+      }
+    }
+    if (held.length === 0) return { held: 0, left };
+    const checks = await this.cashVaults(0n);
     for (const h of held) {
       const c = checks.find((x) => x.vault === h.vault);
       if (c === undefined) continue;
@@ -1199,6 +1922,7 @@ export class StrategyService {
     routes: { route: string; value: string; apy: string; perDay: string }[];
     carries: { symbol: string; debt: string; ofLltvLimit: string; priceDropToLiquidation: string }[];
     realized: { vault: Address; since: string; growth: string }[];
+    treasuryAccounts?: { positions: Record<string, string | null>[]; totals: { yield: string; fees: string; net: string; credits: string }; note: string };
   }> {
     await this.gate();
     const h = await this.holdings();
@@ -1227,6 +1951,20 @@ export class StrategyService {
       if (first === undefined || f === undefined || nowPrice === undefined || BigInt(f.sharePrice) === 0n) continue;
       const before = BigInt(f.sharePrice);
       realized.push({ vault: c.vault, since: new Date(first.at * 1000).toISOString(), growth: pct(((nowPrice - before) * WAD) / before) });
+    }
+    // A version 4 vault: the treasury's accounts, and its venues' routes at their realized rates.
+    if (await this.#treasuryOn().catch(() => false)) {
+      const venues = this.#venues();
+      const buyer = getAddress(await this.#p.buyer.vaultAddress());
+      for (const def of VENUES) {
+        if (def.token !== USDG) continue;
+        const now = await venues.position(def, buyer);
+        if (now === 0n) continue;
+        const r = await venues.realized(def);
+        const rate = r.rate ?? 0n;
+        routes.push({ route: `${def.name} ${def.address}${def.kind === VENUE_KIND.RAETO_USDG ? " (credits)" : ""}`, value: usd(now), apy: pct(rate), perDay: usd(yieldOver(now, rate, DAY)) });
+      }
+      return { routes, carries, realized, treasuryAccounts: await this.#accounts() };
     }
     return { routes, carries, realized };
   }

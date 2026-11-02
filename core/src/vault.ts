@@ -58,6 +58,8 @@ import {
   ostraVaultFactoryAbi,
   readRecovery,
   readVault,
+  readVaultGuard,
+  readWithdrawalKeeps,
   setRecoveryPolicyParams,
   setGuardianParams,
   simulateVaultSpend,
@@ -211,6 +213,19 @@ export type RecoveryRequest = {
 export type ChannelOpening = { open: OpenChannelParams; config: ChannelConfig; channel: Hex };
 
 /**
+ * Set while a refill (VaultService.setRefill) runs, in that refill's own async context (Node's AsyncLocalStorage,
+ * reached through process.getBuiltinModule, Node 22.3 and later, so this package still builds for the browser, where
+ * no refill runs): a payment from inside a refill is refused at once instead of waiting on the refill it runs in, and
+ * payments from anywhere else wait for a running refill. Without it (Node before 22.3), a payment that comes while a
+ * refill runs is refused at once (call again), so none can ever wait on itself.
+ */
+type RefillStore = { getStore(): boolean | undefined; run<T>(store: boolean, fn: () => T): T };
+const REFILL_CONTEXT: RefillStore | null = (() => {
+  const m = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process?.getBuiltinModule?.("node:async_hooks") as { AsyncLocalStorage?: new () => RefillStore } | undefined;
+  return m?.AsyncLocalStorage === undefined ? null : new m.AsyncLocalStorage();
+})();
+
+/**
  * A vault operation built outside this file (launchpad.ts: swaps, pool
  * settings, airdrops, dividends, launches): `build` runs its checks once any
  * spend signed earlier was sent, then signs with `keychain` at `v` as the
@@ -265,6 +280,9 @@ export class VaultService {
   #adopted: Address | null | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   #onChannelOpening: ((opening: ChannelOpening) => Promise<void>) | null = null;
+  #refill: ((need: bigint) => Promise<unknown>) | null = null;
+  /** The refill running now: a payment that comes while it runs waits for it, then reads the balance again. */
+  #refilling: Promise<void> | null = null;
 
   constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null, vaultToken: Address | null = null) {
     if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
@@ -439,6 +457,78 @@ export class VaultService {
    */
   setChannelOpeningListener(listener: (opening: ChannelOpening) => Promise<void>): void {
     this.#onChannelOpening = listener;
+  }
+
+  /**
+   * The treasury's refill of a payment (MCP 0.1.18; the strategy's autoRefill): called with what a spend sends out of
+   * the vault (a withdrawal, a channel's deposit, a swap's input, an Ostrapad order's budget) when the vault holds less,
+   * once the payment's own checks pass (#payableNow) and before that spend is queued, so the refill's own spends run
+   * first. The refill decides whether it can (a version 4 vault; the cash and what it can bring in cover the payment
+   * and the exits' fees; never from a venue in loss), and moves nothing otherwise; a refill that fails is not the
+   * payment's failure: the payment's own check then says what the vault holds, as before.
+   */
+  setRefill(refill: ((need: bigint) => Promise<unknown>) | null): void {
+    this.#refill = refill;
+  }
+
+  /**
+   * Runs the refill (setRefill) for a payment of `need` (to `destination`, when it names one) that passes its own
+   * checks (#payableNow) when the vault holds less than `need` of its token; after a refill already running.
+   */
+  async refillFor(need: bigint, destination: Address | null = null): Promise<void> {
+    if (this.#refill === null || need <= 0n) return;
+    // A payment sent from inside the refill (none is today) would wait on the refill it runs in: refused at once.
+    if (REFILL_CONTEXT?.getStore() === true) throw new Error("a payment from inside the treasury's refill of this vault: refused (it would wait on itself); nothing was signed");
+    if (REFILL_CONTEXT === null && this.#refilling !== null) throw new Error("the treasury is refilling this vault for another payment now: call again once it is done; nothing was signed");
+    // Queued before the first await: payments one after another, each after the refill before it, never two at once.
+    const previous = this.#refilling;
+    const refill = this.#refill;
+    const run = (async () => {
+      if (previous !== null) await previous;
+      if (!(await this.#payableNow(need, destination))) return;
+      const vault = await this.vaultAddress();
+      if ((await this.#balance(vault)) >= need) return;
+      try {
+        await (REFILL_CONTEXT === null ? refill(need) : REFILL_CONTEXT.run(true, () => refill(need)));
+      } catch {
+        // the payment's own check speaks for it
+      }
+    })().catch(() => undefined);
+    this.#refilling = run;
+    try {
+      await run;
+    } finally {
+      if (this.#refilling === run) this.#refilling = null;
+    }
+  }
+
+  /**
+   * Whether a payment of `amount` from this vault (to `destination`, when it names one) passes its own checks now, the
+   * ones that refuse it whatever the vault holds: the vault exists and is not frozen, the destination is not the vault
+   * itself nor frozen, and no spend signed earlier waits to be sent first (it would be sent in this payment's place).
+   * The refill runs only for a payment that passes them: one refused anyway must not move the vault's positions.
+   */
+  async #payableNow(amount: bigint, destination: Address | null): Promise<boolean> {
+    if (amount <= 0n || this.#refill === null) return false;
+    const vault = await this.vaultAddress();
+    const v = await this.#read(vault);
+    if (v === null || (await this.#pending(v)) !== null) return false;
+    if (destination !== null && destination === vault) return false;
+    try {
+      await this.#notFrozen(vault, "the vault");
+      if (destination !== null) await this.#notFrozen(destination, "the destination");
+    } catch {
+      return false;
+    }
+    // Under the withdrawal lock what goes out counts against the daily limit (a channel's deposit too), except a
+    // Transfer to the withdrawal address when it keeps what it gets (the vault's own withdrawalKeeps, sdk
+    // readWithdrawalKeeps): a payment over what may still go out today is refused by the vault.
+    const g = await readVaultGuard(this.#client, vault);
+    if (g.outflowAvailable !== null && amount > g.outflowAvailable) {
+      const free = destination !== null && destination === g.lock.withdrawal && (await readWithdrawalKeeps(this.#client, vault));
+      if (!free) return false;
+    }
+    return true;
   }
 
   /**
@@ -930,7 +1020,17 @@ export class VaultService {
     return new Error(`the vault holds ${formatTokenAmount(balance)}, less than ${what}${held}`);
   }
 
-  withdraw(destinationText: string, amountText: string, via?: Sender): Promise<WithdrawResult> {
+  async withdraw(destinationText: string, amountText: string, via?: Sender): Promise<WithdrawResult> {
+    // The payment's own checks first (refused here as below), then the refill when the cash does not cover it.
+    {
+      const amount = parseTokenAmount(amountText);
+      if (amount === 0n) throw new RangeError("amount must be greater than zero");
+      if (!isAddress(destinationText, { strict: false })) throw new RangeError(`${destinationText} is not an address`);
+      const destination = getAddress(destinationText);
+      if (destination === zeroAddress) throw new RangeError("the destination must not be the zero address");
+      if (destination === getAddress(await this.vaultAddress())) throw new Error("the destination is the vault itself");
+      await this.refillFor(amount, destination);
+    }
     return this.#serial(async () => {
       const amount = parseTokenAmount(amountText);
       if (amount === 0n) throw new RangeError("amount must be greater than zero");
@@ -986,7 +1086,12 @@ export class VaultService {
    * before the one-time key signs; it must record the channel. A spend signed
    * earlier and not landed is sent instead, and this channel is not opened.
    */
-  openChannel(open: OpenChannelParams, beforeSign: (opening: ChannelOpening) => Promise<void>): Promise<VaultChannelOpenResult> {
+  async openChannel(open: OpenChannelParams, beforeSign: (opening: ChannelOpening) => Promise<void>): Promise<VaultChannelOpenResult> {
+    if (this.kind !== "seller") {
+      const vault = await this.vaultAddress();
+      const ownVault = getAddress(open.receiverAuthorizer) === vault || getAddress(open.receiver) === vault;
+      if (!ownVault) await this.refillFor(open.amount);
+    }
     return this.#serial(async () => {
       if (this.kind === "seller") throw new Error("channels are not opened from the seller vault");
       await this.#checkToken();

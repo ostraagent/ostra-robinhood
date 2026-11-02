@@ -8,7 +8,7 @@
 // market is touched, so stored totals leave a debt unchanged for as long as nobody interacts. Every read here is
 // taken at one block.
 
-import { getAbiItem, getAddress, parseAbi, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, ExecutionRevertedError, RawContractError, encodeFunctionData, getAbiItem, getAddress, parseAbi, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import { ostraVaultAbi, ostraVaultModuleAbi } from "./abi.ts";
 import { BORRO_IRM, BORRO_ROUTER, BORRO_STOCKS, BORRO_USDG_VAULT, MORPHO_BLUE, USDG, VAULT_MAX_LTV_OF_LLTV_BPS, VAULT_V3 } from "./constants.ts";
 import { marketId, type MarketParams, type WithdrawalLock } from "./messages.ts";
@@ -150,6 +150,60 @@ export async function readVaultGuard(client: PublicClient, vault: Address): Prom
     pendingLock: pLockAt === 0n ? null : { lock: { withdrawal: getAddress(pLock.withdrawal), delay: Number(pLock.delay), dailyLimit: pLock.dailyLimit }, at: pLockAt },
     pendingLink: pLinkAt === 0n ? null : { vault: pLink === zeroAddress ? null : getAddress(pLink), at: pLinkAt },
   };
+}
+
+/** OstraVaultV3.SLOT, the ERC-7201 slot of the version 3 state (OstraVaultV3.Layout). */
+export const VAULT_V3_SLOT = 0xa5f7403588609e9a874083e27e411b9dcd802294b9dfdf2360eac48028015400n;
+const U64 = (1n << 64n) - 1n;
+const U160 = (1n << 160n) - 1n;
+
+/**
+ * The fields of OstraVaultV3.Layout that have no view, read from the vault's storage as Solidity packs them, at
+ * `blockNumber` (default: the latest block): the withdrawal address stored (slot 0, before a change whose wait is over
+ * is applied), lockedSince and withdrawalSince (slots 8 and 9: approvalsEpoch, lockedSince, linkedSince,
+ * pendingLinkedScheduledAt; withdrawalSince, pendingLockScheduledAt), and when the withdrawal address in force was
+ * chosen: withdrawalSince, or, for a change whose wait is over and not applied yet that names another address, its
+ * pendingLockScheduledAt (as applyPendingChanges sets it before a spend is judged).
+ */
+export async function readWithdrawalSince(client: PublicClient, vault: Address, blockNumber?: bigint): Promise<{ stored: Address; lockedSince: bigint; withdrawalSince: bigint; inForceSince: bigint }> {
+  const at = blockNumber ?? (await client.getBlockNumber({ cacheTime: 0 }));
+  const word = async (i: bigint) => BigInt((await client.getStorageAt({ address: vault, slot: `0x${(VAULT_V3_SLOT + i).toString(16).padStart(64, "0")}` as Hex, blockNumber: at })) ?? "0x0");
+  const [s0, s8, s9, lock] = await Promise.all([
+    word(0n),
+    word(8n),
+    word(9n),
+    client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "withdrawalLock", blockNumber: at }) as Promise<{ withdrawal: Address }>,
+  ]);
+  const stored = getAddress(`0x${(s0 & U160).toString(16).padStart(40, "0")}`);
+  const withdrawalSince = s9 & U64;
+  return { stored, lockedSince: (s8 >> 64n) & U64, withdrawalSince, inForceSince: getAddress(lock.withdrawal) !== stored ? (s9 >> 64n) & U64 : withdrawalSince };
+}
+
+/**
+ * Whether `vault`'s withdrawal address in force keeps what it is sent locked, as OstraVaultV3.withdrawalKeeps reads it
+ * (every read at one block, the latest): true for an address that does not answer lockedSince() with 32 bytes (not an
+ * Ostra vault: a revert or no code), else whether that vault's lock was on when the address was chosen and has stayed
+ * on (its lockedSince, not 0, at or before that time). Only then is a Transfer to it free of the daily limit
+ * (OstraVault.spend). False with the lock off and below version 3. An RPC failure is thrown, never read as either
+ * answer.
+ */
+export async function readWithdrawalKeeps(client: PublicClient, vault: Address): Promise<boolean> {
+  const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+  if (Number(await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION", blockNumber })) < VAULT_V3) return false;
+  const lock = (await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "withdrawalLock", blockNumber })) as { withdrawal: Address };
+  const withdrawal = getAddress(lock.withdrawal);
+  if (withdrawal === zeroAddress) return false;
+  let r: Hex | undefined;
+  try {
+    // From the vault, as its staticcall asks.
+    r = (await client.call({ account: vault, to: withdrawal, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "lockedSince" }), blockNumber })).data;
+  } catch (err) {
+    if (err instanceof BaseError && err.walk((e) => e instanceof ExecutionRevertedError || e instanceof RawContractError) !== null) return true;
+    throw err;
+  }
+  if (r === undefined || r.length !== 66) return true;
+  const since = BigInt(r);
+  return since !== 0n && since <= (await readWithdrawalSince(client, vault, blockNumber)).inForceSince;
 }
 
 /** A vault's position in a Borro stock market, and the market around it. */

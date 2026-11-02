@@ -61,6 +61,11 @@ export type Quote = {
    * recorded (28 Oct 2026). The price is on `gas`, what it uses.
    */
   limit?: string;
+  /**
+   * The gas floors of its catalog venue spends (sdk unpricedFloorGas, decided 2 Nov 2026): not in `gas` nor in the
+   * price, kept in its gas limit on top of `gas` (sendGasCap); absent: none, and in quotes made before.
+   */
+  unpricedGas?: string;
   gasPrice: string;
   /** The Chainlink ETH/USD answer the price was converted at (8 decimals, before the deviation). */
   ethUsd: string;

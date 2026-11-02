@@ -21,11 +21,27 @@
 //             swapGas it reserves is paid in full, the bound of what it can
 //             use, and an agent signs a swapGas close to what its swap needs.
 //             With swapGas, a Swap counts the gas limit headroom its check
-//             needs (swapGas / 63 + VAULT_SWAP_GAS_RESERVE). The relayer
+//             needs (swapGas / 63 + VAULT_SWAP_GAS_RESERVE). A vault spend
+//             that must start with a gas floor left (spendFloorGas: a Morpho,
+//             Guard or SupportRecovery spend, an Enter, an Exit, a Guard with
+//             op 5 or 6), or it reverts and keeps its key, counts its floor
+//             the same way, for the same reason: code the vault does not pin
+//             can use little gas simulated and all of its floor when sent.
+//             Except a venue spend of VENUE_CATALOG (catalogVenueSpend, decided
+//             2 Nov 2026: an Enter, an Exit or a Guard with op 5 or 6 in a
+//             venue of the design's first release, whose code the vault pins
+//             when it enables it): it is priced at the gas it uses simulated,
+//             like any other spend, and its floor is kept in the gas limit
+//             without being priced (unpricedFloorGas). The relayer
 //             sends the transaction with a gas limit of at most that gas +
-//             RELAYER_MARGIN_BPS (relayGasCap): code that uses more when sent
-//             than it did simulated cannot make the relayer pay more gas than
-//             it was paid for.
+//             RELAYER_MARGIN_BPS (relayGasCap), with the unpriced floors added
+//             before the margin: code that uses more when sent than it did
+//             simulated cannot make the relayer pay more gas than it was paid
+//             for, except a catalog venue spend, which can never land as
+//             failed for lack of gas and whose extra gas the relayer bears: a
+//             bounded subsidy, at most its floor with the margin per spend
+//             (in practice what a pinned venue uses beyond its simulation,
+//             the state changed in between).
 //             An Ostra Swap OstraRouter.executeEscrow (decided 21 Oct 2026)
 //             gives its swap all the gas left but REFUND_GAS_RESERVE and
 //             refunds the order when the swap runs out, without reverting:
@@ -107,6 +123,7 @@ import type { Deployment } from "./deployment.ts";
 import { ostraPadAbi } from "./pad-abi.ts";
 import { decodeSwapParams } from "./messages.ts";
 import { chainlinkAggregatorAbi, multicall3Abi, nodeInterfaceAbi } from "./external-abi.ts";
+import { inVenueCatalog } from "./venues.ts";
 
 // ---------------------------------------------------------------------------
 // Decided numbers (design v0.3; Robinhood Chain values decided 17 Oct 2026)
@@ -282,9 +299,11 @@ export class RelaySimulationError extends Error {
   }
 }
 
-/** Every error Ostra's contracts define, to name a revert by. */
+/** Every error Ostra's contracts define, to name a revert by (the vault's modules' too: their reverts pass through the vault as they are). */
 const OSTRA_ERRORS = [
   ostraVaultAbi,
+  ostraVaultModuleAbi,
+  ostraVaultModuleV4Abi,
   ostraVaultFactoryAbi,
   ostraPoolAbi,
   ostraLaunchpadAbi,
@@ -312,10 +331,15 @@ export function ostraRevertReason(data: Hex | undefined): string | null {
 }
 
 export type RelayMeasure = {
-  /** Gas the transaction is priced at: its simulated execution, its L1 data component and the swapGas its Swaps reserve. */
+  /**
+   * Gas the transaction is priced at: its simulated execution, its L1 data component, the swapGas its Swaps reserve and
+   * the floors of its spends but those of its catalog venue spends.
+   */
   gas: bigint;
+  /** The floors of its catalog venue spends (unpricedFloorGas): kept in its gas limit on top of `gas`, not priced. */
+  unpricedGas: bigint;
   gasPrice: bigint;
-  /** gas x gasPrice: what the gas costs the relayer at most. */
+  /** gas x gasPrice: what the gas costs the relayer at most, but the unpriced floors, which it bears when used. */
   wei: bigint;
   /** ETH the transaction sends (relayValue: a vault-funded launch's fee the relayer fronts). */
   value: bigint;
@@ -421,22 +445,19 @@ export function swapGasOf(tx: { to: Address; data: Hex }): bigint[] {
 }
 
 /**
- * The gas the vault Swaps of the relay transaction `tx` reserve, added up:
- * each its swapGas (swapGasOf) and the gas limit its check needs beyond it
- * (swapGas / 63 + VAULT_SWAP_GAS_RESERVE), so that the gas limit cap
- * (relayGasCap) stays within what the transaction was priced at.
+ * The gas the vault spends of the relay transaction `tx` reserve beyond what they use, added up: each Swap its swapGas
+ * (swapGasOf) and the gas limit its check needs beyond it (swapGas / 63 + VAULT_SWAP_GAS_RESERVE), and each spend's
+ * gas floor (floorGasOf), so that the gas limit cap (relayGasCap) leaves room for them. The relayer prices all of it
+ * but the floors of catalog venue spends (unpricedFloorGas), which the cap keeps on top of the priced gas.
  */
 export function reservedSwapGas(tx: { to: Address; data: Hex }): bigint {
   const swaps = swapGasOf(tx).reduce((a, g) => a + g + g / 63n + 1n + BigInt(VAULT_SWAP_GAS_RESERVE), 0n);
   return swaps + floorGasOf(tx).reduce((a, g) => a + g, 0n);
 }
 
-/**
- * The gas floor each vault spend of `tx` needs left when its call starts (spendFloorGas): with less the spend
- * reverts. Added to what the transaction is priced at (reservedSwapGas), so the gas limit cap leaves room for it.
- */
-export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
-  const out: bigint[] = [];
+/** The vault spends among the calls of the relay transaction `tx` that decode: their action and params. */
+function spendsOf(tx: { to: Address; data: Hex }): { action: number; params: Hex }[] {
+  const out: { action: number; params: Hex }[] = [];
   for (const c of relayedCalls(tx)) {
     if (c.data.slice(0, 10).toLowerCase() !== SPEND_SELECTOR) continue;
     let args: readonly unknown[];
@@ -445,10 +466,63 @@ export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
     } catch {
       continue;
     }
-    const floor = spendFloorGas(Number(args[0]), args[2] as Hex);
+    out.push({ action: Number(args[0]), params: args[2] as Hex });
+  }
+  return out;
+}
+
+/**
+ * The gas floor each vault spend of `tx` needs left when its call starts (spendFloorGas): with less the spend
+ * reverts. Added to what the transaction reserves (reservedSwapGas), so the gas limit cap leaves room for it; priced
+ * unless the spend is a catalog venue spend (unpricedFloorGas).
+ */
+export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
+  const out: bigint[] = [];
+  for (const s of spendsOf(tx)) {
+    const floor = spendFloorGas(s.action, s.params);
     if (floor !== 0n) out.push(floor);
   }
   return out;
+}
+
+/**
+ * The floors of the catalog venue spends of `tx` (catalogVenueSpend), added up: what its gas limit keeps on top of the
+ * gas it is priced at. Such a spend is priced at the gas it uses, like any other spend; the relayer bears what it uses
+ * beyond that when sent. None in a transaction with an escrow execution (escrowCalls): it is sent at exactly its gas
+ * cap and its swap gets all the gas left, code the agent picks (a pool's hook) that could burn an unpriced floor on
+ * purpose, so there every floor is priced.
+ */
+export function unpricedFloorGas(tx: { to: Address; data: Hex }): bigint {
+  if (escrowCalls(tx) > 0) return 0n;
+  return spendsOf(tx).reduce((a, s) => (catalogVenueSpend(s.action, s.params) ? a + spendFloorGas(s.action, s.params) : a), 0n);
+}
+
+/** The part of a spend's gas floor (spendFloorGas) the relayer prices: all of it, none for a catalog venue spend. */
+export function pricedFloorGas(action: number, params: Hex): bigint {
+  return catalogVenueSpend(action, params) ? 0n : spendFloorGas(action, params);
+}
+
+const U160 = (1n << 160n) - 1n;
+
+/**
+ * Whether a vault spend of `action` with `params` is a venue spend of VENUE_CATALOG (the design's first release; the
+ * vault pins a venue's code when it enables it): an Enter or an Exit whose kind and venue words name one, or a Guard
+ * spend with op 5 or 6 whose arg names one (kind << 160 | venue, as OstraVaultModuleV4._guardSpend reads it). Words the
+ * module's abi.decode would refuse (dirty bits) name none, and neither do params too short for them.
+ */
+export function catalogVenueSpend(action: number, params: Hex): boolean {
+  const word = (i: number) => (params.length >= 2 + 64 * (i + 1) ? BigInt(`0x${params.slice(2 + 64 * i, 2 + 64 * (i + 1))}`) : null);
+  const named = (kind: bigint, venue: bigint) => kind <= 0xffn && venue <= U160 && inVenueCatalog(Number(kind), getAddress(`0x${venue.toString(16).padStart(40, "0")}`));
+  if (action === VAULT_ACTION.ENTER || action === VAULT_ACTION.EXIT) {
+    const [kind, venue] = [word(0), word(1)];
+    return kind !== null && venue !== null && named(kind, venue);
+  }
+  if (action === VAULT_ACTION.GUARD) {
+    const [op, arg] = [word(1), word(2)];
+    if (op === null || arg === null || (op !== BigInt(GUARD_OP.EXIT) && op !== BigInt(GUARD_OP.EXIT_SWEEP)) || arg >> 168n !== 0n) return false;
+    return named(arg >> 160n, arg & U160);
+  }
+  return false;
 }
 
 /**
@@ -561,7 +635,11 @@ export async function escrowGasLimit(client: PublicClient, a: RelayTxInput, gasU
  * for the 63/64 of each nested call and the L1 component moving. Whatever the
  * code a call runs does when sent, the relayer pays at most this much gas,
  * what it was paid for at the quote's gas price; a transaction that needs
- * more than this limit now is not sent.
+ * more than this limit now is not sent. A transaction with catalog venue
+ * spends is capped at the priced gas plus their floors (RelayMeasure
+ * unpricedGas): its cap exceeds what it was paid for by at most those floors
+ * with the margin, a subsidy the relayer bears so that such a spend never
+ * lands as failed for lack of gas.
  */
 export function relayGasCap(gas: bigint): bigint {
   return withMargin(gas);
@@ -570,23 +648,35 @@ export function relayGasCap(gas: bigint): bigint {
 const SPEND_SELECTOR = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "function" && x.name === "spend") as Parameters<typeof toFunctionSelector>[0]).toLowerCase();
 
 /**
+ * The gas the relay transaction `tx` is priced at when it used `gasUsed` simulated and its L1 data component is `l1`
+ * (escrow executions aside: estimateRelay): those, and what its spends reserve (reservedSwapGas) but the floors of its
+ * catalog venue spends, which come apart as `unpricedGas` (unpricedFloorGas: its gas limit keeps them, unpriced).
+ */
+export function relayGas(tx: { to: Address; data: Hex }, gasUsed: bigint, l1: bigint): { gas: bigint; unpricedGas: bigint } {
+  const unpricedGas = unpricedFloorGas(tx);
+  return { gas: gasUsed + l1 + reservedSwapGas(tx) - unpricedGas, unpricedGas };
+}
+
+/**
  * The gas `tx` is priced at sent from `relayer`: what it uses (simulateRelay),
- * its L1 data component and the swapGas its Swaps reserve (reservedSwapGas),
- * or for escrow executions at least the gas limit their swaps need
- * (escrowGasLimit);
- * the current gas price, their product (what the relayer pays for it at
- * most), and the logs it emits. The relayer gate prices with it; an agent
+ * its L1 data component and what its spends reserve (reservedSwapGas) but the
+ * floors of its catalog venue spends (unpricedFloorGas, returned apart as
+ * unpricedGas: its gas limit keeps them), or for escrow executions at least
+ * the gas limit their swaps need (escrowGasLimit);
+ * the current gas price, the product of gas and price (what the relayer is
+ * paid for), and the logs it emits. The relayer gate prices with it; an agent
  * checks a quote with it.
  */
 export async function estimateRelay(client: PublicClient, a: RelayTxInput): Promise<RelayMeasure> {
   const { gasUsed, logs } = await simulateRelay(client, a);
   const [l1, gasPrice] = await Promise.all([l1DataGas(client, a.to, a.data), client.getGasPrice()]);
-  let gas = gasUsed + l1 + reservedSwapGas(a);
+  const { gas: priced, unpricedGas } = relayGas(a, gasUsed, l1);
+  let gas = priced;
   if (escrowCalls(a) > 0) {
     const floor = (await escrowGasLimit(client, a, gasUsed, escrowSwaps(logs, escrowRouters(a)))) + l1;
     if (floor > gas) gas = floor;
   }
-  return { gas, gasPrice, wei: gas * gasPrice, value: a.value ?? 0n, logs };
+  return { gas, unpricedGas, gasPrice, wei: gas * gasPrice, value: a.value ?? 0n, logs };
 }
 
 /** What a relay of `m` is charged in wei before conversion: its gas with RELAYER_MARGIN_BPS, plus the ETH it sends (no margin on that). */

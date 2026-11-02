@@ -48,7 +48,8 @@ export function envFile(vars: Record<string, string>): string {
     .join("\n")}\n`;
 }
 
-async function writePrivateIfChanged(path: string, text: string): Promise<boolean> {
+/** Writes `text` to `path` (0600, through a temporary file) unless it holds that already; whether it wrote. */
+export async function writePrivateIfChanged(path: string, text: string): Promise<boolean> {
   try {
     if ((await readFile(path, "utf8")) === text) return false;
   } catch (err) {

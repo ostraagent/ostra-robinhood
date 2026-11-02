@@ -36,4 +36,5 @@ export * from "./tide.ts";
 export * from "./trading.ts";
 export * from "./unshield.ts";
 export * from "./vault.ts";
+export * from "./venues.ts";
 export * from "./wallet-swap.ts";

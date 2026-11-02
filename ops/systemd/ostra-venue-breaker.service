@@ -1,0 +1,25 @@
+# Ostra's venue breaker keeper on Robinhood Chain: reads every version 4 vault's venue positions and sends
+# OstraVault.tripVenue when a venue changed (its code, implementation or Raeto source) or a Raeto stock vault is above
+# its max LTV, while the vault's agent is offline as well. Its environment file and directories are made by
+# keeper/scripts/setup-venue-breaker.ts. Installed with the release that finalizes the version 4 record, with @NODE@
+# replaced by the path of node.
+[Unit]
+Description=Ostra venue breaker keeper on Robinhood Chain: trips version 4 vaults' venue positions when a venue changes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+EnvironmentFile=/etc/ostra/robinhood/venue-breaker.env
+ExecStart=@NODE@ src/venue-breaker-main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,11 @@
 // What it says never holds the RPC URL, which may carry an API key, also
 // when the replacement proof decides. A transaction that earns a gas refund
 // needs a limit above what it uses: sent within the gate's cap of its priced
-// gas alone it is refused, within sendGasCap it lands.
+// gas alone it is refused, within sendGasCap it lands. A venue spend of sdk
+// VENUE_CATALOG (a Spark Savings USDG Enter of a fresh deployment's vault) is
+// priced at the gas it uses simulated, its floor kept apart: within the cap of
+// that price alone it is not sent, within sendGasCap it lands with its floor
+// left; an Enter into a venue outside the catalog is priced with its floor.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -36,10 +40,12 @@ import {
   http,
   keccak256,
   numberToHex,
+  parseAbi,
   stringToHex,
   toEventSelector,
   toFunctionSelector,
   zeroAddress,
+  type Address,
   type Hex,
   type PrivateKeyAccount,
   type PublicClient,
@@ -47,24 +53,31 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import {
   FileWotsStore,
+  RAETO_USDG_VAULT,
   ROBINHOOD_CHAIN_ID,
   SPARK_SAVINGS_USDG,
   USDG,
   VAULT_ACTION,
+  VAULT_ERC4626_MIN_GAS,
   VENUE_KIND,
   WotsKeychain,
   enterParams,
   estimateRelay,
   failedModuleSpends,
   failedSwaps,
+  l1DataGas,
   ostraVaultAbi,
   ostraVaultFactoryAbi,
   relayGasCap,
+  relayPriceWei,
   retryingHttp,
   robinhoodChain,
+  setVenueParams,
   signVaultSpend,
+  simulateRelay,
   usdgAbi,
   vaultAddress,
+  withMargin,
 } from "@ostraagent/sdk";
 import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { sendGasCap } from "../src/gate.ts";
@@ -207,6 +220,83 @@ test("a transaction whose vault Enter fails now (VenueFailed) is not sent when t
     assert.equal(receipt.status, "success");
     assert.deepEqual(failedModuleSpends(receipt.logs, [vault]), [{ vault, kind: "venue", action: VAULT_ACTION.ENTER, reason: notEnabled }]);
     assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "nonce" }), 1n, "the spend used its key");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a venue spend of the catalog is priced at the gas it uses and sent with its floor left; one outside the catalog is priced with its floor", async () => {
+  // A version 4 vault of a fresh deployment enables Spark Savings USDG and enters it: a venue spend of sdk
+  // VENUE_CATALOG, priced at the gas it uses simulated (with the margin, relayPriceWei) while its gas limit keeps the
+  // floor the module checks (VAULT_ERC4626_MIN_GAS) on top of it (sendGasCap). Raeto's USDG vault named as an ERC4626
+  // venue is outside the catalog: an Enter into it is priced with that floor, as before.
+  const d = await deployOnFork(fork);
+  const dir = await mkdtemp(join(tmpdir(), "ostra-relayer-catalog-"));
+  try {
+    const keychain = new WotsKeychain(new Uint8Array(32).fill(6), keccak256(stringToHex("OSTRA/EVM/RELAYER-SEND-TEST/catalog-vault"), "bytes"), new FileWotsStore(join(dir, "wots")));
+    const root0 = bytesToHex(keychain.keyRoot(0n));
+    const deployer = fork.accounts[0]!;
+    const created = await fork.wallet(deployer).writeContract({ address: d.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "createVault", args: [USDG, root0, zeroAddress], account: deployer, chain: fork.client.chain });
+    assert.equal((await fork.client.waitForTransactionReceipt({ hash: created })).status, "success");
+    const vault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root0, initialCrank: zeroAddress });
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 4);
+    await fork.dealUsdg(vault, 10_000_000n);
+    const spend = async (nonce: bigint, action: number, params: Hex) => {
+      const signed = await signVaultSpend(keychain, { vault, nonce, keyRoot: bytesToHex(keychain.keyRoot(nonce)) }, { chainId: ROBINHOOD_CHAIN_ID, action: action as never, params });
+      return { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, signed.signature] }) };
+    };
+    /** The gate's quote of `tx` from the relayer's account (gate.ts #quote): its measure, and the fields sendGasCap reads. */
+    const quote = async (tx: { to: Address; data: Hex }) => {
+      const m = await estimateRelay(fork.client, { relayer: account.address, ...tx });
+      const limit = await fork.client.estimateGas({ account: account.address, ...tx });
+      return { m, q: { gas: m.gas.toString(), limit: limit.toString(), ...(m.unpricedGas === 0n ? {} : { unpricedGas: m.unpricedGas.toString() }) } };
+    };
+    const floor = BigInt(VAULT_ERC4626_MIN_GAS);
+
+    const enable = await sender.send(await spend(0n, VAULT_ACTION.SET_VENUE, setVenueParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, enabled: true })));
+    assert.equal((await fork.client.getTransactionReceipt({ hash: enable.txHash })).status, "success");
+    assert.equal(((await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "venueOf", args: [VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG] })) as readonly [boolean, boolean, boolean, bigint])[2], true, "Spark is in force");
+
+    // The catalog Enter: priced at what it uses simulated (no L1 data part on anvil), its floor apart.
+    const enter = await spend(1n, VAULT_ACTION.ENTER, enterParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, amount: 1_000_000n, minPosition: 0n }));
+    const { m, q } = await quote(enter);
+    const simulated = (await simulateRelay(fork.client, { relayer: account.address, ...enter })).gasUsed;
+    assert.equal(m.unpricedGas, floor);
+    assert.equal(m.gas, simulated + (await l1DataGas(fork.client, enter.to, enter.data)));
+    assert.ok(m.gas < floor, `priced at ${m.gas} gas, under its floor of ${floor}`);
+    assert.equal(relayPriceWei(m), withMargin(m.gas * m.gasPrice), "the gas it uses + RELAYER_MARGIN_BPS");
+    // Within the cap of its price alone it cannot start with its floor: not sent, its key unused.
+    const nonce = await fork.client.getTransactionCount({ address: account.address });
+    await assert.rejects(sender.send(enter, { maxGas: relayGasCap(m.gas) }), (err: unknown) => err instanceof NotSentError && err.overCap);
+    assert.equal(await fork.client.getTransactionCount({ address: account.address }), nonce);
+    // Within sendGasCap it lands, its floor left: the Enter takes effect (no VenueFailed).
+    const landed = await sender.send(enter, { maxGas: sendGasCap(q, false) });
+    const receipt = await fork.client.getTransactionReceipt({ hash: landed.txHash });
+    const sentTx = await fork.client.getTransaction({ hash: landed.txHash });
+    assert.equal(receipt.status, "success");
+    assert.deepEqual(failedModuleSpends(receipt.logs, [vault]), []);
+    assert.ok(sentTx.gas >= floor && sentTx.gas <= sendGasCap(q, false), `sent with a limit of ${sentTx.gas}`);
+    const shares = await fork.client.readContract({ address: SPARK_SAVINGS_USDG, abi: parseAbi(["function balanceOf(address) view returns (uint256)"]), functionName: "balanceOf", args: [vault] });
+    assert.ok(shares > 0n, "the vault holds Spark shares");
+    // Charged about the gas it used: the price is on the simulated gas, within 10% of the receipt's.
+    const used = receipt.gasUsed;
+    assert.ok(m.gas * 10n >= used * 9n && m.gas * 10n <= used * 11n, `priced at ${m.gas} gas, used ${used}`);
+    console.log(`catalog Spark Enter: priced at ${m.gas} gas (simulated ${simulated}), used ${used}, floor ${floor} unpriced, sent with a limit of ${sentTx.gas} (cap ${sendGasCap(q, false)}); charged ${relayPriceWei(m)} wei at ${m.gasPrice} wei a gas, against ${withMargin((m.gas + floor) * m.gasPrice)} with its floor`);
+
+    // Outside the catalog: an Enter into Raeto's USDG vault named as an ERC4626 venue, which the vault never enabled,
+    // is priced with its floor and nothing apart; sent (allowFailedSwaps), it lands as VenueFailed, its floor left too.
+    const outside = await spend(2n, VAULT_ACTION.ENTER, enterParams({ kind: VENUE_KIND.ERC4626, venue: RAETO_USDG_VAULT, amount: 1_000_000n, minPosition: 0n }));
+    const o = await quote(outside);
+    const simulatedOutside = (await simulateRelay(fork.client, { relayer: account.address, ...outside })).gasUsed;
+    assert.equal(o.m.unpricedGas, 0n);
+    assert.equal(o.m.gas, simulatedOutside + (await l1DataGas(fork.client, outside.to, outside.data)) + floor);
+    assert.equal(relayPriceWei(o.m), withMargin((simulatedOutside + floor) * o.m.gasPrice));
+    const failed = await sender.send(outside, { maxGas: sendGasCap(o.q, false) });
+    const r2 = await fork.client.getTransactionReceipt({ hash: failed.txHash });
+    assert.equal(r2.status, "success");
+    assert.deepEqual(failedModuleSpends(r2.logs, [vault]), [{ vault, kind: "venue", action: VAULT_ACTION.ENTER, reason: toFunctionSelector("NotEnabled()") }]);
+    console.log(`non-catalog ERC4626 Enter: priced at ${o.m.gas} gas (simulated ${simulatedOutside} + floor ${floor}), used ${r2.gasUsed}`);
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "nonce" }), 3n);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

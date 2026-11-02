@@ -8,7 +8,8 @@
 // nothing) and, when it holds vault Swaps that must not fail, simulated once
 // more for their SwapFailed (one that fails now is not sent). Its gas limit
 // is the estimate + 20%, at most the cap the gate gives (what the
-// transaction was priced at, relayGasCap): one that needs more now is not
+// transaction was priced at, relayGasCap, with the floors of its catalog
+// venue spends: gate.ts sendGasCap): one that needs more now is not
 // sent. It is signed locally,
 // so its hash is known before the RPC sees it, with the value the gate gives
 // (a vault-funded launch's fee), and then waited for:

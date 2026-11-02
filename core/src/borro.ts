@@ -15,11 +15,13 @@
 import { encodeFunctionData, getAddress, isAddress, keccak256, toHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import {
   BORRO_USDG_VAULT,
+  GUARD_OP,
   MAX_RECOVERY_DELAY,
   MIN_RECOVERY_DELAY,
   QuoteError,
   VAULT_ACTION,
   VAULT_V3,
+  VAULT_V4,
   approveHashParams,
   borroStock,
   borroStocks,
@@ -41,6 +43,7 @@ import {
   setWithdrawalLockParams,
   signVaultSpend,
   simulateVaultSpend,
+  pricedFloorGas,
   spendFloorGas,
   vaultV2Abi,
   withdrawCollateralParams,
@@ -110,8 +113,9 @@ function less(x: bigint, bps: bigint): bigint {
 
 /**
  * The gas a spend must have left to run (a Morpho spend MORPHO_MIN_GAS, a Guard spend GUARD_MIN_GAS or with op 5
- * GUARD_EXIT_MIN_GAS, an Enter or an Exit its venue kind's floor): sdk spendFloorGas, the floor the relayer prices on
- * top of the gas the spend uses (sdk reservedSwapGas).
+ * GUARD_EXIT_MIN_GAS, an Enter or an Exit its venue kind's floor): sdk spendFloorGas, which the spend is reserved for
+ * on top of the gas it uses (sdk reservedSwapGas). The relayer prices it too, except for a venue spend of sdk
+ * VENUE_CATALOG (sdk pricedFloorGas: spendCostAt).
  */
 function gasFloor(action: number, params: Hex): bigint {
   return spendFloorGas(action, params);
@@ -309,8 +313,9 @@ export class BorroService {
   /**
    * What a spend of `action` with `params` from the vault holding `what` ("USDG" or a Borro stock) costs through the
    * relayer now, in USDG base units, by the relayer's own rule: the gas it uses (simulated with a throwaway key: it
-   * must not fail now), the floor a Morpho or Guard spend reserves, the L1 data of its calldata, at the gas price, with
-   * the relayer's margin, at the Chainlink price.
+   * must not fail now), the floor a Morpho, Guard, Enter or Exit spend reserves but that of a venue spend of sdk
+   * VENUE_CATALOG (sdk pricedFloorGas: the relayer does not price that one), the L1 data of its calldata, at the gas
+   * price, with the relayer's margin, at the Chainlink price.
    */
   async spendCost(what: string, action: number, params: Hex, label: string): Promise<{ gas: bigint; usdg: bigint }> {
     const { vault } = this.#vaultOf(what);
@@ -327,7 +332,7 @@ export class BorroService {
     const at = await vault.vaultAddress();
     const data = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256(toHex("OSTRA/STRATEGY/NEXT-ROOT")), params, standInSignature()] });
     const [l1, gasPrice] = await Promise.all([l1DataGas(this.#p.client, at, data), this.#p.gasPrice === undefined ? this.#p.client.getGasPrice() : this.#p.gasPrice()]);
-    const gas = gasUsed + gasFloor(action, params) + l1;
+    const gas = gasUsed + pricedFloorGas(action, params) + l1;
     const ethUsd = await (this.#p.ethUsd ?? chainlinkEthUsd(this.#p.client))();
     return { gas, usdg: weiToTokenUnits(withMargin(gas * gasPrice), ethUsd, TOKEN_DECIMALS) };
   }
@@ -534,16 +539,26 @@ export class BorroService {
 
   /**
    * As a guardian of another (locked) vault, from the buyer vault: drops its waiting changes, withdraws one of its
-   * hash approvals, sends its whole balance to its withdrawal address, or takes its Borro shares or collateral back
-   * into it (OstraVault.guard through a Guard spend).
+   * hash approvals, sends its whole balance to its withdrawal address, takes its Borro shares or collateral back into
+   * it, or (version 4, ops 5 and 6) brings a venue position back into it, and with op 6 sweeps it to its withdrawal
+   * address in the same call (OstraVault.guard through a Guard spend). Ops 5 and 6 need both vaults at version 4: a
+   * Guard spend runs them in OstraVaultModuleV4, and the other vault's guard does too.
    */
   async guardOther(vaultText: string, call: GuardCall): Promise<VaultOperationResult> {
     if (!isAddress(vaultText, { strict: false })) throw new RangeError(`${vaultText} is not an address`);
     const target = getAddress(vaultText);
     await this.#v3(target);
+    if (call.op === GUARD_OP.EXIT || call.op === GUARD_OP.EXIT_SWEEP) {
+      const own = await this.#address(this.#p.buyer, "USDG");
+      for (const [v, whose] of [[target, "the guarded vault"], [own, "this guardian vault"]] as const) {
+        const version = Number(await this.#p.client.readContract({ address: v, abi: ostraVaultAbi, functionName: "VERSION" }));
+        if (version < VAULT_V4) throw new Error(`${whose} ${v} runs version ${version}; a venue exit through Guard (ops 5 and 6) opens once the vaults run version ${VAULT_V4} (the upgrade waits its public delay in OstraUpgradeOwner); nothing was signed`);
+      }
+    }
     const g = await readVaultGuard(this.#p.client, target);
     if (g.lockedSince === 0n) throw new Error(`${target} is not locked: guardians act on a vault only while its withdrawal lock is on; nothing was signed`);
-    const names = ["cancel", "revoke", "sweep", "redeem", "withdraw collateral"];
+    if (call.op === GUARD_OP.EXIT_SWEEP && getAddress(call.expected) !== g.lock.withdrawal) throw new Error(`${target}'s withdrawal address is ${g.lock.withdrawal}, not ${call.expected}: op 6 sweeps only to the one in force; nothing was signed`);
+    const names = ["cancel", "revoke", "sweep", "redeem", "withdraw collateral", "venue exit", "venue exit and sweep"];
     return this.#spend(this.#p.buyer, VAULT_ACTION.GUARD, guardParams(target, call), `guard (${names[call.op] ?? call.op}) of ${target}`);
   }
 

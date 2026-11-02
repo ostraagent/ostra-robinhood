@@ -10,6 +10,7 @@ import {
   GUARD_OP,
   MULTICALL3,
   RAETO_NVDA_VAULT,
+  RAETO_TSLA_VAULT,
   RAETO_USDG_VAULT,
   SPARK_SAVINGS_USDG,
   USDG,
@@ -26,6 +27,7 @@ import {
 } from "../src/constants.ts";
 import { enterParams, exitParams, forwardParams, guardParams, lendParams, setVenueParams, supportRecoveryParams, swapParams, transferParams } from "../src/messages.ts";
 import { multicall3Abi } from "../src/external-abi.ts";
+import { STEAKHOUSE_USDG } from "../src/strategy.ts";
 import {
   ETH_USD_DEVIATION_BPS,
   ETH_USD_MAX_AGE_SECONDS,
@@ -45,10 +47,15 @@ import {
   escrowCalls,
   escrowSwaps,
   failedModuleSpends,
+  catalogVenueSpend,
   floorGasOf,
   moduleFailureText,
+  pricedFloorGas,
+  relayGas,
+  relayPriceWei,
   reservedSwapGas,
   spendFloorGas,
+  unpricedFloorGas,
   swapGasOf,
   weiToTokenUnits,
   withMargin,
@@ -225,6 +232,66 @@ test("the gas floors of a relay transaction's vault spends: Morpho, Guard and Su
   const both = relayTransaction([venue(VAULT_ACTION.ENTER, VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT), venue(VAULT_ACTION.EXIT, VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG)]);
   assert.deepEqual(floorGasOf(both), [BigInt(VAULT_RAETO_USDG_MIN_GAS), BigInt(VAULT_ERC4626_MIN_GAS)]);
   assert.equal(reservedSwapGas(both), BigInt(VAULT_RAETO_USDG_MIN_GAS + VAULT_ERC4626_MIN_GAS));
+});
+
+test("a venue spend of VENUE_CATALOG is priced at the gas it uses, its floor kept apart for the gas limit; one outside it is priced with its floor", () => {
+  const spend = (action: number, params: Hex) => ({ to: at(1), data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256("0x02"), params, "0x00"] }) });
+  const enter = (kind: number, v: Hex) => enterParams({ kind: kind as never, venue: v, amount: 1n, minPosition: 0n });
+  const exit = (kind: number, v: Hex) => exitParams({ kind: kind as never, venue: v, amount: 1n, minOut: 0n });
+  // The catalog: Spark as ERC4626, Raeto's USDG vault, Raeto's stock vaults; Enter and Exit, and a Guard with op 5 or 6.
+  for (const [kind, venue] of [[VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG], [VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT], [VENUE_KIND.RAETO_STOCK, RAETO_NVDA_VAULT], [VENUE_KIND.RAETO_STOCK, RAETO_TSLA_VAULT]] as const) {
+    for (const params of [enter(kind, venue), exit(kind, venue)]) {
+      for (const action of [VAULT_ACTION.ENTER, VAULT_ACTION.EXIT]) {
+        assert.equal(catalogVenueSpend(action, params), true, `${action} ${kind} ${venue}`);
+        assert.equal(pricedFloorGas(action, params), 0n);
+      }
+    }
+    assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT, kind, venue, amount: 0n })), true);
+    assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT_SWEEP, kind, venue, amount: 0n, expected: at(6) })), true);
+    assert.equal(pricedFloorGas(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT, kind, venue, amount: 0n })), 0n);
+  }
+  // Outside it: another venue of a kind (Steakhouse is an ERC-4626, a venue anyone deploys too), a catalog venue under
+  // another kind, a Guard of another op, any other spend: their floors are priced.
+  for (const params of [enter(VENUE_KIND.ERC4626, STEAKHOUSE_USDG), enter(VENUE_KIND.ERC4626, at(0x4626)), enter(VENUE_KIND.ERC4626, RAETO_USDG_VAULT), enter(VENUE_KIND.RAETO_USDG, SPARK_SAVINGS_USDG), exit(VENUE_KIND.RAETO_STOCK, RAETO_USDG_VAULT)]) {
+    assert.equal(catalogVenueSpend(VAULT_ACTION.ENTER, params), false, params);
+    assert.equal(pricedFloorGas(VAULT_ACTION.ENTER, params), spendFloorGas(VAULT_ACTION.ENTER, params));
+  }
+  assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.EXIT, kind: VENUE_KIND.ERC4626, venue: at(0x4626), amount: 0n })), false);
+  assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.SWEEP, expected: SPARK_SAVINGS_USDG })), false);
+  assert.equal(pricedFloorGas(VAULT_ACTION.GUARD, guardParams(at(5), { op: GUARD_OP.SWEEP, expected: at(6) })), BigInt(VAULT_GUARD_MIN_GAS));
+  assert.equal(pricedFloorGas(VAULT_ACTION.LEND, lendParams({ vault: STEAKHOUSE_USDG, assets: 1n, minShares: 0n })), BigInt(VAULT_MORPHO_MIN_GAS));
+  assert.equal(catalogVenueSpend(VAULT_ACTION.SET_VENUE, setVenueParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, enabled: true })), false);
+  // Words the module's abi.decode refuses name no venue: a dirty kind or venue word, a Guard arg with bits above the
+  // kind, an op word of more than a byte, and params too short.
+  const spark = enter(VENUE_KIND.ERC4626, SPARK_SAVINGS_USDG);
+  assert.equal(catalogVenueSpend(VAULT_ACTION.ENTER, `0x${"00".repeat(30)}01${spark.slice(64)}` as Hex), false);
+  assert.equal(catalogVenueSpend(VAULT_ACTION.ENTER, `${spark.slice(0, 66)}01${spark.slice(68)}` as Hex), false);
+  const guard = guardParams(at(5), { op: GUARD_OP.EXIT, kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, amount: 0n });
+  assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, `${guard.slice(0, 130)}01${guard.slice(132)}` as Hex), false);
+  assert.equal(catalogVenueSpend(VAULT_ACTION.GUARD, `${guard.slice(0, 66)}${"00".repeat(30)}0105${guard.slice(130)}` as Hex), false);
+  assert.equal(catalogVenueSpend(VAULT_ACTION.ENTER, spark.slice(0, 66) as Hex), false);
+
+  // The price: a Spark Enter that used 300,000 gas simulated with 50,000 of L1 data is priced at those alone, and its
+  // floor (600,000) is kept apart for the gas limit; the same Enter into a venue outside the catalog is priced with it.
+  const gasPrice = 20_000_000n;
+  const inCatalog = relayTransaction([spend(VAULT_ACTION.ENTER, spark)]);
+  const outside = relayTransaction([spend(VAULT_ACTION.ENTER, enter(VENUE_KIND.ERC4626, at(0x4626)))]);
+  assert.deepEqual(relayGas(inCatalog, 300_000n, 50_000n), { gas: 350_000n, unpricedGas: BigInt(VAULT_ERC4626_MIN_GAS) });
+  assert.deepEqual(relayGas(outside, 300_000n, 50_000n), { gas: 350_000n + BigInt(VAULT_ERC4626_MIN_GAS), unpricedGas: 0n });
+  assert.equal(relayPriceWei({ wei: relayGas(inCatalog, 300_000n, 50_000n).gas * gasPrice, value: 0n }), withMargin(350_000n * gasPrice));
+  assert.equal(relayPriceWei({ wei: relayGas(outside, 300_000n, 50_000n).gas * gasPrice, value: 0n }), withMargin((350_000n + BigInt(VAULT_ERC4626_MIN_GAS)) * gasPrice));
+  // What the transaction reserves (and its gas limit cap keeps) is the same for both: the floor is never dropped from it.
+  assert.equal(reservedSwapGas(inCatalog), reservedSwapGas(outside));
+  // Several calls: each catalog spend's floor apart, every other floor priced.
+  const mixed = relayTransaction([spend(VAULT_ACTION.EXIT, exit(VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT)), spend(VAULT_ACTION.LEND, lendParams({ vault: STEAKHOUSE_USDG, assets: 1n, minShares: 0n })), spend(VAULT_ACTION.ENTER, spark)]);
+  assert.equal(unpricedFloorGas(mixed), BigInt(VAULT_RAETO_USDG_MIN_GAS + VAULT_ERC4626_MIN_GAS));
+  assert.deepEqual(relayGas(mixed, 1_000n, 0n), { gas: 1_000n + BigInt(VAULT_MORPHO_MIN_GAS), unpricedGas: BigInt(VAULT_RAETO_USDG_MIN_GAS + VAULT_ERC4626_MIN_GAS) });
+  assert.equal(unpricedFloorGas({ to: at(3), data: "0xabcdef01" }), 0n);
+  // With an escrow execution in the transaction (sent at its cap, its swap given all the gas left) every floor is
+  // priced, a catalog venue spend's too.
+  const withEscrow = relayTransaction([spend(VAULT_ACTION.EXIT, exit(VENUE_KIND.RAETO_USDG, RAETO_USDG_VAULT)), { to: at(7), data: concat([EXECUTE_ESCROW_SELECTOR, "0x00"]) }]);
+  assert.equal(unpricedFloorGas(withEscrow), 0n);
+  assert.deepEqual(relayGas(withEscrow, 1_000n, 0n), { gas: 1_000n + BigInt(VAULT_RAETO_USDG_MIN_GAS), unpricedGas: 0n });
 });
 
 test("escrow executions: counted by selector in a relay transaction, and their swaps read from EscrowExecuted", () => {

@@ -15,6 +15,8 @@ the list of Ostra's own vaults. Anyone can check the payout itself on chain agai
 - `src/tide-score.ts`: what is read from the chain for a week (`readTideWeek`).
 - `scripts/tide-score.ts`: the command that writes a week's result.
 - `scripts/tide-pay.ts`: the checks before the root is posted, the root, and the payouts.
+- `src/tide-manual.ts`: the vault a share without a payee is paid to, from a link made after the
+  deadline.
 - `test/tide-score.fork.test.ts` and `test/tide-pay.fork.test.ts`: both run end to end on a fork of
   mainnet.
 
@@ -127,6 +129,25 @@ A share whose link names no payee (a link made before MCP 0.1.16, not linked aga
 tree with no payee. OstraTide lets only its owner pay such a share, to an OSTRA vault the owner
 names, within 14 days of the root. After those 14 days, whatever is left in the week's pot moves to
 the pot of the week then running (`OstraTide.rollover`).
+
+`manual` pays those shares (`src/tide-manual.ts`). The owner names the vault the agent named itself
+after the link deadline: a link the index keeps whose set approval by the agent's identity vault
+took effect after the deadline (an approval in force by then was read by the score). It is checked
+as the score checks a link, at the latest block: the identity is still owned by the vault that
+registered it, that vault's approval of the set digest is in force, and the payee follows the same
+rules (a vault of the link in OSTRA, made by OstraTide's factory, with its member approval in force;
+or the OSTRA vault named by its creation parameters, created first when it has no code), never one
+of Ostra's own vaults or another agent's identity vault. Of several such links, the one approved
+latest counts. Each share is paid with `OstraTide.pay`, the vault named, from the owner's account,
+recorded and resumed as `pay` is, and never twice: a share paid on chain is skipped. A share whose
+agent has no such link is listed with the time the owner can pay it until (`rolloverAt`) and left
+alone. `check manual` sends nothing and says what `manual` would do.
+
+What was paid is kept in `week-<n>.paid.json` for the index. A run stopped after a payout was
+mined and before that file was written would leave the share out of it, since a run again does not
+pay it twice. So `root`, `pay` and `manual` first fill the file from the chain: the receipts of the
+payouts they recorded, then OstraTide's `Paid` event of any share paid on chain that the file still
+lacks.
 
 ## Who sees what
 

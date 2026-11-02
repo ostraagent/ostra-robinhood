@@ -13,6 +13,18 @@
 //     agent's OSTRA vault (its key root the agent's) and stops after the batch was signed; the run after sends that
 //     signed batch and pays each payee exactly its share, the new vault included, leaving a share without a payee
 //     unpaid and listed; a run again sends nothing; week-1.paid.json records the root's and the batch's transactions.
+//   * The run that sends the batch stops right after its receipt, before week-1.paid.json is written (as a crash
+//     would): the next run fills the file from the batch's recorded receipt; with the file's entries and the recorded
+//     batch removed, a run fills them again from OstraTide's Paid events.
+//   * A share without a payee (manual): agent L (a live ERC-8004 identity registered by its live creator vault) links
+//     after the link deadline, naming the OSTRA vault its seed creates (not created yet): check manual lists what it
+//     would do and sends nothing; manual creates that vault and pays L's share to it through OstraTide.pay with the
+//     vault named; a run again sends nothing; agent 990003, which never linked, is listed with the time the owner can
+//     pay it until and left alone. Before L's link that counts, each link that does not count is listed with why and
+//     nothing is sent: one its identity vault never approved, one approved before the link deadline (the score read
+//     it), one naming one of Ostra's own vaults or another agent's identity vault as its payee, one naming a vault of
+//     the link without that vault's member approval, and the identity no longer owned by its identity vault (the
+//     result names another one).
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -22,11 +34,30 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
-import { encodeFunctionData, erc20Abi, getAddress, keccak256, numberToHex, pad, parseAbi, parseAbiItem, stringToHex, type Address, type Hex, type PublicClient } from "viem";
+import { decodeEventLog, encodeFunctionData, erc20Abi, getAddress, keccak256, numberToHex, pad, parseAbi, parseAbiItem, sha256, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { FileWotsStore, OSTRA, OSTRA_TIDE, ostraVaultAbi, parseDeployment, retryingHttp, tideLinkDeadline, tidePayeeVault, tideTree, tideWeekSpan } from "@ostraagent/sdk";
+import {
+  FileWotsStore,
+  OSTRA,
+  OSTRA_TIDE,
+  USDG,
+  VAULT_ACTION,
+  approveHashParams,
+  ostraVaultAbi,
+  padCidFromDigest,
+  parseDeployment,
+  registerAgentParams,
+  retryingHttp,
+  signVaultSpend,
+  simulateVaultSpend,
+  tideLinkDeadline,
+  tidePayeeVault,
+  tideSetDigest,
+  tideTree,
+  tideWeekSpan,
+} from "@ostraagent/sdk";
 import { rpc, startFork, type Fork } from "@ostraagent/sdk/test/fork";
-import { Keys, LocalSender, VaultService, X402_NETWORK, type Config } from "../../core/src/index.ts";
+import { Keys, LocalSender, VaultService, X402_NETWORK, spendCall, type Config } from "../../core/src/index.ts";
 import { MemoryFolder } from "../../core/test/memory-folder.ts";
 
 const run = promisify(execFile);
@@ -34,6 +65,8 @@ const FACTORY: Address = "0x043a15c514CFE2c797d33520bFF91a5DCdbf2979";
 const FACTORY_FROM = 91_991_509n;
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 const ownerKey = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/owner"));
+const EARLY_SECRET = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/early-secret"));
+const OWN_VAULT = getAddress("0x00000000000000000000000000000000000000aa");
 const owner = privateKeyToAccount(ownerKey);
 const tideAbi = parseAbi([
   "struct Week { bytes32 root; uint128 total; uint128 paid; uint64 rootAt; bool rolled; }",
@@ -51,6 +84,11 @@ let root: string;
 let payees: Address[] = [];
 /** The agent whose OSTRA vault does not exist yet: its token vault service, as the MCP has it. */
 let fresh: VaultService;
+/** Agent L (manual): its identity, its creator vault (the identity vault) and its OSTRA vault, not created. */
+let lateId: bigint;
+let lateCreator: VaultService;
+let lateSender: LocalSender;
+let lateOstra: VaultService;
 
 before(async () => {
   root = await mkdtemp(join(tmpdir(), "ostra-tide-pay-"));
@@ -77,6 +115,30 @@ before(async () => {
   const transport = retryingHttp(fork.url);
   fresh = new VaultService(fork.client as PublicClient, transport, config, keys, new LocalSender(fork.client as PublicClient, transport, feePayer), "token", null, OSTRA);
   assert.equal(await fork.client.getCode({ address: await fresh.vaultAddress() }), undefined, "the agent's OSTRA vault does not exist");
+  // Agent L: its creator vault registers it in the live ERC-8004 registry; its OSTRA vault is not created.
+  await fork.setBalance(feePayer.address, 10n ** 18n);
+  const lateKeys = new Keys({ master: new Uint8Array(32).fill(78), feePayer, store: new FileWotsStore(join(root, "wots-late")), folder: new MemoryFolder(), backupExported: async () => true });
+  lateSender = new LocalSender(fork.client as PublicClient, transport, feePayer);
+  lateCreator = new VaultService(fork.client as PublicClient, transport, config, await lateKeys.forCreatorVault(live.chainId, USDG), lateSender, "creator");
+  lateOstra = new VaultService(fork.client as PublicClient, transport, config, lateKeys, lateSender, "token", null, OSTRA);
+  await lateCreator.open();
+  const creatorAt = getAddress(await lateCreator.vaultAddress());
+  const tx = await spend(lateCreator, VAULT_ACTION.REGISTER_AGENT, registerAgentParams(padCidFromDigest(sha256(stringToHex('{"name":"L"}')))));
+  for (const log of (await fork.client.getTransactionReceipt({ hash: tx })).logs) {
+    if (getAddress(log.address) !== creatorAt) continue;
+    try {
+      const e = decodeEventLog({ abi: ostraVaultAbi, data: log.data, topics: log.topics });
+      if (e.eventName === "AgentRegistered") lateId = (e.args as { agentId: bigint }).agentId;
+    } catch {
+      // another event
+    }
+  }
+  assert.ok(lateId !== undefined, "agent L is registered");
+  assert.equal(await fork.client.getCode({ address: await lateOstra.vaultAddress() }), undefined, "L has no OSTRA vault");
+  // A link of L approved before the link deadline (the fork is still in week 1): the score read it, manual does not.
+  await spend(lateCreator, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideSetDigest({ chainId: live.chainId, agentId: lateId, vaults: [creatorAt], payee: getAddress(await lateOstra.vaultAddress()), secret: EARLY_SECRET, outsidePayee: true }), approved: true }));
+  await writeFile(join(root, "tide-links.json"), "[]", { mode: 0o600 });
+  await writeFile(join(root, "own.tsv"), "0x00000000000000000000000000000000000000aa\tOstra's own (test)\n", { mode: 0o600 });
   await writeFile(join(root, "rpc.url"), `${fork.url}\n`, { mode: 0o600 });
   await writeFile(join(root, "owner.key"), `${ownerKey}\n`, { mode: 0o600 });
 });
@@ -86,10 +148,28 @@ after(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true });
 });
 
-async function pay(phase: "check" | "root" | "pay", stopAt?: string): Promise<{ ok: boolean; out: string }> {
-  const env = { ...process.env, OSTRA_RPC_URL_FILE: join(root, "rpc.url"), OSTRA_DEPLOYER_KEY_FILE: join(root, "owner.key"), OSTRA_TIDE_RESULTS: root, OSTRA_TIDE_PAY_BATCH: "20", OSTRA_TIDE_TEST_STOP: stopAt ?? "" };
+/** One spend of `vault` (simulated first for its gas), from its LocalSender. */
+async function spend(vault: VaultService, action: number, params: Hex): Promise<Hex> {
+  const at = await vault.vaultAddress();
+  const sim = await simulateVaultSpend(fork.client as PublicClient, live, { relayer: await lateSender.payer(), vault: at, action, params });
+  const r = await vault.operate({ gas: (sim.gasUsed * 5n) / 4n + 100_000n, what: "spend", build: async ({ v, vault: a, keychain, chainId }) => [spendCall(a, await signVaultSpend(keychain, v, { chainId, action: action as never, params }))] });
+  assert.equal(r.status, "sent", JSON.stringify(r));
+  return (r as { txHash: Hex }).txHash;
+}
+
+async function pay(phase: "check" | "root" | "pay" | "manual" | "check manual", stopAt?: string): Promise<{ ok: boolean; out: string }> {
+  const env = {
+    ...process.env,
+    OSTRA_RPC_URL_FILE: join(root, "rpc.url"),
+    OSTRA_DEPLOYER_KEY_FILE: join(root, "owner.key"),
+    OSTRA_TIDE_RESULTS: root,
+    OSTRA_TIDE_PAY_BATCH: "20",
+    OSTRA_TIDE_TEST_STOP: stopAt ?? "",
+    OSTRA_TIDE_LINKS: join(root, "tide-links.json"),
+    OSTRA_STATS_OWN: join(root, "own.tsv"),
+  };
   try {
-    const r = await run(process.execPath, ["scripts/tide-pay.ts", phase, "1"], { env, cwd: join(import.meta.dirname, ".."), timeout: 600_000 });
+    const r = await run(process.execPath, ["scripts/tide-pay.ts", ...phase.split(" "), "1"], { env, cwd: join(import.meta.dirname, ".."), timeout: 600_000 });
     return { ok: true, out: r.stdout + r.stderr };
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string };
@@ -100,7 +180,7 @@ async function pay(phase: "check" | "root" | "pay", stopAt?: string): Promise<{ 
 const ostra = (a: Address) => fork.client.readContract({ address: OSTRA, abi: erc20Abi, functionName: "balanceOf", args: [a] }) as Promise<bigint>;
 const nonce = () => fork.client.getTransactionCount({ address: owner.address });
 
-test("week 1 is posted and paid from the scorer's result: checks, root, a stopped pay finished, nothing twice", { timeout: 1_800_000 }, async () => {
+test("week 1 is posted and paid from the scorer's result: checks, root, a stopped pay finished, the paid file filled from the chain, a share without a payee paid after a late link, nothing twice", { timeout: 1_800_000 }, async () => {
   const c = fork.client;
   const pot = (await c.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "potBalance", args: [1n] })) as bigint;
   assert.ok(pot >= 3_000_000n * 10n ** 18n, `the live pot holds ${pot}`);
@@ -112,7 +192,9 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
     { week: 1, agentId: "990002", payee: payees[1]!, amount: 600_000n * 10n ** 18n },
     { week: 1, agentId: "990003", payee: ZERO, amount: 400_000n * 10n ** 18n },
     { week: 1, agentId: "990004", payee: created, amount: 300_000n * 10n ** 18n + 3n },
+    { week: 1, agentId: lateId.toString(), payee: ZERO, amount: 200_000n * 10n ** 18n + 5n },
   ];
+  const lateCreatorAt = getAddress(await lateCreator.vaultAddress());
   const tree = tideTree(shares);
   const total = shares.reduce((s, x) => s + x.amount, 0n);
   const { start, end } = tideWeekSpan(1);
@@ -128,7 +210,7 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
     shared: total.toString(),
     agents: shares.map((s) => ({
       agentId: s.agentId,
-      identityVault: ZERO,
+      identityVault: s.agentId === lateId.toString() ? lateCreatorAt : s.agentId === "990002" ? payees[1]! : ZERO,
       registeredAt: start,
       link: { status: "none" },
       vaults: [],
@@ -179,7 +261,7 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
   // A result read after the deadline: check, root, pay.
   await writeFile(join(root, "week-1.json"), JSON.stringify(result), { mode: 0o600 });
   r = await pay("check");
-  assert.ok(r.ok && r.out.includes("TIDE_CHECKED") && r.out.includes("1 without an OSTRA vault"), r.out);
+  assert.ok(r.ok && r.out.includes("TIDE_CHECKED") && r.out.includes("2 without an OSTRA vault"), r.out);
   assert.match(r.out, /1 OSTRA vault\(s\) to create before their shares are paid: about [0-9]+ gas, [0-9.]+ ETH/);
   r = await pay("root");
   assert.ok(r.ok && r.out.includes("TIDE_ROOT_SET"), r.out);
@@ -222,9 +304,14 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
   const kept = JSON.parse(await readFile(join(root, "tide-pay.json"), "utf8")) as Record<string, string>;
   const signed = kept[batch];
   assert.match(signed ?? "", /^0x[0-9a-f]{64}$/);
+  // Stopped right after the batch's receipt, before week-1.paid.json is written (as a crash would leave it).
+  r = await pay("pay", `${batch}:mined`);
+  assert.ok(!r.ok && r.out.includes(`SENT ${batch}: ${signed}`) && !r.out.includes(`SENT ${create}`) && r.out.includes(`TEST STOP at ${batch}:mined`), r.out);
+  const stopped = JSON.parse(await readFile(join(root, "week-1.paid.json"), "utf8")) as { paid: Record<string, unknown> };
+  assert.deepEqual(stopped.paid, {}, "the batch is paid on chain and not in the file yet");
+  // The next run fills the file from the batch's recorded receipt and sends nothing.
   r = await pay("pay");
-  assert.ok(r.out.includes(`SENT ${batch}: ${signed}`) && !r.out.includes(`SENT ${create}`), r.out);
-  assert.ok(r.ok && r.out.includes("TIDE_PAID"), r.out);
+  assert.ok(r.ok && r.out.includes("TIDE_PAID") && /week-1\.paid\.json: 3 share\(s\) paid on chain recorded from the chain/.test(r.out) && !r.out.includes("SENT "), r.out);
   assert.equal(await ostra(payees[0]!), before0 + shares[0]!.amount, "payee 1 paid its share exactly");
   assert.equal(await ostra(payees[1]!), before1 + shares[1]!.amount, "payee 2 paid its share exactly");
   assert.equal(await ostra(created), shares[3]!.amount, "the vault created at payout paid its share exactly");
@@ -232,6 +319,7 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
   for (const id of [990001n, 990002n, 990004n]) assert.equal(await c.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "paid", args: [1n, id] }), true);
   assert.equal(await c.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "paid", args: [1n, 990003n] }), false, "no payee: not paid");
   assert.match(r.out, /agent 990003: 400000 OSTRA waits for an OSTRA vault/);
+  assert.match(r.out, new RegExp(`agent ${lateId}: 200000\\.000000000000000005 OSTRA waits for an OSTRA vault`));
   assert.equal(await nonce(), 3);
   const paidFile = JSON.parse(await readFile(join(root, "week-1.paid.json"), "utf8")) as { root: Hex; rootTx: Hex; paid: Record<string, { tx: Hex; amount: string; vault: Address }> };
   assert.equal(paidFile.root, tree.root);
@@ -248,4 +336,90 @@ test("week 1 is posted and paid from the scorer's result: checks, root, a stoppe
   }
   assert.equal(await nonce(), 3, "nothing sent again");
   assert.equal(r.out.includes(fork.url), false, "the RPC URL is never printed");
+
+  // The paid file's entries and the recorded batch removed: a run fills them again from OstraTide's Paid events.
+  const full = JSON.parse(await readFile(join(root, "week-1.paid.json"), "utf8")) as { paid: Record<string, unknown> };
+  await writeFile(join(root, "week-1.paid.json"), JSON.stringify({ ...full, paid: {} }), { mode: 0o600 });
+  const keptNow = JSON.parse(await readFile(join(root, "tide-pay.json"), "utf8")) as Record<string, string>;
+  for (const k of Object.keys(keptNow)) if (k.startsWith("pay:")) delete keptNow[k];
+  await writeFile(join(root, "tide-pay.json"), JSON.stringify(keptNow), { mode: 0o600 });
+  r = await pay("pay");
+  assert.ok(r.ok && /3 share\(s\) paid on chain recorded from the chain/.test(r.out), r.out);
+  assert.deepEqual(JSON.parse(await readFile(join(root, "week-1.paid.json"), "utf8")).paid, full.paid, "the same entries, read from the Paid events");
+  assert.equal(await nonce(), 3);
+
+  // Manual: L has linked nothing yet; 990003 never links. check manual lists both, left alone, and sends nothing.
+  const lateRoot = await c.readContract({ address: OSTRA_TIDE, abi: parseAbi(["function rolloverAt(uint256 week) view returns (uint256)"]), functionName: "rolloverAt", args: [1n] });
+  const until = new Date(Number(lateRoot) * 1000).toISOString();
+  r = await pay("check manual");
+  assert.ok(r.ok && r.out.includes("TIDE_MANUAL_CHECKED"), r.out);
+  assert.ok(r.out.includes(`agent ${lateId}: 200000.000000000000000005 OSTRA left alone (no link made after the link deadline ${new Date(tideLinkDeadline(1) * 1000).toISOString()}); the owner can pay it until ${until}`), r.out);
+  assert.ok(new RegExp(`agent 990003: 400000 OSTRA left alone \\(.+\\); the owner can pay it until ${until.replace(/\./g, "\\.")}`).test(r.out), r.out);
+  // L links after the deadline: its identity vault approves the set digest naming the OSTRA vault its seed creates
+  // (outside the list, by its creation params), and the index keeps the link.
+  const secret = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/late-secret"));
+  const lateCreation = lateOstra.creationParams();
+  const lateVault = getAddress(await lateOstra.vaultAddress());
+  assert.equal(tidePayeeVault(live, lateCreation), lateVault);
+
+  // Links that do not count, each listed with why; nothing is sent.
+  const deadlineText = new Date(tideLinkDeadline(1) * 1000).toISOString();
+  const nonceNegative = await nonce();
+  const approveSet = async (x: { secret: Hex; vaults: Address[]; payee: Address; outside: boolean }) =>
+    spend(lateCreator, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideSetDigest({ chainId: live.chainId, agentId: lateId, vaults: [lateCreatorAt, ...x.vaults], payee: x.payee, secret: x.secret, outsidePayee: x.outside }), approved: true }));
+  const leftAlone = async (records: unknown[], why: string, resultFile?: unknown) => {
+    await writeFile(join(root, "tide-links.json"), JSON.stringify(records), { mode: 0o600 });
+    if (resultFile !== undefined) await writeFile(join(root, "week-1.json"), JSON.stringify(resultFile), { mode: 0o600 });
+    const x = await pay("check manual");
+    if (resultFile !== undefined) await writeFile(join(root, "week-1.json"), JSON.stringify(result), { mode: 0o600 });
+    assert.ok(x.ok && x.out.includes(`agent ${lateId}: 200000.000000000000000005 OSTRA left alone (`) && x.out.includes(why), `${why}\n${x.out}`);
+  };
+  const link = (secretOf: Hex, vaults: Address[], payee: Address, payeeCreation?: unknown) => ({ agentId: lateId.toString(), secret: secretOf, vaults, payee, ...(payeeCreation === undefined ? {} : { payeeCreation }), at: Number((Date.now() / 1000).toFixed(0)) });
+  // Never approved by the identity vault.
+  await leftAlone([link(keccak256(stringToHex("not approved")), [], lateVault, lateCreation)], `the identity vault ${lateCreatorAt} has no approval of a link's set digest naming ${lateVault} in force now`);
+  // Approved before the deadline (in before()): the score read it.
+  await leftAlone([link(EARLY_SECRET, [], lateVault, lateCreation)], `the link naming ${lateVault} was in force by the link deadline ${deadlineText}: the score read it`);
+  // One of Ostra's own vaults as the payee.
+  const ownSecret = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/own-secret"));
+  await approveSet({ secret: ownSecret, vaults: [], payee: OWN_VAULT, outside: true });
+  await leftAlone([link(ownSecret, [], OWN_VAULT, lateCreation)], `${OWN_VAULT} is one of Ostra's own vaults`);
+  // Another agent's identity vault as the payee (990002's, as the result names it).
+  const idSecret = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/identity-secret"));
+  await approveSet({ secret: idSecret, vaults: [], payee: payees[1]!, outside: true });
+  await leftAlone([link(idSecret, [], payees[1]!, lateCreation)], `${payees[1]} is another agent's identity vault`);
+  // A vault of the link (a live OSTRA vault) as the payee, without that vault's member approval.
+  const memberSecret = keccak256(stringToHex("OSTRA/KEEPER/TIDE-PAY-FORK/member-secret"));
+  await approveSet({ secret: memberSecret, vaults: [payees[0]!], payee: payees[0]!, outside: false });
+  await leftAlone([link(memberSecret, [payees[0]!], payees[0]!)], `${payees[0]} has no approval of its member digest in force now`);
+  // The identity no longer owned by the vault the result names.
+  await leftAlone(
+    [link(memberSecret, [payees[0]!], payees[0]!)],
+    `its identity is now owned by ${lateCreatorAt}, not its identity vault ${payees[0]}`,
+    { ...result, agents: result.agents.map((a) => (a.agentId === lateId.toString() ? { ...a, identityVault: payees[0]! } : a)) },
+  );
+  assert.equal(await nonce(), nonceNegative, "check manual sends nothing");
+  const digest = tideSetDigest({ chainId: live.chainId, agentId: lateId, vaults: [lateCreatorAt], payee: lateVault, secret, outsidePayee: true });
+  await spend(lateCreator, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: digest, approved: true }));
+  const linkedAt = Number((await c.getBlock()).timestamp);
+  assert.ok(linkedAt > tideLinkDeadline(1), "the link is made after the link deadline");
+  await writeFile(join(root, "tide-links.json"), JSON.stringify([{ agentId: lateId.toString(), secret, vaults: [], payee: lateVault, payeeCreation: lateCreation, at: linkedAt }]), { mode: 0o600 });
+  const nonceBefore = await nonce();
+  r = await pay("check manual");
+  assert.ok(r.ok && r.out.includes(`agent ${lateId}: 200000.000000000000000005 OSTRA to its OSTRA vault ${lateVault}, created first`), r.out);
+  assert.ok(r.out.includes("1 share(s) without a payee to pay, 1 left alone"), r.out);
+  assert.equal(await nonce(), nonceBefore, "check manual sends nothing");
+  // manual: the vault created, the share paid to it.
+  r = await pay("manual");
+  assert.ok(r.ok && r.out.includes("TIDE_MANUAL_PAID") && r.out.includes(`SENT create:1:${lateVault}`) && r.out.includes(`SENT manual:1:${lateId}`), r.out);
+  assert.equal(await nonce(), nonceBefore + 2);
+  assert.equal(getAddress((await c.readContract({ address: lateVault, abi: ostraVaultAbi, functionName: "token" })) as Address), OSTRA);
+  assert.equal(await ostra(lateVault), shares[4]!.amount, "L's OSTRA vault holds its share exactly");
+  assert.equal(await c.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "paid", args: [1n, lateId] }), true);
+  assert.equal(await c.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "paid", args: [1n, 990003n] }), false, "990003 left alone");
+  const paidNow = JSON.parse(await readFile(join(root, "week-1.paid.json"), "utf8")) as { paid: Record<string, { vault: Address; amount: string }> };
+  assert.deepEqual({ vault: paidNow.paid[lateId.toString()]?.vault, amount: paidNow.paid[lateId.toString()]?.amount }, { vault: lateVault, amount: shares[4]!.amount.toString() });
+  // A run again sends nothing.
+  r = await pay("manual");
+  assert.ok(r.ok && r.out.includes("TIDE_MANUAL_PAID") && !r.out.includes("SENT "), r.out);
+  assert.equal(await nonce(), nonceBefore + 2, "nothing sent again");
 });

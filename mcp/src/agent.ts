@@ -52,6 +52,7 @@ import {
   UnshieldService,
   VaultService,
   repProverOf,
+  VenueService,
   uploadJson,
   type Keys,
   type PrivateVaultContext,
@@ -131,6 +132,8 @@ export class Agent {
   readonly borro: BorroService;
   /** OstraBreaker on the USDG vault (Strategy 3). */
   readonly breaker: BreakerService;
+  /** The venues of the agent's version 4 vaults (core venues.ts): Spark, Raeto's USDG and stock vaults, and their breaker. */
+  readonly venues: VenueService;
   /** Ostra's strategy planner (core strategy.ts), for an agent registered in ERC-8004 through Ostra. */
   readonly strategy: StrategyService;
   /** The trading capital (core trading.ts): its limits, positions and trades through Ostra Swap. */
@@ -223,6 +226,8 @@ export class Agent {
     // OSTRA_LOGS_RPC_URL (default Robinhood Chain's public RPC) serves the planner's eth_getLogs over long windows too.
     const strategyLogs = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
     const launchFolder = keys.folder.folder(LAUNCHPAD_DIR);
+    // The venues keep their spends' prices in the strategy's folder, for strategy_report's accounts.
+    this.venues = new VenueService({ client, logsClient: strategyLogs, config, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), sender: this.sender, borro: this.borro, folder: keys.folder.folder("strategy") });
     // The trading capital's gate is the strategies' (read when it is called, after the planner exists).
     this.trading = new TradingService({ client, swap: this.swap, buyer: this.buyer, tokenVault: (token) => this.vaultFor(token), folder: keys.folder.folder("strategy"), gate: () => this.strategy.gate() });
     this.strategy = new StrategyService({
@@ -248,6 +253,7 @@ export class Agent {
       ethClient: config.ethRpcUrl === null ? null : (createPublicClient({ chain: mainnet, transport: http(config.ethRpcUrl, { retryCount: 1, timeout: 5_000 }) }) as PublicClient),
       breaker: this.breaker,
       trading: this.trading,
+      venues: this.venues,
     });
     // Reputation proofs: the USDG vault is the provider vault whose record is proven; the secret is kept in OSTRA_HOME.
     // OSTRA_LOGS_RPC_URL serves the epoch trees' event searches.
@@ -260,6 +266,8 @@ export class Agent {
             reputation.listingProof({ agentId: a.agentId, file: a.file, thresholds: a.thresholds as ThresholdsInput, upload: (f) => uploadJson(config.relayerUrl, f) }).then((r) => r.entry as unknown as Record<string, unknown>);
     // publish_profile carries a listing's reputation proof into the new file (made again for it).
     if (listingProof !== undefined) this.launchpad?.attachListingProof(listingProof);
+    // A payment from the USDG vault that its cash does not cover is refilled from the treasury first (version 4).
+    this.buyer.setRefill((need) => this.strategy.autoRefill(need));
     // Ostrapad: the agent's identity (creator vault, ERC-8004 id and registration file) comes from the launchpad service's
     // identity tool (publish_profile), which stays with the launchpad closed.
     const lp = this.launchpad;

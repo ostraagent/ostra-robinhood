@@ -5,8 +5,8 @@
 //      IP address);
 //   2. checks the calls against its policy (the Kora allowed-program list on
 //      Solana): createVault on the deployment's vault factory; spend,
-//      requestClose, finalizeWithdraw and finishRecovery on an Ostra vault of
-//      the deployment in its token; spendLeaf, approveBatch, depositWithAuthorization,
+//      requestClose, finalizeWithdraw, finishRecovery and (version 4) tripVenue on an
+//      Ostra vault of the deployment in its token; spendLeaf, approveBatch, depositWithAuthorization,
 //      cancelDeposit and closeDeposit on the deployment's pool; and on its
 //      launchpad (design v0.4, D2): OstraDevBuy.launchFromVault alone, from a
 //      creator vault in the relayer's token, in WETH or in a listed pair
@@ -28,7 +28,8 @@
 //      WETH or pair token vault also ConfigurePool, SetProfile and
 //      SetTokenMetadata, what a pair's creator vault does as its pool's owner,
 //      and SetLinkedVault, ApproveHash and Borro's Lend, Redeem,
-//      PostCollateral, WithdrawCollateral and Borrow, a stock vault's; a vault
+//      PostCollateral, WithdrawCollateral and Borrow, a stock vault's, and from
+//      version 4 its venues' SetVenue, Enter, Exit and Forward, and tripVenue; a vault
 //      of a stock Borro lists that is not a pair, GME, is served as a pair
 //      token vault), paid by a `payer` vault in the relayer's token; dividends (a vesting's, a launched-token vault's
 //      ClaimDividend) only of a pool paying them in USDG, WETH, a listed
@@ -51,12 +52,17 @@
 //      ConfigurePool names, and Morpho Blue with the Vault V2, market oracle
 //      and rate model a version 3 Borro spend names (the vault checks that
 //      Morpho's VaultV2Factory made the Vault V2, and borrows only on markets
-//      Borro lists), within the gas cap the request paid for;
+//      Borro lists), and a venue a version 4 Enter, Exit or tripVenue names (one
+//      the vault's owner enabled, of a kind the vault's code speaks:
+//      OstraVaultModuleV4), within the gas cap the request paid for;
 //   3. prices the transaction: the gas it uses, simulated from the relayer
-//      (eth_simulateV1), with its L1 data component and the swapGas each
-//      vault Swap in it reserves, x eth_gasPrice, + 10%, at Chainlink
+//      (eth_simulateV1), with its L1 data component, the swapGas each
+//      vault Swap in it reserves and the gas floor each vault spend with one
+//      must start with, x eth_gasPrice, + 10%, at Chainlink
 //      ETH/USD + 0.5% (@ostraagent/sdk relayer.ts, the same rules an agent
-//      checks the price with). A vault Swap the simulation shows failing
+//      checks the price with); a venue spend of sdk VENUE_CATALOG (decided 2
+//      Nov 2026) at the gas it uses alone, its floor kept in the gas limit
+//      unpriced (sendGasCap). A vault Swap the simulation shows failing
 //      (SwapFailed) is refused, 422 swap_fails, and so is a version 3 or 4 spend
 //      that fails without reverting (MorphoFailed, Guarded with ok false,
 //      VenueFailed), 422 spend_fails, unless the request asks for it with allowFailedSwaps: such a spend moves nothing and is only worth
@@ -70,7 +76,10 @@
 //      of at most what it was priced at plus the margin (relayGasCap): code
 //      that uses more gas when sent than simulated (a hook or a contract the
 //      agent picks) cannot make the relayer pay more than it was paid, and a
-//      transaction that needs more than that now is not sent. A transaction
+//      transaction that needs more than that now is not sent; a catalog venue
+//      spend's floor counts as priced in that limit, so the relayer bears what
+//      such a spend uses beyond its simulation, at most that floor with the
+//      margin (a venue whose code the vault pins). A transaction
 //      that earns a gas refund (a storage slot cleared, as finalizeWithdraw
 //      does) needs a gas limit above what it uses: its quote also records
 //      the limit eth_estimateGas finds, and it is sent with at most that plus
@@ -183,7 +192,7 @@ import {
 } from "@ostraagent/sdk";
 import { decodePaymentSignatureHeader, type HTTPResponseInstructions } from "@x402/core/http";
 import type { OstraMerchant } from "../../merchant/src/merchant.ts";
-import { classify, decodeRelayRequest, type Classified, type CreateVaultCall, type OpenChannelCall, type RelayTx, type SpendLeafCall } from "./calls.ts";
+import { classify, decodeRelayRequest, type Classified, type CreateVaultCall, type OpenChannelCall, type ParsedCall, type RelayTx, type SpendLeafCall } from "./calls.ts";
 import {
   Ledger,
   LedgerRefusal,
@@ -311,19 +320,22 @@ function fromInstructions(r: HTTPResponseInstructions): Answer {
  * the gas used before it (EIP-3529), so the limit a refund needs is at most 1.25 times what the transaction uses, plus
  * what nested calls keep back (a sixty-fourth at each). The price stays on the gas used, which is what the agent
  * computes too (within RELAYER_QUOTE_TOLERANCE_BPS), so code that uses more when sent than quoted can make the relayer pay at most this
- * share more than it was paid, at its own expense.
+ * share more than it was paid, at its own expense (with a catalog venue spend's floor counted as priced: see sendGasCap).
  */
 export const LIMIT_OVER_PRICED_BPS = 13_000n;
 
 /**
  * The highest gas limit a quoted transaction is sent with: its margin (relayGasCap) on the larger of the gas it was
  * priced at and the limit eth_estimateGas found at the quote (`limit`: what a transaction earning a refund needs above
- * what it uses), that limit counted up to LIMIT_OVER_PRICED_BPS of the priced gas. An escrow execution (`atCap`, sent
- * at exactly this limit) keeps the cap of its priced gas, which already holds the gas its refund path needs (sdk
- * escrowGasLimit).
+ * what it uses), that limit counted up to LIMIT_OVER_PRICED_BPS of the priced gas. The floors of its catalog venue
+ * spends (`unpricedGas`, sdk unpricedFloorGas) count as priced here, though they are not in the price: such a spend
+ * starts with its floor left, so it never lands as failed for lack of gas, and the relayer bears what it uses beyond
+ * the gas it was priced at, at most those floors with the margin (and LIMIT_OVER_PRICED_BPS) per transaction. An
+ * escrow execution (`atCap`, sent at exactly this limit) keeps the cap of its priced gas, which already holds the gas
+ * its refund path needs (sdk escrowGasLimit).
  */
-export function sendGasCap(quote: Pick<Quote, "gas" | "limit">, atCap: boolean): bigint {
-  const priced = BigInt(quote.gas);
+export function sendGasCap(quote: Pick<Quote, "gas" | "limit" | "unpricedGas">, atCap: boolean): bigint {
+  const priced = BigInt(quote.gas) + BigInt(quote.unpricedGas ?? "0");
   if (atCap || quote.limit === undefined) return relayGasCap(priced);
   const bound = (priced * LIMIT_OVER_PRICED_BPS) / 10_000n;
   const limit = BigInt(quote.limit);
@@ -402,8 +414,10 @@ function liveQuote(q: Quote | undefined, now: number): Quote | undefined {
  * What a vault in another token spends through the relayer. A WETH or pair token vault (a pair's creator vault, or the
  * token vault trading its pools; a stock vault on Borro): Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile,
  * SetTokenMetadata, and from version 3 its withdrawal lock, its waiting changes, its link, an EIP-1271 approval and
- * Borro (Lend, Redeem, PostCollateral, WithdrawCollateral, Borrow: Repay is the USDG vault's). A vault of a launched
- * token: Transfer, Swap, ClaimDividend and its withdrawal lock.
+ * Borro (Lend, Redeem, PostCollateral, WithdrawCollateral, Borrow: Repay is the USDG vault's), and from version 4, for
+ * a stock vault only, its venues (STOCK_VENUE_ACTIONS: SetVenue, Enter, Exit, Forward: Raeto's stock vault of its stock,
+ * and the USDG a liquidation left it sent to its linked USDG vault). A vault of a launched token: Transfer, Swap,
+ * ClaimDividend and its withdrawal lock.
  */
 const PAIR_VAULT_ACTIONS: readonly number[] = [
   VAULT_ACTION.TRANSFER,
@@ -422,6 +436,23 @@ const PAIR_VAULT_ACTIONS: readonly number[] = [
   VAULT_ACTION.BORROW,
   VAULT_ACTION.APPROVE_HASH,
 ];
+/** Version 4's venue spends, relayed for a stock vault only (Raeto's stock vault of its stock; Forward of a liquidation's USDG). */
+const STOCK_VENUE_ACTIONS: readonly number[] = [VAULT_ACTION.SET_VENUE, VAULT_ACTION.ENTER, VAULT_ACTION.EXIT, VAULT_ACTION.FORWARD];
+/** The stock tokens: a vault in one of these is a stock vault. */
+const STOCK_TOKENS: ReadonlySet<Address> = new Set([...LAUNCH_PAIRS.filter((p) => p.kind === "stock").map((p) => getAddress(p.address)), ...BORRO_STOCKS.map((b) => getAddress(b.token))]);
+
+/**
+ * The vault whose credit at the relayer pays a request, and whether the request acts for that vault alone (then its
+ * credit may pay all of the price with no voucher): the payer the request names, else the one vault it acts for. A
+ * tripVenue is anyone's to send, so it never acts for its vault in that sense: the tripped vault's credit is not used
+ * without a voucher from the vault's own channel (anyone could otherwise relay trips at that vault's expense while a
+ * breaker reason holds), and with no payer named nobody's credit is.
+ */
+export function creditVaultOf(parsed: readonly ParsedCall[], vaults: readonly Address[], payer: Address | null): { creditVault: Address | null; actsFor: boolean } {
+  const trips = parsed.some((c) => c.fn === "tripVenue");
+  const creditVault = payer ?? (vaults.length === 1 && !trips ? (vaults[0] as Address) : null);
+  return { creditVault, actsFor: creditVault !== null && !trips && vaults.length === 1 && vaults[0] === creditVault };
+}
 const LAUNCHED_VAULT_ACTIONS: readonly number[] = [
   VAULT_ACTION.TRANSFER,
   VAULT_ACTION.SWAP,
@@ -431,7 +462,7 @@ const LAUNCHED_VAULT_ACTIONS: readonly number[] = [
 ];
 
 const POOL_FNS = new Set(["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]);
-const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw", "finishRecovery"]);
+const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw", "finishRecovery", "tripVenue"]);
 
 export class RelayerGate {
   readonly #o: GateOptions;
@@ -907,10 +938,13 @@ export class RelayerGate {
       if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched`;
       if (request.payer === null) return `calls[${i}]: a vault in ${v.token} is paid for by a payer vault in ${token}`;
       // finishRecovery: anyone may finish a recovery past its delay (under the withdrawal lock it comes before the new key's first spend).
-      if (c.fn === "finishRecovery") continue;
-      const allowed: readonly number[] = kind === "weth" || kind === "pair" ? PAIR_VAULT_ACTIONS : LAUNCHED_VAULT_ACTIONS;
+      // tripVenue: anyone may trip the venue breaker, which only brings a position home into the vault (or deleverages a
+      // Raeto stock vault).
+      if (c.fn === "finishRecovery" || c.fn === "tripVenue") continue;
+      const stock = kind === "pair" && STOCK_TOKENS.has(getAddress(v.token));
+      const allowed: readonly number[] = kind === "weth" || kind === "pair" ? (stock ? [...PAIR_VAULT_ACTIONS, ...STOCK_VENUE_ACTIONS] : PAIR_VAULT_ACTIONS) : LAUNCHED_VAULT_ACTIONS;
       if (c.fn !== "spend" || !allowed.includes(c.action)) {
-        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "launched" ? "Transfer, Swap, ClaimDividend and its withdrawal lock" : "Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile, SetTokenMetadata, its withdrawal lock and link, and Borro (Lend, Redeem, collateral and Borrow)"}`;
+        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "launched" ? "Transfer, Swap, ClaimDividend and its withdrawal lock" : `Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile, SetTokenMetadata, its withdrawal lock and link, Borro (Lend, Redeem, collateral and Borrow)${stock ? ", and its venues (SetVenue, Enter, Exit, Forward)" : ""}`}`;
       }
       if (kind === "launched" && c.action === VAULT_ACTION.CLAIM_DIVIDEND && l !== undefined) {
         const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [v.token] })) as Hex;
@@ -1081,6 +1115,7 @@ export class RelayerGate {
       value: m.value.toString(),
       gas: m.gas.toString(),
       limit: limit.toString(),
+      ...(m.unpricedGas === 0n ? {} : { unpricedGas: m.unpricedGas.toString() }),
       gasPrice: m.gasPrice.toString(),
       ethUsd: price.answer.toString(),
       to: tx.to,
@@ -1106,7 +1141,7 @@ export class RelayerGate {
       if (kept === undefined) data.quotes[tx.hash] = quote;
     });
     if (kept !== undefined) return kept;
-    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, limit: quote.limit, gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
+    this.#o.log("quoted", { request: tx.hash, kind: quote.kind, gas: quote.gas, limit: quote.limit, unpricedGas: quote.unpricedGas ?? "0", gasPrice: quote.gasPrice, wei: quote.wei, value: quote.value, ethUsd: quote.ethUsd, amount: quote.amount, vaults: quote.vaults });
     return quote;
   }
 
@@ -1306,8 +1341,9 @@ export class RelayerGate {
   }
 
   async #paid(tx: RelayTx, vaults: readonly Address[], quote: Quote, input: RelayInput, payer: Address | null, swaps: readonly Address[]): Promise<Answer> {
-    // Credit belongs to a vault: the payer the request names, else the one vault the request acts for.
-    const creditVault = payer ?? (vaults.length === 1 ? (vaults[0] as Address) : null);
+    // Credit belongs to a vault: the payer the request names, else the one vault the request acts for (creditVaultOf:
+    // never a tripped vault's without its voucher).
+    const { creditVault } = creditVaultOf(tx.parsed, vaults, payer);
     if (creditVault === null) return this.#paidWithCredit(tx, vaults, quote, input, null, swaps);
     // A vault's credit is read and changed by one request at a time.
     return this.#serialized(`credit:${creditVault}`, () => this.#paidWithCredit(tx, vaults, quote, input, creditVault, swaps));
@@ -1334,7 +1370,7 @@ export class RelayerGate {
     const plan = creditPlan({
       price,
       credit: creditVault === null ? 0n : creditOf(view, creditVault),
-      actsForCreditVault: creditVault !== null && vaults.length === 1 && vaults[0] === creditVault,
+      actsForCreditVault: creditVault !== null && creditVaultOf(tx.parsed, vaults, creditVault).actsFor,
     });
     /** Records a landed transaction: the credit it used, and its hash. */
     const landedIn = (data: LedgerData, txHash: string, paid: bigint) => {

@@ -28,4 +28,5 @@ export * from "./reads.ts";
 export * from "./strategy.ts";
 export * from "./relayer.ts";
 export * from "./reputation.ts";
+export * from "./venues.ts";
 export * from "./wots.ts";

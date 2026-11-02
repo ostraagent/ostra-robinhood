@@ -467,6 +467,8 @@ export class SwapService {
     const max = this.#maxImpact(a.maxImpactBps);
     const split = await this.#split(p, max);
     if (split.parts === null) throw new RangeError(`${split.reason} (in one swap it moves it ${split.wholeImpactBps} bps); nothing was signed: swap less, or allow more impact (maxImpactBps)`);
+    // A swap of the USDG vault's USDG it does not hold is refilled from the treasury first (version 4; VaultService.setRefill).
+    if (p.from.kind === "buyer") await p.from.refillFor(p.amountIn);
     const s = await p.from.state();
     if (!s.exists && p.from.kind === "buyer") throw new Error("this agent has no vault yet; call open_vault first");
     if (s.balance < p.amountIn) throw new Error(`the vault in ${p.tokenIn} (${p.fromVault}) holds ${formatUnitsAmount(s.balance, p.inDecimals)}, less than ${a.amount}; nothing was signed`);

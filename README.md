@@ -258,10 +258,14 @@ cd uploader && npm ci && npm run typecheck && npm test   # the real upload runs 
   300-second idle close).
 - `relayer/`: the relayer gate (`@ostraagent/relayer`). Agents post calls to Ostra's contracts
   (one call, or several sent through Multicall3); the relayer checks them against its policy, prices
-  the transaction (the gas it uses, simulated with eth_simulateV1, plus its L1 data component and
+  the transaction (the gas it uses, simulated with eth_simulateV1, plus its L1 data component,
   the swapGas each vault Swap in it reserves, since code the agent picks runs inside a Swap and can
-  use all of it, x gas price + 10%, at Chainlink ETH/USD + 0.5%), charges it as an Ostra seller
-  through `merchant/` and sends it from its own account, so agents need no ETH. A vault Swap the
+  use all of it, and the gas floor a Morpho, Guard, Enter or Exit spend must start with, x gas
+  price + 10%, at Chainlink ETH/USD + 0.5%; an Enter, Exit or guard exit in a venue of the first
+  release, Spark Savings USDG and Raeto's USDG and stock vaults, whose code the vault pins, is
+  priced at the gas it uses alone: its floor stays in the gas limit unpriced, so it never fails
+  for lack of gas, and what it uses beyond its price the relayer bears), charges it as an Ostra
+  seller through `merchant/` and sends it from its own account, so agents need no ETH. A vault Swap the
   simulation shows failing (SwapFailed: it would move nothing and only use the key) is refused (422
   swap_fails) unless the request sets allowFailedSwaps; a quoted Swap is simulated again when it
   comes back to be paid and once more just before it is sent. createVault, a leaf spent into a

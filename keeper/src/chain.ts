@@ -61,9 +61,10 @@ export class Sender {
     return next;
   }
 
-  async #sendNow(account: PrivateKeyAccount, call: Call): Promise<Sent> {
+  async #sendNow(account: PrivateKeyAccount, call: Call, maxGas?: bigint): Promise<Sent> {
     const { request } = await this.#client.simulateContract({ ...call, account } as Parameters<PublicClient["simulateContract"]>[0]);
     const gas = withMargin(await this.#client.estimateContractGas({ ...call, account: account.address } as Parameters<PublicClient["estimateContractGas"]>[0]));
+    if (maxGas !== undefined && gas > maxGas) throw new Error(`${call.functionName} needs ${gas} gas, over its cap of ${maxGas}; it was not sent`);
     const wallet = createWalletClient({ account, chain: robinhoodChain, transport: this.#transport });
     const hash = await wallet.writeContract({ ...(request as Parameters<typeof wallet.writeContract>[0]), gas });
     const receipt = await this.#client.waitForTransactionReceipt({ hash });
@@ -71,9 +72,9 @@ export class Sender {
     return { hash, gasUsed: receipt.gasUsed };
   }
 
-  /** Sends `call` from the fee payer. */
-  fromFeePayer(call: Call): Promise<Sent> {
-    return this.#locked(this.#feePayer.address, () => this.#sendNow(this.#feePayer, call));
+  /** Sends `call` from the fee payer; refused before it is sent when its gas limit would be over `maxGas`. */
+  fromFeePayer(call: Call, maxGas?: bigint): Promise<Sent> {
+    return this.#locked(this.#feePayer.address, () => this.#sendNow(this.#feePayer, call, maxGas));
   }
 
   /** Tops `crank` up from the fee payer with CRANK_TOP_UP_FACTOR x `cost` when it holds less than `cost`. */
