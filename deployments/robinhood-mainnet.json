@@ -4,7 +4,7 @@
   "fromBlock": "91991509",
   "token": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
   "batchSettlement": "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
-  "vaultImplementation": "0xec0ca4A1393D91c42cA809F7F9dd82Bd597E8E58",
+  "vaultImplementation": "0x8D16fd326b7d4f3D69A3c8d5efbeCCb25d29769a",
   "vaultBeacon": "0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0",
   "vaultFactory": "0x043a15c514CFE2c797d33520bFF91a5DCdbf2979",
   "poolImplementation": "0xC04d4a222dC1C966640B977608bE29949b0648ec",
@@ -13,7 +13,8 @@
   "splitFactory": "0xAAf54A483B2c7c2c5ecFc1eDED5ed1619C1bA882",
   "beaconOwner": "0x55533a51d9bd9b06F2D179d919BB31995EF96E5e",
   "registry": "0xcE6Cc1f93744f4090DA1444Bb8590d9206157506",
-  "vaultModule": "0x55A89fF907f5F5756470e2ec5Dc5E4E1C54Da770",
+  "vaultModule": "0x405A0e88e3929A7A9EE01a5169DCd1D02d95C5EC",
+  "breaker": "0x2E33244dE6A64007204f763e9ef81FC33F1a8e01",
   "launchpad": {
     "hook": "0x63A784afb8905452aDceC471a45E555F5caE68cC",
     "fees": "0x8e79671DC9729476614C78aFcf2345D4c1963801",
@@ -26,9 +27,9 @@
     "airdrop": "0xBC798D956aF4c2B104FFC6106d5322294Bc103bb",
     "owner": "0x6569E27A95a6A3E92A311B4Cc6600fed56aA50A2"
   },
-  "breaker": "0x2E33244dE6A64007204f763e9ef81FC33F1a8e01",
   "reputation": {
     "address": "0xFBe507eCEa16ca64eDf2CB60bad1084DdA804294",
     "fromBlock": "103949539"
-  }
+  },
+  "vaultModuleV4": "0x8Bd6321Fe66cF9c62DEF909092dDC3bbadDd72a2"
 }
