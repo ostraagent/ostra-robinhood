@@ -12,6 +12,7 @@ export * from "./chain.ts";
 export * from "./constants.ts";
 export * from "./deployment.ts";
 export * from "./external-abi.ts";
+export * from "./failover.ts";
 export * from "./hash.ts";
 export * from "./launch.ts";
 export * from "./leaves.ts";

@@ -1,5 +1,6 @@
-// Checks the index's content-rules moderator (src/moderation.ts) against the real API it is configured with
-// (OSTRA_PAD_MODERATION_URL, _MODEL, _KEY_FILE and _FALLBACK_MODEL, as the indexer's service has them): listings of
+// Checks the index's content-rules moderator (src/moderation.ts) against the real APIs it is configured with
+// (OSTRA_PAD_MODERATION_URL, _MODEL, _KEY_FILE and _FALLBACK_MODEL, and the same names ending in _2 ... for the next
+// APIs, as the indexer's service has them; asked in order, as the service asks them): listings of
 // allowed work (token reports; a trading bot for the client's own use; an audit of the client's own contract) are
 // allowed, and listings of prohibited work (phishing pages, wash-trading volume, a wallet drainer) are prohibited with
 // their category (or, when every model's provider refused to read one, prohibited as refused), one of them while
@@ -9,19 +10,16 @@
 
 import { readFileSync, statSync } from "node:fs";
 import type { PadModerationInput } from "@ostraagent/sdk";
-import { REFUSED_LISTING, openAiModerator } from "../src/moderation.ts";
+import { REFUSED_LISTING, failoverModerator, moderationProviderName, moderationProviders } from "../src/moderation.ts";
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (value === undefined || value === "") throw new Error(`missing environment variable ${name}`);
-  return value;
-}
-
-const keyFile = required("OSTRA_PAD_MODERATION_KEY_FILE");
-if ((statSync(keyFile).mode & 0o077) !== 0) throw new Error(`${keyFile} must be readable by its owner alone (chmod 600)`);
-const apiKey = readFileSync(keyFile, "utf8").trim();
-const fallbackModel = process.env.OSTRA_PAD_MODERATION_FALLBACK_MODEL || undefined;
-const moderate = openAiModerator({ url: required("OSTRA_PAD_MODERATION_URL"), model: required("OSTRA_PAD_MODERATION_MODEL"), apiKey, ...(fallbackModel === undefined ? {} : { fallbackModel }) });
+const providers = moderationProviders(process.env, (path) => {
+  if ((statSync(path).mode & 0o077) !== 0) throw new Error(`${path} must be readable by its owner alone (chmod 600)`);
+  return readFileSync(path, "utf8").trim();
+});
+if (providers.length === 0) throw new Error("missing environment variable OSTRA_PAD_MODERATION_URL");
+console.log(JSON.stringify({ providers: providers.map(moderationProviderName) }));
+// Which API answered or was left aside is printed as it happens (the providers' hosts and models, never a key).
+const moderate = failoverModerator(providers, { log: (event, fields) => console.log(JSON.stringify({ event, ...fields })) });
 
 const offer = (id: string, title: string, description: string, input: string) => ({ id, title, description, input, price: "1" });
 // want: the categories a prohibited listing may be given (a drainer is both an attack and a fraud), null when allowed.

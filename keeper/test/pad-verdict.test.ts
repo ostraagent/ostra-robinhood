@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { JUDGE_MAX_BYTES, REFUSED_REASON, judgeMessage, openAiJudge, parseVerdict, providerRefusal, type Case } from "../src/pad-evaluator.ts";
+import { JUDGE_MAX_BYTES, REFUSED_REASON, failoverJudges, judgeMessage, judgeProviders, judgeSameApi, openAiJudge, parseVerdict, providerRefusal, type Case } from "../src/pad-evaluator.ts";
 
 test("a judge's answer is read only when it is one JSON verdict", () => {
   assert.deepEqual(parseVerdict('{"approve": true, "reason": "Fulfils the order."}'), { approve: true, reason: "Fulfils the order." });
@@ -97,4 +97,73 @@ test("a provider's refusal is read as one, and the judge asks the other model", 
   assert.deepEqual(asked, [grok]);
   assert.ok(plain !== null && plain !== "unreached" && plain.refusedBy === undefined);
   assert.equal(await openAiJudge({ url: "https://api.example/v1", model: grok, apiKey: "k", fetch: answers({}, 402) })(c), "unreached");
+  // A refusal (a paid answer), then no answer from the fallback: an answer of another shape, never "unreached" (which
+  // would send the case on to another API).
+  const byModel = (refusal: unknown): typeof fetch => async (_u, i) => {
+    const model = (JSON.parse(String(i?.body)) as { model: string }).model;
+    return model === sonnet ? new Response(JSON.stringify(refusal), { status: 200 }) : new Response("{}", { status: 503 });
+  };
+  assert.equal(await openAiJudge({ url: "https://api.example/v1", model: sonnet, fallbackModel: grok, apiKey: "k", fetch: byModel(SONNET_REFUSED) })(c), null);
+});
+
+test("the judges over several APIs: a paid refusal with no fallback answer stays on its API", async () => {
+  const c: Case = { jobId: `0x${"55".repeat(32)}`, budget: "1", offer: null, order: { input: "x" }, delivery: { output: "y" }, notes: [] };
+  const asked: string[] = [];
+  // API a: its judge model refuses, its panel model (the fallback) gives no answer; API b answers.
+  const f: typeof fetch = async (u, i) => {
+    const model = (JSON.parse(String(i?.body)) as { model: string }).model;
+    const host = new URL(String(u)).host;
+    asked.push(`${host} ${model}`);
+    if (host === "a.example") return model === "m1" ? new Response(JSON.stringify(SONNET_REFUSED), { status: 200 }) : new Response("{}", { status: 503 });
+    return new Response(JSON.stringify(GROK_ANSWER), { status: 200 });
+  };
+  const ps = judgeProviders(
+    { OSTRA_PAD_JUDGE_URL: "https://a.example/v1", OSTRA_PAD_JUDGE_MODEL: "m1", OSTRA_PAD_JUDGE_KEY_FILE: "/k", OSTRA_PAD_PANEL_JUDGE_MODEL: "f1", OSTRA_PAD_JUDGE_URL_2: "https://b.example/v1", OSTRA_PAD_JUDGE_MODEL_2: "m2", OSTRA_PAD_JUDGE_KEY_FILE_2: "/k" },
+    () => "key",
+  );
+  const { judge } = failoverJudges(ps, { fetch: f });
+  assert.equal(await judge(c), null);
+  assert.deepEqual(asked, ["a.example m1", "a.example f1"]);
+  // API a gives no answer at all: API b is asked and decides.
+  asked.length = 0;
+  const down: typeof fetch = async (u, i) => (new URL(String(u)).host === "a.example" ? new Response("{}", { status: 502 }) : f(u, i));
+  const v = await failoverJudges(ps, { fetch: down }).judge(c);
+  assert.ok(v !== null && v !== "unreached" && v.approve === false);
+  assert.deepEqual(asked, ["b.example m2"]);
+});
+
+test("the judging APIs from the environment: the panel on the judge's API and key unless set, each set whole", () => {
+  const keys: Record<string, string> = { "/j1": "judge-one", "/j2": "judge-two", "/p1": "panel-one" };
+  const read = (path: string) => keys[path] ?? "";
+  assert.throws(() => judgeProviders({}, read), /missing environment variable OSTRA_PAD_JUDGE_URL/);
+  const ps = judgeProviders(
+    {
+      OSTRA_PAD_JUDGE_URL: "https://first.example/v1",
+      OSTRA_PAD_JUDGE_MODEL: "j1",
+      OSTRA_PAD_JUDGE_KEY_FILE: "/j1",
+      OSTRA_PAD_PANEL_JUDGE_MODEL: "p1",
+      OSTRA_PAD_JUDGE_URL_2: "https://second.example/v1",
+      OSTRA_PAD_JUDGE_MODEL_2: "j2",
+      OSTRA_PAD_JUDGE_KEY_FILE_2: "/j2",
+      OSTRA_PAD_PANEL_JUDGE_MODEL_2: "p2",
+    },
+    read,
+  );
+  assert.deepEqual(ps, [
+    { url: "https://first.example/v1", model: "j1", apiKey: "judge-one", panelUrl: "https://first.example/v1", panelModel: "p1", panelKey: "judge-one" },
+    { url: "https://second.example/v1", model: "j2", apiKey: "judge-two", panelUrl: "https://second.example/v1", panelModel: "p2", panelKey: "judge-two" },
+  ]);
+  assert.deepEqual(ps.map(judgeSameApi), [true, true]);
+  const one = { OSTRA_PAD_JUDGE_URL: "https://first.example/v1", OSTRA_PAD_JUDGE_MODEL: "j1", OSTRA_PAD_JUDGE_KEY_FILE: "/j1" };
+  // No panel model: the judge's model, on its API (no fallback between them: one model).
+  const [same] = judgeProviders(one, read);
+  assert.equal(same?.panelModel, "j1");
+  assert.equal(judgeSameApi(same as never), false);
+  // A panel of its own (another API and key): not the judge's fallback.
+  const [own] = judgeProviders({ ...one, OSTRA_PAD_PANEL_JUDGE_MODEL: "p1", OSTRA_PAD_PANEL_JUDGE_URL: "https://panel.example/v1", OSTRA_PAD_PANEL_JUDGE_KEY_FILE: "/p1" }, read);
+  assert.deepEqual(own, { url: "https://first.example/v1", model: "j1", apiKey: "judge-one", panelUrl: "https://panel.example/v1", panelModel: "p1", panelKey: "panel-one" });
+  assert.equal(judgeSameApi(own as never), false);
+  assert.throws(() => judgeProviders({ ...one, OSTRA_PAD_JUDGE_MODEL_2: "j2" }, read), /OSTRA_PAD_JUDGE_URL_2, OSTRA_PAD_JUDGE_MODEL_2 and OSTRA_PAD_JUDGE_KEY_FILE_2 go together/);
+  assert.throws(() => judgeProviders({ ...one, OSTRA_PAD_JUDGE_KEY_FILE: "/none" }, read), /is empty/);
+  assert.throws(() => judgeProviders({ ...one, OSTRA_PAD_PANEL_JUDGE_URL: "panel.example" }, read), /OSTRA_PAD_PANEL_JUDGE_URL must be an http\(s\) URL/);
 });

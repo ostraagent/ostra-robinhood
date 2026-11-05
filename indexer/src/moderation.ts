@@ -1,10 +1,11 @@
 // Ostrapad's content rules in the index (design "Ostrapad", decided by Edu on 30 Oct 2026): each listing is checked
-// once by a model behind an OpenAI-compatible API (Raeto, the evaluator bot's account), and checked again only when
-// what it lists changes; a listing found to sell prohibited work is left out of the listings (MCP's pad_search) and
-// the board, its reason kept with the agent. The rules and the answer's shape: sdk pad-rules.ts.
+// once by a model behind an OpenAI-compatible API, and checked again only when what it lists changes; a listing found
+// to sell prohibited work is left out of the listings (MCP's pad_search) and the board, its reason kept with the
+// agent. Several APIs can be configured, asked in order: when one gives no answer, the next is asked (sdk
+// failover.ts). The rules and the answer's shape: sdk pad-rules.ts.
 
 import { sha256, stringToHex, type Hex } from "viem";
-import { PAD_MODERATION_PROMPT, parsePadModeration, type PadModeration, type PadModerationInput } from "@ostraagent/sdk";
+import { FAILOVER_COOLDOWN_MS, PAD_MODERATION_PROMPT, failover, numberedSettings, parsePadModeration, type PadModeration, type PadModerationInput } from "@ostraagent/sdk";
 
 /**
  * A listing's verdict; null when the model answered with something that is not a verdict (a paid call); "unreached"
@@ -34,7 +35,8 @@ export const REFUSED_LISTING: PadModeration = { prohibited: true, category: null
  * A moderator behind POST <url>/chat/completions at temperature 0; an answer of another shape is null, no answer (no
  * response, an error status) "unreached". When the model's provider refuses the request under its usage policy (seen
  * on 31 Oct 2026 for anthropic/claude-sonnet-5.5 on phishing content), `fallbackModel` (another provider's, on the same
- * API) is asked; if that one refuses too, or there is none, the listing is prohibited (REFUSED_LISTING). It runs
+ * API) is asked; if that one refuses too, or there is none, the listing is prohibited (REFUSED_LISTING); if it gives no
+ * answer, the result is null (the refusal was a paid call). It runs
  * inside the index's pass: 20 seconds at most a call, 5 listings a pass.
  */
 export function openAiModerator(o: { url: string; model: string; apiKey: string; fallbackModel?: string; fetch?: typeof fetch; timeoutMs?: number }): Moderator {
@@ -74,6 +76,48 @@ export function openAiModerator(o: { url: string; model: string; apiKey: string;
     if (first !== "refused") return first;
     if (o.fallbackModel === undefined) return REFUSED_LISTING;
     const second = await once(o.fallbackModel, listing);
-    return second === "refused" ? REFUSED_LISTING : second;
+    // The first model answered (a refusal is a paid call): no answer from the fallback leaves an answer of another
+    // shape (null), checked again later on this API, never passed on to another one.
+    return second === "refused" ? REFUSED_LISTING : second === "unreached" ? null : second;
   };
+}
+
+/** One API the moderator may ask: its base URL, model, key and, optionally, a fallback model on the same API. */
+export type ModerationProvider = { url: string; model: string; apiKey: string; fallbackModel?: string };
+
+const MODERATION_SETTINGS = ["OSTRA_PAD_MODERATION_URL", "OSTRA_PAD_MODERATION_MODEL", "OSTRA_PAD_MODERATION_KEY_FILE"] as const;
+
+/**
+ * The moderation APIs the environment names, in the order they are asked: OSTRA_PAD_MODERATION_URL, _MODEL,
+ * _KEY_FILE (all three) and _FALLBACK_MODEL (optional) for the first, the same names ending in _2, _3 ... for the next
+ * ones (sdk numberedSettings, over the first three: a fallback model alone names no API and is ignored, as it was).
+ * None: an empty list (listings are served unchecked). `readKey` reads a key file (refusing one others can read).
+ */
+export function moderationProviders(env: Record<string, string | undefined>, readKey: (path: string) => string): ModerationProvider[] {
+  return numberedSettings(env, MODERATION_SETTINGS).map((s, i) => {
+    const n = i === 0 ? "" : `_${i + 1}`;
+    const url = s.OSTRA_PAD_MODERATION_URL;
+    const model = s.OSTRA_PAD_MODERATION_MODEL;
+    const keyFile = s.OSTRA_PAD_MODERATION_KEY_FILE;
+    if (url === undefined || model === undefined || keyFile === undefined) throw new Error(`OSTRA_PAD_MODERATION_URL${n}, OSTRA_PAD_MODERATION_MODEL${n} and OSTRA_PAD_MODERATION_KEY_FILE${n} go together`);
+    if (!/^https?:\/\//i.test(url)) throw new Error(`OSTRA_PAD_MODERATION_URL${n} must be an http(s) URL`);
+    const apiKey = readKey(keyFile);
+    if (apiKey === "") throw new Error(`${keyFile} (OSTRA_PAD_MODERATION_KEY_FILE${n}) is empty`);
+    const fallbackModel = env[`OSTRA_PAD_MODERATION_FALLBACK_MODEL${n}`] || undefined;
+    return { url, model, apiKey, ...(fallbackModel === undefined ? {} : { fallbackModel }) };
+  });
+}
+
+/** A provider's name in the logs: its API's host and model (never its key). */
+export function moderationProviderName(p: ModerationProvider): string {
+  return `${new URL(p.url).host} ${p.model}`;
+}
+
+/** The moderator over `providers`, asked in order (sdk failover: an API that gives no answer is left aside a while). */
+export function failoverModerator(providers: readonly ModerationProvider[], o: { log?: (event: string, fields: Record<string, unknown>) => void; fetch?: typeof fetch; timeoutMs?: number; cooldownMs?: number } = {}): Moderator {
+  const extra = { ...(o.fetch === undefined ? {} : { fetch: o.fetch }), ...(o.timeoutMs === undefined ? {} : { timeoutMs: o.timeoutMs }) };
+  return failover(
+    providers.map((p) => ({ name: moderationProviderName(p), call: openAiModerator({ ...p, ...extra }) })),
+    { cooldownMs: o.cooldownMs ?? FAILOVER_COOLDOWN_MS, ...(o.log === undefined ? {} : { log: o.log }) },
+  );
 }

@@ -27,6 +27,9 @@
 //                             (moderation.ts); all three or none. Unset: listings are served unchecked
 //   OSTRA_PAD_MODERATION_FALLBACK_MODEL  another provider's model on the same API, asked when the first model's
 //                             provider refuses a listing under its usage policy (optional)
+//   OSTRA_PAD_MODERATION_URL_2, _MODEL_2, _KEY_FILE_2, _FALLBACK_MODEL_2 (then _3 ... _5)
+//                             more APIs, asked in that order when the ones before them give no answer (no response,
+//                             an error status); one that gave none is left aside for 5 minutes (sdk failover.ts)
 //   OSTRA_TIDE_LINKS          Ostra Tide's links (tide.ts), 0600 (default: tide-links.json next to
 //                             OSTRA_INDEXER_STATE; off: no Tide routes)
 //   OSTRA_TIDE_RESULTS        the directory of the Tide score's results (default /var/lib/ostra-tide)
@@ -38,7 +41,7 @@ import { dirname, join } from "node:path";
 import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
-import { openAiModerator, type Moderator } from "./moderation.ts";
+import { failoverModerator, moderationProviders, type Moderator } from "./moderation.ts";
 import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
 import { TideApi, tideLinkVerifier, tidePayeeChecker } from "./tide.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
@@ -108,16 +111,11 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   const hideText = process.env.OSTRA_PAD_HIDE;
   const hideFiles = hideText === undefined || hideText.trim() === "" ? [] : hideText.split(",").map((f) => f.trim()).filter((f) => f !== "");
   const hidden = hideFiles.length === 0 ? () => null : hiddenListFromFiles(hideFiles, log);
-  const moderation = ["OSTRA_PAD_MODERATION_URL", "OSTRA_PAD_MODERATION_MODEL", "OSTRA_PAD_MODERATION_KEY_FILE"].map((k) => process.env[k] ?? "");
-  if (moderation.some((v) => v !== "") && moderation.some((v) => v === "")) throw new Error("OSTRA_PAD_MODERATION_URL, OSTRA_PAD_MODERATION_MODEL and OSTRA_PAD_MODERATION_KEY_FILE go together");
+  const moderators = moderationProviders(process.env, (path) => privateFile(path, "the moderation API key file"));
   let moderate: Moderator | null = null;
-  if (moderation[0] !== "") {
-    const [url, model, keyFile] = moderation as [string, string, string];
-    const apiKey = privateFile(keyFile, "the moderation API key file");
-    if (apiKey === "") throw new Error(`${keyFile} is empty`);
-    const fallbackModel = process.env.OSTRA_PAD_MODERATION_FALLBACK_MODEL || undefined;
-    moderate = openAiModerator({ url, model, apiKey, ...(fallbackModel === undefined ? {} : { fallbackModel }) });
-    log("pad_moderation", { host: new URL(url).host, model, fallback: fallbackModel ?? null });
+  if (moderators.length > 0) {
+    moderate = failoverModerator(moderators, { log });
+    log("pad_moderation", { providers: moderators.map((p) => ({ host: new URL(p.url).host, model: p.model, fallback: p.fallbackModel ?? null })) });
   } else {
     log("pad_moderation", { host: null });
   }

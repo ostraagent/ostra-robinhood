@@ -9,7 +9,8 @@
 //     delivery file are fetched by their CIDs and their bytes checked against the job's sha256, the offer is read
 //     from the provider's listing (its ERC-8004 registration file), and a model behind an OpenAI-compatible API
 //     (OSTRA_PAD_JUDGE_*: the operator's choice) answers whether the delivery does what the order asked, as JSON.
-//     Everything the parties wrote is passed to it as data, never as instructions.
+//     Everything the parties wrote is passed to it as data, never as instructions. Several APIs can be configured,
+//     asked in order: when one gives no answer, the next is asked (failoverJudges, sdk failover.ts).
 //   * Content rules (decided by Edu on 30 Oct 2026, sdk pad-rules.ts): a job whose order or delivery is prohibited
 //     work (hacking and malware, fraud and phishing, market manipulation, illegal and harmful) is rejected, the
 //     reason naming the category, whatever the delivery does; the panel judges under the same rules.
@@ -36,11 +37,14 @@ import { join } from "node:path";
 import { getAddress, sha256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import {
   ERC8004_IDENTITY_REGISTRY,
+  FAILOVER_COOLDOWN_MS,
   OSTRAPAD,
   OSTRAPAD_FROM_BLOCK,
   PAD,
   PAD_EVENTS,
+  failover,
   getLogsChunked,
+  numberedSettings,
   ostraPadAbi,
   padCidFromDigest,
   padDigestFromCid,
@@ -219,7 +223,8 @@ export const REFUSED_REASON = "Rejected: the judging models' providers refused t
  * appeal prompt for a case carrying a decision. Its answer must be the JSON verdict; an answer of another shape is
  * null, no answer (no response, an error status) "unreached". When the model's provider refuses the request under its
  * usage policy (providerRefusal), `fallbackModel` (a model of another provider, on the same API) is asked the same; if
- * that one refuses too, or there is none, the verdict is a rejection (REFUSED_REASON). max_tokens 1,000 leaves room
+ * that one refuses too, or there is none, the verdict is a rejection (REFUSED_REASON); if it gives no answer, the
+ * result is null (the refusal was a paid call). max_tokens 1,000 leaves room
  * for a reasoning model's thinking (x-ai/grok-4.7 used about 150 tokens on 31 Oct 2026) within the cost bound.
  */
 export function openAiJudge(o: { url: string; model: string; apiKey: string; fallbackModel?: string; fetch?: typeof fetch; timeoutMs?: number }): Judge {
@@ -260,10 +265,69 @@ export function openAiJudge(o: { url: string; model: string; apiKey: string; fal
     if (first === null || first === "unreached" || !("refused" in first)) return first;
     if (o.fallbackModel === undefined) return { approve: false, reason: REFUSED_REASON, refusedBy: [o.model] };
     const second = await once(o.fallbackModel, c);
-    if (second === null || second === "unreached") return second;
+    // The first model answered (a refusal is a paid call): no answer from the fallback leaves an answer of another
+    // shape (null), counted and tried again later on this API, never passed on to another one.
+    if (second === null || second === "unreached") return null;
     if ("refused" in second) return { approve: false, reason: REFUSED_REASON, refusedBy: [o.model, o.fallbackModel] };
     return { ...second, refusedBy: [o.model] };
   };
+}
+
+/**
+ * One API the bot may judge through: the judge's base URL, model and key, and the appeal panel's (by default the
+ * judge's API and key; its model by default the judge's).
+ */
+export type JudgeProvider = { url: string; model: string; apiKey: string; panelUrl: string; panelModel: string; panelKey: string };
+
+const JUDGE_SETTINGS = ["OSTRA_PAD_JUDGE_URL", "OSTRA_PAD_JUDGE_MODEL", "OSTRA_PAD_JUDGE_KEY_FILE", "OSTRA_PAD_PANEL_JUDGE_MODEL", "OSTRA_PAD_PANEL_JUDGE_URL", "OSTRA_PAD_PANEL_JUDGE_KEY_FILE"] as const;
+
+/**
+ * The judging APIs the environment names, in the order they are asked: OSTRA_PAD_JUDGE_URL, _MODEL, _KEY_FILE (all
+ * three) and OSTRA_PAD_PANEL_JUDGE_MODEL, _URL, _KEY_FILE (optional) for the first, the same names ending in _2, _3
+ * ... for the next ones (sdk numberedSettings). At least one is required: without a judge the bot could only reject at
+ * the late point. `readKey` reads a key file (refusing one others can read).
+ */
+export function judgeProviders(env: Record<string, string | undefined>, readKey: (path: string) => string): JudgeProvider[] {
+  const sets = numberedSettings(env, JUDGE_SETTINGS);
+  if (sets.length === 0) throw new Error("missing environment variable OSTRA_PAD_JUDGE_URL");
+  return sets.map((s, i) => {
+    const n = i === 0 ? "" : `_${i + 1}`;
+    const url = s.OSTRA_PAD_JUDGE_URL;
+    const model = s.OSTRA_PAD_JUDGE_MODEL;
+    const keyFile = s.OSTRA_PAD_JUDGE_KEY_FILE;
+    if (url === undefined || model === undefined || keyFile === undefined) throw new Error(`OSTRA_PAD_JUDGE_URL${n}, OSTRA_PAD_JUDGE_MODEL${n} and OSTRA_PAD_JUDGE_KEY_FILE${n} go together`);
+    const panelUrl = s.OSTRA_PAD_PANEL_JUDGE_URL ?? url;
+    for (const [name, u] of [[`OSTRA_PAD_JUDGE_URL${n}`, url], [`OSTRA_PAD_PANEL_JUDGE_URL${n}`, panelUrl]] as const) if (!/^https?:\/\//i.test(u)) throw new Error(`${name} must be an http(s) URL`);
+    const apiKey = readKey(keyFile);
+    if (apiKey === "") throw new Error(`${keyFile} (OSTRA_PAD_JUDGE_KEY_FILE${n}) is empty`);
+    const panelKey = s.OSTRA_PAD_PANEL_JUDGE_KEY_FILE === undefined ? apiKey : readKey(s.OSTRA_PAD_PANEL_JUDGE_KEY_FILE);
+    if (panelKey === "") throw new Error(`${s.OSTRA_PAD_PANEL_JUDGE_KEY_FILE} (OSTRA_PAD_PANEL_JUDGE_KEY_FILE${n}) is empty`);
+    return { url, model, apiKey, panelUrl, panelModel: s.OSTRA_PAD_PANEL_JUDGE_MODEL ?? model, panelKey };
+  });
+}
+
+/** The judge and the panel on one API with one key and two models: each model is the other's fallback for a request its provider refuses. */
+export function judgeSameApi(p: JudgeProvider): boolean {
+  return p.panelUrl === p.url && p.panelKey === p.apiKey && p.panelModel !== p.model;
+}
+
+/**
+ * The judge and the appeal panel over `providers`, each asked in order (sdk failover: an API that gives no answer is
+ * left aside a while, and the next one is asked). Within one API, a request a model's provider refuses goes to the
+ * other model (judgeSameApi), as openAiJudge does.
+ */
+export function failoverJudges(providers: readonly JudgeProvider[], o: { log?: (event: string, fields: Record<string, unknown>) => void; fetch?: typeof fetch; timeoutMs?: number; cooldownMs?: number } = {}): { judge: Judge; panelJudge: Judge } {
+  const extra = { ...(o.fetch === undefined ? {} : { fetch: o.fetch }), ...(o.timeoutMs === undefined ? {} : { timeoutMs: o.timeoutMs }) };
+  const options = { cooldownMs: o.cooldownMs ?? FAILOVER_COOLDOWN_MS, ...(o.log === undefined ? {} : { log: o.log }) };
+  const judge = failover(
+    providers.map((p) => ({ name: `${new URL(p.url).host} ${p.model}`, call: openAiJudge({ url: p.url, model: p.model, apiKey: p.apiKey, ...(judgeSameApi(p) ? { fallbackModel: p.panelModel } : {}), ...extra }) })),
+    options,
+  );
+  const panelJudge = failover(
+    providers.map((p) => ({ name: `${new URL(p.panelUrl).host} ${p.panelModel}`, call: openAiJudge({ url: p.panelUrl, model: p.panelModel, apiKey: p.panelKey, ...(judgeSameApi(p) ? { fallbackModel: p.model } : {}), ...extra }) })),
+    options,
+  );
+  return { judge, panelJudge };
 }
 
 export type PadEvaluatorParts = {
