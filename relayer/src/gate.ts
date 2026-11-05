@@ -31,7 +31,13 @@
 //      PostCollateral, WithdrawCollateral and Borrow, a stock vault's, and from
 //      version 4 its venues' SetVenue, Enter, Exit and Forward, and tripVenue; a vault
 //      of a stock Borro lists that is not a pair, GME, is served as a pair
-//      token vault), paid by a `payer` vault in the relayer's token; dividends (a vesting's, a launched-token vault's
+//      token vault; when the relayer is configured with Ostra Swap, a vault
+//      of any other ERC-20, which Ostra Swap buys into and sells from, is
+//      created (createVault runs no code of its token) and spends only
+//      Transfer and its withdrawal lock, whatever the token does now, so what
+//      such a vault holds can always leave: whether a token is worth buying is
+//      the agent's token check, @ostraagent/swap tokencheck.ts, MCP 0.1.20),
+//      paid by a `payer` vault in the relayer's token; dividends (a vesting's, a launched-token vault's
 //      ClaimDividend) only of a pool paying them in USDG, WETH, a listed
 //      pair token or a launched token; and of Ostra Swap (decided 21 Oct
 //      2026), when the relayer is configured with it: OstraRouter
@@ -48,6 +54,7 @@
 //      relayer's account is never the caller of anything that gives a caller
 //      a role, and no code runs but Ostra's, USDG's, WETH's, the listed pair
 //      tokens' (OSTRA's and the stock tokens') and the launchpad's, except
+//      another ERC-20's transfer from its vault (the spend simulated first),
 //      the pool, hook and tokens a vault Swap names, the hook a vault
 //      ConfigurePool names, and Morpho Blue with the Vault V2, market oracle
 //      and rate model a version 3 Borro spend names (the vault checks that
@@ -240,7 +247,10 @@ export type GateOptions = {
   priceFeed: Address;
   /** ETH/USD, checked and fresh (the SDK's chainlinkEthUsd on priceFeed). */
   ethUsd: EthUsdSource;
-  /** Ostra Swap (OSTRA_SWAP_DEPLOYMENT): its router's escrow orders are relayed; `private` relays private spends. */
+  /**
+   * Ostra Swap (OSTRA_SWAP_DEPLOYMENT): its router's escrow orders are relayed; `private` relays private spends; the
+   * vaults of other ERC-20s are served for their Transfer and withdrawal lock.
+   */
   swap?: { router: Address; private?: PrivateRelay };
   /** OstraPad (Ostrapad): its calls are relayed, none naming the relayer's account or Multicall3 in a role (#padProblem). */
   pad?: Address;
@@ -460,6 +470,8 @@ const LAUNCHED_VAULT_ACTIONS: readonly number[] = [
   VAULT_ACTION.SET_WITHDRAWAL_LOCK,
   VAULT_ACTION.CANCEL_PENDING_CHANGES,
 ];
+/** A vault of another ERC-20 (with Ostra Swap): its Transfer (to an order's escrow, or out) and its withdrawal lock. */
+const OTHER_VAULT_ACTIONS: readonly number[] = [VAULT_ACTION.TRANSFER, VAULT_ACTION.SET_WITHDRAWAL_LOCK, VAULT_ACTION.CANCEL_PENDING_CHANGES];
 
 const POOL_FNS = new Set(["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]);
 const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw", "finishRecovery", "tripVenue"]);
@@ -843,6 +855,9 @@ export class RelayerGate {
       const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [t] })) as Hex;
       return BigInt(id) === 0n ? null : "launched";
     };
+    // A vault's token: one of the above, or with Ostra Swap any other ERC-20 (null: not served).
+    const vaultTokenKind = async (t: Address): Promise<"weth" | "pair" | "launched" | "other" | null> => (await wethOrLaunched(t)) ?? (this.#o.swap === undefined ? null : "other");
+    const NOT_SERVED = "WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched";
     // Dividends move the pool's dividend token: relayed only when its code is known (USDG, WETH, a listed pair token, a launched token).
     const dividendProblem = async (i: number, id: Hex): Promise<string | null> => {
       if (l === undefined) return null;
@@ -872,7 +887,7 @@ export class RelayerGate {
       if (c.to === d.vaultFactory) {
         if (c.fn !== "createVault") return `calls[${i}]: ${name} on the vault factory ${c.to} is not relayed`;
         if (c.token !== token) {
-          if ((await wethOrLaunched(c.token)) === null) return `calls[${i}]: vaults are created in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched, not ${c.token}`;
+          if ((await vaultTokenKind(c.token)) === null) return `calls[${i}]: vaults are created in ${token}, ${NOT_SERVED}, not ${c.token}`;
           if (request.payer === null) return `calls[${i}]: a vault in ${c.token} is paid for by a payer vault in ${token}`;
         }
         continue;
@@ -933,18 +948,19 @@ export class RelayerGate {
       if (v === null) return `calls[${i}]: ${c.to} is not an Ostra vault`;
       if (v.token === token) continue;
       // A vault in another token: only what that vault needs, its token's code the launchpad's (or WETH's, or a listed
-      // pair token's), paid by a payer vault. A WETH or pair token vault may be a pair's creator vault: it owns its pools.
-      const kind = await wethOrLaunched(v.token);
-      if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, WETH, a listed pair token (OSTRA or a stock token) or a token the Ostra launchpad launched`;
+      // pair token's), or with Ostra Swap any other ERC-20's for its Transfer and withdrawal lock alone, paid by a payer
+      // vault. A WETH or pair token vault may be a pair's creator vault: it owns its pools.
+      const kind = await vaultTokenKind(v.token);
+      if (kind === null) return `calls[${i}]: ${c.to} is not an Ostra vault in ${token}, ${NOT_SERVED}`;
       if (request.payer === null) return `calls[${i}]: a vault in ${v.token} is paid for by a payer vault in ${token}`;
       // finishRecovery: anyone may finish a recovery past its delay (under the withdrawal lock it comes before the new key's first spend).
       // tripVenue: anyone may trip the venue breaker, which only brings a position home into the vault (or deleverages a
       // Raeto stock vault).
       if (c.fn === "finishRecovery" || c.fn === "tripVenue") continue;
       const stock = kind === "pair" && STOCK_TOKENS.has(getAddress(v.token));
-      const allowed: readonly number[] = kind === "weth" || kind === "pair" ? (stock ? [...PAIR_VAULT_ACTIONS, ...STOCK_VENUE_ACTIONS] : PAIR_VAULT_ACTIONS) : LAUNCHED_VAULT_ACTIONS;
+      const allowed: readonly number[] = kind === "weth" || kind === "pair" ? (stock ? [...PAIR_VAULT_ACTIONS, ...STOCK_VENUE_ACTIONS] : PAIR_VAULT_ACTIONS) : kind === "other" ? OTHER_VAULT_ACTIONS : LAUNCHED_VAULT_ACTIONS;
       if (c.fn !== "spend" || !allowed.includes(c.action)) {
-        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "launched" ? "Transfer, Swap, ClaimDividend and its withdrawal lock" : `Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile, SetTokenMetadata, its withdrawal lock and link, Borro (Lend, Redeem, collateral and Borrow)${stock ? ", and its venues (SetVenue, Enter, Exit, Forward)" : ""}`}`;
+        return `calls[${i}]: a vault in ${v.token} is relayed only for ${kind === "other" ? "Transfer and its withdrawal lock" : kind === "launched" ? "Transfer, Swap, ClaimDividend and its withdrawal lock" : `Transfer, Swap, ConfigurePool, ClaimDividend, SetProfile, SetTokenMetadata, its withdrawal lock and link, Borro (Lend, Redeem, collateral and Borrow)${stock ? ", and its venues (SetVenue, Enter, Exit, Forward)" : ""}`}`;
       }
       if (kind === "launched" && c.action === VAULT_ACTION.CLAIM_DIVIDEND && l !== undefined) {
         const id = (await this.#o.client.readContract({ address: l.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [v.token] })) as Hex;

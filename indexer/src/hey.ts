@@ -11,10 +11,13 @@
 //   - a 404 means HEY has not published a project for the contract (its scan_url is offered); on 429, 5xx or any
 //     other failure nothing is said about the builder;
 //   - an answer is kept 60 seconds at most.
-// The key (an account's free key: 120 a minute, 10,000 a month) never leaves the server. Only the tokens Ostra Swap
-// trades are asked about (`allowed`); a running index makes at most `dailyCalls` calls to HEY a UTC day, none for a
-// minute after HEY gave no answer (or for retry-after on a 429), and none for the rest of the UTC day once HEY says
-// fewer than HEY_MONTH_RESERVE of the key's month remain; then the answer is "unavailable".
+// The key (an account's free key: 120 a minute, 10,000 a month) never leaves the server. A running index makes at
+// most `dailyCalls` calls to HEY a UTC day, of which at most `otherDailyCalls` about tokens outside `allowed` (USDG's
+// pair tokens and the launched tokens): since MCP 0.1.20 Ostra Swap trades any ERC-20 that passes its token check, and
+// anyone can ask the index about any address, so those calls cannot use up the day of the listed tokens (anyone
+// can use up the other tokens' calls of a day: then those answer "unavailable" until the next UTC day). None are
+// made for a minute after HEY gave no answer (or for retry-after on a 429), nor for the rest of the UTC day once HEY
+// says fewer than HEY_MONTH_RESERVE of the key's month remain; then the answer is "unavailable".
 // HEY's text is a third party's data shown to AI agents: each string is cut to HEY_TEXT_MAX characters, without
 // control or bidirectional characters.
 
@@ -27,6 +30,8 @@ export const HEY_CHAIN = 4663;
 export const HEY_CACHE_MS = 60_000;
 /** Calls to HEY a UTC day: 300 keeps a month under the free key's 10,000. */
 export const HEY_DAILY_CALLS = 300;
+/** Of HEY_DAILY_CALLS, the most about tokens outside `allowed`. */
+export const HEY_OTHER_DAILY_CALLS = 100;
 /** The name Ostra declares on its calls (x-hey-integration), so HEY credits the integration. */
 export const HEY_INTEGRATION = "ostra";
 /** Below this many calls left in the key's month (x-hey-monthly-remaining), no more are made that UTC day. */
@@ -145,12 +150,13 @@ export function cardOf(body: Record<string, unknown>): HeyBuilder | null {
 export type HeyOptions = {
   /** HEY's key (an account's key, sent as a bearer token); never logged. */
   key: string;
-  /** Whether Ostra asks HEY about this address (a token Ostra Swap trades). */
+  /** The tokens HEY is asked about first (USDG's pair tokens, the launched tokens); others share otherDailyCalls. */
   allowed: (token: Address) => boolean;
   log: (event: string, fields?: Record<string, unknown>) => void;
   api?: string;
   cacheMs?: number;
   dailyCalls?: number;
+  otherDailyCalls?: number;
   timeoutMs?: number;
   now?: () => number;
 };
@@ -162,12 +168,14 @@ export class HeyBuilders {
   readonly #api: string;
   readonly #cacheMs: number;
   readonly #dailyCalls: number;
+  readonly #otherDailyCalls: number;
   readonly #timeoutMs: number;
   readonly #now: () => number;
   readonly #cache = new Map<string, { at: number; answer: HeyBuilder }>();
   readonly #inFlight = new Map<string, Promise<HeyBuilder>>();
   #day = "";
   #calls = 0;
+  #otherCalls = 0;
   #pausedUntil = 0;
   /** The UTC day no more calls are made, as HEY said the key's month is nearly used. */
   #stoppedDay = "";
@@ -183,36 +191,42 @@ export class HeyBuilders {
     this.#cacheMs = o.cacheMs ?? HEY_CACHE_MS;
     if (!(this.#cacheMs >= 0 && this.#cacheMs <= HEY_CACHE_MS)) throw new Error(`cacheMs must be 0 to ${HEY_CACHE_MS}`);
     this.#dailyCalls = o.dailyCalls ?? HEY_DAILY_CALLS;
+    this.#otherDailyCalls = o.otherDailyCalls ?? HEY_OTHER_DAILY_CALLS;
     this.#timeoutMs = o.timeoutMs ?? 4_000;
     this.#now = o.now ?? Date.now;
   }
 
-  /** The builder answer for `tokenText`, or null when the address is not one Ostra asks HEY about. */
+  /** The builder answer for `tokenText`, or null when it is not an address. */
   async builder(tokenText: string): Promise<HeyBuilder | null> {
     if (!isAddress(tokenText, { strict: false })) return null;
     const token = getAddress(tokenText);
-    if (!this.#allowed(token)) return null;
     const k = token.toLowerCase();
     const hit = this.#cache.get(k);
     if (hit !== undefined && this.#now() - hit.at < this.#cacheMs) return hit.answer;
     const running = this.#inFlight.get(k);
     if (running !== undefined) return running;
-    const p = this.#ask(token).finally(() => this.#inFlight.delete(k));
+    const p = this.#ask(token, this.#allowed(token)).finally(() => this.#inFlight.delete(k));
     this.#inFlight.set(k, p);
     return p;
   }
 
-  async #ask(token: Address): Promise<HeyBuilder> {
+  async #ask(token: Address, listed: boolean): Promise<HeyBuilder> {
     const now = this.#now();
     if (now < this.#pausedUntil) return UNAVAILABLE;
     const day = new Date(now).toISOString().slice(0, 10);
     if (day !== this.#day) {
       this.#day = day;
       this.#calls = 0;
+      this.#otherCalls = 0;
     }
     if (this.#calls >= this.#dailyCalls) return UNAVAILABLE;
+    if (!listed && this.#otherCalls >= this.#otherDailyCalls) return UNAVAILABLE;
     if (this.#stoppedDay === day) return UNAVAILABLE;
     this.#calls += 1;
+    if (!listed) {
+      this.#otherCalls += 1;
+      if (this.#otherCalls === this.#otherDailyCalls) this.#log("hey_other_daily_calls_reached", { day, calls: this.#otherCalls });
+    }
     this.callsMade += 1;
     if (this.#calls === this.#dailyCalls) this.#log("hey_daily_calls_reached", { day, calls: this.#calls });
     let status = 0;

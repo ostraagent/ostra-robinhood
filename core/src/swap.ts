@@ -1,7 +1,13 @@
 // Ostra Swap from the agent's vaults (decided 22 Oct 2026: agents swap through MCP): any pair of the tokens an Ostra
-// vault can hold and the relayer serves (USDG, WETH, OSTRA, the listed stock tokens, tokens the Ostra launchpad
-// launched), routed through Uniswap v3 and v4 against USDG or WETH by @ostraagent/swap (findRoute), at the fee of the
-// vault the output goes to (OstraStake.feeBps: lower with OSTRA locked for it).
+// vault can hold and the relayer serves, routed through Uniswap v3 and v4 against USDG or WETH by @ostraagent/swap
+// (findRoute), at the fee of the vault the output goes to (OstraStake.feeBps: lower with OSTRA locked for it). Those
+// tokens are USDG, WETH, OSTRA, the listed stock tokens and the tokens the Ostra launchpad launched, and since MCP
+// 0.1.20 any other ERC-20 on Robinhood Chain. Such a token is bought only when it passes @ostraagent/swap's token
+// check (tokencheck.ts: in one eth_call, a holder with code buys it through an OstraRouter escrow order, moves part of
+// it to a fresh address and sells the rest back through another escrow order, each step as its quote in the same
+// state): one that cannot be sold, takes a cut when it moves, has no route or loses over a quarter on a round trip is
+// refused before anything is signed. What a vault holds is sold without the
+// check (its route and the router's minOut decide), so a token that stopped passing can still leave.
 //
 // A vault can transfer but not approve, so a swap is an escrow order of OstraRouter (an immediate order): the vault
 // of the input token signs one Transfer of the input to the order's escrow address (CREATE2 of the order's terms:
@@ -46,6 +52,8 @@ import {
   type PoolIndexData,
   type Route,
   type SwapDeployment,
+  TokenChecks,
+  type TokenVerdict,
 } from "@ostraagent/swap";
 import { formatUnitsAmount, parseUnitsAmount } from "./amount.ts";
 import { chainTime, hasCode, tokenBalance, tokenDecimals } from "./chain.ts";
@@ -264,6 +272,7 @@ const address = (text: string, what: string): Address => {
 export class SwapService {
   readonly #p: SwapParts;
   #index: PoolIndex | null = null;
+  #checks: TokenChecks | null = null;
   #splitQueue: Promise<unknown> = Promise.resolve();
 
   constructor(p: SwapParts) {
@@ -282,11 +291,13 @@ export class SwapService {
   }
 
   /**
-   * Refuses a token an Ostra vault cannot hold through the relayer: USDG, WETH, OSTRA, the listed stock tokens and
-   * the tokens the Ostra launchpad launched are served (relayer gate.ts), anything else would stay in its vault.
+   * Refuses a token an Ostra vault cannot trade: native ETH (a vault holds WETH); to buy, any token but USDG, WETH,
+   * OSTRA, the listed stock tokens and the tokens the Ostra launchpad launched that fails the token check
+   * (tokenVerdict). A token sold is what a vault holds: only native ETH is refused.
    */
-  async checkToken(token: Address): Promise<void> {
+  async checkToken(token: Address, side: "buy" | "sell" = "buy"): Promise<void> {
     if (token === ETH) throw new RangeError("an Ostra vault holds WETH, not native ETH: swap WETH");
+    if (side === "sell") return;
     if (token === this.#p.config.deployment.token || token === WETH) return;
     if (LAUNCH_PAIRS.some((p) => (p.kind === "ostra" || p.kind === "stock") && getAddress(p.address) === token)) return;
     const lp: LaunchpadDeployment | undefined = this.#p.config.deployment.launchpad;
@@ -294,15 +305,28 @@ export class SwapService {
       const id = (await this.#p.client.readContract({ address: lp.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [token] })) as Hex;
       if (BigInt(id) !== 0n) return;
     }
-    throw new RangeError(`${token} is not a token an Ostra vault swaps: USDG, WETH, OSTRA, a listed stock token or a token the Ostra launchpad launched`);
+    const v = await this.tokenVerdict(token);
+    if (!v.ok) throw new RangeError(`${token} is not a token Ostra Swap buys: ${v.reason}; nothing was signed`);
+  }
+
+  /**
+   * The token check of `token` (@ostraagent/swap tokencheck.ts), run at the address of this agent's vault for it and
+   * from the account that sends its vault transactions (the relayer's or the local fee payer); a verdict that passed is
+   * kept a minute, so a buy signed later is checked again.
+   */
+  async tokenVerdict(token: Address): Promise<TokenVerdict> {
+    this.#checks ??= new TokenChecks({ client: this.#p.client, logsClient: this.#p.logsClient, index: await this.#poolIndex(), router: this.#p.swap.router, from: () => this.#p.sender.payer(), holder: (t) => this.#p.vaultFor(t).vaultAddress() });
+    const v = await this.#checks.check(token);
+    await this.#saveIndex();
+    return v;
   }
 
   async #plan(a: { tokenIn: string; tokenOut: string; amount: string; slippageBps?: number }): Promise<Plan> {
     const tokenIn = address(a.tokenIn, "tokenIn");
     const tokenOut = address(a.tokenOut, "tokenOut");
     if (tokenIn === tokenOut) throw new RangeError("tokenIn and tokenOut are the same");
-    await this.checkToken(tokenIn);
-    await this.checkToken(tokenOut);
+    await this.checkToken(tokenIn, "sell");
+    await this.checkToken(tokenOut, "buy");
     const slippageBps = a.slippageBps ?? DEFAULT_SWAP_SLIPPAGE_BPS;
     if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > MAX_SWAP_SLIPPAGE_BPS) throw new RangeError(`slippage must be 0 to ${MAX_SWAP_SLIPPAGE_BPS} bps`);
     const [inDecimals, outDecimals] = await Promise.all([tokenDecimals(this.#p.client, tokenIn), tokenDecimals(this.#p.client, tokenOut)]);

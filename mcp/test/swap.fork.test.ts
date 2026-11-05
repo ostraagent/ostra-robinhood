@@ -155,13 +155,14 @@ test("Ostra Swap over MCP: vault swaps by escrow order, a private note shielded,
     await fork.dealUsdg(vault, parseUnits("1000", 6));
     await keepPoolIndex(home);
 
-    // Refused before anything is signed: an unknown symbol, the same token twice, a token no Ostra vault swaps.
+    // Refused before anything is signed: an unknown symbol, the same token twice, an address no pool trades (the token
+    // check finds no route to it).
     const unknown = await call(client, "ostra_swap_quote", { tokenIn: "USDG", tokenOut: "DOGE", amount: "1" });
     assert.ok(!unknown.ok && /^invalid_input: DOGE is not a symbol/.test(unknown.text), unknown.text);
     const same = await call(client, "ostra_swap_quote", { tokenIn: "ETH", tokenOut: WETH, amount: "1" });
     assert.ok(!same.ok && /the same/.test(same.text), same.text);
     const stray = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: RECIPIENT, amount: "1" });
-    assert.ok(!stray.ok && /not a token an Ostra vault swaps/.test(stray.text), stray.text);
+    assert.ok(!stray.ok && /is not a token Ostra Swap buys: .*no Uniswap v3 or v4 pool.*; nothing was signed/.test(stray.text), stray.text);
     const tooMuch = await call(client, "ostra_swap", { tokenIn: "USDG", tokenOut: "ETH", amount: "5000" });
     assert.ok(!tooMuch.ok && /less than 5000; nothing was signed/.test(tooMuch.text), tooMuch.text);
 

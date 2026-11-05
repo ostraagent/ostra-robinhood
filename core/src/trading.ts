@@ -21,6 +21,7 @@
 
 import { getAddress, type Address, type Hex, type PublicClient } from "viem";
 import { USDG } from "@ostraagent/sdk";
+import { NoRouteError } from "@ostraagent/swap";
 import { formatUnitsAmount, parseUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { chainTime, tokenBalance, tokenDecimals } from "./chain.ts";
 import type { Folder } from "./storage.ts";
@@ -156,9 +157,18 @@ export class TradingService {
     return open;
   }
 
-  /** What `amount` of `token` sells for now (USDG base units); 0 for nothing. */
+  /**
+   * What `amount` of `token` sells for now (USDG base units); 0 for nothing, and for a token no pool buys now (a
+   * token bought through Ostra Swap's token check whose pools later dried up is worth nothing it can be sold for).
+   */
   async #sellValue(token: Address, amount: bigint): Promise<bigint> {
-    return amount === 0n ? 0n : this.#swap().expectedOut(token, USDG, amount);
+    if (amount === 0n) return 0n;
+    try {
+      return await this.#swap().expectedOut(token, USDG, amount);
+    } catch (err) {
+      if (err instanceof NoRouteError) return 0n;
+      throw err;
+    }
   }
 
   /**

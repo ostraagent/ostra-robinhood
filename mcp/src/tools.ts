@@ -351,7 +351,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   // --- Ostra Swap: swaps between the agent's vaults, and private balances in OstraPrivatePool -----------------
   tool(
     "ostra_swap_quote",
-    `Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault), how far the whole amount moves the price in one swap (impactBps), and how many parts ostra_swap splits it into at maxImpactBps (null: too large for the pool even in 16 parts). Nothing is signed. ${BUILDER_RULES}`,
+    `Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (any ERC-20 with a Uniswap v3 or v4 pool against USDG or WETH), routed through those pools: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault), how far the whole amount moves the price in one swap (impactBps), and how many parts ostra_swap splits it into at maxImpactBps (null: too large for the pool even in 16 parts). A token other than USDG, WETH, OSTRA, the listed stock tokens and the launched ones is bought only when it passes Ostra Swap's token check, a buy, a transfer and a sale back through OstraRouter escrow orders simulated in one call (a pass is kept a minute, so a buy signed later is checked again; a check can take half a minute): one that cannot be sold, takes a cut when it moves, has no pool that quotes it, or loses over 25% on a round trip is refused with why. Selling what a vault holds needs no check. Nothing is signed. ${BUILDER_RULES}`,
     { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
     (a) => {
       const tokenIn = tokenAddress(a.tokenIn);
@@ -890,8 +890,8 @@ export function registerTools(server: McpServer, agent: Agent): void {
     { token: address, amount: units, slippageBps: slippage, referrer: address.optional() },
     (a) => lp().sell({ token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
-  tool("token_vault", "The agent's vault for a launched token: address, balance, dividends to claim.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
-  tool("transfer_token", "Sends a token other than USDG (a launched token, WETH, OSTRA or a stock token) from the agent's vault of it to an address; USDG goes with withdraw.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
+  tool("token_vault", "The agent's vault for a token (one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token): address, balance, and for a launched token the dividends to claim.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
+  tool("transfer_token", "Sends a token other than USDG (any token a vault of the agent holds: one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token) from the agent's vault of it to an address; USDG goes with withdraw.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
   tool("claim_dividends", "Claims the dividends the agent's token vault earned, into the agent's vault of the dividend token.", { token: address }, (a) => lp().claimDividends(a.token));
 
   // --- the creator vault (it owns the agent's identity) ----------------------------------------------------------

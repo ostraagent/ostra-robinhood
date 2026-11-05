@@ -3,9 +3,10 @@
 // words, project_link carrying Ostra's integration name, a count or null, never a made-up 0); a second read within
 // 60 seconds is kept and not asked again; the NVDA stock token, which HEY has not published, answers not_published
 // with HEY's scan link; two reads of one address at once make one call; past the day's calls nothing more is asked
-// (unavailable); an address Ostra does not trade is not asked about; and a card whose project names another contract
-// (OSTRA's real card with activity_applies_to_token turned false) passes on the project and its link alone.
-// Makes four calls to HEY. Prints the answers, never the key.
+// (unavailable); an address outside the listed tokens is asked about within the other tokens' calls of the day and not
+// past them, and text that is not an address never; and a card whose project names another contract (OSTRA's real
+// card with activity_applies_to_token turned false) passes on the project and its link alone.
+// Makes five calls to HEY. Prints the answers, never the key.
 //
 //   OSTRA_HEY_KEY_FILE=/etc/ostra/hey-research.key node scripts/hey-builder-check.ts
 
@@ -23,7 +24,6 @@ const OSTRA = getAddress("0x68Ff81dFFF6eccefb74706fE1e0a86320CB2Eb96");
 const NVDA = getAddress("0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC");
 const STEAKHOUSE = getAddress("0xBeEff033F34C046626B8D0A041844C5d1A5409dd");
 const BORRO_USDG = getAddress("0xF8e0ab443098c0738489B5BAFFbd32A1341F2289");
-const NOT_TRADED = getAddress("0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003");
 
 const events: string[] = [];
 const allowed = new Set<Address>([OSTRA, NVDA, STEAKHOUSE, BORRO_USDG]);
@@ -67,10 +67,21 @@ assert.deepEqual(borro && borro.state, "unavailable");
 assert.equal(hey.callsMade, 3, "no call past the day's limit");
 assert.ok(events.includes("hey_daily_calls_reached"));
 
-// 6. An address Ostra does not trade: not asked about.
-assert.equal(await hey.builder(NOT_TRADED), null);
+// 6. Addresses outside the listed tokens (here none is listed): asked about within the other tokens' calls of the day,
+// not past them; text that is not an address is never asked about.
+const others = new HeyBuilders({ key, allowed: () => false, log: (e) => events.push(e), otherDailyCalls: 1 });
+const other = await others.builder(BORRO_USDG);
+console.log("an unlisted address:", JSON.stringify(other));
+assert.ok(other !== null && other.state === "not_published");
+assert.equal(others.callsMade, 1);
+const past = await others.builder(NVDA);
+assert.deepEqual(past && past.state, "unavailable");
+assert.equal(others.callsMade, 1, "no call past the other tokens' calls of the day");
+assert.ok(events.includes("hey_other_daily_calls_reached"));
 assert.equal(await hey.builder("not an address"), null);
+assert.equal(await others.builder("not an address"), null);
 assert.equal(hey.callsMade, 3);
+assert.equal(others.callsMade, 1);
 
 // 7. A project that names another contract: OSTRA's real card with activity_applies_to_token turned false; and one
 // that says nothing of whether its activity applies to the token is not passed on.

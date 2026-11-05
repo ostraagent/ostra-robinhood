@@ -26,10 +26,11 @@
 //   The board answers 503 board_unavailable while its hidden list cannot be read.
 //   POST /api/v1/tide/link, POST /api/v1/tide/points, GET /api/v1/tide/summary   Ostra Tide (tide.ts): an agent's
 //                                                vault link, and its own points to the holder of its view key
-//   GET /api/v1/builder/<token>                  a token's builder status from HEY Research Lab (hey.ts), for a token
-//                                                Ostra Swap trades: { builder } (published, project_only,
-//                                                not_published or unavailable); 404 not_tracked for another address;
-//                                                never cached (HEY's answers are kept 60 seconds, in hey.ts)
+//   GET /api/v1/builder/<token>                  a token's builder status from HEY Research Lab (hey.ts), for any
+//                                                token address (Ostra Swap trades any ERC-20 that passes its token
+//                                                check): { builder } (published, project_only, not_published or
+//                                                unavailable); 400 bad_address for anything else; never cached
+//                                                (HEY's answers are kept 60 seconds, in hey.ts)
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";

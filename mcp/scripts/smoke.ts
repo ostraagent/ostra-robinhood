@@ -6,7 +6,9 @@
 // reads Borro's markets on Morpho (NVDA among them, listed), a quote of 1 USDG
 // to $OSTRA carries $OSTRA's builder status from HEY Research Lab through Ostra's
 // index (published, its project_link naming Ostra's integration) and a quote of
-// 1 USDG to ETH carries none, and `backup`
+// 1 USDG to ETH carries none, a quote of 1 USDG to a token outside the listed
+// ones runs Ostra Swap's token check (a quote when the token passes it, else
+// the check's refusal), and `backup`
 // without arguments prints its usage. Run on the packed tarball before publishing and on the
 // published version after:
 //
@@ -93,11 +95,16 @@ try {
   const ethQuote = await call("ostra_swap_quote", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
   assert.ok(ethQuote.ok, ethQuote.text);
   assert.equal("builder" in (JSON.parse(ethQuote.text) as object), false, ethQuote.text);
+  // A token outside the listed ones, its only pool a hookless native ETH pool of Uniswap v4: the token check decides.
+  const otherQuote = await call("ostra_swap_quote", { tokenIn: "USDG", tokenOut: "0xf858011999Dfb3c82Dd7b11e65b1b73579b1F515", amount: "1" });
+  const otherCheck = otherQuote.ok ? `passed the token check: ${String((JSON.parse(otherQuote.text) as { expectedOut?: string }).expectedOut)}` : otherQuote.text;
+  if (otherQuote.ok) assert.ok(Number((JSON.parse(otherQuote.text) as { expectedOut?: string }).expectedOut) > 0, otherQuote.text);
+  else assert.match(otherQuote.text, /is not a token Ostra Swap buys: .*; nothing was signed/, otherQuote.text);
   await client.close();
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");
   process.stdout.write(
-    `${info?.name}@${info?.version}: ${names.size} tools; pad_search: ${listings.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nostra_swap_quote USDG to OSTRA: builder ${oq.builder.card?.hey_status_label} (${oq.builder.card?.project_link})\nSMOKE_OK\n`,
+    `${info?.name}@${info?.version}: ${names.size} tools; pad_search: ${listings.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nostra_swap_quote USDG to OSTRA: builder ${oq.builder.card?.hey_status_label} (${oq.builder.card?.project_link})\nostra_swap_quote USDG to a token outside the list: ${otherCheck.slice(0, 200)}\nSMOKE_OK\n`,
   );
 } catch (err) {
   process.stderr.write(`${stderr.slice(-3000)}\n`);

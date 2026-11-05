@@ -454,9 +454,19 @@ export class LaunchpadService {
     return readPoolView(this.#client, this.#lp(), tokenText);
   }
 
-  /** The agent's vault for a launched token: its address, whether it exists, the balance and the dividends it can claim. */
+  /**
+   * The agent's vault for a token: its address, whether it exists, the balance and, for a launched token, the
+   * dividends it can claim (null for any other token, such as one bought through Ostra Swap).
+   */
   async tokenVaultInfo(tokenText: string): Promise<{ token: Address; vault: Address; exists: boolean; balance: string; dividends: string | null; pendingOperation: number | null }> {
-    const pool = await this.#pool(tokenText);
+    const token = address(tokenText, "token");
+    const lp = this.#config.deployment.launchpad;
+    const launched = lp !== undefined && BigInt((await this.#client.readContract({ address: lp.launchpad, abi: ostraLaunchpadAbi, functionName: "poolOf", args: [token] })) as Hex) !== 0n;
+    if (!launched) {
+      const [s, decimals] = await Promise.all([this.tokenVault(token).state(), tokenDecimals(this.#client, token)]);
+      return { token, vault: s.vault, exists: s.exists, balance: formatUnitsAmount(s.balance, decimals), dividends: null, pendingOperation: s.pendingAction };
+    }
+    const pool = await this.#pool(token);
     const s = await this.tokenVault(pool.token).state();
     let dividends: string | null = null;
     if (getAddress(pool.config.dividendToken) !== zeroAddress) {
