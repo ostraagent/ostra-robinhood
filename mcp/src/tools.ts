@@ -15,6 +15,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, uploadImage, venueByName } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
+import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
 import { ensurePrivateDir } from "./disk.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
@@ -148,6 +149,27 @@ export function registerTools(server: McpServer, agent: Agent): void {
   // and an agent that sends it again would swap twice. The swap goes on in the server; ostra_swap_orders tells how it
   // ended. Swaps that answered "pending", by id:
   const answerMs = agent.config.swapAnswerMs;
+  // A swap's token's builder status from HEY Research Lab, through Ostra's index (builder.ts): asked when the call
+  // starts, beside the swap, never waited on by it; none without the index (OSTRA_PAD_INDEXER_URL off, or a fork).
+  const indexerUrl = agent.config.padIndexerUrl;
+  const builderFor = (tokenIn: string, tokenOut: string): Promise<unknown> | null => {
+    const t = indexerUrl === null ? null : builderToken(tokenIn, tokenOut);
+    return t === null || indexerUrl === null ? null : builderOf(indexerUrl, t);
+  };
+  const withBuilder = async (builder: Promise<unknown> | null, result: Promise<unknown>): Promise<unknown> => {
+    const value = await result;
+    if (builder === null || value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    // An answer that is ready waits a little for the builder status, never long.
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<unknown>((resolve) => {
+      timer = setTimeout(() => resolve(UNAVAILABLE), BUILDER_AFTER_MS);
+    });
+    try {
+      return { ...(value as Record<string, unknown>), builder: await Promise.race([builder, late]) };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const swaps = new Map<string, RunningSwap>();
   const swapView = (r: RunningSwap) => ({
     swap: r.id,
@@ -329,20 +351,26 @@ export function registerTools(server: McpServer, agent: Agent): void {
   // --- Ostra Swap: swaps between the agent's vaults, and private balances in OstraPrivatePool -----------------
   tool(
     "ostra_swap_quote",
-    "Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault), how far the whole amount moves the price in one swap (impactBps), and how many parts ostra_swap splits it into at maxImpactBps (null: too large for the pool even in 16 parts). Nothing is signed.",
-    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
-    (a) => ostraSwap().quote({ tokenIn: tokenAddress(a.tokenIn), tokenOut: tokenAddress(a.tokenOut), amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }),
-  );
-  tool(
-    "ostra_swap",
-    `Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault. A swap not done within ${answerMs / 1_000} s answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended.`,
+    `Quotes a swap on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut (USDG, WETH, OSTRA, listed stock tokens, tokens the Ostra launchpad launched), routed through Uniswap v3 and v4 against USDG or WETH: expected and minimum output, the hub and Ostra's fee (lower with OSTRA locked for the receiving vault), how far the whole amount moves the price in one swap (impactBps), and how many parts ostra_swap splits it into at maxImpactBps (null: too large for the pool even in 16 parts). Nothing is signed. ${BUILDER_RULES}`,
     { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
     (a) => {
       const tokenIn = tokenAddress(a.tokenIn);
       const tokenOut = tokenAddress(a.tokenOut);
-      return boundedSwap({ what: "the swap", tokenIn, tokenOut, amount: a.amount }, (hooks) =>
+      const builder = builderFor(tokenIn, tokenOut);
+      return withBuilder(builder, ostraSwap().quote({ tokenIn, tokenOut, amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }));
+    },
+  );
+  tool(
+    "ostra_swap",
+    `Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault. A swap not done within ${answerMs / 1_000} s answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. ${BUILDER_RULES}`,
+    { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
+    (a) => {
+      const tokenIn = tokenAddress(a.tokenIn);
+      const tokenOut = tokenAddress(a.tokenOut);
+      const builder = builderFor(tokenIn, tokenOut);
+      return withBuilder(builder, boundedSwap({ what: "the swap", tokenIn, tokenOut, amount: a.amount }, (hooks) =>
         ostraSwap().swap({ tokenIn, tokenOut, amount: a.amount, ...opt("slippageBps", a.slippageBps), ...opt("maxImpactBps", a.maxImpactBps) }, hooks),
-      );
+      ));
     },
   );
   tool(
@@ -618,7 +646,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   const bpsLimit = z.number().int().min(1).max(10_000).optional();
   tool(
     "trading",
-    `The trading capital: USDG of the vault set aside for trades the agent decides, with Ostra's limits (an agent may only tighten them): a position at most 25% of the capital (positionMaxBps) and no larger than a buy whose quote moves the price 1% (maxImpactBps); buys stop for the day after a 5% loss of the capital that day (dailyLossBps) and for the week after 10% that week (weeklyLossBps). set: sets it (capital in USDG, the limits), only with no position open; the plans keep its cash out of the cash vaults. status: its value now (cash, positions at the quote of selling them), whether buys may happen and, with token, the most that position may be. buy: buys token with amount USDG of the capital, refused past those limits. sell: sells amount (or "all") of the capital's token, split like any large swap. A buy or sell not done in time (${agent.config.swapAnswerMs / 1_000} s) answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. end: ends it (positions stay in their vaults, untracked). Trades go through Ostra Swap; only for an agent registered in ERC-8004 (publish_profile) to set it or buy.`,
+    `The trading capital: USDG of the vault set aside for trades the agent decides, with Ostra's limits (an agent may only tighten them): a position at most 25% of the capital (positionMaxBps) and no larger than a buy whose quote moves the price 1% (maxImpactBps); buys stop for the day after a 5% loss of the capital that day (dailyLossBps) and for the week after 10% that week (weeklyLossBps). set: sets it (capital in USDG, the limits), only with no position open; the plans keep its cash out of the cash vaults. status: its value now (cash, positions at the quote of selling them), whether buys may happen and, with token, the most that position may be. buy: buys token with amount USDG of the capital, refused past those limits. sell: sells amount (or "all") of the capital's token, split like any large swap. A buy or sell not done in time (${agent.config.swapAnswerMs / 1_000} s) answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. end: ends it (positions stay in their vaults, untracked). Trades go through Ostra Swap; only for an agent registered in ERC-8004 (publish_profile) to set it or buy. status with token, and buy: ${BUILDER_RULES}`,
     {
       action: z.enum(["set", "status", "buy", "sell", "end"]),
       capital: usdg.optional(),
@@ -642,14 +670,18 @@ export function registerTools(server: McpServer, agent: Agent): void {
         };
         return t.set({ capital: a.capital, limits });
       }
-      if (a.action === "status") return t.status(a.token === undefined ? undefined : (tokenAddress(a.token) as `0x${string}`));
+      if (a.action === "status") {
+        if (a.token === undefined) return t.status(undefined);
+        const token = tokenAddress(a.token) as `0x${string}`;
+        return withBuilder(builderFor(USDG, token), t.status(token));
+      }
       if (a.action === "end") return t.end();
       if (a.token === undefined || a.amount === undefined) throw new RangeError(`${a.action} takes token and amount`);
       const token = tokenAddress(a.token) as `0x${string}`;
       if (a.action === "buy") {
         if (a.amount === "all") throw new RangeError("buy takes an amount of USDG");
         const amount = a.amount;
-        return boundedSwap({ what: "the trading buy", tokenIn: USDG, tokenOut: token, amount }, () => t.buy({ token, amount, ...opt("slippageBps", a.slippageBps) }));
+        return withBuilder(builderFor(USDG, token), boundedSwap({ what: "the trading buy", tokenIn: USDG, tokenOut: token, amount }, () => t.buy({ token, amount, ...opt("slippageBps", a.slippageBps) })));
       }
       const amount = a.amount;
       return boundedSwap({ what: "the trading sell", tokenIn: token, tokenOut: USDG, amount }, () => t.sell({ token, amount, ...opt("slippageBps", a.slippageBps) }));

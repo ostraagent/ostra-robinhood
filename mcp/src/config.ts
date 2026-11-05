@@ -34,10 +34,12 @@
 //                         goes into such a vault). Never printed
 //   OSTRA_RAETO_URL       Raeto's API (default https://api.raeto.cc; "off":
 //                         the raeto tool refuses to run)
-//   OSTRA_PAD_INDEXER_URL Ostra's Ostrapad index, for pad_search (default, on
+//   OSTRA_PAD_INDEXER_URL Ostra's Ostrapad index, for pad_search and a swap's
+//                         builder status from HEY Research Lab (default, on
 //                         the packaged mainnet deployment, the web app's host
 //                         https://app.ostraagent.xyz; "off": pad_search
-//                         refuses, an agent's listing is still read by its id)
+//                         refuses, an agent's listing is still read by its id,
+//                         and swaps answer without builder)
 //   OSTRA_SWAP_ANSWER_MS  how long ostra_swap and trading buy and sell wait
 //                         for their swap before answering "pending" while it
 //                         goes on (milliseconds, 1 to 600000; default 40000,

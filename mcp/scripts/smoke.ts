@@ -3,7 +3,10 @@
 // absent), `pad_search` reads Ostra's Ostrapad index, `balance` answers, `ostra_ai_credit` reaches Ostra
 // AI (no payment), `private_recover` reads the private pool's whole history
 // (its events against its trees: a fresh seed holds no notes), `borro_markets`
-// reads Borro's markets on Morpho (NVDA among them, listed), and `backup`
+// reads Borro's markets on Morpho (NVDA among them, listed), a quote of 1 USDG
+// to $OSTRA carries $OSTRA's builder status from HEY Research Lab through Ostra's
+// index (published, its project_link naming Ostra's integration) and a quote of
+// 1 USDG to ETH carries none, and `backup`
 // without arguments prints its usage. Run on the packed tarball before publishing and on the
 // published version after:
 //
@@ -81,11 +84,20 @@ try {
   assert.ok(markets.ok, markets.text);
   const rows = JSON.parse(markets.text) as { symbol: string; listed: boolean }[];
   assert.ok(rows.some((m) => m.symbol === "NVDA" && m.listed), markets.text);
+  const ostraQuote = await call("ostra_swap_quote", { tokenIn: "USDG", tokenOut: "OSTRA", amount: "1" });
+  assert.ok(ostraQuote.ok, ostraQuote.text);
+  const oq = JSON.parse(ostraQuote.text) as { expectedOut?: string; builder?: { source?: string; state?: string; card?: { project_link?: string; hey_status_label?: string } } };
+  assert.ok(Number(oq.expectedOut) > 0, ostraQuote.text);
+  assert.ok(oq.builder?.source === "HEY Research Lab" && oq.builder.state === "published", ostraQuote.text);
+  assert.equal(new URL(oq.builder.card?.project_link ?? "").searchParams.get("utm_source"), "ostra", ostraQuote.text);
+  const ethQuote = await call("ostra_swap_quote", { tokenIn: "USDG", tokenOut: "ETH", amount: "1" });
+  assert.ok(ethQuote.ok, ethQuote.text);
+  assert.equal("builder" in (JSON.parse(ethQuote.text) as object), false, ethQuote.text);
   await client.close();
   const started = stderr.split("\n").find((l) => l.includes('"event":"started"'));
   assert.ok(started !== undefined, "the server logged its start");
   process.stdout.write(
-    `${info?.name}@${info?.version}: ${names.size} tools; pad_search: ${listings.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nSMOKE_OK\n`,
+    `${info?.name}@${info?.version}: ${names.size} tools; pad_search: ${listings.text.slice(0, 160).replace(/\s+/g, " ")}...; ${started}\nbalance: ${balance.text.slice(0, 400).replace(/\s+/g, " ")}\nostra_ai_credit: ${credit.text.replace(/\s+/g, " ")}\nprivate_recover: ${recovered.text.replace(/\s+/g, " ")}\nborro_markets: ${rows.length} markets, listed: ${rows.filter((m) => m.listed).map((m) => m.symbol).join(" ")}\nostra_swap_quote USDG to OSTRA: builder ${oq.builder.card?.hey_status_label} (${oq.builder.card?.project_link})\nSMOKE_OK\n`,
   );
 } catch (err) {
   process.stderr.write(`${stderr.slice(-3000)}\n`);

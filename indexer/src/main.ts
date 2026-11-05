@@ -33,12 +33,16 @@
 //   OSTRA_TIDE_LINKS          Ostra Tide's links (tide.ts), 0600 (default: tide-links.json next to
 //                             OSTRA_INDEXER_STATE; off: no Tide routes)
 //   OSTRA_TIDE_RESULTS        the directory of the Tide score's results (default /var/lib/ostra-tide)
+//   OSTRA_HEY_KEY_FILE        HEY Research Lab's API key file (mode 0600; never printed): GET /api/v1/builder/<token>
+//                             answers a token's builder status from HEY (hey.ts). Unset, or a file that cannot be
+//                             used (logged): that route answers 503, and the rest of the index runs
 //
 // Logs are JSON lines on stdout, with the RPC URL replaced wherever it appears.
 
 import { readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, parseDeployment, redact, robinhoodClient, type Deployment } from "@ostraagent/sdk";
+import { HeyBuilders } from "./hey.ts";
 import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { failoverModerator, moderationProviders, type Moderator } from "./moderation.ts";
@@ -134,7 +138,21 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
     await tide.load();
   }
   log("tide", { links: tide === null ? "off" : tideLinks });
-  const server = createIndexerServer(indexer, log, pad, tide);
+  // HEY is asked only about tokens Ostra Swap trades: OSTRA, the listed stock tokens and the launchpad's tokens.
+  const heyKeyFile = process.env.OSTRA_HEY_KEY_FILE;
+  const pairTokens = new Set(LAUNCH_PAIRS.filter((p) => p.kind === "ostra" || p.kind === "stock").map((p) => p.address.toLowerCase()));
+  // A HEY key file that cannot be used turns the builder route off (503), never the index.
+  let hey: HeyBuilders | null = null;
+  let heyOff: string | null = heyKeyFile === undefined || heyKeyFile === "" ? "no OSTRA_HEY_KEY_FILE" : null;
+  if (heyOff === null) {
+    try {
+      hey = new HeyBuilders({ key: privateFile(heyKeyFile as string, "the HEY key file"), allowed: (token) => pairTokens.has(token.toLowerCase()) || indexer.launched(token), log });
+    } catch (err) {
+      heyOff = (err as Error).message.replace(/hey_[\x21-\x7e]+/g, "hey_...").slice(0, 200);
+    }
+  }
+  log("hey", hey === null ? { builder: "off", reason: heyOff } : { builder: "on" });
+  const server = createIndexerServer(indexer, log, pad, tide, hey);
   server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString(), pad: pad === null ? "off" : padStatePath }));
   indexer.start(everyMs);
   // Ostrapad's index: its own scans, a few seconds apart (its files and records are read again every few minutes).

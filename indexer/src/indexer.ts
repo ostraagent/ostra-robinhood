@@ -790,6 +790,11 @@ export class Indexer {
     return { total: list.length, tokens: list.slice(a.offset, a.offset + a.limit) };
   }
 
+  /** Whether the launchpad launched `token` (as the index has read so far). */
+  launched(token: Address): boolean {
+    return this.#tokenIndex.has(getAddress(token));
+  }
+
   token(tokenText: string): (TokenSummary & { metadataUri: string | null; metadata: unknown; creator: { vault: Address; profileUri: string | null; profile: unknown } }) | null {
     const launch = this.#tokenIndex.get(getAddress(tokenText));
     if (launch === undefined) return null;

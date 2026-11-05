@@ -26,10 +26,15 @@
 //   The board answers 503 board_unavailable while its hidden list cannot be read.
 //   POST /api/v1/tide/link, POST /api/v1/tide/points, GET /api/v1/tide/summary   Ostra Tide (tide.ts): an agent's
 //                                                vault link, and its own points to the holder of its view key
+//   GET /api/v1/builder/<token>                  a token's builder status from HEY Research Lab (hey.ts), for a token
+//                                                Ostra Swap trades: { builder } (published, project_only,
+//                                                not_published or unavailable); 404 not_tracked for another address;
+//                                                never cached (HEY's answers are kept 60 seconds, in hey.ts)
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
 import { CANDLE_INTERVALS, type Indexer } from "./indexer.ts";
+import type { HeyBuilders } from "./hey.ts";
 import type { PadIndexer } from "./pad.ts";
 import { TIDE_BODY_MAX, TideBadRequest, type TideApi } from "./tide.ts";
 
@@ -209,9 +214,31 @@ export async function handleTide(tide: TideApi, req: IncomingMessage, res: Serve
   }
 }
 
-export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null, tide: TideApi | null = null): Server {
+/** A token's builder status from HEY (hey.ts); never cached here, as HEY's answers are private and kept 60 seconds. */
+export async function handleBuilder(hey: HeyBuilders | null, req: IncomingMessage, res: ServerResponse, token: string): Promise<void> {
+  const reply = (status: number, body: unknown) => {
+    res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+    res.end(JSON.stringify(body));
+  };
+  if (req.method !== "GET" && req.method !== "HEAD") return reply(405, { error: "method_not_allowed" });
+  if (!isAddress(token, { strict: false })) return reply(400, { error: "bad_address" });
+  if (hey === null) return reply(503, { error: "builder_off" });
+  const builder = await hey.builder(token);
+  return builder === null ? reply(404, { error: "not_tracked" }) : reply(200, { builder });
+}
+
+export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null, tide: TideApi | null = null, hey: HeyBuilders | null = null): Server {
   return createServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0] ?? "/";
+    const b = /^\/api\/v1\/builder\/([^/]{1,64})$/.exec(path);
+    if (b !== null) {
+      handleBuilder(hey, req, res, b[1] as string).catch((err: unknown) => {
+        log("request_failed", { path: path.slice(0, 200), reason: (err as Error).message.slice(0, 200) });
+        if (!res.headersSent) send(res, 500, { error: "internal" });
+        else res.end();
+      });
+      return;
+    }
     const m = /^\/api\/v1\/tide\/([a-z]{1,16})$/.exec(path);
     if (m !== null) {
       if (tide === null) return send(res, 404, { error: "not_found" });

@@ -18,6 +18,8 @@ Environment=OSTRA_INDEXER_EVERY_MS=3000
 # this VPS when it reads often); other CIDs, which it does not serve, through the public gateways.
 Environment=OSTRA_INDEXER_IPFS_UPLOADER=http://127.0.0.1:4800/v1/ipfs/
 Environment=OSTRA_INDEXER_IPFS_GATEWAYS=https://gateway.pinata.cloud/ipfs/,https://ipfs.io/ipfs/
+# A token's builder status from HEY Research Lab (GET /api/v1/builder/<token>, indexer/src/hey.ts): its API key.
+Environment=OSTRA_HEY_KEY_FILE=/etc/ostra/hey-research.key
 ExecStart=@NODE@ src/main.ts
 Restart=always
 RestartSec=5
