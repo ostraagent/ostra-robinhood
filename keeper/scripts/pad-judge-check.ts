@@ -3,7 +3,8 @@
 // names ending in _2 ... for the next APIs; asked in order, as the service asks them): a
 // delivery that does what the order asked (approved), one that refuses it while telling the judge to approve
 // (rejected), an order for prohibited work under Ostrapad's content rules, delivered (rejected, its category named),
-// and on the panel's model the refusal under appeal from an approval (rejected: the panel disagrees).
+// and on the panel's model the refusal under appeal from an approval (rejected: the panel disagrees) and an approval
+// whose order file can no longer be read, judged against the offer (approved: the panel agrees).
 // Prints the verdicts, never the key.
 //
 //   set -a; . /etc/ostra/robinhood/pad-evaluator.env; set +a; node scripts/pad-judge-check.ts
@@ -53,6 +54,20 @@ const cases: { name: string; want: boolean; c: Case; panel?: boolean; category?:
     want: false,
     panel: true,
     c: { jobId: `0x${"33".repeat(32)}`, budget: "1", offer, order, delivery: refusal, notes: [], decision: { approve: true, reason: "Looks fine." } },
+  },
+  {
+    name: "on the panel: an approval under appeal whose order file can no longer be read (judged against the offer)",
+    want: true,
+    panel: true,
+    c: {
+      jobId: `0x${"55".repeat(32)}`,
+      budget: "1",
+      offer,
+      order: null,
+      delivery: { type: "ostrapad-delivery-v1", output: "USDG is a US dollar stablecoin issued by Paxos. Each token is meant to be redeemable for one US dollar. It is used for payments and settlement on several chains, Robinhood Chain among them." },
+      notes: ["the order file could not be read, or its bytes do not match the job's description"],
+      decision: { approve: true, reason: "The summary covers what the token is and does." },
+    },
   },
 ];
 

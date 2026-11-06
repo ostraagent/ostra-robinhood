@@ -18,8 +18,15 @@
 //     otherwise drain Ostra's accounts with jobs whose order cannot be read. Until LATE_MARGIN before the window ends
 //     the bot waits for what it lacks (a file a gateway does not serve yet, a judge that does not answer), trying
 //     again every RETRY_MS; from then on it decides with what it has: the judge's answer with the order marked
-//     unreadable if it is, else a rejection (the delivery could not be confirmed). A vote with no answer by then
-//     agrees with the decision (a panel does not overturn without a reason). Every such case is logged (pad_alert).
+//     unreadable if it is, else a rejection (the delivery could not be confirmed). On a panel, a delivery that cannot
+//     be read is a rejection too (its provider controls whether its file is served), and a vote with no answer from
+//     the judge by then agrees with the decision (a panel does not overturn without a reason). Every such case is
+//     logged (pad_alert).
+//   * Files kept: the order and the delivery of every job followed, and every reason file the bot reads, once their
+//     bytes match the job's sha256, are kept in the data directory until the job is finished, whoever judges the job
+//     and also for jobs decided before the bot (re)started. So a file unpinned after the bot read it is still read by
+//     Ostra's accounts (a provider cannot unpin its delivery after an approval and have Ostra's panel overturn
+//     it, slashing Ostra's evaluator; a client cannot hide its order the same way).
 //   * Cost (the evaluator's fee pays for a judgment): a judge's message is at most JUDGE_MAX_BYTES (a larger order or
 //     delivery is cut, with a note), and a judge is called at most MAX_JUDGE_CALLS times per job, purpose and round
 //     before the late point, once more at it (answers that are not verdicts count).
@@ -32,7 +39,7 @@
 //     (sdk padHead).
 // The accounts' gas: each is topped up from the fee payer when it cannot pay its call (Sender.fromCrank).
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getAddress, sha256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import {
@@ -69,6 +76,10 @@ export const PAD_RESCAN_BLOCKS = 3_000n;
 export const LATE_MARGIN = 6n * 3600n;
 /** How long the bot waits before judging a job again after it could not (a file not served, no answer). */
 export const RETRY_MS = 10 * 60_000;
+/** The most a pass spends keeping files (#keepFiles), after every job's decisions, votes and housekeeping. */
+export const KEEP_BUDGET_MS = 60_000;
+/** The longest wait between two tries to keep a job's files (the wait doubles from RETRY_MS after each miss). */
+const KEEP_MAX_WAIT_MS = 3600_000;
 /** A job with no verdict for this long raises an alert (and again each hour), well before the late point. */
 export const ALERT_AFTER_MS = 2 * 3600_000;
 /** The most a file read here may be (the uploader's JSON limit is 16 KB; files are read with room). */
@@ -131,6 +142,7 @@ const APPEAL_PROMPT = [
   "An evaluator decided a job and one side appealed. You receive the provider's offer, the client's order, the provider's delivery and the evaluator's decision with its reason, as JSON.",
   DATA_RULE,
   "Judge the job yourself, from the documents: does the delivery do what the order asked, within what the offer promised? The evaluator's decision is not evidence;",
+  "if the order could not be read, judge the delivery against the offer alone;",
   "approve work that fulfils the order, even if imperfect, and reject work that is missing, empty, off-topic, a refusal, a copy of the order, or clearly does not do what was asked.",
   CONTENT_RULE,
   ANSWER_RULE,
@@ -420,6 +432,10 @@ export class PadEvaluator {
   readonly #retryAt = new Map<string, number>();
   /** Since when a job has had no verdict, and when its alert was last raised (milliseconds). */
   readonly #noVerdict = new Map<string, { since: number; alerted: number }>();
+  /** When the files of a followed job are next read to be kept (milliseconds), and the misses so far; absent: now. */
+  readonly #keepAt = new Map<Hex, { at: number; misses: number; deliverable: Hex }>();
+  /** Jobs whose files could not be written, alerted once. */
+  readonly #keepAlerted = new Set<Hex>();
   /** Decisions under appeal, by job and round, once their Decided event was found. */
   readonly #decisions = new Map<string, { approve: boolean; reason: string | null }>();
 
@@ -493,11 +509,31 @@ export class PadEvaluator {
     await this.#save();
   }
 
-  /** A JSON file by its sha256: undefined when it cannot be read, its bytes differ, or it is not JSON. */
-  async #json(digest: Hex): Promise<unknown | undefined> {
+  /** Where a job's files are kept once read (removed when the job is finished). */
+  #filesOf(id: Hex): string {
+    return join(this.#p.dataDir, "files", id.toLowerCase());
+  }
+
+  /**
+   * A job's JSON file by its sha256: undefined when it cannot be read, its bytes differ, or it is not JSON. A file read
+   * once is kept (its bytes checked) and read from there afterwards.
+   */
+  async #json(id: Hex, digest: Hex): Promise<unknown | undefined> {
     if (digest === ZERO32) return undefined;
-    const bytes = await this.#p.fetchBytes(padCidFromDigest(digest), FILE_MAX_BYTES);
-    if (bytes === null || sha256(bytes) !== digest) return undefined;
+    const kept = join(this.#filesOf(id), digest.toLowerCase());
+    let bytes: Uint8Array | null = await readFile(kept).then((b) => new Uint8Array(b), () => null);
+    if (bytes === null || sha256(bytes) !== digest) {
+      bytes = await this.#p.fetchBytes(padCidFromDigest(digest), FILE_MAX_BYTES);
+      if (bytes === null || sha256(bytes) !== digest) return undefined;
+      try {
+        await mkdir(this.#filesOf(id), { recursive: true, mode: 0o700 });
+        await writeFile(`${kept}.tmp`, bytes, { mode: 0o600 });
+        await rename(`${kept}.tmp`, kept);
+      } catch (err) {
+        if (!this.#keepAlerted.has(id)) this.#p.log("pad_alert", { what: "keep", jobId: id, why: `a file read could not be kept: ${((err as Error).message ?? String(err)).split("\n")[0]}` });
+        this.#keepAlerted.add(id);
+      }
+    }
     try {
       return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     } catch {
@@ -505,13 +541,45 @@ export class PadEvaluator {
     }
   }
 
+  /** Whether a job's file is kept on disk (its bytes were checked when it was written, and are again when read). */
+  async #onDisk(id: Hex, digest: Hex): Promise<boolean> {
+    return access(join(this.#filesOf(id), digest.toLowerCase())).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  /**
+   * Keeps the order and the delivery of a followed pool job (Accepted, Submitted, Decided or Appealed) as soon as they
+   * can be read, whoever judges it: a job decided before the bot (re)started, or by an evaluator other than Ostra's, is
+   * then protected as one the bot judged (Ostra's accounts on its panel read them even if they are unpinned later).
+   * Only pool jobs: Ostra's accounts never judge or vote on the others. Until both are on disk, tried again after
+   * RETRY_MS, the wait doubling after each miss (a file that could not be read) up to KEEP_MAX_WAIT_MS.
+   */
+  async #keepFiles(j: PadJob): Promise<void> {
+    if (!j.pool || (j.status !== "Accepted" && j.status !== "Submitted" && j.status !== "Decided" && j.status !== "Appealed")) return;
+    const t = this.#nowMs();
+    const last = this.#keepAt.get(j.id);
+    // A delivery that came since the last try is tried at once, whatever the wait.
+    if (last !== undefined && last.at > t && last.deliverable === j.deliverable) return;
+    const order = this.#kept.orders[j.id];
+    let orderKept = order === null;
+    if (order !== null && order !== undefined) orderKept = (await this.#json(j.id, order)) !== undefined && (await this.#onDisk(j.id, order));
+    const deliveryKept = j.deliverable !== ZERO32 && (await this.#json(j.id, j.deliverable)) !== undefined && (await this.#onDisk(j.id, j.deliverable));
+    // No delivery yet is not a miss: the job is tried again after RETRY_MS, so a delivery is kept soon after it comes.
+    const missed = !orderKept || (j.deliverable !== ZERO32 && !deliveryKept);
+    const misses = missed ? (last?.misses ?? 0) + 1 : 0;
+    const at = orderKept && deliveryKept ? Number.POSITIVE_INFINITY : missed ? t + Math.min(RETRY_MS * 2 ** (misses - 1), KEEP_MAX_WAIT_MS) : t + RETRY_MS;
+    this.#keepAt.set(j.id, { at, misses, deliverable: j.deliverable });
+  }
+
   /** The job's case for a judge: its offer, order and delivery, each file checked against its hash (null, with a note, when it cannot be read). */
   async #case(j: PadJob): Promise<Case> {
     const notes: string[] = [];
     const orderDigest = this.#kept.orders[j.id] ?? null;
-    const order = orderDigest === null ? undefined : await this.#json(orderDigest);
+    const order = orderDigest === null ? undefined : await this.#json(j.id, orderDigest);
     if (order === undefined) notes.push(orderDigest === null ? "the order's digest could not be found in the transaction that created the job" : "the order file could not be read, or its bytes do not match the job's description");
-    const delivery = await this.#json(j.deliverable);
+    const delivery = await this.#json(j.id, j.deliverable);
     if (delivery === undefined) notes.push("the delivery file could not be read, or its bytes do not match the job's deliverable");
     let offer: unknown = null;
     if (typeof order === "object" && order !== null) {
@@ -556,7 +624,7 @@ export class PadEvaluator {
       const logs = await getLogsChunked(this.#p.logsClient, { address: this.#pad, event: PAD_EVENTS.Decided, args: { jobId: j.id }, fromBlock: OSTRAPAD_FROM_BLOCK, toBlock: await this.#p.logsClient.getBlockNumber({ cacheTime: 0 }) });
       const last = logs[logs.length - 1];
       const digest = last === undefined ? ZERO32 : (last.args as { reason: Hex }).reason;
-      const file = await this.#json(digest);
+      const file = await this.#json(j.id, digest);
       if (typeof file === "object" && file !== null && typeof (file as { reason?: unknown }).reason === "string") reason = (file as { reason: string }).reason;
       // Kept once the event is found and its reason read, or when it gave none: later votes do not scan again.
       found = last !== undefined && (digest === ZERO32 || reason !== null);
@@ -571,7 +639,9 @@ export class PadEvaluator {
 
   /**
    * A verdict on the job for `purpose`, or null to wait: before `late`, only a judge's answer on readable files;
-   * once late, the judge's answer on what can be read, else a rejection (the delivery could not be confirmed).
+   * once late, the judge's answer on what can be read; else a rejection when the delivery cannot be read, and when the
+   * judge gave no answer, a rejection for a decision (the delivery could not be confirmed) and null for a vote (the caller
+   * then votes for the decision).
    */
   async #verdict(j: PadJob, purpose: "decide" | "vote", late: boolean): Promise<Verdict | null> {
     const key = `${purpose}:${j.id}:${j.round}`;
@@ -585,7 +655,7 @@ export class PadEvaluator {
       const n = this.#noVerdict.get(key) ?? { since: t, alerted: 0 };
       if (t - n.since >= ALERT_AFTER_MS && t - n.alerted >= 3600_000) {
         n.alerted = t;
-        this.#p.log("pad_alert", { purpose, jobId: j.id, why: `no verdict for ${Math.floor((t - n.since) / 3600_000)} hours (files not served, or the judge not answering): at the late point the bot decides without one` });
+        this.#p.log("pad_alert", { purpose, jobId: j.id, why: `no verdict for ${Math.floor((t - n.since) / 3600_000)} hours (files not served, or the judge not answering): at the late point the bot decides without one, and a vote agrees with the decision` });
       }
       this.#noVerdict.set(key, n);
     } else {
@@ -631,15 +701,21 @@ export class PadEvaluator {
       if (v === null) this.#p.log("judge_unavailable", { purpose, jobId: j.id });
       return v;
     }
-    // Late: decide with what there is.
+    // Late: decide with what there is. A delivery that cannot be read is a rejection, for a decision and a vote alike (the
+    // provider controls whether its file can be read). A vote with no answer from the judge is null, and the caller votes
+    // for the decision (a panel does not overturn without a reason).
     if (c.delivery === null) {
-      this.#p.log("pad_alert", { purpose, jobId: j.id, decided: "rejected", why: "the delivery could not be read before the window's end", notes: c.notes });
+      this.#p.log("pad_alert", { purpose, jobId: j.id, ...(purpose === "vote" ? { verdict: "reject" } : { decided: "rejected" }), why: "the delivery could not be read before the window's end", notes: c.notes });
       return { approve: false, reason: "Rejected: the delivery file could not be read, or its bytes did not match the job's deliverable, before the evaluation window ended." };
     }
     const v = judge === null ? null : await this.#ask(judge, c, `${purpose}:${j.id}:${j.round}`, true);
     if (v !== null) {
-      if (unreadable) this.#p.log("pad_alert", { purpose, jobId: j.id, decided: v.approve ? "approved" : "rejected", why: "judged late without every file", notes: c.notes });
+      if (unreadable) this.#p.log("pad_alert", { purpose, jobId: j.id, ...(purpose === "vote" ? { verdict: v.approve ? "approve" : "reject" } : { decided: v.approve ? "approved" : "rejected" }), why: "judged late without every file", notes: c.notes });
       return v;
+    }
+    if (purpose === "vote") {
+      this.#p.log("pad_alert", { purpose, jobId: j.id, voted: "agreed", why: judge === null ? "no judge is configured" : "the judge gave no answer before the vote's late point", notes: c.notes });
+      return null;
     }
     this.#p.log("pad_alert", { purpose, jobId: j.id, decided: "rejected", why: judge === null ? "no judge is configured" : "the judge gave no answer before the window's end", notes: c.notes });
     return { approve: false, reason: "Rejected: the delivery could not be confirmed against the order before the evaluation window ended." };
@@ -675,6 +751,7 @@ export class PadEvaluator {
       await this.#refresh();
       const head = await padHead(this.#p.client);
       const still: Hex[] = [];
+      const open: PadJob[] = [];
       for (const id of this.#kept.jobs) {
         const j = await readPadJob(this.#p.client, id, this.#pad).catch(() => null);
         if (j === null) {
@@ -682,16 +759,33 @@ export class PadEvaluator {
           continue;
         }
         if (FINISHED.has(j.status)) {
-          this.#kept.finished.push(id);
+          if (!this.#kept.finished.includes(id)) this.#kept.finished.push(id);
           delete this.#kept.orders[id];
           for (const k of Object.keys(this.#kept.calls)) if (k.includes(`:${id}:`)) delete this.#kept.calls[k];
+          for (const m of [this.#retryAt, this.#noVerdict]) for (const k of [...m.keys()]) if (k.includes(`:${id}:`)) m.delete(k);
+          for (const k of [...this.#decisions.keys()]) if (k.startsWith(`${id}:`)) this.#decisions.delete(k);
+          for (const k of Object.keys(this.#kept.done)) if (k.includes(`:${id}:`)) delete this.#kept.done[k];
+          this.#keepAt.delete(id);
+          this.#keepAlerted.delete(id);
+          await rm(this.#filesOf(id), { recursive: true, force: true }).catch((err: unknown) =>
+            this.#p.log("pad_alert", { what: "keep", jobId: id, why: `the files kept for a finished job could not be removed: ${((err as Error).message ?? String(err)).split("\n")[0]}` }),
+          );
           continue;
         }
         still.push(id);
+        open.push(j);
         await this.#job(j, head.timestamp, head.padBlock);
       }
       this.#kept.jobs = still;
       await this.#save();
+      // Files are kept last, within a time budget, so that files slow to fetch never delay a decision or a vote; the
+      // jobs whose try is the oldest due (never tried first) go first, so none is left behind by others that miss.
+      const until = Date.now() + KEEP_BUDGET_MS;
+      const due = (j: PadJob) => this.#keepAt.get(j.id)?.at ?? 0;
+      for (const j of [...open].sort((x, y) => (due(x) < due(y) ? -1 : due(x) > due(y) ? 1 : 0))) {
+        if (Date.now() > until) break;
+        await this.#keepFiles(j).catch((err: unknown) => this.#p.log("pad_alert", { what: "keep", jobId: j.id, why: ((err as Error).message ?? String(err)).split("\n")[0] }));
+      }
     } finally {
       this.#ticking = false;
     }

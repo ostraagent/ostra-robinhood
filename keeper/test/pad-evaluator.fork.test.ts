@@ -13,6 +13,10 @@
 //     its CID with its bytes checked; on the panel, the decision and its reason too;
 //   * an order file that cannot be read: the bot waits (it does not reject the provider over it), and at the late
 //     point of its window decides with what it has instead of staying silent (which would get it slashed);
+//   * approvals appealed by the client: where the panel gets no answer from its judge, the bot's panel accounts wait,
+//     then at the vote's late point vote for the decision, which stands; a delivery unpinned after the bot read it is
+//     still read from the copy the bot kept, and the approval stands; a delivery none of the bot's accounts ever read
+//     that cannot be read is a rejection at the late point, as when deciding, and the approval is overturned;
 //   * finished jobs are dropped from the passes; a bot started again on the same data sends nothing twice;
 //   * the jobs mainnet held already at the fork (real agents' jobs since 28 Oct 2026, judged by their clients) are
 //     seen too, as on mainnet, and the bot sends nothing for those already finished then.
@@ -21,7 +25,7 @@
 // delivery unless its output says REFUSED; openAiJudge is checked against the real API by scripts/pad-judge-check.ts).
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -39,6 +43,7 @@ import {
   ostraPadAbi,
   ostraVaultAbi,
   padCidFromDigest,
+  padDigestFromCid,
   padProviderPay,
   readPadAppeal,
   readPadJob,
@@ -50,7 +55,7 @@ import {
   usdgAbi,
   type Deployment,
 } from "@ostraagent/sdk";
-import { deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { deployOnFork, rpc, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { Keys, LocalSender, PadService, VaultService, X402_NETWORK, profileFile, spendCall, type Config } from "../../core/src/index.ts";
 import { MemoryFolder } from "../../core/test/memory-folder.ts";
 import { Sender } from "../src/chain.ts";
@@ -162,6 +167,16 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   const agentId = await provider.register();
   await provider.pad.publish([{ id: "pool-report", title: "Pool-judged report", description: "A short report on a topic.", input: "The topic.", price: "1", hours: 24, evaluator: "pool" }]);
 
+  // OstraPad's live pool on mainnet (Ostra's evaluator accounts, counted in draws since 2 Nov 2026) leaves on the fork,
+  // so every draw here picks one of this test's accounts, all of them the bot's.
+  for (const m of (await c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "pool" })) as Address[]) {
+    await fork.setBalance(m, 10n ** 18n);
+    await rpc(fork.url, "anvil_impersonateAccount", [m]);
+    const hash = (await rpc(fork.url, "eth_sendTransaction", [{ from: m, to: OSTRAPAD, data: encodeFunctionData({ abi: ostraPadAbi, functionName: "leavePool", args: [m] }) }])) as Hex;
+    assert.equal((await c.waitForTransactionReceipt({ hash })).status, "success");
+    await rpc(fork.url, "anvil_stopImpersonatingAccount", [m]);
+  }
+  assert.equal(((await c.readContract({ address: OSTRAPAD, abi: ostraPadAbi, functionName: "pool" })) as Address[]).length, 0);
   // The bot's five accounts join the pool (msg.sender, bonds by transferFrom), then hold no ETH: the bot tops them up.
   for (const e of evaluators) {
     await fork.setBalance(e.address, 10n ** 18n);
@@ -176,9 +191,10 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   const logs: { event: string; fields: Record<string, unknown> }[] = [];
   const cases: Case[] = [];
   let judgeUp = true;
+  const silent = new Set<string>();
   const judge = async (k: Case): Promise<Verdict | null> => {
     cases.push(k);
-    if (!judgeUp) return null;
+    if (!judgeUp || silent.has(k.jobId)) return null;
     const out = (k.delivery as { output?: string }).output ?? "";
     return out.includes("REFUSED") ? { approve: false, reason: "The delivery refuses the order." } : { approve: true, reason: "The delivery is a report on the topic asked." };
   };
@@ -315,12 +331,81 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   assert.equal(late.order, null);
   assert.ok(late.notes.some((n) => /order file could not be read/.test(n)), JSON.stringify(late.notes));
 
+  // Jobs D, E and F: approved, then appealed by the client. The panel's judge gives no answer on D. E's delivery file is
+  // unpinned after the bot read it: its panel reads the copy the bot kept. F's delivery file is unpinned and the bot's
+  // copy removed (as if an evaluator other than the bot's had read it). Before the vote's late point the panel waits on
+  // D and F; at it, on D it votes for the decision (a panel does not overturn without a reason) and on F against it
+  // (a delivery that cannot be read is a rejection: its provider controls whether its file is served).
+  const ids: Hex[] = [];
+  const orderUris: string[] = [];
+  for (const topic of ["A fourth topic", "A fifth topic", "A sixth topic"]) {
+    const o = await client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: topic });
+    ids.push(o.jobId as Hex);
+    orderUris.push(o.orderUri as string);
+  }
+  const [dj, ej, fj] = ids as [Hex, Hex, Hex];
+  for (const id of ids) await provider.pad.accept(id);
+  await client.pad.sweep();
+  await provider.pad.sweep();
+  await fork.increaseTime(2);
+  await bot.tick();
+  const uris: string[] = [];
+  for (const [i, id] of ids.entries()) uris.push((await provider.pad.deliver({ jobId: id, output: `A report on topic ${i + 4}.` })).deliveryUri as string);
+  await bot.tick();
+  for (const id of ids) {
+    job = await readPadJob(c, id);
+    assert.equal(job?.status, "Decided", JSON.stringify(logs.slice(-5)));
+    assert.equal(job?.approved, true);
+  }
+  const keptDir = (id: Hex) => join(root, "bot", "files", id.toLowerCase());
+  const eDigest = (await readPadJob(c, ej))?.deliverable as Hex;
+  await access(join(keptDir(ej), eDigest.toLowerCase()));
+  // The kept files lost (a data directory not carried over): a bot started then keeps them again from IPFS on its first
+  // pass, as for any pool job it follows (one decided before it started, or by another evaluator). This one has no
+  // accounts of its own, so it neither decides nor votes.
+  await rm(keptDir(ej), { recursive: true, force: true });
+  const sentBefore = logs.filter((l) => l.event === "pad_sent").length;
+  await (await PadEvaluator.open({ ...parts, evaluators: [] })).tick();
+  await access(join(keptDir(ej), eDigest.toLowerCase()));
+  assert.equal(logs.filter((l) => l.event === "pad_sent").length, sentBefore, "nothing sent by the bot started again");
+  // A kept file whose bytes no longer match is read again from IPFS, and kept again.
+  const eOrder = padDigestFromCid(orderUris[1] as string) as Hex;
+  await writeFile(join(keptDir(ej), eOrder.toLowerCase()), "not the order");
+  ipfs.delete(uris[1] as string);
+  ipfs.delete(uris[2] as string);
+  await rm(keptDir(fj), { recursive: true, force: true });
+  silent.add(dj);
+  const p1 = await usdg(provider.vault);
+  for (const id of ids) await client.pad.appeal(id);
+  await fork.increaseTime(2);
+  await bot.tick();
+  const votesBefore = sent("vote");
+  await bot.tick();
+  assert.equal(sent("vote"), votesBefore + 3, "E's panel reads the kept delivery and votes at once; D and F wait");
+  assert.equal((await readPadJob(c, ej))?.status, "Completed", "the kept copy: the approval stands");
+  assert.equal(sha256(new Uint8Array(await readFile(join(keptDir(ej), eOrder.toLowerCase())))), eOrder, "the order read again from IPFS and kept");
+  assert.equal((cases.filter((x) => x.jobId === ej).at(-1)?.order as { input?: string } | null)?.input, "A fifth topic", "E's panel read its order");
+  for (const id of [dj, fj]) assert.equal((await readPadJob(c, id))?.status, "Appealed");
+  assert.ok(logs.some((l) => l.event === "pad_waiting" && l.fields.jobId === fj && l.fields.purpose === "vote"));
+  const voteBy = (await readPadAppeal(c, dj)).voteBy;
+  const now = (await c.getBlock()).timestamp;
+  await fork.increaseTime(Number(voteBy - LATE_MARGIN - now) + 60);
+  await bot.tick();
+  assert.equal(sent("vote"), votesBefore + 9, JSON.stringify(logs.slice(-10)));
+  assert.equal((await readPadJob(c, dj))?.status, "Completed", "three votes for the decision: the approval stands");
+  assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === dj && l.fields.voted === "agreed"));
+  assert.equal((await readPadJob(c, fj))?.status, "Rejected", "three votes against an approval whose delivery cannot be read");
+  assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === fj && l.fields.verdict === "reject"));
+  assert.equal(await usdg(provider.vault), p1 + 2n * padProviderPay(1_000_000n), "the provider is paid for D and E");
+
   // Finished jobs are dropped from the passes. A bot started again on the same data: nothing sent twice.
-  assert.ok(!bot.jobs.includes(a) && !bot.jobs.includes(b), "finished jobs dropped");
-  assert.deepEqual([...bot.seen].sort(), [...onChain, a, b, cid].sort());
+  await bot.tick(); // D and F finished in the last pass: this one drops them
+  assert.ok(![a, b, dj, ej, fj].some((id) => bot.jobs.includes(id)), "finished jobs dropped");
+  await assert.rejects(access(keptDir(ej)), "the files kept for a finished job are removed");
+  assert.deepEqual([...bot.seen].sort(), [...onChain, a, b, cid, dj, ej, fj].sort());
   assert.equal(logs.filter((l) => l.event === "pad_sent" && finishedThen.has(l.fields.jobId as string)).length, 0, "nothing sent for the jobs mainnet had finished already");
   const again = await PadEvaluator.open(parts);
-  assert.deepEqual([...again.seen].sort(), [...onChain, a, b, cid].sort());
+  assert.deepEqual([...again.seen].sort(), [...onChain, a, b, cid, dj, ej, fj].sort());
   const before = logs.length;
   await again.tick();
   assert.equal(logs.slice(before).filter((l) => l.event === "pad_sent").length, 0);
