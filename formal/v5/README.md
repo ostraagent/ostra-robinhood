@@ -54,4 +54,19 @@ With `OSTRA_MODEL_STATS=<file>`, the replay appends one line per step (`<op> <ou
 
 ## Results
 
-Not yet proved. Each run's verdicts will be listed here with the Aristotle project id.
+Aristotle project `ae86c061-f5f2-4a53-8bde-aae773cccbb5`. Each run is one prompt in `prompts/`; Aristotle adds a
+memory safety property (no undefined behavior) for each function it reaches.
+
+| Run | Properties | Verdict |
+|---|---|---|
+| 1. The agent key's authority | P1 to P5, and 46 memory safety properties | 51 proved, 0 refuted (7 Nov 2026) |
+| 2. The budget | P6 to P9 | pending |
+| 3. Standing orders | P10 to P14 | pending |
+| 4. Changes under the lock | P15 to P19 | pending |
+
+Run 1 also proved that the state `model_init` leaves is reachable and that every operation, called on a reachable
+state with any arguments, leaves a reachable state; so P1 to P5 hold for every state that `model_init` followed by a
+finite sequence of operations produces. The memory safety properties cover every function of `ostra_v5_model.c`
+except `budget_available`, which no operation calls. The proofs assume what C asks of a caller (pointers to valid,
+initialized, non-overlapping objects), the C standard's specification of `memset`, and x86-64 Linux type sizes, and
+they are partial correctness: what holds when a call returns.
