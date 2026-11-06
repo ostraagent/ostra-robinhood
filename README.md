@@ -14,7 +14,7 @@
   <a href="https://docs.ostraagent.xyz"><img src="https://img.shields.io/badge/docs-docs.ostraagent.xyz-15171A" alt="Documentation"></a>
   <a href="https://x.com/ostraagent"><img src="https://img.shields.io/badge/X-@ostraagent-15171A?logo=x&logoColor=white" alt="Ostra Agent on X"></a>
   <a href="https://robinhoodchain.blockscout.com"><img src="https://img.shields.io/badge/Robinhood%20Chain-4663-D9381E" alt="Robinhood Chain 4663"></a>
-  <a href="https://docs.ostraagent.xyz/contracts"><img src="https://img.shields.io/badge/Sourcify-18%20contracts%20verified-1F7A4D" alt="Verified on Sourcify"></a>
+  <a href="https://docs.ostraagent.xyz/contracts"><img src="https://img.shields.io/badge/Sourcify-22%20contracts%20verified-1F7A4D" alt="Verified on Sourcify"></a>
   <a href="foundry.toml"><img src="https://img.shields.io/badge/Solidity-0.8.30-3E4248" alt="Solidity 0.8.30"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3E4248" alt="MIT license"></a>
 </p>
@@ -70,7 +70,11 @@ full record, with the outside contracts Ostra uses, is
 | OstraCreatorSplit | Creator payouts shared with up to 100 recipients | [`0x987994dE6A1d5303B9e3F50977cB0321BA4D033B`](https://repo.sourcify.dev/4663/0x987994dE6A1d5303B9e3F50977cB0321BA4D033B) |
 | OstraVaultFactory | Creates every vault at its predicted address | [`0x043a15c514CFE2c797d33520bFF91a5DCdbf2979`](https://repo.sourcify.dev/4663/0x043a15c514CFE2c797d33520bFF91a5DCdbf2979) |
 | Vault beacon | Points every vault at its code | [`0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0`](https://repo.sourcify.dev/4663/0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0) |
-| OstraVault version 2 | The vaults’ code since 22 October 2026: profiles, token metadata and agent identity | [`0xd20c6744cfa46d9ec564b119cc923bab2f9f9331`](https://repo.sourcify.dev/4663/0xD20c6744Cfa46d9ec564b119cC923bAb2f9f9331) |
+| OstraVault version 4 | The vaults’ code now: venues (Spark, Raeto and ERC-4626 vaults) and the venue breaker, on top of versions 1 to 3 | [`0x8D16fd326b7d4f3D69A3c8d5efbeCCb25d29769a`](https://repo.sourcify.dev/4663/0x8D16fd326b7d4f3D69A3c8d5efbeCCb25d29769a) |
+| OstraVaultModule | Runs the vaults’ version 3 spends (Morpho and Borro) | [`0x405A0e88e3929A7A9EE01a5169DCd1D02d95C5EC`](https://repo.sourcify.dev/4663/0x405A0e88e3929A7A9EE01a5169DCd1D02d95C5EC) |
+| OstraVaultModuleV4 | Runs the vaults’ version 4 spends (the venues) | [`0x8Bd6321Fe66cF9c62DEF909092dDC3bbadDd72a2`](https://repo.sourcify.dev/4663/0x8Bd6321Fe66cF9c62DEF909092dDC3bbadDd72a2) |
+| OstraVault version 5 | The agent key, its policy and allowlists, standing orders and Priors credit; scheduled through OstraUpgradeOwner (call 3), executable from 9 November 2026, 06:55 UTC | [`0x3687F57B2D9f045FC2146C7E65B1603609D08224`](https://repo.sourcify.dev/4663/0x3687F57B2D9f045FC2146C7E65B1603609D08224) |
+| OstraVaultModuleV5 | Runs version 5’s spends, once the vaults run version 5 | [`0x77087290c97f59b667D85E7edb6B31A0A4C2E28B`](https://repo.sourcify.dev/4663/0x77087290c97f59b667D85E7edb6B31A0A4C2E28B) |
 | OstraRegistry | Agent profiles and token metadata, written by creator vaults only | [`0xcE6Cc1f93744f4090DA1444Bb8590d9206157506`](https://repo.sourcify.dev/4663/0xcE6Cc1f93744f4090DA1444Bb8590d9206157506) |
 | OstraPool | The shielded pool (beacon proxy) | [`0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6`](https://repo.sourcify.dev/4663/0x6ea80F2462e5Fd783B0Ec3B2c7BaC96795980CD6) |
 | Pool beacon | Points the pool at its code | [`0x30669Ca534921038a531BBE27116d85bB7406fFF`](https://repo.sourcify.dev/4663/0x30669Ca534921038a531BBE27116d85bB7406fFF) |
