@@ -14,6 +14,7 @@ import {
 import {OstraVaultV3} from "../src/OstraVaultV3.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 import {VaultStack} from "./utils/VaultStack.sol";
+import {SafeWallet} from "./utils/SafeWallet.sol";
 
 /// @notice What the tests read of BorroBuilders and BorroRouter (github.com/Borro-Markets/contracts, commit 129f1e8).
 interface IBorroBuildersView {
@@ -54,7 +55,12 @@ contract VaultV3ForkTest is Test {
     bytes32 internal constant STOCK = keccak256("OSTRA/EVM/TEST/v3-stock-vault");
     bytes32 internal constant CASH = keccak256("OSTRA/EVM/TEST/v3-usdg-vault");
     bytes32 internal constant OTHER = keccak256("OSTRA/EVM/TEST/v3-other-vault");
-    address internal constant WITHDRAWAL = address(0xC01D);
+    /// @dev The withdrawal address: a real Safe (version 5 refuses one with no code), made in setUp.
+    address internal WITHDRAWAL;
+    /// @dev Other withdrawal addresses (real Safes): one the owner moves to, another, and one a thief picks.
+    address internal OTHER_SAFE;
+    address internal SECOND_SAFE;
+    address internal THIEF_SAFE;
     address internal constant GUARDIAN = address(0x6A2D);
     uint32 internal constant DELAY = 36 hours;
 
@@ -64,6 +70,10 @@ contract VaultV3ForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork("robinhood");
+        WITHDRAWAL = SafeWallet.create(makeAddr("withdrawal owner"), 1);
+        OTHER_SAFE = SafeWallet.create(makeAddr("other withdrawal owner"), 2);
+        SECOND_SAFE = SafeWallet.create(makeAddr("second withdrawal owner"), 3);
+        THIEF_SAFE = SafeWallet.create(makeAddr("thief"), 4);
         assertEq(block.chainid, 4663);
         // Borro as this test expects it: the code registered, both vaults and the NVDA market listed.
         assertTrue(IBorroBuildersView(BORRO_BUILDERS).builders(CODE) != address(0));
@@ -83,7 +93,7 @@ contract VaultV3ForkTest is Test {
         assertEq(address(module.MORPHO()), MORPHO);
         assertEq(module.BORRO_CODE(), CODE);
         OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
-        assertEq(implementation.VERSION(), 4);
+        assertEq(implementation.VERSION(), 5);
         assertEq(implementation.MODULE(), address(module));
     }
 
@@ -194,7 +204,7 @@ contract VaultV3ForkTest is Test {
         vm.expectRevert(OstraVault.BadParams.selector);
         v.spend(17, next, abi.encode(BUSDG, uint256(1)), sig);
         _spendReverts(v, OTHER, 15, abi.encode(uint256(0)), abi.encodeWithSelector(OstraVault.BadParams.selector));
-        _spendReverts(v, OTHER, 29, "", abi.encodeWithSelector(OstraVault.BadAction.selector));
+        _spendReverts(v, OTHER, 47, "", abi.encodeWithSelector(OstraVault.BadAction.selector));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -389,10 +399,10 @@ contract VaultV3ForkTest is Test {
         (, at,,) = v.pendingChanges();
         assertEq(at, 0);
         // Another withdrawal address waits, then applies.
-        _spend(v, OTHER, 14, abi.encode(address(0xD00D), DELAY, uint128(1e6)));
+        _spend(v, OTHER, 14, abi.encode(OTHER_SAFE, DELAY, uint128(1e6)));
         assertEq(v.withdrawalLock().withdrawal, WITHDRAWAL);
         vm.warp(block.timestamp + DELAY);
-        assertEq(v.withdrawalLock().withdrawal, address(0xD00D));
+        assertEq(v.withdrawalLock().withdrawal, OTHER_SAFE);
         // Turning it off waits too.
         _spend(v, OTHER, 14, abi.encode(address(0), uint32(0), uint128(0)));
         assertTrue(v.lockActive());
@@ -403,14 +413,14 @@ contract VaultV3ForkTest is Test {
 
     function test_aGuardianOrTheOwnerCancelsAWaitingChange() public {
         OstraVault v = _locked(5e6);
-        _spend(v, OTHER, 14, abi.encode(address(0xD00D), DELAY, uint128(5e6)));
+        _spend(v, OTHER, 14, abi.encode(OTHER_SAFE, DELAY, uint128(5e6)));
         vm.expectRevert(OstraVault.NotGuardian.selector);
         v.guard(0, "");
         vm.prank(GUARDIAN);
         v.guard(0, "");
         vm.warp(block.timestamp + DELAY);
         assertEq(v.withdrawalLock().withdrawal, WITHDRAWAL);
-        _spend(v, OTHER, 14, abi.encode(address(0xD00D), DELAY, uint128(5e6)));
+        _spend(v, OTHER, 14, abi.encode(OTHER_SAFE, DELAY, uint128(5e6)));
         _spend(v, OTHER, 15, "");
         vm.warp(block.timestamp + DELAY);
         assertEq(v.withdrawalLock().withdrawal, WITHDRAWAL);
@@ -497,7 +507,7 @@ contract VaultV3ForkTest is Test {
         _spendReverts(cash, CASH, 22, params, abi.encodeWithSelector(OstraVaultV3.OverDailyLimit.selector, 1e6));
         // Locking the stock vault now does not make it the owner's own (a thief can lock it to himself at once).
         vm.warp(block.timestamp + 1);
-        _spend(stock, STOCK, 14, abi.encode(address(0xBAD), DELAY, uint128(type(uint128).max)));
+        _spend(stock, STOCK, 14, abi.encode(THIEF_SAFE, DELAY, uint128(type(uint128).max)));
         _spendReverts(cash, CASH, 22, params, abi.encodeWithSelector(OstraVaultV3.OverDailyLimit.selector, 1e6));
         // Linked again under the USDG vault's lock, after its delay: the stock vault was locked first, so it counts
         // as the owner's own, and the repay is free.
@@ -516,7 +526,7 @@ contract VaultV3ForkTest is Test {
         _lendAndPost(stock, 1e18);
         _spend(stock, STOCK, 14, abi.encode(WITHDRAWAL, DELAY, uint128(0)));
         vm.warp(block.timestamp + 1);
-        _spend(cash, CASH, 14, abi.encode(address(0xBAD), DELAY, uint128(0)));
+        _spend(cash, CASH, 14, abi.encode(THIEF_SAFE, DELAY, uint128(0)));
         assertTrue(cash.lockActive());
         assertEq(cash.lockedSince(), block.timestamp);
         _spendReverts(stock, STOCK, 21, abi.encode(nvdaMarket, uint256(1e6)), abi.encodeWithSelector(OstraVaultModule.Locked.selector));
@@ -562,7 +572,7 @@ contract VaultV3ForkTest is Test {
         _spend(stock, STOCK, 16, abi.encode(address(cash)));
         // The USDG vault is locked (to the thief) while the link waits, and when it takes effect.
         vm.warp(block.timestamp + DELAY);
-        _spend(cash, CASH, 14, abi.encode(address(0xBAD), DELAY, uint128(0)));
+        _spend(cash, CASH, 14, abi.encode(THIEF_SAFE, DELAY, uint128(0)));
         assertEq(stock.linkedVault(), address(cash));
         _spendReverts(stock, STOCK, 21, abi.encode(nvdaMarket, uint256(1e6)), abi.encodeWithSelector(OstraVaultModule.Locked.selector));
         assertEq(IERC20(USDG).balanceOf(address(cash)), 0);
@@ -644,7 +654,7 @@ contract VaultV3ForkTest is Test {
         _spend(w, CASH, 14, abi.encode(WITHDRAWAL, DELAY, uint128(0)));
         _spendReverts(v, OTHER, 0, abi.encode(address(w), uint256(50e6)), abi.encodeWithSelector(OstraVaultV3.OverDailyLimit.selector, 1e6));
         // Chosen again (it waits the delay) while locked: now free.
-        _spend(v, OTHER, 14, abi.encode(address(0x1234), DELAY, uint128(1e6)));
+        _spend(v, OTHER, 14, abi.encode(SECOND_SAFE, DELAY, uint128(1e6)));
         vm.warp(block.timestamp + DELAY);
         _spend(v, OTHER, 14, abi.encode(address(w), DELAY, uint128(1e6)));
         vm.warp(block.timestamp + DELAY);
@@ -668,7 +678,7 @@ contract VaultV3ForkTest is Test {
         stock.guard(2, abi.encode(WITHDRAWAL));
         vm.stopPrank();
         assertApproxEqAbs(IERC20(NVDA).balanceOf(WITHDRAWAL), 1e18, 1e6);
-        vm.prank(address(0xBAD));
+        vm.prank(THIEF_SAFE);
         vm.expectRevert(OstraVault.NotGuardian.selector);
         stock.guard(2, abi.encode(WITHDRAWAL));
     }
@@ -740,7 +750,7 @@ contract VaultV3ForkTest is Test {
         uint64 n = g.nonce();
         vm.expectEmit(address(g));
         emit OstraVaultModule.Guarded(address(v), 2, false, OstraVault.BadParams.selector);
-        _spend(g, GUARD_VAULT, 24, abi.encode(address(v), uint8(2), bytes32(uint256(uint160(address(0xBAD)))), uint256(0)));
+        _spend(g, GUARD_VAULT, 24, abi.encode(address(v), uint8(2), bytes32(uint256(uint160(THIEF_SAFE))), uint256(0)));
         assertEq(g.nonce(), n + 1, "the key moves on");
         assertEq(IERC20(USDG).balanceOf(address(v)), 10e6);
     }
@@ -770,14 +780,14 @@ contract VaultV3ForkTest is Test {
         _spend(v, OTHER, 14, abi.encode(WITHDRAWAL, DELAY, uint128(1e6)));
 
         // The thief's first spend moves the key to his own chain: the owner's seed signs nothing any more.
-        _thiefSpend(v, 0, abi.encode(address(0xBAD), uint256(1e6)), true);
+        _thiefSpend(v, 0, abi.encode(THIEF_SAFE, uint256(1e6)), true);
         // Under the lock he cannot take the guardians or the policy away, nor change the crank or a pool.
         _thiefSpendReverts(v, 6, abi.encode(GUARDIAN, false), OstraVault.Locked.selector);
         _thiefSpendReverts(v, 7, abi.encode(uint8(0), uint32(0)), OstraVault.Locked.selector);
-        _thiefSpendReverts(v, 2, abi.encode(address(0xBAD)), OstraVault.Locked.selector);
-        _thiefSpendReverts(v, 4, abi.encode(address(0xBAD), bytes32(0), uint8(0), uint256(0)), OstraVault.Locked.selector);
+        _thiefSpendReverts(v, 2, abi.encode(THIEF_SAFE), OstraVault.Locked.selector);
+        _thiefSpendReverts(v, 4, abi.encode(THIEF_SAFE, bytes32(0), uint8(0), uint256(0)), OstraVault.Locked.selector);
         // He schedules himself as the withdrawal address; the guardian cancels it, and sweeps the balance out.
-        _thiefSpend(v, 14, abi.encode(address(0xBAD), DELAY, uint128(1e6)), false);
+        _thiefSpend(v, 14, abi.encode(THIEF_SAFE, DELAY, uint128(1e6)), false);
         vm.prank(GUARDIAN);
         v.guard(0, "");
         vm.prank(GUARDIAN);
@@ -802,8 +812,8 @@ contract VaultV3ForkTest is Test {
         deal(USDG, address(v), 100e6);
         _spend(v, OTHER, 14, abi.encode(WITHDRAWAL, DELAY, uint128(1e6)));
         assertEq(v.guardianCount(), 0);
-        _thiefSpend(v, 14, abi.encode(address(0xBAD), DELAY, uint128(1e6)), true);
-        vm.prank(address(0xBAD));
+        _thiefSpend(v, 14, abi.encode(THIEF_SAFE, DELAY, uint128(1e6)), true);
+        vm.prank(THIEF_SAFE);
         vm.expectRevert(OstraVault.NotGuardian.selector);
         v.guard(2, abi.encode(WITHDRAWAL));
         vm.startPrank(WITHDRAWAL);
@@ -845,7 +855,7 @@ contract VaultV3ForkTest is Test {
         _spend(w, CASH, 14, abi.encode(WITHDRAWAL, DELAY, uint128(0)));
         _spend(v, OTHER, 6, abi.encode(address(g), true));
         _spend(v, OTHER, 14, abi.encode(address(w), DELAY, uint128(1e6)));
-        _thiefSpend(v, 14, abi.encode(address(0xBAD), DELAY, uint128(1e6)), true);
+        _thiefSpend(v, 14, abi.encode(THIEF_SAFE, DELAY, uint128(1e6)), true);
         _spend(g, GUARD_VAULT, 24, abi.encode(address(v), uint8(0), bytes32(0), uint256(0)));
         (, uint64 at,,) = v.pendingChanges();
         assertEq(at, 0);
@@ -881,7 +891,7 @@ contract VaultV3ForkTest is Test {
 
     function test_aCancelOrSweepAfterAChangeTookEffectIsRefused() public {
         OstraVault v = _locked(1e6);
-        _thiefSpend(v, 14, abi.encode(address(0xBAD), DELAY, uint128(1e6)), true);
+        _thiefSpend(v, 14, abi.encode(THIEF_SAFE, DELAY, uint128(1e6)), true);
         vm.warp(block.timestamp + DELAY);
         vm.startPrank(GUARDIAN);
         vm.expectRevert(OstraVault.BadParams.selector);

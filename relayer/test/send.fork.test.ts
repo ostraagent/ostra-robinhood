@@ -124,10 +124,16 @@ after(async () => {
 test("the relayer's sending account must have no code: an EIP-7702-delegated one is refused at start", async () => {
   await checkSendingAccount(fork.client, account.address);
   // anvil's development account 0 is EIP-7702-delegated on Robinhood Chain mainnet (code 0xef0100 || delegate).
+  // The fork clears it (startFork): put back the code account 0 has on mainnet for this check, then clear it again.
   const delegated = fork.accounts[0]!.address;
-  const code = await fork.client.getCode({ address: delegated });
-  assert.match(code ?? "0x", /^0xef0100[0-9a-f]{40}$/i, "account 0 is delegated on mainnet");
-  await assert.rejects(checkSendingAccount(fork.client, delegated), new RegExp(`${delegated} has code \\(an EIP-7702 delegation to 0x${(code ?? "").slice(8)}\\)`, "i"));
+  await rpc("anvil_setCode", [delegated, fork.mainnetCode(delegated)]);
+  try {
+    const code = await fork.client.getCode({ address: delegated });
+    assert.match(code ?? "0x", /^0xef0100[0-9a-f]{40}$/i, "account 0 is delegated on mainnet");
+    await assert.rejects(checkSendingAccount(fork.client, delegated), new RegExp(`${delegated} has code \\(an EIP-7702 delegation to 0x${(code ?? "").slice(8)}\\)`, "i"));
+  } finally {
+    await rpc("anvil_setCode", [delegated, "0x"]);
+  }
   // Any other code too.
   const contract = getAddress("0x00000000000000000000000000000000c0de0001");
   await rpc("anvil_setCode", [contract, "0x00"]);
@@ -194,8 +200,9 @@ test("a transaction whose vault Swap fails now is not sent when the sender is as
 });
 
 test("a transaction whose vault Enter fails now (VenueFailed) is not sent when the sender is asked to refuse it; sent, it lands as failed", async () => {
-  // A version 4 vault of a fresh deployment, its first spend an Enter into Spark Savings USDG, which it never enabled:
-  // the module refuses it (NotEnabled), and the spend lands as VenueFailed when the relayer's account sends it alone.
+  // A vault of a fresh deployment (version 5, whose venue spends run in OstraVaultModuleV4), its first spend an Enter
+  // into Spark Savings USDG, which it never enabled: the module refuses it (NotEnabled), and the spend lands as
+  // VenueFailed when the relayer's account sends it alone.
   const d = await deployOnFork(fork);
   const dir = await mkdtemp(join(tmpdir(), "ostra-relayer-venue-"));
   try {
@@ -205,7 +212,7 @@ test("a transaction whose vault Enter fails now (VenueFailed) is not sent when t
     const created = await fork.wallet(deployer).writeContract({ address: d.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "createVault", args: [USDG, root0, zeroAddress], account: deployer, chain: fork.client.chain });
     assert.equal((await fork.client.waitForTransactionReceipt({ hash: created })).status, "success");
     const vault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root0, initialCrank: zeroAddress });
-    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 4);
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 5);
     const params = enterParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, amount: 1n, minPosition: 0n });
     const signed = await signVaultSpend(keychain, { vault, nonce: 0n, keyRoot: root0 }, { chainId: ROBINHOOD_CHAIN_ID, action: VAULT_ACTION.ENTER, params });
     const call = { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [signed.action, signed.nextKeyRoot, signed.params, signed.signature] }) };
@@ -226,10 +233,11 @@ test("a transaction whose vault Enter fails now (VenueFailed) is not sent when t
 });
 
 test("a venue spend of the catalog is priced at the gas it uses and sent with its floor left; one outside the catalog is priced with its floor", async () => {
-  // A version 4 vault of a fresh deployment enables Spark Savings USDG and enters it: a venue spend of sdk
-  // VENUE_CATALOG, priced at the gas it uses simulated (with the margin, relayPriceWei) while its gas limit keeps the
-  // floor the module checks (VAULT_ERC4626_MIN_GAS) on top of it (sendGasCap). Raeto's USDG vault named as an ERC4626
-  // venue is outside the catalog: an Enter into it is priced with that floor, as before.
+  // A vault of a fresh deployment (version 5, whose venue spends run in OstraVaultModuleV4) enables Spark Savings USDG
+  // and enters it: a venue spend of sdk VENUE_CATALOG, priced at the gas it uses simulated (with the margin,
+  // relayPriceWei) while its gas limit keeps the floor the module checks (VAULT_ERC4626_MIN_GAS) on top of it
+  // (sendGasCap). Raeto's USDG vault named as an ERC4626 venue is outside the catalog: an Enter into it is priced with
+  // that floor, as before.
   const d = await deployOnFork(fork);
   const dir = await mkdtemp(join(tmpdir(), "ostra-relayer-catalog-"));
   try {
@@ -239,7 +247,7 @@ test("a venue spend of the catalog is priced at the gas it uses and sent with it
     const created = await fork.wallet(deployer).writeContract({ address: d.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "createVault", args: [USDG, root0, zeroAddress], account: deployer, chain: fork.client.chain });
     assert.equal((await fork.client.waitForTransactionReceipt({ hash: created })).status, "success");
     const vault = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token: USDG, initialKeyRoot: root0, initialCrank: zeroAddress });
-    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 4);
+    assert.equal(await fork.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }), 5);
     await fork.dealUsdg(vault, 10_000_000n);
     const spend = async (nonce: bigint, action: number, params: Hex) => {
       const signed = await signVaultSpend(keychain, { vault, nonce, keyRoot: bytesToHex(keychain.keyRoot(nonce)) }, { chainId: ROBINHOOD_CHAIN_ID, action: action as never, params });
@@ -509,7 +517,7 @@ test("a transaction that earns a gas refund needs a limit above what it is price
 
 test("an account that gains code after start (an EIP-7702 delegation) sends nothing more", async () => {
   // The sender's own account delegated as anvil's account 0 is on mainnet: refused before anything is signed.
-  const delegation = (await fork.client.getCode({ address: fork.accounts[0]!.address })) as Hex;
+  const delegation = fork.mainnetCode(fork.accounts[0]!.address);
   const nonce = await fork.client.getTransactionCount({ address: account.address });
   await rpc("anvil_setCode", [account.address, delegation]);
   try {

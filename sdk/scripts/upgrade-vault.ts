@@ -1,35 +1,44 @@
-// Prepares and records the upgrade of every vault from OstraVault version 3 to version 4 (the venues: SetVenue,
-// Enter, Exit and Forward into Raeto's vaults and ERC-4626 vaults, guard ops 5 and 6 and the venue breaker;
-// src/OstraVault.sol, which runs its version 4 spends in src/OstraVaultModuleV4.sol and its version 3 spends in
-// src/OstraVaultModule.sol), through the vault beacon, which OstraUpgradeOwner owns: the upgrade itself is a
-// WOTS-signed call that waits 72 hours in public (scripts/upgrade-owner.ts). Versions 1 to 3's storage is unchanged
-// and version 4's state sits at its own ERC-7201 slot, so every vault keeps its token, key, nonce, crank, guardians,
-// channels, withdrawal lock, linked vault, hash approvals and Morpho positions; the live OstraRegistry carries over.
-// Version 4 comes with a new OstraVaultModule too (a failed spend lands only for a sender with no code, so not for
-// an EIP-7702 account), so the record's vaultModule changes with its vaultImplementation.
+// Prepares and records the upgrade of every vault from OstraVault version 4 to version 5 (the agent key, its policy and
+// allowlists, standing orders and Priors credit: spends 29 to 46, spendAsAgent, runOrder, repayDue, guard ops 7 and 8;
+// src/OstraVault.sol, which runs its version 5 spends in src/OstraVaultModuleV5.sol), through the vault beacon, which
+// OstraUpgradeOwner owns: the upgrade itself is a WOTS-signed call that waits 72 hours in public
+// (scripts/upgrade-owner.ts). Versions 1 to 4's storage is unchanged and version 5's state sits at its own ERC-7201
+// slot, so every vault keeps its token, key, nonce, crank, guardians, channels, withdrawal lock, linked vault, hash
+// approvals, Morpho positions and venues, and starts version 5 with no agent key, no policy and no order. Version 5
+// keeps the live OstraVaultModule and OstraVaultModuleV4 (their deployed code, unchanged): only OstraVaultModuleV5
+// and the implementation are new.
 //
-//   node scripts/upgrade-vault.ts prepare   deploys OstraVaultModule (bound to the live factory, Morpho Blue,
-//                                            Morpho's VaultV2Factory, BorroBuilders, BorroRouter and Ostra's Borro
-//                                            code), OstraVaultModuleV4 (bound to the live factory, Morpho's
-//                                            VaultV2Factory and the ERC-8004 Identity Registry) and the version 4
-//                                            implementation (bound to the live registry and the two modules; the
-//                                            deployer key pays gas, it authorizes nothing), checks all three on chain
-//                                            and prints the upgrade to schedule; run again, it resumes. It refuses
-//                                            to start unless the build is the one of this checkout's sources
-//   node scripts/upgrade-vault.ts finalize  once the scheduled upgrade has run: checks the beacon and writes the
-//                                            record's vaultImplementation, vaultModule and vaultModuleV4
+//   node scripts/upgrade-vault.ts prepare     deploys OstraVaultModuleV5 (bound to the live factory, the live module V4,
+//                                              the Priors pool and its code hash, USDG, the ERC-8004 Identity Registry
+//                                              and OstraPad) and the version 5 implementation (bound to the live
+//                                              registry and the three modules; the deployer key pays gas, it authorizes
+//                                              nothing), checks both on chain, scans the live vaults' locks and prints
+//                                              the upgrade to schedule; run again, it resumes. It refuses to start
+//                                              unless the build is the one of this checkout's sources
+//   node scripts/upgrade-vault.ts scan-locks  the scan alone (upgrade-owner.ts execute runs it again before the
+//                                              upgrade): every vault the factory made whose withdrawal lock, in force
+//                                              or waiting, names an address with no code
+//   node scripts/upgrade-vault.ts finalize    once the scheduled upgrade has run: checks the beacon and writes the
+//                                              record's vaultImplementation and vaultModuleV5
 //
 //   OSTRA_DEPLOYER_KEY_FILE   file (0600) with the deployer's 32-byte hex private key (default
 //                             /etc/ostra/deployer.key); never printed
 //   OSTRA_RPC_URL_FILE        file (0600) with the RPC URL (default /etc/ostra/robinhood-rpc.url); never printed
+//   OSTRA_LOGS_RPC_URL        RPC the scan reads the factory's VaultCreated logs from (default the public RPC, which
+//                             serves wide block ranges)
 //   OSTRA_DEPLOYMENT          the deployment record; finalize rewrites it
 //   OSTRA_OUT_DIR             the Foundry build (default ../../out)
 //
-// What prepare deploys is kept next to the record (<record>.vault-v4.json) until finalize: each deployment's name, the
+// Why the scan: version 5 refuses a new withdrawal address with no code (an Ostra vault not created yet at such an
+// address could be created later, unlocked, by whoever holds the seed), but a lock chosen under version 4 stays. Before
+// the upgrade, every such lock is listed, so that its owner can be told; upgrade-owner.ts execute refuses to run the
+// upgrade while one exists unless OSTRA_ACCEPT_CODELESS_LOCKS names each such vault (comma separated), once checked.
+//
+// What prepare deploys is kept next to the record (<record>.vault-v5.json) until finalize: each deployment's name, the
 // deployer, its nonce and the address that nonce creates, written before the transaction is sent, so a run that stops
 // half-way never deploys twice (code at a recorded address is adopted once it passes the code check below).
 //
-// prepare, finalize and upgrade-owner.ts schedule-upgrade (for the vault beacon) prove the three contracts are the
+// prepare, finalize and upgrade-owner.ts schedule-upgrade (for the vault beacon) prove the two contracts are the
 // reviewed code (checkPrepared): the Foundry build is the one of the sources in this checkout (every source the
 // compiler's metadata of each artifact names, OpenZeppelin's included, has the keccak-256 the compiler recorded; the
 // compiler's own record, which neither forge's cache nor file times can fool), and the code at each address is
@@ -56,29 +65,29 @@ import {
   type PublicClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { ostraVaultAbi, ostraVaultModuleAbi, ostraVaultModuleV4Abi, upgradeableBeaconAbi } from "../src/abi.ts";
+import { ostraVaultAbi, ostraVaultModuleV5Abi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { redact, robinhoodChain } from "../src/chain.ts";
 import {
-  BORRO_BUILDERS,
-  BORRO_CODE,
-  BORRO_ROUTER,
   ERC8004_IDENTITY_REGISTRY,
-  MORPHO_BLUE,
-  MORPHO_VAULT_V2_FACTORY,
+  OSTRA_REGISTRY,
+  OSTRA_VAULT_MODULE,
+  OSTRA_VAULT_MODULE_V4,
   ROBINHOOD_CHAIN_ID,
+  ROBINHOOD_PUBLIC_RPC,
   UNISWAP_V4_POOL_MANAGER,
-  VAULT_V4,
+  VAULT_V5,
   X402_BATCH_SETTLEMENT,
 } from "../src/constants.ts";
-import { checkDeployment, checkVaultModule, checkVaultModuleV4 } from "../src/deploy.ts";
+import { checkDeployment, checkVaultModule, checkVaultModuleV4, checkVaultModuleV5, vaultModuleV5Args } from "../src/deploy.ts";
 import { parseDeployment, type Deployment } from "../src/deployment.ts";
+import { listOstraVaults } from "../src/strategy.ts";
 
 /**
- * Gas prepare may use, for the balance check before anything is sent: the implementation's creation code is 25.5 KB
- * (24.2 KB deployed), OstraVaultModule's 17.9 KB (17.3 KB) and OstraVaultModuleV4's 15.5 KB (15.1 KB): 12.4 million
- * gas together on a fork of Robinhood Chain mainnet (5.32, 3.79 and 3.33 million), with room for the chain's data fee.
+ * Gas prepare may use, for the balance check before anything is sent: OstraVaultModuleV5's creation code is 35.8 KB
+ * (34.7 KB deployed) and the implementation's 32.8 KB (31.1 KB): 14.4 million gas together on a fork of Robinhood
+ * Chain mainnet (7.58 and 6.82 million), with room for the chain's data fee.
  */
-export const PREPARE_GAS_BUDGET = 19_000_000n;
+export const PREPARE_GAS_BUDGET = 22_000_000n;
 
 /** OpenZeppelin 5's Initializable storage (ERC-7201 "openzeppelin.storage.Initializable"), and its value once disabled. */
 const INITIALIZABLE_SLOT: Hex = "0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00";
@@ -89,17 +98,19 @@ const SOURCE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
 /** One deployment of prepare, recorded before it is sent: the deployer, its nonce and the address that nonce creates. */
 export type Deployed = { name: string; deployer: Address; nonce: number; address: Address };
-/** What prepare deployed (<record>.vault-v4.json). */
-export type Prepared = { module: Deployed; moduleV4: Deployed; implementation: Deployed };
+/** What prepare deployed (<record>.vault-v5.json). */
+export type Prepared = { moduleV5: Deployed; implementation: Deployed };
 type Step = keyof Prepared;
+
+/** The state file prepare keeps next to the record until finalize. */
+export const preparedPath = (recordPath: string) => `${recordPath}.vault-v5.json`;
 
 /** The artifact of each step in the Foundry build: [file, contract]. */
 const ARTIFACTS: Readonly<Record<Step, readonly [string, string]>> = {
-  module: ["OstraVaultModule.sol", "OstraVaultModule"],
-  moduleV4: ["OstraVaultModuleV4.sol", "OstraVaultModuleV4"],
+  moduleV5: ["OstraVaultModuleV5.sol", "OstraVaultModuleV5"],
   implementation: ["OstraVault.sol", "OstraVault"],
 };
-const ABIS: Readonly<Record<Step, Abi>> = { module: ostraVaultModuleAbi, moduleV4: ostraVaultModuleV4Abi, implementation: ostraVaultAbi };
+const ABIS: Readonly<Record<Step, Abi>> = { moduleV5: ostraVaultModuleV5Abi, implementation: ostraVaultAbi };
 
 type Artifact = {
   bytecode: { object: string };
@@ -127,25 +138,40 @@ function artifact(outDir: string, step: Step): Artifact {
   return a;
 }
 
-/** The constructor arguments of each step, for the live `factory` and `registry` and the modules `p` names. */
-function constructorArgs(step: Step, factory: Address, registry: Address, p: Partial<Prepared>): readonly unknown[] {
-  if (step === "module") return [factory, MORPHO_BLUE, MORPHO_VAULT_V2_FACTORY, BORRO_BUILDERS, BORRO_ROUTER, BORRO_CODE];
-  if (step === "moduleV4") return [factory, MORPHO_VAULT_V2_FACTORY, ERC8004_IDENTITY_REGISTRY];
-  if (p.module === undefined || p.moduleV4 === undefined) throw new Error("the implementation names both modules: deploy them first");
+/**
+ * The live registry and modules, which version 5 keeps: the pinned addresses (OSTRA_REGISTRY, OSTRA_VAULT_MODULE,
+ * OSTRA_VAULT_MODULE_V4), never what a record file names; throws unless the record is a version 4 one naming them.
+ */
+function liveModules(d: Deployment): { registry: Address; module: Address; moduleV4: Address } {
+  if (d.registry === undefined || d.vaultModule === undefined || d.vaultModuleV4 === undefined) {
+    throw new Error("the record has no registry, vault module or vault module V4: the vaults do not run version 4");
+  }
+  if (getAddress(d.registry) !== OSTRA_REGISTRY || getAddress(d.vaultModule) !== OSTRA_VAULT_MODULE || getAddress(d.vaultModuleV4) !== OSTRA_VAULT_MODULE_V4) {
+    throw new Error(`the record's registry, vault module or vault module V4 is not the live one (${OSTRA_REGISTRY}, ${OSTRA_VAULT_MODULE}, ${OSTRA_VAULT_MODULE_V4})`);
+  }
+  return { registry: OSTRA_REGISTRY, module: OSTRA_VAULT_MODULE, moduleV4: OSTRA_VAULT_MODULE_V4 };
+}
+
+/** The constructor arguments of each step, for the live record `d` and the module V5 `p` names. */
+function constructorArgs(step: Step, d: Deployment, p: Partial<Prepared>): readonly unknown[] {
+  const live = liveModules(d);
+  if (step === "moduleV5") return vaultModuleV5Args(d.vaultFactory, live.moduleV4);
+  if (p.moduleV5 === undefined) throw new Error("the implementation names module V5: deploy it first");
   return [
     {
       batchSettlement: X402_BATCH_SETTLEMENT,
       poolManager: UNISWAP_V4_POOL_MANAGER,
-      registry,
+      registry: live.registry,
       identityRegistry: ERC8004_IDENTITY_REGISTRY,
-      module: p.module.address,
-      moduleV4: p.moduleV4.address,
+      module: live.module,
+      moduleV4: live.moduleV4,
+      moduleV5: p.moduleV5.address,
     },
   ];
 }
 
 /**
- * Throws unless the build in `outDir` of the three contracts is the one of the sources in this checkout: every source
+ * Throws unless the build in `outDir` of the two contracts is the one of the sources in this checkout: every source
  * the compiler's metadata of each artifact names has the keccak-256 the compiler recorded.
  */
 export function checkBuildCurrent(outDir: string): void {
@@ -194,28 +220,28 @@ export async function checkDeployedCode(client: PublicClient, outDir: string, st
 /**
  * Throws unless `p` is what prepare deploys for the record `d` and is the reviewed code: the build is current
  * (checkBuildCurrent), each contract's code is exactly the build's (checkDeployedCode), and the implementation is a
- * version 4 vault bound to the chain's contracts, to the record's registry and to the two modules, both bound to its
- * factory.
+ * version 5 vault bound to the chain's contracts, to the record's registry, to the record's module and module V4 and to
+ * the new module V5, which is bound to the record's factory and module V4.
  */
 export async function checkPrepared(client: PublicClient, outDir: string, p: Prepared, d: Deployment): Promise<void> {
-  if (d.registry === undefined) throw new Error("the record has no registry: the vaults run version 1");
-  const registry = d.registry;
+  const { registry, module, moduleV4 } = liveModules(d);
   const factory = d.vaultFactory;
   checkBuildCurrent(outDir);
-  for (const step of Object.keys(ARTIFACTS) as Step[]) await checkDeployedCode(client, outDir, step, p[step], constructorArgs(step, factory, registry, p));
+  for (const step of Object.keys(ARTIFACTS) as Step[]) await checkDeployedCode(client, outDir, step, p[step], constructorArgs(step, d, p));
   const read = (address: Address, abi: Abi, functionName: string) => client.readContract({ address, abi, functionName });
   const same = (what: string, got: unknown, want: unknown) => {
     const norm = (x: unknown) => (typeof x === "string" ? x.toLowerCase() : x);
     if (norm(got) !== norm(want)) throw new Error(`${what} is ${String(got)}, expected ${String(want)}`);
   };
   const implementation = p.implementation.address;
-  same("implementation version", await read(implementation, ostraVaultAbi, "VERSION"), VAULT_V4);
+  same("implementation version", await read(implementation, ostraVaultAbi, "VERSION"), VAULT_V5);
   same("implementation registry", await read(implementation, ostraVaultAbi, "REGISTRY"), registry);
   same("implementation identity registry", await read(implementation, ostraVaultAbi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
   same("implementation settlement", await read(implementation, ostraVaultAbi, "BATCH_SETTLEMENT"), X402_BATCH_SETTLEMENT);
   same("implementation pool manager", await read(implementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
-  await checkVaultModule(client, implementation, p.module.address, factory);
-  await checkVaultModuleV4(client, implementation, p.moduleV4.address, factory);
+  await checkVaultModule(client, implementation, module, factory);
+  await checkVaultModuleV4(client, implementation, moduleV4, factory);
+  await checkVaultModuleV5(client, implementation, p.moduleV5.address, moduleV4, factory);
   // The implementation itself can never be initialized (its constructor's _disableInitializers): OpenZeppelin 5's
   // Initializable slot holds _initialized type(uint64).max and _initializing false, nothing else.
   const initializable = await client.getStorageAt({ address: implementation, slot: INITIALIZABLE_SLOT });
@@ -223,11 +249,11 @@ export async function checkPrepared(client: PublicClient, outDir: string, p: Pre
 }
 
 /**
- * What prepare recorded next to `recordPath` (<record>.vault-v4.json), every deployment present and all three by one
+ * What prepare recorded next to `recordPath` (<record>.vault-v5.json), every deployment present and both by one
  * deployer (the deployment record names none, so they are held to each other); throws when it is not so.
  */
 export function readPrepared(recordPath: string): Prepared {
-  const statePath = `${recordPath}.vault-v4.json`;
+  const statePath = preparedPath(recordPath);
   if (!existsSync(statePath)) throw new Error(`no ${statePath}: run upgrade-vault.ts prepare first`);
   const p = JSON.parse(readFileSync(statePath, "utf8")) as Partial<Prepared>;
   for (const step of Object.keys(ARTIFACTS) as Step[]) {
@@ -236,22 +262,62 @@ export function readPrepared(recordPath: string): Prepared {
   }
   const prepared = p as Prepared;
   const deployers = new Set((Object.keys(ARTIFACTS) as Step[]).map((step) => getAddress(prepared[step].deployer)));
-  if (deployers.size !== 1) throw new Error(`${statePath} names more than one deployer (${[...deployers].join(", ")}): prepare deploys all three from one account`);
+  if (deployers.size !== 1) throw new Error(`${statePath} names more than one deployer (${[...deployers].join(", ")}): prepare deploys both from one account`);
   return prepared;
+}
+
+/** A vault whose withdrawal lock, in force or waiting, names an address with no code. */
+export type CodelessLock = { vault: Address; withdrawal: Address; waiting: boolean };
+
+/**
+ * Every vault `d`'s factory made (its VaultCreated logs, read through `logsClient`) whose withdrawal lock in force, or
+ * whose waiting lock change, names an address with no code: such a lock, chosen under version 4, stays under version 5.
+ */
+export async function scanCodelessLocks(client: PublicClient, logsClient: PublicClient, d: Deployment): Promise<{ vaults: number; locked: number; codeless: CodelessLock[] }> {
+  // Every vault up to the head of the RPC the state is read from: a logs RPC behind it is refused, not trusted.
+  const toBlock = await client.getBlockNumber({ cacheTime: 0 });
+  const logsHead = await logsClient.getBlockNumber({ cacheTime: 0 });
+  if (logsHead < toBlock) throw new Error(`the logs RPC is at block ${logsHead}, behind the state RPC's ${toBlock}: run the scan again`);
+  const vaults = await listOstraVaults(logsClient, d.vaultFactory, BigInt(d.fromBlock), toBlock);
+  const codeless: CodelessLock[] = [];
+  let locked = 0;
+  const noCode = async (a: Address) => {
+    const code = await client.getCode({ address: a });
+    return code === undefined || code === "0x";
+  };
+  for (const { vault } of vaults) {
+    const lock = (await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "withdrawalLock" })) as { withdrawal: Address };
+    const [pending] = (await client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "pendingChanges" })) as readonly [{ withdrawal: Address }, bigint, Address, bigint];
+    const zero = (a: Address) => BigInt(a) === 0n;
+    if (!zero(lock.withdrawal)) {
+      ++locked;
+      if (await noCode(lock.withdrawal)) codeless.push({ vault, withdrawal: getAddress(lock.withdrawal), waiting: false });
+    }
+    if (!zero(pending.withdrawal) && (await noCode(pending.withdrawal))) codeless.push({ vault, withdrawal: getAddress(pending.withdrawal), waiting: true });
+  }
+  return { vaults: vaults.length, locked, codeless };
+}
+
+/** The client the scan reads logs through: OSTRA_LOGS_RPC_URL, else the public RPC (wide block ranges). */
+export function logsClientFromEnv(): PublicClient {
+  const url = process.env.OSTRA_LOGS_RPC_URL || ROBINHOOD_PUBLIC_RPC;
+  return createPublicClient({ chain: robinhoodChain, transport: http(url) }) as PublicClient;
 }
 
 async function main(): Promise<void> {
   const command = process.argv[2];
-  if (command !== "prepare" && command !== "finalize") throw new Error("usage: upgrade-vault.ts prepare | finalize");
+  if (command !== "prepare" && command !== "finalize" && command !== "scan-locks") throw new Error("usage: upgrade-vault.ts prepare | scan-locks | finalize");
   const keyFile = process.env.OSTRA_DEPLOYER_KEY_FILE || "/etc/ostra/deployer.key";
   const rpcFile = process.env.OSTRA_RPC_URL_FILE || "/etc/ostra/robinhood-rpc.url";
   const recordPath = process.env.OSTRA_DEPLOYMENT;
   if (recordPath === undefined || recordPath === "") throw new Error("missing environment variable OSTRA_DEPLOYMENT");
-  const statePath = `${recordPath}.vault-v4.json`;
+  const statePath = preparedPath(recordPath);
   const outDir = process.env.OSTRA_OUT_DIR || fileURLToPath(new URL("../../out", import.meta.url));
   const rpcUrl = privateFile(rpcFile, "the RPC URL file");
+  // Both RPC URLs may carry an API key in their path: neither is ever printed.
+  const hide = (text: string) => redact(redact(text, rpcUrl), process.env.OSTRA_LOGS_RPC_URL ?? "");
   const log = (event: string, fields: Record<string, unknown> = {}) =>
-    console.log(redact(JSON.stringify({ event, ...fields }, (_, v) => (typeof v === "bigint" ? v.toString() : v)), rpcUrl));
+    console.log(hide(JSON.stringify({ event, ...fields }, (_, v) => (typeof v === "bigint" ? v.toString() : v))));
   try {
     const client = createPublicClient({ chain: robinhoodChain, transport: http(rpcUrl) }) as PublicClient;
     const chainId = await client.getChainId();
@@ -260,14 +326,23 @@ async function main(): Promise<void> {
     if (d.chainId !== chainId) throw new Error(`${recordPath} is a deployment on chain ${d.chainId}`);
     const beaconImplementation = async () =>
       getAddress((await client.readContract({ address: d.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address);
+    const scan = async () => {
+      const r = await scanCodelessLocks(client, logsClientFromEnv(), d);
+      for (const c of r.codeless) log("codeless_lock", { ...c });
+      log("locks_scanned", { vaults: r.vaults, locked: r.locked, codeless: r.codeless.length });
+      return r;
+    };
 
-    if (d.registry === undefined) throw new Error("the record has no registry: the vaults run version 1 (upgrade to version 2 first)");
-    const registry = d.registry;
+    if (command === "scan-locks") {
+      await scan();
+      console.log("VAULT_LOCKS_SCANNED");
+      return;
+    }
     if (command === "finalize") {
-      if (d.vaultModuleV4 !== undefined) {
+      if (d.vaultModuleV5 !== undefined) {
         await checkDeployment(client, d);
-        log("checked", { vaultImplementation: d.vaultImplementation, vaultModule: d.vaultModule, vaultModuleV4: d.vaultModuleV4 });
-        console.log("VAULT_V4_RECORDED");
+        log("checked", { vaultImplementation: d.vaultImplementation, vaultModuleV5: d.vaultModuleV5 });
+        console.log("VAULT_V5_RECORDED");
         return;
       }
       const p = readPrepared(recordPath);
@@ -277,8 +352,7 @@ async function main(): Promise<void> {
       const next: Deployment = {
         ...d,
         vaultImplementation: getAddress(p.implementation.address),
-        vaultModule: getAddress(p.module.address),
-        vaultModuleV4: getAddress(p.moduleV4.address),
+        vaultModuleV5: getAddress(p.moduleV5.address),
       };
       await checkDeployment(client, next);
       writeJson(recordPath, next);
@@ -286,18 +360,16 @@ async function main(): Promise<void> {
       log("written", {
         record: recordPath,
         vaultImplementation: next.vaultImplementation,
-        vaultModule: next.vaultModule,
-        vaultModuleV4: next.vaultModuleV4,
+        vaultModuleV5: next.vaultModuleV5,
         previous: d.vaultImplementation,
-        previousModule: d.vaultModule,
       });
-      console.log("VAULT_V4_RECORDED");
+      console.log("VAULT_V5_RECORDED");
       return;
     }
 
     // prepare
-    if (d.vaultModuleV4 !== undefined) throw new Error("the record has a vault module V4 already: the vaults run version 4");
-    if (d.vaultModule === undefined) throw new Error("the record has no vault module: the vaults run version 2 (upgrade to version 3 first)");
+    if (d.vaultModuleV5 !== undefined) throw new Error("the record has a vault module V5 already: the vaults run version 5");
+    liveModules(d);
     checkBuildCurrent(outDir);
     await checkDeployment(client, d);
     const key = privateFile(keyFile, "the deployer key file");
@@ -306,7 +378,7 @@ async function main(): Promise<void> {
     const wallet = createWalletClient({ account, chain: robinhoodChain, transport: http(rpcUrl) });
     const p: Partial<Prepared> = existsSync(statePath) ? (JSON.parse(readFileSync(statePath, "utf8")) as Partial<Prepared>) : {};
     const has = async (s: Deployed | undefined) => s !== undefined && (await client.getCode({ address: s.address })) !== undefined;
-    if (!(await has(p.module)) || !(await has(p.moduleV4)) || !(await has(p.implementation))) {
+    if (!(await has(p.moduleV5)) || !(await has(p.implementation))) {
       const gasPrice = await client.getGasPrice();
       const balance = await client.getBalance({ address: account.address });
       log("deployer", { address: account.address, eth: formatEther(balance), gasPriceGwei: formatGwei(gasPrice) });
@@ -318,7 +390,7 @@ async function main(): Promise<void> {
      */
     const ensure = async (step: Step): Promise<void> => {
       const [file, contract] = ARTIFACTS[step];
-      const args = constructorArgs(step, d.vaultFactory, registry, p);
+      const args = constructorArgs(step, d, p);
       const recorded = p[step];
       // Only this script's account is adopted or waited for: a state file naming another deployer is refused.
       if (recorded !== undefined && getAddress(recorded.deployer) !== account.address) {
@@ -338,7 +410,7 @@ async function main(): Promise<void> {
       const nonce = await client.getTransactionCount({ address: account.address, blockTag: "pending" });
       const next: Deployed = { name: contract, deployer: account.address, nonce, address: getContractAddress({ from: account.address, nonce: BigInt(nonce) }) };
       p[step] = next;
-      // The implementation names the modules: a module deployed anew means a new implementation too.
+      // The implementation names module V5: a module V5 deployed anew means a new implementation too.
       if (step !== "implementation") delete p.implementation;
       writeJson(statePath, p);
       log("deploying", { ...next });
@@ -353,17 +425,17 @@ async function main(): Promise<void> {
     await checkPrepared(client, outDir, prepared, d);
     const owner = getAddress((await client.readContract({ address: d.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "owner" })) as Address);
     log("prepared", {
-      module: prepared.module.address,
-      moduleV4: prepared.moduleV4.address,
+      moduleV5: prepared.moduleV5.address,
       implementation: prepared.implementation.address,
       beacon: d.vaultBeacon,
       beaconOwner: owner,
       beaconImplementation: await beaconImplementation(),
     });
+    await scan();
     console.log(`next: node scripts/upgrade-owner.ts schedule-upgrade ${d.vaultBeacon} ${prepared.implementation.address}`);
-    console.log("VAULT_V4_PREPARED");
+    console.log("VAULT_V5_PREPARED");
   } catch (err) {
-    throw new Error(redact(err instanceof Error ? err.message : String(err), rpcUrl));
+    throw new Error(hide(err instanceof Error ? err.message : String(err)));
   }
 }
 

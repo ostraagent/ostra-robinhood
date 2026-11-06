@@ -11,6 +11,7 @@ import {OstraVaultFactory} from "../src/OstraVaultFactory.sol";
 import {IMorphoBlue, IMorphoOracle, MarketParams, OstraVaultModule} from "../src/OstraVaultModule.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 import {VaultStack} from "./utils/VaultStack.sol";
+import {SafeWallet} from "./utils/SafeWallet.sol";
 
 /// @notice What the tests read and do on a Morpho Vault V2 and its market adapter (vault-v2, as verified on Sourcify).
 interface IVaultV2Test {
@@ -124,7 +125,8 @@ contract BreakerForkTest is Test {
     bytes32 internal constant MASTER = keccak256("OSTRA/EVM/TEST/master");
     bytes32 internal constant AGENT = keccak256("OSTRA/EVM/TEST/breaker-agent");
     bytes32 internal constant OTHER = keccak256("OSTRA/EVM/TEST/breaker-other");
-    address internal constant WITHDRAWAL = address(0xC01D);
+    /// @dev The withdrawal address: a real Safe (version 5 refuses one with no code), made in setUp.
+    address internal WITHDRAWAL;
     address internal constant SUBMITTER = address(0x5EB);
     uint32 internal constant DELAY = 36 hours;
 
@@ -136,6 +138,7 @@ contract BreakerForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork("robinhood");
+        WITHDRAWAL = SafeWallet.create(makeAddr("withdrawal owner"), 1);
         assertEq(block.chainid, 4663);
         (factory,) = VaultStack.deploy(address(new OstraRegistry()));
         breaker = new OstraBreaker(address(factory), VAULT_V2_FACTORY, MORPHO, ADAPTER_FACTORY);

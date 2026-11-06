@@ -14,13 +14,17 @@
 //   node scripts/upgrade-owner.ts schedule-upgrade <beacon> <implementation>
 //                                                               for the vault beacon, only the implementation
 //                                                               upgrade-vault.ts prepare recorded in
-//                                                               <record>.vault-v4.json, and only when it passes
+//                                                               <record>.vault-v5.json, and only when it passes
 //                                                               that script's checks (the reviewed code, exactly);
 //                                                               any call to the vault beacon goes through the same
 //                                                               checks (see checkVaultBeaconCall)
 //   node scripts/upgrade-owner.ts schedule <target> <calldata>  any other call (renounceOwnership, ...)
 //   node scripts/upgrade-owner.ts cancel <id>
-//   node scripts/upgrade-owner.ts execute <id>                  once DELAY has passed (anyone may)
+//   node scripts/upgrade-owner.ts execute <id>                  once DELAY has passed (anyone may); for the vault
+//                                                               beacon's upgrade, only when no vault's withdrawal
+//                                                               lock names an address with no code (upgrade-vault.ts
+//                                                               scan-locks), but those OSTRA_ACCEPT_CODELESS_LOCKS
+//                                                               names
 //   node scripts/upgrade-owner.ts status
 //
 //   OSTRA_DEPLOYER_KEY_FILE   file (0600) with the deployer's hex private key (default /etc/ostra/deployer.key):
@@ -34,6 +38,12 @@
 //                             signing two messages: keep it, and back it up with the seed after every call
 //   OSTRA_ALLOW_BEACON_OWNERSHIP  1 to let schedule send transferOwnership or renounceOwnership to the vault
 //                             beacon (refused otherwise)
+//   OSTRA_LOGS_RPC_URL        RPC the lock scan reads the factory's logs from (default the public RPC)
+//   OSTRA_ACCEPT_CODELESS_LOCKS  locks on an address with no code that were checked and are accepted at execute, as
+//                             vault:withdrawal pairs (comma separated)
+//
+// The execute check binds only this script: once the delay has passed, anyone may run the scheduled upgrade on
+// chain. A lock on an address with no code found after scheduling is dealt with by cancel (and a new schedule).
 //
 // The record must name the live vault beacon (OSTRA_VAULT_BEACON): with another record the vault beacon's checks
 // would not apply, so the script refuses to run.
@@ -83,7 +93,7 @@ import { parseDeployment, type Deployment } from "../src/deployment.ts";
 import { UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload, type UpgradeOwnerAction } from "../src/messages.ts";
 import { FileWotsStore } from "../src/wots-file.ts";
 import { WotsKeychain } from "../src/wots.ts";
-import { checkPrepared, readPrepared } from "./upgrade-vault.ts";
+import { checkPrepared, logsClientFromEnv, preparedPath, readPrepared, scanCodelessLocks } from "./upgrade-vault.ts";
 
 /** OstraUpgradeOwner.DELAY on mainnet: 72 hours, so every vault owner has three days to withdraw before an upgrade. */
 export const UPGRADE_DELAY_SECONDS = 72n * 3600n;
@@ -243,6 +253,10 @@ class OwnerTool {
   readonly log: (event: string, fields?: Record<string, unknown>) => void;
   /** OSTRA_ALLOW_BEACON_OWNERSHIP=1: transferOwnership and renounceOwnership of the vault beacon may be scheduled. */
   readonly allowBeaconOwnership: boolean;
+  /** Reads the factory's logs for the lock scan before the vault beacon's upgrade runs. */
+  readonly logsClient: PublicClient;
+  /** OSTRA_ACCEPT_CODELESS_LOCKS: locks on an address with no code that were checked and are accepted ("vault:withdrawal"). */
+  readonly acceptedCodelessLocks: ReadonlySet<string>;
   readonly passphrases = new Passphrases();
   #seed: Uint8Array | undefined;
   #lock: string | undefined;
@@ -256,6 +270,8 @@ class OwnerTool {
     seedFile: string;
     log: OwnerTool["log"];
     allowBeaconOwnership: boolean;
+    logsClient: PublicClient;
+    acceptedCodelessLocks: ReadonlySet<string>;
   }) {
     this.client = o.client;
     this.wallet = o.wallet;
@@ -265,6 +281,8 @@ class OwnerTool {
     this.seedFile = o.seedFile;
     this.log = o.log;
     this.allowBeaconOwnership = o.allowBeaconOwnership;
+    this.logsClient = o.logsClient;
+    this.acceptedCodelessLocks = o.acceptedCodelessLocks;
   }
 
   /** One run at a time: an exclusive lock file in the state directory, removed when the run ends. */
@@ -415,12 +433,12 @@ class OwnerTool {
     if (encodeFunctionData({ abi: upgradeableBeaconAbi, functionName: "upgradeTo", args: [implementation] }) !== data.toLowerCase()) throw new Error("the vault beacon upgrade's calldata is not exactly upgradeTo(address)");
     const p = readPrepared(this.recordPath);
     if (implementation !== getAddress(p.implementation.address)) {
-      throw new Error(`${implementation} is not the vault implementation upgrade-vault.ts prepared (${p.implementation.address} in ${this.recordPath}.vault-v4.json)`);
+      throw new Error(`${implementation} is not the vault implementation upgrade-vault.ts prepared (${p.implementation.address} in ${preparedPath(this.recordPath)})`);
     }
     const current = getAddress(await this.read<Address>(target, upgradeableBeaconAbi, "implementation"));
     if (implementation === current) throw new Error(`the vault beacon ${target} points at ${implementation} already: nothing to schedule`);
     await checkPrepared(this.client, outDir, p, d);
-    this.log("checked", { vaultImplementation: implementation, module: p.module.address, moduleV4: p.moduleV4.address });
+    this.log("checked", { vaultImplementation: implementation, moduleV5: p.moduleV5.address });
   }
 
   async schedule(target: Address, data: Hex, outDir: string): Promise<void> {
@@ -480,6 +498,21 @@ class OwnerTool {
     const grace = await this.read<bigint>(owner, ostraUpgradeOwnerAbi, "GRACE");
     if (now < call.eta) throw new Error(`call ${id} may be executed from ${new Date(Number(call.eta) * 1000).toISOString()} (chain time), in ${call.eta - now} seconds`);
     if (now > call.eta + grace) throw new Error(`call ${id} expired at ${new Date(Number(call.eta + grace) * 1000).toISOString()}`);
+    const d = this.record();
+    if (getAddress(call.target) === d.vaultBeacon || getAddress(call.target) === OSTRA_VAULT_BEACON) {
+      // Right before the vault beacon's upgrade runs: a lock on an address with no code, chosen under version 4, stays
+      // under version 5 (which refuses new ones); each must have been looked at.
+      const scan = await scanCodelessLocks(this.client, this.logsClient, d);
+      const accepted = (c: { vault: Address; withdrawal: Address }) => this.acceptedCodelessLocks.has(`${getAddress(c.vault)}:${getAddress(c.withdrawal)}`);
+      const open = scan.codeless.filter((c) => !accepted(c));
+      for (const c of scan.codeless) this.log("codeless_lock", { ...c, accepted: accepted(c) });
+      this.log("locks_scanned", { vaults: scan.vaults, locked: scan.locked, codeless: scan.codeless.length });
+      if (open.length > 0) {
+        throw new Error(
+          `${open.length} withdrawal lock(s) on an address with no code (${open.map((c) => `${c.vault}:${c.withdrawal}`).join(", ")}): check each, then name it as vault:withdrawal in OSTRA_ACCEPT_CODELESS_LOCKS`,
+        );
+      }
+    }
     await this.send(owner, ostraUpgradeOwnerAbi, "execute", [id, intent.data]);
     this.log("executed", { id, target: call.target });
   }
@@ -666,11 +699,32 @@ async function main(): Promise<void> {
   const key = privateFile(keyFile, "the deployer key file");
   if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error(`${keyFile} does not hold a 32-byte hex private key`);
   const payer = privateKeyToAccount(key as Hex);
+  // Both RPC URLs may carry an API key in their path: neither is ever printed.
+  const hide = (text: string) => redact(redact(text, rpcUrl), process.env.OSTRA_LOGS_RPC_URL ?? "");
   const log = (event: string, fields: Record<string, unknown> = {}) =>
-    console.log(redact(JSON.stringify({ event, ...fields }, (_, v) => (typeof v === "bigint" ? v.toString() : v)), rpcUrl));
+    console.log(hide(JSON.stringify({ event, ...fields }, (_, v) => (typeof v === "bigint" ? v.toString() : v))));
   const client = createPublicClient({ chain: robinhoodChain, transport: http(rpcUrl) }) as PublicClient;
   const wallet = createWalletClient({ account: payer, chain: robinhoodChain, transport: http(rpcUrl) });
-  const tool = new OwnerTool({ client, wallet, payer, recordPath, state, seedFile, log, allowBeaconOwnership: process.env.OSTRA_ALLOW_BEACON_OWNERSHIP === "1" });
+  const accepted = new Set<string>();
+  for (const pair of (process.env.OSTRA_ACCEPT_CODELESS_LOCKS ?? "").split(",").map((x) => x.trim()).filter((x) => x !== "")) {
+    const [v, w, ...rest] = pair.split(":");
+    if (v === undefined || w === undefined || rest.length !== 0 || !isAddress(v, { strict: false }) || !isAddress(w, { strict: false })) {
+      throw new Error(`OSTRA_ACCEPT_CODELESS_LOCKS: ${pair} is not vault:withdrawal`);
+    }
+    accepted.add(`${getAddress(v)}:${getAddress(w)}`);
+  }
+  const tool = new OwnerTool({
+    client,
+    wallet,
+    payer,
+    recordPath,
+    state,
+    seedFile,
+    log,
+    allowBeaconOwnership: process.env.OSTRA_ALLOW_BEACON_OWNERSHIP === "1",
+    logsClient: logsClientFromEnv(),
+    acceptedCodelessLocks: accepted,
+  });
   try {
     const chainId = await client.getChainId();
     if (chainId !== ROBINHOOD_CHAIN_ID) throw new Error(`the RPC is chain ${chainId}, not Robinhood Chain (${ROBINHOOD_CHAIN_ID})`);
@@ -703,7 +757,7 @@ async function main(): Promise<void> {
     } else throw new Error("usage: upgrade-owner.ts init | rekey | deploy | schedule-upgrade <beacon> <implementation> | schedule <target> <calldata> | cancel <id> | execute <id> | status");
     console.log("UPGRADE_OWNER_OK");
   } catch (err) {
-    throw new Error(redact(err instanceof Error ? err.message : String(err), rpcUrl));
+    throw new Error(hide(err instanceof Error ? err.message : String(err)));
   }
 }
 

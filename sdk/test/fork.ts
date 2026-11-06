@@ -13,6 +13,7 @@ import {
   http,
   numberToHex,
   type Address,
+  type Hex,
   type PrivateKeyAccount,
   type PublicClient,
   type WalletClient,
@@ -35,6 +36,9 @@ const DEV_KEYS = [
 
 export const OUT_DIR = fileURLToPath(new URL("../../out", import.meta.url));
 
+/** Robinhood Chain's contract code size limit: 98,304 bytes accepted, 98,305 refused (eth_estimateGas, 3 Nov 2026). */
+export const ROBINHOOD_CODE_SIZE_LIMIT = 98_304;
+
 export type Fork = {
   url: string;
   client: PublicClient;
@@ -46,6 +50,8 @@ export type Fork = {
   dealToken: (holder: Address, token: Address, amount: bigint) => Promise<void>;
   /** Sets `holder`'s ETH balance in wei (anvil_setBalance). */
   setBalance: (holder: Address, wei: bigint) => Promise<void>;
+  /** The code a development account has on Robinhood Chain mainnet (its EIP-7702 delegation), cleared on the fork. */
+  mainnetCode: (account: Address) => Hex;
   /** Moves the fork's clock forward and mines a block. */
   increaseTime: (seconds: number) => Promise<void>;
   stop: () => Promise<void>;
@@ -69,7 +75,9 @@ export async function startFork(opts: { blockNumber?: bigint } = {}): Promise<Fo
   // public RPC drops after some minutes): anvil's errors are passed on line by line with the URL replaced.
   const forkUrl = process.env.OSTRA_FORK_RPC !== undefined && process.env.OSTRA_FORK_RPC !== "" ? process.env.OSTRA_FORK_RPC : ROBINHOOD_PUBLIC_RPC;
   const at = opts.blockNumber === undefined ? [] : ["--fork-block-number", opts.blockNumber.toString()];
-  const child: ChildProcess = spawn("anvil", ["--fork-url", forkUrl, ...at, "--port", String(port), "--silent"], {
+  // Robinhood Chain's own code size limit (98,304 bytes, read on chain on 3 Nov 2026), not EIP-170's: the version 5
+  // vault implementation and OstraVaultModuleV5 are above 24,576 bytes.
+  const child: ChildProcess = spawn("anvil", ["--fork-url", forkUrl, ...at, "--port", String(port), "--silent", "--code-size-limit", String(ROBINHOOD_CODE_SIZE_LIMIT)], {
     stdio: ["ignore", "ignore", "pipe"],
   });
   let pendingErr = "";
@@ -108,6 +116,15 @@ export async function startFork(opts: { blockNumber?: bigint } = {}): Promise<Fo
   }
   const client = createPublicClient({ chain: robinhoodChain, transport: http(url) }) as PublicClient;
   const accounts = DEV_KEYS.map((k) => privateKeyToAccount(k));
+  // On Robinhood Chain mainnet these public development keys carry an EIP-7702 delegation (0xef0100 || a delegate,
+  // read on chain on 6 Nov 2026), so they read as accounts with code. The tests use them as plain accounts, as Ostra's
+  // relayer is: the delegation is cleared on the fork (a failed spend lands only for a sender with no code), and kept
+  // as mainnetCode for the tests about accounts with code.
+  const mainnetCode = new Map<Address, Hex>();
+  for (const a of accounts) {
+    mainnetCode.set(a.address, (await rpc(url, "eth_getCode", [a.address, "latest"])) as Hex);
+    await rpc(url, "anvil_setCode", [a.address, "0x"]);
+  }
   return {
     url,
     client,
@@ -121,6 +138,11 @@ export async function startFork(opts: { blockNumber?: bigint } = {}): Promise<Fo
     },
     setBalance: async (holder, wei) => {
       await rpc(url, "anvil_setBalance", [holder, numberToHex(wei)]);
+    },
+    mainnetCode: (account) => {
+      const code = mainnetCode.get(getAddress(account));
+      if (code === undefined) throw new Error(`${account} is not a development account of the fork`);
+      return code;
     },
     increaseTime: async (seconds) => {
       await rpc(url, "evm_increaseTime", [seconds]);

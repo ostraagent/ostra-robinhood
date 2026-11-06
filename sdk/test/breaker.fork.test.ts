@@ -1,6 +1,6 @@
 // OstraBreaker's deployment and reads (src/breaker.ts, deploy.ts: deployBreaker, scripts/deploy-breaker.ts) on a
 // fork of Robinhood Chain mainnet, against the live Steakhouse USDG, Morpho Blue and Morpho's factories, next to a
-// fresh Ostra deployment (version 4 vaults):
+// fresh Ostra deployment (version 5 vaults):
 //   * deployBreaker deploys it bound to the record's factory and Morpho's contracts, the record carries it and
 //     checkDeployment checks it; a record without a vault module, or with a breaker already, is refused;
 //   * breakerLimitsHash is the contract's limitsHash, and the limits it refuses are the ones the contract refuses;
@@ -47,7 +47,7 @@ after(async () => {
 let withBreaker: Deployment;
 
 test("deployBreaker binds OstraBreaker to the record's factory and Morpho's contracts, and the record carries it", async () => {
-  assert.ok(d.vaultModule !== undefined && d.vaultModuleV4 !== undefined, "deployOstra makes version 4 vaults");
+  assert.ok(d.vaultModule !== undefined && d.vaultModuleV4 !== undefined, "deployOstra makes version 4 and 5 vaults: both modules are recorded");
   const deployer = fork.accounts[0] as PrivateKeyAccount;
   const events: Record<string, unknown>[] = [];
   withBreaker = await deployBreaker({ publicClient: fork.client, walletClient: fork.wallet(deployer), outDir: OUT_DIR, log: (_, f) => events.push(f) }, d);
@@ -156,7 +156,7 @@ test("scripts/deploy-breaker.ts deploys once from 0600 files and then only check
       timeout: 300_000,
     });
   // A version 2 record is refused before anything is sent.
-  const { vaultModule: _, vaultModuleV4: _4, ...v2 } = d;
+  const { vaultModule: _, vaultModuleV4: _4, vaultModuleV5: _5, ...v2 } = d;
   writeFileSync(record, `${JSON.stringify(v2, null, 2)}\n`, { mode: 0o644 });
   const refused = run();
   assert.notEqual(refused.status, 0);

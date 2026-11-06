@@ -18,6 +18,7 @@ import {OstraVaultV3} from "../src/OstraVaultV3.sol";
 import {OstraVaultV4} from "../src/OstraVaultV4.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 import {VaultStack} from "./utils/VaultStack.sol";
+import {SafeWallet} from "./utils/SafeWallet.sol";
 
 /// @notice What the tests call on the venues as their owners (RaetoVault, RaetoStockVault; Sourcify sources).
 interface IRaetoOwned {
@@ -90,7 +91,8 @@ contract VaultV4ForkTest is Test {
     bytes32 internal constant CASH = keccak256("OSTRA/EVM/TEST/v4-usdg-vault");
     bytes32 internal constant STOCK = keccak256("OSTRA/EVM/TEST/v4-stock-vault");
     bytes32 internal constant GUARD_VAULT = keccak256("OSTRA/EVM/TEST/v4-guard-vault");
-    address internal constant WITHDRAWAL = address(0xC01D);
+    /// @dev The withdrawal address: a real Safe (version 5 refuses one with no code), made in setUp.
+    address internal WITHDRAWAL;
     address internal constant GUARDIAN = address(0x6A2D);
     address internal constant SUBMITTER = address(0x5EB);
     uint32 internal constant DELAY = 36 hours;
@@ -100,6 +102,7 @@ contract VaultV4ForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork("robinhood");
+        WITHDRAWAL = SafeWallet.create(makeAddr("withdrawal owner"), 1);
         assertEq(block.chainid, 4663);
         // The venues as this test expects them.
         assertEq(IERC4626Venue(SPARK).asset(), USDG);
@@ -110,7 +113,7 @@ contract VaultV4ForkTest is Test {
         OstraRegistry registry = new OstraRegistry();
         (factory,) = VaultStack.deploy(address(registry));
         OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
-        assertEq(implementation.VERSION(), 4);
+        assertEq(implementation.VERSION(), 5);
         m4 = OstraVaultModuleV4(implementation.MODULE_V4());
         assertEq(address(m4.FACTORY()), address(factory));
         assertEq(m4.IDENTITY_REGISTRY(), IDENTITY_REGISTRY);
@@ -227,9 +230,9 @@ contract VaultV4ForkTest is Test {
             vm.prank(SUBMITTER, SUBMITTER);
             v.spend(25 + i, n, wrong[i], g);
         }
-        (bytes32 next, bytes memory sig) = _signed(v, CASH, 29, "");
+        (bytes32 next, bytes memory sig) = _signed(v, CASH, 47, "");
         vm.expectRevert(OstraVault.BadAction.selector);
-        v.spend(29, next, "", sig);
+        v.spend(47, next, "", sig);
         assertEq(v.nonce(), 0);
     }
 

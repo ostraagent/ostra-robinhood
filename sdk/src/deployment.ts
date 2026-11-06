@@ -26,6 +26,8 @@ export type Deployment = {
   vaultModule?: Address;
   /** OstraVaultModuleV4, which version 4 vaults run their version 4 spends in; absent while the vaults run version 3 or below. */
   vaultModuleV4?: Address;
+  /** OstraVaultModuleV5, which version 5 vaults run their version 5 spends in; absent while the vaults run version 4 or below. */
+  vaultModuleV5?: Address;
   /** OstraBreaker (Strategy 3), which serves version 3 vaults; absent before it was deployed. */
   breaker?: Address;
   /** The launchpad (deployLaunchpad), when it is deployed. */
@@ -99,6 +101,11 @@ export function parseDeployment(value: unknown): Deployment {
     if (typeof v.vaultModuleV4 !== "string" || !isAddress(v.vaultModuleV4, { strict: false })) throw new Error("deployment vaultModuleV4 is not an address");
     if (v.vaultModule === undefined) throw new Error("a deployment with a vaultModuleV4 has a vaultModule");
     out.vaultModuleV4 = getAddress(v.vaultModuleV4);
+  }
+  if (v.vaultModuleV5 !== undefined) {
+    if (typeof v.vaultModuleV5 !== "string" || !isAddress(v.vaultModuleV5, { strict: false })) throw new Error("deployment vaultModuleV5 is not an address");
+    if (v.vaultModuleV4 === undefined) throw new Error("a deployment with a vaultModuleV5 has a vaultModuleV4");
+    out.vaultModuleV5 = getAddress(v.vaultModuleV5);
   }
   if (v.launchpad !== undefined) {
     if (typeof v.launchpad !== "object" || v.launchpad === null) throw new Error("deployment launchpad must be an object");

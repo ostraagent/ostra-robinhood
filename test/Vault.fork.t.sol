@@ -19,6 +19,7 @@ import {Wots} from "../src/Wots.sol";
 import {IX402BatchSettlement} from "../src/interfaces/IX402BatchSettlement.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 import {VaultStack} from "./utils/VaultStack.sol";
+import {SafeWallet} from "./utils/SafeWallet.sol";
 import {OstraVaultV3} from "../src/OstraVaultV3.sol";
 import {OstraVaultModule} from "../src/OstraVaultModule.sol";
 
@@ -90,7 +91,7 @@ contract VaultForkTest is Test {
         (factory,) = VaultStack.deploy(address(registry));
         OstraVault implementation = OstraVault(UpgradeableBeacon(factory.BEACON()).implementation());
         assertEq(address(implementation.POOL_MANAGER()), POOL_MANAGER);
-        assertEq(implementation.VERSION(), 4);
+        assertEq(implementation.VERSION(), 5);
         splitFactory = new OstraSplitFactory();
     }
 
@@ -113,8 +114,13 @@ contract VaultForkTest is Test {
     /// @dev Signs and submits a spend with the vault's current key, as a relayer would.
     function _spend(OstraVault vault, bytes32 keychain, uint8 action, bytes memory params) internal {
         (bytes32 next, bytes memory signature) = _sign(vault, keychain, action, params);
+        // A failed swap lands only for a spend sent on its own (version 5): swaps go from an account with no code.
+        if (action == 3) vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend(action, next, params, signature);
     }
+
+    /// @dev An account with no code that sends swap spends on their own (a transaction's own call).
+    address internal constant SWAP_SUBMITTER = address(0x5EB);
 
     function _sign(OstraVault vault, bytes32 keychain, uint8 action, bytes memory params)
         internal
@@ -249,7 +255,7 @@ contract VaultForkTest is Test {
         OstraVault vault = _vault(BUYER, address(0));
         bytes memory signature = new bytes(Wots.SIGNATURE_LEN);
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(29, bytes32(0), "", signature);
+        vault.spend(47, bytes32(0), "", signature);
         // DevBuy: abi.encode(devBuy, launchHash, amount), 96 bytes.
         vm.expectRevert(OstraVault.BadParams.selector);
         vault.spend(9, bytes32(0), new bytes(64), signature);
@@ -521,6 +527,7 @@ contract VaultForkTest is Test {
         (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
         vm.expectEmit(address(vault));
         emit OstraVault.SwapFailed(keccak256(abi.encode(_ethUsdg())), OstraVault.InsufficientOutput.selector);
+        vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend(3, next, params, signature);
         assertEq(vault.nonce(), 1);
         assertEq(vault.keyRoot(), next);
@@ -542,6 +549,17 @@ contract VaultForkTest is Test {
         _spend(vault, BUYER, 3, _swapParams(_ethUsdg(), false, 10e6, 1, to));
         assertEq(usdg.balanceOf(address(vault)), 80e6);
         assertGt(to.balance, expected);
+
+        // Sent by a contract (this test), a failed swap reverts and keeps the key (version 5): a contract could have
+        // moved the price past the minimum in the same transaction to burn the owner's key.
+        uint256 sent = to.balance;
+        params = _swapParams(_ethUsdg(), false, 10e6, type(uint128).max, to);
+        (next, signature) = _sign(vault, BUYER, 3, params);
+        vm.expectRevert(OstraVault.InsufficientOutput.selector);
+        vault.spend(3, next, params, signature);
+        assertEq(vault.nonce(), 3);
+        assertEq(usdg.balanceOf(address(vault)), 80e6);
+        assertEq(to.balance, sent);
     }
 
     /// @dev The token at 0xaF3D...93f9 (symbol AAPL, 18 decimals), a stock token on Robinhood Chain.
@@ -646,6 +664,7 @@ contract VaultForkTest is Test {
         params = _swapParams(_ethUsdg(), false, 101e6, 1, to);
         (next, signature) = _sign(vault, BUYER, 3, params);
         vm.recordLogs();
+        vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend(3, next, params, signature);
         assertTrue(_swapFailed(address(vault)));
         assertEq(vault.nonce(), 1);
@@ -670,10 +689,12 @@ contract VaultForkTest is Test {
         (next, signature) = _sign(vault, BUYER, 3, params);
         uint256 snapshot = vm.snapshotState();
         vm.recordLogs();
+        vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend{gas: 2_000_000}(3, next, params, signature);
         assertTrue(_swapFailed(address(vault)));
         vm.revertToState(snapshot);
         vm.recordLogs();
+        vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend{gas: 20_000_000}(3, next, params, signature);
         assertTrue(_swapFailed(address(vault)));
         assertEq(vault.nonce(), 1);
@@ -695,7 +716,8 @@ contract VaultForkTest is Test {
     function test_theWithdrawalLockCountsSwapsAndChannelsButNotAFailedSwap() public {
         OstraVault vault = _vault(BUYER, address(0));
         _fund(address(vault), 100e6);
-        address withdrawal = makeAddr("withdrawal");
+        // A real Safe: version 5 refuses a withdrawal address with no code.
+        address withdrawal = SafeWallet.create(makeAddr("withdrawal owner"), 1);
         _spend(vault, BUYER, 14, abi.encode(withdrawal, uint32(36 hours), uint128(15e6)));
         address to = makeAddr("eth recipient");
 
@@ -800,6 +822,7 @@ contract VaultForkTest is Test {
         (bytes32 next, bytes memory signature) = _sign(vault, BUYER, 3, params);
         vm.expectEmit(address(vault));
         emit OstraVault.SwapFailed(keccak256(abi.encode(_ethUsdg())), CustomRevert.WrappedError.selector);
+        vm.prank(SWAP_SUBMITTER, SWAP_SUBMITTER);
         vault.spend(3, next, params, signature);
         assertEq(vault.nonce(), 1);
         assertEq(usdg.balanceOf(address(vault)), 100e6);
@@ -1040,8 +1063,8 @@ contract VaultForkTest is Test {
         }
         // The longest URI passes; an action past the last one is refused.
         _spend(vault, BUYER, setProfile, abi.encode(string(new bytes(256))));
-        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 29, abi.encode("ipfs://x"));
+        (bytes32 n2, bytes memory s2) = _sign(vault, BUYER, 47, abi.encode("ipfs://x"));
         vm.expectRevert(OstraVault.BadAction.selector);
-        vault.spend(29, n2, abi.encode("ipfs://x"), s2);
+        vault.spend(47, n2, abi.encode("ipfs://x"), s2);
     }
 }

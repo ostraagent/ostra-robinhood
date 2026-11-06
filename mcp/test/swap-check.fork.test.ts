@@ -20,7 +20,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { createPublicClient, createWalletClient, getAddress, http, numberToHex, parseUnits, type Address, type PrivateKeyAccount, type PublicClient } from "viem";
-import { VAULT_V3, VAULT_V4, VAULT_VERSION, checkDeployment, ostraVaultAbi, parseDeployment } from "@ostraagent/sdk";
+import { VAULT_V3, VAULT_V4, VAULT_V5, VAULT_VERSION, checkDeployment, ostraVaultAbi, parseDeployment } from "@ostraagent/sdk";
 import { startFork, vaultBeaconAtRecord, type Fork } from "@ostraagent/sdk/test/fork";
 import { PoolIndex, ROBINHOOD_PUBLIC_RPC, USDG, WETH, findRoute } from "@ostraagent/swap";
 import { setupMainnet } from "../../relayer/scripts/setup-mainnet.ts";
@@ -94,7 +94,7 @@ test("scripts/swap-check.ts passes through the relayer and keeper processes set 
   // Every vault on the record's version: the scheduled upgrade run on the fork when mainnet has not run it yet.
   const how = await vaultBeaconAtRecord(fork, live);
   await checkDeployment(fork.client, live);
-  const version = live.vaultModuleV4 !== undefined ? VAULT_V4 : live.vaultModule === undefined ? VAULT_VERSION : VAULT_V3;
+  const version = live.vaultModuleV5 !== undefined ? VAULT_V5 : live.vaultModuleV4 !== undefined ? VAULT_V4 : live.vaultModule === undefined ? VAULT_VERSION : VAULT_V3;
   assert.equal(await fork.client.readContract({ address: live.vaultImplementation, abi: ostraVaultAbi, functionName: "VERSION" }), version);
   console.log(`vault version ${version}: ${how}`);
   const deploymentPath = LIVE_DEPLOYMENT;

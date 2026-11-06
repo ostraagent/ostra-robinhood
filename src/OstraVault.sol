@@ -19,6 +19,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Wots} from "./Wots.sol";
 import {OstraVaultV3} from "./OstraVaultV3.sol";
 import {OstraVaultV4} from "./OstraVaultV4.sol";
+import {OstraVaultV5} from "./OstraVaultV5.sol";
 import {IX402BatchSettlement} from "./interfaces/IX402BatchSettlement.sol";
 
 /// @notice What a ConfigurePool spend calls (OstraHook.configure; PoolId is a bytes32).
@@ -35,6 +36,11 @@ interface IOstraDevBuyLaunch {
 interface IOstraRegistry {
     function setProfile(string calldata uri) external;
     function setTokenMetadata(address token, bytes32 poolId, string calldata uri) external;
+}
+
+/// @notice The OstraVaultModuleV5 an implementation is built with names the OstraVaultModuleV4 it runs orders through.
+interface IOstraVaultModuleV5 {
+    function MODULE_V4() external view returns (address);
 }
 
 /// @notice What RegisterAgent and SetAgentUri spends call: the ERC-8004 Identity Registry.
@@ -55,7 +61,8 @@ interface IAgentIdentityRegistry {
 ///                  x402BatchSettlement channel {payer: this vault, token: this vault's token, ...}; the vault
 ///                  itself is the deposit collector, and only for that one deposit. payerAuthorizer (the
 ///                  channel's voucher key) must not be zero.
-/// * 2 SetCrankKey: params abi.encode(address crank). address(0) removes the crank.
+/// * 2 SetCrankKey: params abi.encode(address crank). address(0) removes the crank; under the withdrawal lock that is
+///                  all it may do (version 5).
 /// * 3 Swap:        params abi.encode(PoolKey key, bool zeroForOne, uint128 amountIn, uint128 minOut,
 ///                  address recipient, address referrer, uint32 swapGas). An exact-input swap of up to `amountIn`
 ///                  of this vault's token on the Uniswap v4 pool `key`, which must have this vault's token on its
@@ -67,10 +74,13 @@ interface IAgentIdentityRegistry {
 ///                  MAX_SWAP_GAS, signed: a quote's gas with a margin), whatever gas the spend was sent with; with
 ///                  less available the spend reverts. A swap that fails inside the PoolManager (below `minOut`,
 ///                  refused by the pool's hook, such as an Ostra pool's circuit breaker, a token that refuses the
-///                  transfer, or more than `swapGas` needed) moves nothing but still uses the spend: the vault emits
+///                  transfer, or more than `swapGas` needed) moves nothing but still uses the spend, when the spend
+///                  is sent on its own (a transaction's own call from an account with no code): the vault emits
 ///                  SwapFailed with the failure's selector (WrappedError for a hook's or a token's refusal) and the
-///                  next key signs again, so a swap whose market moved never holds the key. A spend sent from inside
-///                  another PoolManager unlock, and malformed params, revert.
+///                  next key signs again, so a swap whose market moved never holds the key. Sent from a contract the
+///                  failure reverts and keeps the key (version 5: the contract could have set the failure up), and an
+///                  agent key's failed swap always reverts. A spend sent from inside another PoolManager unlock, and
+///                  malformed params, revert.
 /// * 4 ConfigurePool: params abi.encode(address hook, bytes32 poolId, uint8 field, uint256 value). Calls
 ///                  hook.configure(poolId, field, value) as this vault: an OstraHook lets a pool's creator vault
 ///                  change the pool's rules, and only in the traders' favour (OstraHook.configure).
@@ -101,7 +111,9 @@ interface IAgentIdentityRegistry {
 ///                  identity token, so an identity stays with the vault that registered it.
 /// * 14 SetWithdrawalLock: params abi.encode(address withdrawal, uint32 delay, uint128 dailyLimit). Turns the
 ///                  withdrawal lock on (withdrawal not zero, MIN_RECOVERY_DELAY <= delay <= MAX_RECOVERY_DELAY) or off
-///                  (all three zero). See "Withdrawal lock" below.
+///                  (all three zero). Version 5: a new withdrawal address must have code when it is chosen (an Ostra
+///                  vault or a smart wallet, not an account with no code); the one already in force may stay. See
+///                  "Withdrawal lock" below.
 /// * 15 CancelPendingChanges: params empty. Drops a lock change and a link change that are still waiting, and the venue
 ///                  enables still waiting (version 4).
 /// * 16 SetLinkedVault: params abi.encode(address vault). The owner's other vault that Borrow pays and that
@@ -149,6 +161,24 @@ interface IAgentIdentityRegistry {
 ///                  the position itself. Their rules, and the breaker (tripVenue) and guard op 5 that bring a position
 ///                  home, are in OstraVaultModuleV4, where they run by delegatecall (as do CancelPendingChanges, which
 ///                  also drops the venue enables still waiting, and guard op 0).
+/// * 29 to 46 (version 5, in OstraVaultModuleV5, which has their params and rules): 29 SetPolicy, 30 SetAllow,
+///                  31 SetAgentKey, 32 RevokeAgentKey, 33 SetOrder, 34 CancelOrder, 35 PriorsBorrow, 36 PriorsRepay,
+///                  37 PriorsConsent, 38 PriorsLeave, 39 RootEnroll, 40 RootAddStake, 41 RootSponsor, 42 RootVouch,
+///                  43 RootUnvouch, 44 RootFreeze, 45 RootUnlock, 46 RootClaimFees.
+///
+/// Agent key (version 5, optional): a second WOTS key chain the owner sets (SetAgentKey: its root and an expiry), with its
+/// own nonce and its own signed message, "OSTRA/VAULT/EVM/AGENT/v1" || chainid (32) || vault (20) || agent nonce (8) ||
+/// nextKeyRoot (32) || action (1) || params, sent through spendAsAgent. It may use only the actions the policy allows,
+/// out of a fixed set that never includes the guardians, the recovery, the lock, the link, the crank, a hash approval,
+/// the venues, the identity, the policy or setting an agent key (it may end its own); what it sends out counts against
+/// the policy's per-spend and daily bounds and its recipients must be on the policy's allowlists, on top of everything
+/// an owner spend is held to.
+/// Standing orders (runOrder) and Priors repays that are due (repayDue) run for anyone, within the policy. Setting an
+/// agent key, a looser policy and a new allowlist entry wait the lock's delay under the lock, as a looser lock does; a
+/// guardian or the withdrawal address can drop them (guard op 0) and end the agent key and every order (guard op 7), and
+/// a recovery that reaches its threshold ends them all. Turning the lock on ends the agent key and its orders; an owner
+/// spend whose next key is the agent key's root ends the agent key too. With no policy (the state after the upgrade)
+/// the agent key can do nothing and no order runs.
 ///
 /// Withdrawal lock (optional): a fixed withdrawal address, always reachable at once, and a daily limit on every
 /// other outflow, so that a stolen seed cannot empty the vault at once, and its owner can move everything to the
@@ -168,9 +198,11 @@ interface IAgentIdentityRegistry {
 ///   a new linked vault, and a hash approval take effect only `delay` after they are signed; meanwhile the owner
 ///   (CancelPendingChanges), any guardian or the withdrawal address (guard, or Guard from a guardian vault) can
 ///   drop them. A change that only tightens the lock takes effect at once and drops a loosening still waiting.
-///   Turning the lock on is at once, and drops every hash approval given before.
+///   Turning the lock on is at once, and drops every hash approval given before (and, version 5, the agent key and the
+///   orders it set).
 /// * A key a thief has taken over (any spend picks the next key) must not end the owner's protection: SetGuardian,
-///   SetRecoveryPolicy, SetCrankKey and ConfigurePool are refused, a spend no longer stops a recovery under way, and
+///   SetRecoveryPolicy, SetCrankKey (except to remove the crank) and ConfigurePool are refused, any guardian or the
+///   withdrawal address can remove the crank (guard op 8), a spend no longer stops a recovery under way, and
 ///   any guardian or the withdrawal address can bring lent shares and collateral back into the vault and send the
 ///   whole balance of the token to the withdrawal address (guard). A recovery that reaches its threshold drops the
 ///   changes and hash approvals waiting, and while it waits nothing new may start waiting. So the guardians can
@@ -229,11 +261,30 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     uint8 public constant ACTION_ENTER = 26;
     uint8 public constant ACTION_EXIT = 27;
     uint8 public constant ACTION_FORWARD = 28;
+    uint8 public constant ACTION_SET_POLICY = 29;
+    uint8 public constant ACTION_SET_ALLOW = 30;
+    uint8 public constant ACTION_SET_AGENT_KEY = 31;
+    uint8 public constant ACTION_REVOKE_AGENT_KEY = 32;
+    uint8 public constant ACTION_SET_ORDER = 33;
+    uint8 public constant ACTION_CANCEL_ORDER = 34;
+    uint8 public constant ACTION_PRIORS_BORROW = 35;
+    uint8 public constant ACTION_PRIORS_REPAY = 36;
+    uint8 public constant ACTION_PRIORS_CONSENT = 37;
+    uint8 public constant ACTION_PRIORS_LEAVE = 38;
+    uint8 public constant ACTION_ROOT_ENROLL = 39;
+    uint8 public constant ACTION_ROOT_ADD_STAKE = 40;
+    uint8 public constant ACTION_ROOT_SPONSOR = 41;
+    uint8 public constant ACTION_ROOT_VOUCH = 42;
+    uint8 public constant ACTION_ROOT_UNVOUCH = 43;
+    uint8 public constant ACTION_ROOT_FREEZE = 44;
+    uint8 public constant ACTION_ROOT_UNLOCK = 45;
+    uint8 public constant ACTION_ROOT_CLAIM_FEES = 46;
 
     /// @notice The implementation version: 2 adds the profile, token metadata and agent identity spends; 3 adds the
     ///         withdrawal lock, Morpho Vault V2 and Morpho Blue (Borro) spends and EIP-1271; 4 adds the venues (SetVenue,
-    ///         Enter, Exit, Forward), guard op 5 and the venue breaker.
-    uint8 public constant VERSION = 4;
+    ///         Enter, Exit, Forward), guard op 5 and the venue breaker; 5 adds the agent key and its policy, standing orders and
+    ///         Priors credit (29 to 46, spendAsAgent, runOrder, repayDue, guard ops 7 and 8).
+    uint8 public constant VERSION = 5;
     /// @notice Longest URI a SetProfile, SetTokenMetadata, RegisterAgent or SetAgentUri spend may carry.
     uint256 public constant MAX_URI_LENGTH = 256;
 
@@ -265,6 +316,22 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     /// @dev Guard op 0 (drop the waiting changes) and ops 5 and up (venue exit) run in OstraVaultModuleV4.
     uint8 private constant GUARD_CANCEL = 0;
     uint8 private constant GUARD_EXIT = 5;
+    /// @dev Guard op 7 (end the agent key and every standing order) runs in OstraVaultModuleV5.
+    uint8 private constant GUARD_AGENT_STOP = 7;
+    /// @dev Guard op 8 (remove the crank) runs here.
+    uint8 private constant GUARD_CLEAR_CRANK = 8;
+    /// @dev OstraVaultModuleV5's entry points.
+    bytes4 private constant MODULE_V5_AGENT = bytes4(keccak256("agent(uint8,bytes32,bytes,bytes,bool)"));
+    bytes4 private constant MODULE_V5_RUN = bytes4(keccak256("run(uint8,bytes,address,bool,bool)"));
+    bytes4 private constant MODULE_V5_AGENT_EXIT = bytes4(keccak256("agentExit(bytes,address)"));
+    bytes4 private constant MODULE_V5_RUN_ORDER = bytes4(keccak256("runOrder(uint256,address,bool)"));
+    bytes4 private constant MODULE_V5_REPAY_DUE = bytes4(keccak256("repayDue(uint256,address)"));
+    bytes4 private constant MODULE_V5_CANCEL = bytes4(keccak256("cancel(address)"));
+    bytes4 private constant MODULE_V5_STOP = bytes4(keccak256("stop(address,bytes)"));
+    bytes4 private constant MODULE_V5_ON_RECOVERY = bytes4(keccak256("onRecovery()"));
+    bytes4 private constant MODULE_V5_ON_LOCK_ON = bytes4(keccak256("onLockOn()"));
+    bytes4 private constant MODULE_V5_GUARD_SPEND = bytes4(keccak256("guardSpend(bytes)"));
+    bytes24 private constant AGENT_DOMAIN = "OSTRA/VAULT/EVM/AGENT/v1";
 
     bytes18 private constant SPEND_DOMAIN = "OSTRA/VAULT/EVM/v1";
     bytes32 public constant CLOSE_REQUEST_TYPEHASH =
@@ -285,6 +352,9 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     ///         with op 5 or 6, guard ops 0, 5 and 6 and the breaker run in by delegatecall; OstraVaultModule runs the other
     ///         spends from 5 to 24.
     address public immutable MODULE_V4;
+    /// @notice OstraVaultModuleV5, which this vault's version 5 spends (29 to 46), the agent key's checks, standing orders,
+    ///         Priors repays, guard op 7 and a Guard spend with op 7 or 8 run in by delegatecall.
+    address public immutable MODULE_V5;
 
     IERC20 public token;
     bytes32 public initialKeyRoot;
@@ -359,6 +429,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     error NoRecovery();
     error RecoveryNotReady();
     error Locked();
+    error WithdrawalHasNoCode();
 
     /// @notice The contracts every vault uses, fixed in the implementation.
     struct Externals {
@@ -368,19 +439,23 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         address identityRegistry;
         address module;
         address moduleV4;
+        address moduleV5;
     }
 
     constructor(Externals memory e) EIP712("Ostra Vault", "1") {
         if (
             e.registry == address(0) || e.identityRegistry == address(0) || e.module.code.length == 0
-                || e.moduleV4.code.length == 0
+                || e.moduleV4.code.length == 0 || e.moduleV5.code.length == 0
         ) revert BadParams();
+        // Module V5 runs orders, repays and the agent key's exits through this implementation's own module V4.
+        if (IOstraVaultModuleV5(e.moduleV5).MODULE_V4() != e.moduleV4) revert BadParams();
         BATCH_SETTLEMENT = IX402BatchSettlement(e.batchSettlement);
         POOL_MANAGER = IPoolManager(e.poolManager);
         REGISTRY = IOstraRegistry(e.registry);
         IDENTITY_REGISTRY = IAgentIdentityRegistry(e.identityRegistry);
         MODULE = e.module;
         MODULE_V4 = e.moduleV4;
+        MODULE_V5 = e.moduleV5;
         _disableInitializers();
     }
 
@@ -414,6 +489,13 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         bytes memory message = spendMessage(action, nextKeyRoot, params);
         bytes32 signer = Wots.recoverKeyRoot(signature, message);
         if (signer != keyRoot) _finishRecoveryBy(signer);
+        // A zero next key would end the vault's key for good.
+        if (nextKeyRoot == bytes32(0)) revert BadParams();
+        // The agent key's root as the owner's next key ends the agent key here, so that no one-time key ever signs for
+        // both. (The agent key can copy the next root of an owner spend seen in flight; refusing would hold that signed
+        // spend for good.)
+        OstraVaultV5.Layout storage l5 = OstraVaultV5.layout();
+        if (nextKeyRoot == l5.agentRoot) OstraVaultV5.revokeAgent(l5, address(this));
 
         // Rotate before any external call: the signature can never be used again.
         uint64 spent = nonce;
@@ -431,7 +513,33 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             }
         }
         emit Spent(spent, action, nextKeyRoot);
+        _run(action, params, v3, locked, false);
+    }
 
+    /// @notice A spend signed by the agent key (version 5), with the agent key's own message (agentSpendMessage) and
+    ///         nonce: OstraVaultModuleV5 checks the signature, rotates the agent key and judges the spend against the
+    ///         policy, then the action runs exactly as an owner spend's would. Refused while a recovery is under way; never
+    ///         stops or finishes one.
+    function spendAsAgent(uint8 action, bytes32 nextKeyRoot, bytes calldata params, bytes calldata signature)
+        external
+        nonReentrant
+    {
+        _checkParamsShape(action, params);
+        OstraVaultV3.Layout storage v3 = OstraVaultV3.layout();
+        OstraVaultV3.applyPendingChanges(v3);
+        _delegate(
+            MODULE_V5,
+            abi.encodeWithSelector(
+                MODULE_V5_AGENT, action, nextKeyRoot, params, signature, _recovering()
+            )
+        );
+        _run(action, params, v3, v3.lock.withdrawal != address(0), true);
+    }
+
+    /// @dev Runs a spend whose signature was checked and whose key has rotated; `byAgent`: the agent key signed it.
+    function _run(uint8 action, bytes calldata params, OstraVaultV3.Layout storage v3, bool locked, bool byAgent)
+        private
+    {
         if (action == ACTION_TRANSFER) {
             (address to, uint256 amount) = abi.decode(params, (address, uint256));
             if (amount == 0) revert ZeroAmount();
@@ -440,12 +548,13 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
         } else if (action == ACTION_OPEN_CHANNEL) {
             _openChannel(params);
         } else if (action == ACTION_SET_CRANK_KEY) {
-            if (locked) revert Locked();
             address newCrank = abi.decode(params, (address));
+            // Under the lock the crank may only be removed (a stolen crank could refund the channels paid to this vault).
+            if (locked && newCrank != address(0)) revert Locked();
             crank = newCrank;
             emit CrankChanged(newCrank);
         } else if (action == ACTION_SWAP) {
-            _swap(params);
+            _swap(params, byAgent);
         } else if (action == ACTION_CONFIGURE_POOL) {
             if (locked) revert Locked();
             (address hook, bytes32 poolId, uint8 field, uint256 value) =
@@ -481,8 +590,22 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             (uint256 agentId, string memory uri) = abi.decode(params, (uint256, string));
             IDENTITY_REGISTRY.setAgentURI(agentId, uri);
         } else {
-            // ClaimDividend (5), SupportRecovery (8) and the version 3 and 4 spends (14 to 28).
-            _moduleSpend(action, params);
+            if (action == ACTION_SET_WITHDRAWAL_LOCK) {
+                // Version 5: a new withdrawal address must have code now (an Ostra vault, a smart wallet).
+                // An address with no code counts as keeping what it gets, and an Ostra vault can still be created at
+                // one (by anyone, unlocked): a stolen seed could send everything there past the daily limit.
+                // The withdrawal already in force (one chosen before version 5) may stay, so its lock can be tightened.
+                address withdrawal = abi.decode(params, (address));
+                if (withdrawal != address(0) && withdrawal != v3.lock.withdrawal && withdrawal.code.length == 0) {
+                    revert WithdrawalHasNoCode();
+                }
+            }
+            // ClaimDividend (5), SupportRecovery (8) and the version 3, 4 and 5 spends (14 to 46).
+            _moduleSpend(action, params, byAgent);
+            // Turning the lock on drops what was given before it, as the hash approvals: the agent key and its orders.
+            if (action == ACTION_SET_WITHDRAWAL_LOCK && !locked && v3.lock.withdrawal != address(0)) {
+                _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_ON_LOCK_ON));
+            }
         }
     }
 
@@ -531,9 +654,25 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             if (params.length != 96) revert BadParams();
         } else if (action == ACTION_ENTER || action == ACTION_EXIT) {
             if (params.length != 128) revert BadParams();
+        } else if (action >= ACTION_SET_POLICY && action <= ACTION_ROOT_CLAIM_FEES) {
+            if (params.length != _v5ParamsLength(action)) revert BadParams();
         } else {
             revert BadAction();
         }
+    }
+
+    /// @dev The exact params length of a version 5 spend (OstraVaultModuleV5 checks it again).
+    function _v5ParamsLength(uint8 action) private pure returns (uint256) {
+        if (action == ACTION_SET_POLICY) return 416;
+        if (action == ACTION_SET_ORDER) return 256;
+        if (action == ACTION_PRIORS_BORROW) return 384;
+        if (action == ACTION_ROOT_SPONSOR) return 352;
+        if (action == ACTION_PRIORS_CONSENT) return 128;
+        if (action == ACTION_SET_ALLOW || action == ACTION_ROOT_VOUCH || action == ACTION_ROOT_UNVOUCH) return 96;
+        if (action == ACTION_REVOKE_AGENT_KEY) return 0;
+        if (action == ACTION_CANCEL_ORDER || action == ACTION_PRIORS_LEAVE || action == ACTION_ROOT_CLAIM_FEES) return 32;
+        // SetAgentKey, PriorsRepay, RootEnroll, RootAddStake, RootFreeze, RootUnlock.
+        return 64;
     }
 
     /// @dev params is the ABI encoding of `heads` words whose last is a string: that word points just past the
@@ -605,7 +744,7 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     // Swaps on Uniswap v4
     // ---------------------------------------------------------------------------------------------
 
-    function _swap(bytes calldata params) private {
+    function _swap(bytes calldata params, bool byAgent) private {
         (PoolKey memory key, bool zeroForOne, uint128 amountIn,, address recipient) =
             abi.decode(params, (PoolKey, bool, uint128, uint128, address));
         if (amountIn == 0) revert ZeroAmount();
@@ -628,7 +767,16 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             // What the swap took counts against the lock's daily limit, whatever the recipient.
             _outflow(paid);
             emit Swapped(PoolId.unwrap(key.toId()), zeroForOne, paid, received, recipient);
-        } catch {
+        } catch (bytes memory ret) {
+            // A failure lands (and uses up the key) only for a spend sent on its own, as a transaction's own call from an
+            // account with no code: inside another contract's call the failure could be one it set up (moving the
+            // price past minOut and back), so the spend reverts and keeps its key. An agent spend never lands a failed
+            // swap, so that nobody can spend its budget on a swap that paid nothing.
+            if (byAgent || msg.sender != tx.origin || msg.sender.code.length != 0) {
+                assembly ("memory-safe") {
+                    revert(add(ret, 0x20), mload(ret))
+                }
+            }
             // The swap failed on its own merits: nothing moved (the PoolManager undid it all) and the key has rotated.
             _swapPending = false;
             bytes4 reason;
@@ -738,18 +886,36 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     ///         abi.encode(address vault, uint256 shares); 4 take collateral back here, abi.encode(bytes32 marketId,
     ///         uint256 shares), within the same LTV cap; 5 bring a venue position back here, abi.encode(uint8 kind,
     ///         address venue, uint256 amount); 6 op 5 then op 2 in one call, abi.encode(uint8 kind, address venue,
-    ///         uint256 amount, address expected). So the owner's way out survives a key a thief has taken over.
-    ///         Changes whose wait is over are made first.
+    ///         uint256 amount, address expected). So the owner's way out survives a key a thief has taken over. Version 5:
+    ///         op 0 also drops the version 5 changes waiting (a policy, an agent key, allowlist entries); op 7 (params
+    ///         empty) ends the agent key and every standing order; op 8 (params empty) removes the crank. Changes whose
+    ///         wait is over are made first.
     function guard(uint8 op, bytes calldata params) external nonReentrant {
         OstraVaultV3.Layout storage l = OstraVaultV3.layout();
         OstraVaultV3.applyPendingChanges(l);
         address withdrawal = l.lock.withdrawal;
         if (withdrawal == address(0)) revert Locked();
         if (!isGuardian[msg.sender] && msg.sender != withdrawal) revert NotGuardian();
-        _delegate(
-            op == GUARD_CANCEL || op >= GUARD_EXIT ? MODULE_V4 : MODULE,
-            abi.encodeWithSelector(MODULE_GUARD, op, params, address(token))
-        );
+        if (op == GUARD_CANCEL) {
+            // The version 3 and 4 changes in OstraVaultModuleV4 (which refuses when nothing waits at all), version 5's in
+            // OstraVaultModuleV5.
+            bool waiting5 = OstraVaultV5.waiting(OstraVaultV5.layout());
+            if (
+                !waiting5 || l.pendingLockAt != 0 || l.pendingLinkedAt != 0
+                    || OstraVaultV4.waiting(OstraVaultV4.layout())
+            ) {
+                _delegate(MODULE_V4, abi.encodeWithSelector(MODULE_GUARD, op, params, address(token)));
+            }
+            if (waiting5) _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_CANCEL, msg.sender));
+        } else if (op == GUARD_AGENT_STOP) {
+            _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_STOP, msg.sender, params));
+        } else if (op == GUARD_CLEAR_CRANK) {
+            if (params.length != 0) revert BadParams();
+            crank = address(0);
+            emit CrankChanged(address(0));
+        } else {
+            _delegate(op >= GUARD_EXIT ? MODULE_V4 : MODULE, abi.encodeWithSelector(MODULE_GUARD, op, params, address(token)));
+        }
     }
 
     /// @notice The venue breaker (OstraVaultModuleV4.trip): anyone may bring this vault's position in `venue` home
@@ -795,15 +961,40 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
     // ---------------------------------------------------------------------------------------------
 
     /// @dev Runs a version 3 or 4 spend in its module by delegatecall, and passes on its revert as it is; the module also
-    ///      learns whether a recovery is under way. OstraVaultModuleV4 runs 25 to 28, CancelPendingChanges (it drops
-    ///      the venue enables waiting too) and a Guard spend with op 5 or 6 (its op word's last byte; the module's
-    ///      decode refuses a dirty word); OstraVaultModule runs the rest.
-    function _moduleSpend(uint8 action, bytes calldata params) private {
-        PendingRecovery memory p = pendingRecovery;
-        bool recovering = p.executableAt != 0 && p.round == recoveryRound;
+    ///      learns whether a recovery is under way. OstraVaultModuleV5 runs 29 to 46 and a Guard spend with op 7 or 8;
+    ///      OstraVaultModuleV4 runs 25 to 28, CancelPendingChanges (it drops the venue enables waiting too, and
+    ///      OstraVaultModuleV5 then version 5's) and a Guard spend with op 5 or 6 (its op word's last byte; the
+    ///      module's decode refuses a dirty word); OstraVaultModule runs the rest.
+    function _moduleSpend(uint8 action, bytes calldata params, bool byAgent) private {
+        bool recovering = _recovering();
+        if (action >= ACTION_SET_POLICY) {
+            _delegate(
+                MODULE_V5, abi.encodeWithSelector(MODULE_V5_RUN, action, params, address(token), recovering, byAgent)
+            );
+            return;
+        }
+        if (byAgent && action == ACTION_EXIT) {
+            // The agent key's Exit is always strict and never in a loss (OstraVaultModuleV5.agentExit).
+            _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_AGENT_EXIT, params, address(token)));
+            return;
+        }
+        if (action == ACTION_GUARD && (uint8(params[63]) == GUARD_AGENT_STOP || uint8(params[63]) == GUARD_CLEAR_CRANK)) {
+            _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_GUARD_SPEND, params));
+            return;
+        }
         bool v4 = action >= ACTION_SET_VENUE || action == ACTION_CANCEL_PENDING_CHANGES
             || (action == ACTION_GUARD && uint8(params[63]) >= GUARD_EXIT);
         _delegate(v4 ? MODULE_V4 : MODULE, abi.encodeWithSelector(MODULE_RUN, action, params, address(token), recovering));
+        // CancelPendingChanges drops the version 5 changes waiting too.
+        if (action == ACTION_CANCEL_PENDING_CHANGES) {
+            _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_CANCEL, address(0)));
+        }
+    }
+
+    /// @dev Whether a guardian recovery is under way: one reached its threshold in the current round.
+    function _recovering() private view returns (bool) {
+        PendingRecovery memory p = pendingRecovery;
+        return p.executableAt != 0 && p.round == recoveryRound;
     }
 
     /// @dev Calls `module` by delegatecall and passes on its revert as it is.
@@ -814,6 +1005,86 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
                 revert(add(ret, 0x20), mload(ret))
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Version 5: standing orders, Priors repays, views
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice Runs standing order `id` (OstraVaultModuleV5.runOrder): anyone, once its interval has passed, judged
+    ///         against the policy in force; refused while a recovery is under way.
+    function runOrder(uint256 id) external nonReentrant {
+        OstraVaultV3.applyPendingChanges(OstraVaultV3.layout());
+        _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_RUN_ORDER, id, address(token), _recovering()));
+    }
+
+    /// @notice Repays Priors loan `loanId`, one this vault borrowed, in full (OstraVaultModuleV5.repayDue): anyone, from
+    ///         the policy's repay lead before it is due.
+    function repayDue(uint256 loanId) external nonReentrant {
+        OstraVaultV3.applyPendingChanges(OstraVaultV3.layout());
+        _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_REPAY_DUE, loanId, address(token)));
+    }
+
+    /// @notice The exact message the agent key must sign for its next spend.
+    function agentSpendMessage(uint8 action, bytes32 nextKeyRoot, bytes calldata params)
+        external
+        view
+        returns (bytes memory)
+    {
+        return abi.encodePacked(
+            AGENT_DOMAIN, block.chainid, address(this), OstraVaultV5.layout().agentNonce, nextKeyRoot, action, params
+        );
+    }
+
+    /// @notice The agent key: its current root (0: none), the nonce of its next spend, from when and until when it
+    ///         may sign, and whether it may sign now.
+    function agentKey() external view returns (bytes32 root, uint64 agentNonce, uint64 from, uint64 expiry, bool inForce) {
+        OstraVaultV5.Layout storage l = OstraVaultV5.layout();
+        return (l.agentRoot, l.agentNonce, l.agentFrom, l.agentExpiry, OstraVaultV5.agentInForce(l));
+    }
+
+    /// @notice The policy in force (a waiting one whose wait is over counts as made), and the one still waiting
+    ///         (`pendingAt` 0: none).
+    function policy()
+        external
+        view
+        returns (OstraVaultV5.Policy memory inForce, OstraVaultV5.Policy memory pending, uint64 pendingAt)
+    {
+        OstraVaultV5.Layout storage l = OstraVaultV5.layout();
+        inForce = OstraVaultV5.current(l);
+        if (l.pendingPolicyAt > block.timestamp) (pending, pendingAt) = (l.pendingPolicy, l.pendingPolicyAt);
+    }
+
+    /// @notice An allowlist entry: in force now, and from when it takes effect (0: not on the list).
+    function allowEntry(uint8 kind, bytes32 value) external view returns (bool inForce, uint64 from) {
+        OstraVaultV5.Layout storage l = OstraVaultV5.layout();
+        return (OstraVaultV5.allowed(l, kind, value), l.allows[OstraVaultV5.allowKey(kind, value)].from);
+    }
+
+    /// @notice Standing order `id`, and whether it can still run (not cancelled, stopped, run out or ended).
+    function order(uint256 id) external view returns (OstraVaultV5.Order memory o, bool live) {
+        OstraVaultV5.Layout storage l = OstraVaultV5.layout();
+        o = l.orders[id];
+        live = o.kind != 0 && o.epoch == l.orderEpoch && (o.endAt == 0 || block.timestamp < o.endAt)
+            && OstraVaultV5.setterLive(l, l.orders[id]);
+    }
+
+    /// @notice The number of standing orders ever set (ids 1 to it).
+    function orderCount() external view returns (uint64) {
+        return OstraVaultV5.layout().orderCount;
+    }
+
+    /// @notice What the agent key and the orders may still count now under the policy in force.
+    function budgetAvailable() external view returns (uint256) {
+        OstraVaultV5.Layout storage l = OstraVaultV5.layout();
+        uint128 daily = OstraVaultV5.current(l).daily;
+        uint256 u = OstraVaultV5.used(l, daily);
+        return u >= daily ? 0 : daily - u;
+    }
+
+    /// @notice Whether Priors loan `loanId` is one this vault borrowed and has not repaid itself.
+    function ownLoan(uint256 loanId) external view returns (bool) {
+        return OstraVaultV5.layout().ownLoans[loanId];
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -876,6 +1147,8 @@ contract OstraVault is Initializable, ReentrancyGuardTransient, EIP712, IUnlockC
             // And the venue enables still waiting.
             OstraVaultV4.Layout storage l4 = OstraVaultV4.layout();
             if (OstraVaultV4.waiting(l4)) OstraVaultV4.cancelWaiting(l4, address(this));
+            // And version 5's, and the agent key and every standing order end.
+            _delegate(MODULE_V5, abi.encodeWithSelector(MODULE_V5_ON_RECOVERY));
         }
     }
 

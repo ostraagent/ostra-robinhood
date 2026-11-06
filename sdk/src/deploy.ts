@@ -4,9 +4,11 @@
 //      OstraVaultModule (naming the factory about to be made, Morpho Blue,
 //      Morpho's VaultV2Factory, BorroBuilders, BorroRouter and Ostra's Borro
 //      code), OstraVaultModuleV4 (naming the same factory, Morpho's
-//      VaultV2Factory and the ERC-8004 Identity Registry), the OstraVault
+//      VaultV2Factory and the ERC-8004 Identity Registry), OstraVaultModuleV5
+//      (naming the same factory, that module V4, the Priors pool and its code
+//      hash, USDG, the ERC-8004 Identity Registry and OstraPad), the OstraVault
 //      implementation (bound to x402BatchSettlement, the Uniswap v4
-//      PoolManager, OstraRegistry, the ERC-8004 Identity Registry and the two
+//      PoolManager, OstraRegistry, the ERC-8004 Identity Registry and the three
 //      modules), its UpgradeableBeacon, and OstraVaultFactory on that beacon;
 //   2. OstraPool implementation, its UpgradeableBeacon, and the pool as a
 //      BeaconProxy initialized for USDG with the decided fee and limits;
@@ -47,6 +49,7 @@ import {
   ostraVaultFactoryAbi,
   ostraVaultModuleAbi,
   ostraVaultModuleV4Abi,
+  ostraVaultModuleV5Abi,
   upgradeableBeaconAbi,
 } from "./abi.ts";
 import {
@@ -59,11 +62,14 @@ import {
   MORPHO_VAULT_V2_FACTORY,
   VAULT_V3,
   VAULT_V4,
+  VAULT_V5,
   ERC8004_IDENTITY_REGISTRY,
   LAUNCHPAD,
   POOL_FEE_BPS,
   POOL_MAX_DEPOSIT,
   POOL_MAX_TOTAL,
+  PRIORS_POOL,
+  PRIORS_POOL_CODEHASH,
   ROBINHOOD_CHAIN_ID,
   UNISWAP_V4_POOL_MANAGER,
   USDG,
@@ -74,6 +80,7 @@ import {
 } from "./constants.ts";
 import type { Deployment, LaunchpadDeployment } from "./deployment.ts";
 import { LEAF_DENOMINATION } from "./leaves.ts";
+import { OSTRAPAD } from "./pad.ts";
 
 function creationCode(outDir: string, file: string, contract: string): Hex {
   const artifact = JSON.parse(readFileSync(`${outDir}/${file}/${contract}.json`, "utf8")) as { bytecode: { object: string } };
@@ -123,10 +130,10 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
   };
 
   const registry = await deploy("OstraRegistry", ostraRegistryAbi, creationCode(o.outDir, "OstraRegistry.sol", "OstraRegistry"), []);
-  // The modules name the factory, which is made four transactions later (module, module V4, implementation, beacon,
-  // factory).
+  // The modules name the factory, which is made five transactions later (module, module V4, module V5,
+  // implementation, beacon, factory).
   const nonce = await o.publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-  const predictedFactory = getContractAddress({ from: account.address, nonce: BigInt(nonce + 4) });
+  const predictedFactory = getContractAddress({ from: account.address, nonce: BigInt(nonce + 5) });
   const vaultModule = await deploy("OstraVaultModule", ostraVaultModuleAbi, creationCode(o.outDir, "OstraVaultModule.sol", "OstraVaultModule"), [
     predictedFactory,
     MORPHO_BLUE,
@@ -140,6 +147,12 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     MORPHO_VAULT_V2_FACTORY,
     ERC8004_IDENTITY_REGISTRY,
   ]);
+  const vaultModuleV5 = await deploy(
+    "OstraVaultModuleV5",
+    ostraVaultModuleV5Abi,
+    creationCode(o.outDir, "OstraVaultModuleV5.sol", "OstraVaultModuleV5"),
+    vaultModuleV5Args(predictedFactory, vaultModuleV4),
+  );
   const vaultImplementation = await deploy("OstraVault", ostraVaultAbi, creationCode(o.outDir, "OstraVault.sol", "OstraVault"), [
     {
       batchSettlement: X402_BATCH_SETTLEMENT,
@@ -148,6 +161,7 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
       identityRegistry: ERC8004_IDENTITY_REGISTRY,
       module: vaultModule,
       moduleV4: vaultModuleV4,
+      moduleV5: vaultModuleV5,
     },
   ]);
   expect("vault implementation BATCH_SETTLEMENT", await read(vaultImplementation, ostraVaultAbi, "BATCH_SETTLEMENT"), X402_BATCH_SETTLEMENT);
@@ -189,9 +203,15 @@ export async function deployOstra(o: DeployOptions): Promise<Deployment> {
     registry,
     vaultModule,
     vaultModuleV4,
+    vaultModuleV5,
   };
   await checkDeployment(o.publicClient, d, { treasury: o.treasury, poolAuthority: o.poolAuthority });
   return d;
+}
+
+/** OstraVaultModuleV5's constructor arguments, for the vault factory `factory` and the module V4 `moduleV4`. */
+export function vaultModuleV5Args(factory: Address, moduleV4: Address): readonly unknown[] {
+  return [factory, moduleV4, PRIORS_POOL, PRIORS_POOL_CODEHASH, USDG, ERC8004_IDENTITY_REGISTRY, OSTRAPAD];
 }
 
 /** Checks on chain that `d` is the deployment deploy.ts makes (with `treasury` and `poolAuthority` when given). */
@@ -209,11 +229,12 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
   same("vault implementation pool manager", await read(d.vaultImplementation, ostraVaultAbi, "POOL_MANAGER"), UNISWAP_V4_POOL_MANAGER);
   // A record without a registry is one whose vaults still run version 1 (no REGISTRY to read).
   if (d.registry !== undefined) {
-    // A record with a module V4 is one whose vaults run version 4; with a module only, version 3; without, version 2.
+    // A record with a module V5 is one whose vaults run version 5; with a module V4, version 4; with a module only,
+    // version 3; without, version 2.
     same(
       "vault implementation version",
       await read(d.vaultImplementation, ostraVaultAbi, "VERSION"),
-      d.vaultModuleV4 !== undefined ? VAULT_V4 : d.vaultModule !== undefined ? VAULT_V3 : VAULT_VERSION,
+      d.vaultModuleV5 !== undefined ? VAULT_V5 : d.vaultModuleV4 !== undefined ? VAULT_V4 : d.vaultModule !== undefined ? VAULT_V3 : VAULT_VERSION,
     );
     same("vault implementation registry", await read(d.vaultImplementation, ostraVaultAbi, "REGISTRY"), d.registry);
     same("vault implementation identity registry", await read(d.vaultImplementation, ostraVaultAbi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
@@ -221,6 +242,9 @@ export async function checkDeployment(client: PublicClient, d: Deployment, expec
   }
   if (d.vaultModule !== undefined) await checkVaultModule(client, d.vaultImplementation, d.vaultModule, d.vaultFactory);
   if (d.vaultModuleV4 !== undefined) await checkVaultModuleV4(client, d.vaultImplementation, d.vaultModuleV4, d.vaultFactory);
+  if (d.vaultModuleV5 !== undefined && d.vaultModuleV4 !== undefined) {
+    await checkVaultModuleV5(client, d.vaultImplementation, d.vaultModuleV5, d.vaultModuleV4, d.vaultFactory);
+  }
   if (d.breaker !== undefined) await checkBreaker(client, d.breaker, d.vaultFactory);
   same("pool beacon implementation", await read(d.poolBeacon, upgradeableBeaconAbi, "implementation"), d.poolImplementation);
   same("pool beacon owner", await read(d.poolBeacon, upgradeableBeaconAbi, "owner"), d.beaconOwner);
@@ -271,6 +295,29 @@ export async function checkVaultModuleV4(client: PublicClient, implementation: A
   same("vault module V4 factory", await read(moduleV4, ostraVaultModuleV4Abi, "FACTORY"), factory);
   same("vault module V4 VaultV2Factory", await read(moduleV4, ostraVaultModuleV4Abi, "VAULT_V2_FACTORY"), MORPHO_VAULT_V2_FACTORY);
   same("vault module V4 identity registry", await read(moduleV4, ostraVaultModuleV4Abi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
+}
+
+/**
+ * Checks that `implementation` (version 5) runs its version 5 spends in `moduleV5`, and that the module is bound to
+ * `factory`, to the implementation's own module V4 `moduleV4`, to the Priors pool with the code hash it pins (the
+ * pool's code now), USDG, the ERC-8004 Identity Registry and OstraPad.
+ */
+export async function checkVaultModuleV5(client: PublicClient, implementation: Address, moduleV5: Address, moduleV4: Address, factory: Address): Promise<void> {
+  const read = <T>(address: Address, abi: Abi, functionName: string) => client.readContract({ address, abi, functionName }) as Promise<T>;
+  const same = (what: string, got: unknown, want: unknown) => {
+    const norm = (x: unknown) => (typeof x === "string" ? x.toLowerCase() : x);
+    if (norm(got) !== norm(want)) throw new Error(`deployment check: ${what} is ${String(got)}, expected ${String(want)}`);
+  };
+  same("vault implementation module V5", await read(implementation, ostraVaultAbi, "MODULE_V5"), moduleV5);
+  same("vault module V5 factory", await read(moduleV5, ostraVaultModuleV5Abi, "FACTORY"), factory);
+  same("vault module V5 module V4", await read(moduleV5, ostraVaultModuleV5Abi, "MODULE_V4"), moduleV4);
+  same("vault module V5 Priors pool", await read(moduleV5, ostraVaultModuleV5Abi, "POOL"), PRIORS_POOL);
+  same("vault module V5 Priors pool code hash", await read(moduleV5, ostraVaultModuleV5Abi, "POOL_CODEHASH"), PRIORS_POOL_CODEHASH);
+  same("vault module V5 USDG", await read(moduleV5, ostraVaultModuleV5Abi, "USDG"), USDG);
+  same("vault module V5 identity registry", await read(moduleV5, ostraVaultModuleV5Abi, "IDENTITY_REGISTRY"), ERC8004_IDENTITY_REGISTRY);
+  same("vault module V5 OstraPad", await read(moduleV5, ostraVaultModuleV5Abi, "PAD"), OSTRAPAD);
+  const code = await client.getCode({ address: PRIORS_POOL });
+  if (code === undefined || keccak256(code) !== PRIORS_POOL_CODEHASH) throw new Error(`deployment check: the Priors pool's code is not the one vault module V5 pins (${PRIORS_POOL_CODEHASH})`);
 }
 
 /** Deploys OstraBreaker next to `d` (whose vaults run version 3) and checks it; returns `d` with its `breaker`. */

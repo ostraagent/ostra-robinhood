@@ -6,23 +6,27 @@
 // delay and runs after it, and cancels a second one. An upgrade of the vault
 // beacon is scheduled only to the implementation upgrade-vault.ts prepared and
 // checked; a call waiting already is not signed twice, and an upgrade to the
-// implementation the beacon points at is refused. The SDK's owner message is
-// checked byte for byte against the contract's.
+// implementation the beacon points at is refused; the vault beacon's upgrade
+// runs only once every vault locked on an address with no code has been named
+// as checked. The SDK's owner message is checked byte for byte against the
+// contract's.
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { bytesToHex, encodeFunctionData, getAddress, type Address, type Hex } from "viem";
-import { ostraPoolAbi, ostraUpgradeOwnerAbi, upgradeableBeaconAbi } from "../src/abi.ts";
+import { bytesToHex, encodeFunctionData, getAddress, hexToBytes, keccak256, stringToHex, type Address, type Hex } from "viem";
+import { ostraPoolAbi, ostraUpgradeOwnerAbi, ostraVaultAbi, ostraVaultFactoryAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
-import { OSTRA_VAULT_BEACON } from "../src/constants.ts";
+import { OSTRA_VAULT_BEACON, USDG, VAULT_ACTION } from "../src/constants.ts";
 import { checkDeployment } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
-import { UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload } from "../src/messages.ts";
+import { setWithdrawalLockParams, signVaultSpend, UPGRADE_OWNER_ACTION, upgradeOwnerCancelPayload, upgradeOwnerMessage, upgradeOwnerSchedulePayload, vaultAddress } from "../src/messages.ts";
+import { FileWotsStore } from "../src/wots-file.ts";
+import { WotsKeychain } from "../src/wots.ts";
 import { OUT_DIR, handBeaconsTo, startFork, vaultBeaconAtRecord, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/upgrade-owner.ts", import.meta.url));
@@ -62,7 +66,8 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   writeFileSync(record, `${JSON.stringify({ ...live, beaconOwner: testOwner }, null, 2)}\n`, { mode: 0o644 });
   writeFileSync(key, `${DEV_KEY_3}\n`, { mode: 0o600 });
   writeFileSync(rpcFile, `${fork.url}\n`, { mode: 0o600 });
-  const env = { OSTRA_DEPLOYER_KEY_FILE: key, OSTRA_RPC_URL_FILE: rpcFile, OSTRA_DEPLOYMENT: record, OSTRA_OWNER_SEED_FILE: seedFile, OSTRA_OWNER_STATE: join(dir, "owner-state") };
+  // The lock scan reads the factory's logs from the fork itself, so it sees vaults made on the fork too.
+  const env = { OSTRA_DEPLOYER_KEY_FILE: key, OSTRA_RPC_URL_FILE: rpcFile, OSTRA_DEPLOYMENT: record, OSTRA_OWNER_SEED_FILE: seedFile, OSTRA_OWNER_STATE: join(dir, "owner-state"), OSTRA_LOGS_RPC_URL: fork.url };
   const run = (args: string[], input = `${PASSPHRASE}\n`, extra: Record<string, string> = {}) => {
     const r = spawnSync(process.execPath, [script, ...args], { env: { PATH: process.env.PATH ?? "", ...env, ...extra }, input, encoding: "utf8", timeout: 600_000 });
     assert.ok(!r.stdout.includes(DEV_KEY_3.slice(2)) && !r.stderr.includes(DEV_KEY_3.slice(2)), "the key is never printed");
@@ -117,10 +122,10 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   // still matches the chain).
   const unprepared = run(["schedule-upgrade", live.vaultBeacon, live.vaultImplementation]);
   assert.notEqual(unprepared.status, 0);
-  assert.match(unprepared.stderr, /vault-v4\.json: run upgrade-vault\.ts prepare first/);
+  assert.match(unprepared.stderr, /vault-v5\.json: run upgrade-vault\.ts prepare first/);
   const prepare = spawnSync(process.execPath, [vaultScript, "prepare"], { env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8", timeout: 600_000 });
   assert.equal(prepare.status, 0, prepare.stderr);
-  const prepared = (JSON.parse(readFileSync(`${record}.vault-v4.json`, "utf8")) as { implementation: { address: Address } }).implementation.address;
+  const prepared = (JSON.parse(readFileSync(`${record}.vault-v5.json`, "utf8")) as { implementation: { address: Address } }).implementation.address;
 
   // The SDK's owner message is the contract's.
   const someRoot = bytesToHex(new Uint8Array(32).fill(7));
@@ -232,9 +237,31 @@ test("the beacons go to a WOTS-keyed owner; an upgrade waits 72 hours, then anyo
   assert.match(twice.stdout, /"event":"scheduled_already","id":"4"/);
   assert.match(twice.stdout, /UPGRADE_OWNER_OK/);
   assert.equal(await read("nonce"), 5n);
+  // A vault locked under version 4 on an address with no code: its lock would stay under version 5, so the upgrade does
+  // not run until that vault is named as checked.
+  const wotsDir = join(dir, "wots");
+  mkdirSync(wotsDir);
+  const chain = new WotsKeychain(hexToBytes(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/codeless-master"))), hexToBytes(keccak256(stringToHex("OSTRA/EVM/SDK-TEST/codeless"))), new FileWotsStore(wotsDir));
+  const root = bytesToHex(chain.keyRoot(0n));
+  const lockedVault = vaultAddress({ factory: live.vaultFactory, beacon: live.vaultBeacon, token: USDG, initialKeyRoot: root, initialCrank: "0x0000000000000000000000000000000000000000" });
+  const sender = fork.accounts[0]!;
+  const create = await fork.wallet(sender).writeContract({ address: live.vaultFactory, abi: ostraVaultFactoryAbi, functionName: "createVault", args: [USDG, root, "0x0000000000000000000000000000000000000000"], account: sender, chain: robinhoodChain });
+  assert.equal((await fork.client.waitForTransactionReceipt({ hash: create })).status, "success");
+  const plainKey = getAddress("0x000000000000000000000000000000000000c01d");
+  const lockSpend = await signVaultSpend(chain, { vault: lockedVault, nonce: 0n, keyRoot: root }, { chainId: d.chainId, action: VAULT_ACTION.SET_WITHDRAWAL_LOCK, params: setWithdrawalLockParams({ withdrawal: plainKey, delay: 36 * 3600, dailyLimit: 1_000_000n }) });
+  const lockTx = await fork.wallet(sender).writeContract({ address: lockedVault, abi: ostraVaultAbi, functionName: "spend", args: [lockSpend.action, lockSpend.nextKeyRoot, lockSpend.params, lockSpend.signature], account: sender, chain: robinhoodChain });
+  assert.equal((await fork.client.waitForTransactionReceipt({ hash: lockTx })).status, "success");
   // Once it has run (72 hours later, by anyone), an upgrade to the implementation the beacon points at is refused.
   await fork.increaseTime(72 * 3600);
-  const upgraded = run(["execute", "4"], "");
+  const held = run(["execute", "4"], "");
+  assert.notEqual(held.status, 0);
+  assert.match(held.stdout, new RegExp(`"event":"codeless_lock","vault":"${lockedVault}","withdrawal":"${plainKey}","waiting":false,"accepted":false`));
+  assert.match(held.stderr, new RegExp(`withdrawal lock\\(s\\) on an address with no code \\(${lockedVault}:${plainKey}\\): check each, then name it as vault:withdrawal in OSTRA_ACCEPT_CODELESS_LOCKS`));
+  // Another withdrawal address of the same vault is not the lock that was checked.
+  const otherLock = run(["execute", "4"], "", { OSTRA_ACCEPT_CODELESS_LOCKS: `${lockedVault}:${getAddress("0x000000000000000000000000000000000000beef")}` });
+  assert.notEqual(otherLock.status, 0);
+  assert.equal(getAddress((await fork.client.readContract({ address: live.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address), getAddress(live.vaultImplementation));
+  const upgraded = run(["execute", "4"], "", { OSTRA_ACCEPT_CODELESS_LOCKS: `${lockedVault}:${plainKey}` });
   assert.equal(upgraded.status, 0, upgraded.stderr);
   assert.equal(getAddress((await fork.client.readContract({ address: live.vaultBeacon, abi: upgradeableBeaconAbi, functionName: "implementation" })) as Address), getAddress(prepared));
   const noop = run(["schedule-upgrade", live.vaultBeacon, prepared]);

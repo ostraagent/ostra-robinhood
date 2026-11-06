@@ -3,7 +3,7 @@
 // 4663 on 17 Oct 2026 (design v0.4, "Pindah ke Robinhood Chain"); the fork
 // tests (test/constants.fork.test.ts) check them again on every run.
 
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
 
 /** Robinhood Chain mainnet (Arbitrum Nitro, ETH for gas). */
 export const ROBINHOOD_CHAIN_ID = 4663;
@@ -147,6 +147,25 @@ export const VAULT_ACTION = {
   ENTER: 26,
   EXIT: 27,
   FORWARD: 28,
+  // Version 5 (OstraVault.sol notes; OstraVaultModuleV5 runs them).
+  SET_POLICY: 29,
+  SET_ALLOW: 30,
+  SET_AGENT_KEY: 31,
+  REVOKE_AGENT_KEY: 32,
+  SET_ORDER: 33,
+  CANCEL_ORDER: 34,
+  PRIORS_BORROW: 35,
+  PRIORS_REPAY: 36,
+  PRIORS_CONSENT: 37,
+  PRIORS_LEAVE: 38,
+  ROOT_ENROLL: 39,
+  ROOT_ADD_STAKE: 40,
+  ROOT_SPONSOR: 41,
+  ROOT_VOUCH: 42,
+  ROOT_UNVOUCH: 43,
+  ROOT_FREEZE: 44,
+  ROOT_UNLOCK: 45,
+  ROOT_CLAIM_FEES: 46,
 } as const;
 
 /**
@@ -180,6 +199,10 @@ export const GUARD_OP = {
   EXIT: 5,
   /** Version 4: EXIT, then SWEEP in the same call: abi.encode(uint8 kind, address venue, uint256 amount, address expected). */
   EXIT_SWEEP: 6,
+  /** Version 5: end the agent key and every standing order (params empty). */
+  AGENT_STOP: 7,
+  /** Version 5: remove the crank (params empty). */
+  CLEAR_CRANK: 8,
 } as const;
 /** The Guarded event's op for a SupportRecovery spend the other vault refused. */
 export const GUARD_OP_SUPPORT_RECOVERY = 255;
@@ -203,6 +226,68 @@ export const VAULT_RAETO_USDG_MIN_GAS = 3_000_000;
 export const VAULT_RAETO_STOCK_MIN_GAS = 2_400_000;
 export const VAULT_ERC4626_MIN_GAS = 600_000;
 export const VAULT_GUARD_EXIT_MIN_GAS = 2_500_000;
+/**
+ * The first vault version with the agent key and its policy, allowlists, standing orders (runOrder) and Priors credit
+ * (spendAsAgent, repayDue), guard ops 7 and 8; a withdrawal address must have code when it is chosen.
+ */
+export const VAULT_V5 = 5;
+/**
+ * The live contracts version 5 keeps (deployments/robinhood-mainnet.json, read on chain 6 Nov 2026): OstraRegistry,
+ * OstraVaultModule and OstraVaultModuleV4, plain contracts whose code cannot change. upgrade-vault.ts binds the version 5
+ * implementation to these addresses, never to what a record file names.
+ */
+export const OSTRA_REGISTRY: Address = "0xcE6Cc1f93744f4090DA1444Bb8590d9206157506";
+export const OSTRA_VAULT_MODULE: Address = "0x405A0e88e3929A7A9EE01a5169DCd1D02d95C5EC";
+export const OSTRA_VAULT_MODULE_V4: Address = "0x8Bd6321Fe66cF9c62DEF909092dDC3bbadDd72a2";
+/** The agent key's message domain (OstraVaultModuleV5.AGENT_DOMAIN): its spends never stand in for the owner's. */
+export const VAULT_AGENT_DOMAIN = "OSTRA/VAULT/EVM/AGENT/v1";
+/** OstraVaultModuleV5.AGENT_ACTIONS: the actions an agent key may ever use (a policy picks among them), as a bit mask. */
+export const VAULT_AGENT_ACTIONS = 0x5e7f1c7e0c2bn;
+/** OstraVaultModuleV5 bounds, in seconds or basis points. */
+export const VAULT_V5_LIMITS = {
+  MAX_AGENT_KEY_LIFE: 90 * 86_400,
+  MIN_ORDER_INTERVAL: 3_600,
+  MAX_ORDER_INTERVAL: 365 * 86_400,
+  DEFAULT_REPAY_LEAD: 86_400,
+  MAX_REPAY_LEAD: 7 * 86_400,
+  MAX_CONSENT_LIFE: 30 * 86_400,
+  MAX_TERM: 365 * 86_400,
+  MAX_PREMIUM_BPS: 200,
+  COVER_JOBS: 8,
+} as const;
+/** OstraVaultModuleV5.PRIORS_MIN_GAS: gas a Priors spend (35 to 46) must have left when it starts. */
+export const VAULT_PRIORS_MIN_GAS = 2_000_000;
+/** OstraVaultV5's allowlist kinds (SetAllow). */
+export const ALLOW_KIND = {
+  /** A recipient: Transfer, PAY orders, a Swap's recipient other than the vault. */
+  RECIPIENT: 1,
+  /** An x402 channel receiver (OpenChannel). */
+  CHANNEL: 2,
+  /** A Uniswap v4 pool, by its PoolId (Swap). */
+  POOL: 3,
+  /** A Morpho Vault V2 to Lend into and Redeem from. */
+  LEND: 4,
+  /** A Priors root to be sponsored by (its agent id). */
+  SPONSOR: 5,
+  /** An agent the agent key may give a line from this vault's Priors root (its agent id). */
+  BORROWER: 6,
+} as const;
+/** OstraVaultV5's standing order kinds (SetOrder). */
+export const ORDER_KIND = {
+  /** Above `threshold`: Enter at most `amount` into a version 4 venue. */
+  SWEEP: 1,
+  /** Below `threshold`: Exit at most `amount` from a RAETO_USDG or ERC4626 venue. */
+  REFILL: 2,
+  /** Pay `amount` to a fixed recipient every `interval`, `runs` times, until `endAt`. */
+  PAY: 3,
+} as const;
+/**
+ * Priors (CreditPoolV2) on chain 4663 and its runtime code hash (read on chain 6 Nov 2026), which OstraVaultModuleV5
+ * pins: every Priors spend refuses other code at that address.
+ */
+export const PRIORS_POOL: Address = "0x281210097f0de7A8FB6F87310AF0f089c9C8DE21";
+export const PRIORS_POOL_CODEHASH: Hex = "0x0a051b47f363ad2d65820cce3c1a543a60db53df4c9c728477ff101f57f6b95f";
+
 /**
  * Venues on chain 4663 (read on chain 1 Nov 2026). Spark Savings USDG (spUSDG, an ERC4626 venue): asset() USDG, a UUPS
  * proxy that names its implementation (getImplementation()). Raeto's USDG vault (RAETO_USDG): asset() USDG,

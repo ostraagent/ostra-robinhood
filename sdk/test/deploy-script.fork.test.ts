@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { checkDeployment, checkLaunchpad } from "../src/deploy.ts";
 import { parseDeployment } from "../src/deployment.ts";
-import { handBeaconsTo, startFork, type Fork } from "./fork.ts";
+import { handBeaconsTo, rpc as forkRpc, startFork, type Fork } from "./fork.ts";
 
 const script = fileURLToPath(new URL("../scripts/deploy.ts", import.meta.url));
 /** anvil's development account 3 (a public test key, used on the fork only). */
@@ -77,6 +77,8 @@ test("deploys and checks everything owned by the deployer, then resumes as a che
   const beacons = [d.vaultBeacon, d.poolBeacon] as const;
   const delegated = fork.accounts[0]?.address;
   if (delegated === undefined) throw new Error("no fork account 0");
+  // The fork clears it (test/fork.ts): put back the code account 0 has on mainnet.
+  await forkRpc(fork.url, "anvil_setCode", [delegated, fork.mainnetCode(delegated)]);
   assert.match((await fork.client.getCode({ address: delegated })) ?? "", /^0xef0100/, "account 0 carries an EIP-7702 delegation");
   for (const stranger of [privateKeyToAccount(generatePrivateKey()).address, delegated]) {
     await handBeaconsTo(fork, beacons, stranger);

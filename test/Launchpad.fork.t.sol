@@ -32,6 +32,7 @@ import {OstraVesting} from "../src/launchpad/OstraVesting.sol";
 import {TestSwapRouter} from "./utils/TestSwapRouter.sol";
 import {WotsSigner} from "./utils/WotsSigner.sol";
 import {VaultStack} from "./utils/VaultStack.sol";
+import {SafeWallet} from "./utils/SafeWallet.sol";
 
 interface IERC6909Balance {
     function balanceOf(address owner, uint256 id) external view returns (uint256);
@@ -931,11 +932,13 @@ contract LaunchpadForkTest is Test {
         dispatcher.dispatch(id);
         assertGt(token.dividendOf(address(bunker)), 0);
 
+        // The withdrawal address of every lock below: a real Safe (version 5 refuses one with no code).
+        address lockTo = SafeWallet.create(makeAddr("withdrawal owner"), 1);
         // The token vault links to a vault of its own token (which cannot spend USDG), then to the USDG vault.
         OstraVault sameToken = _vault(address(token), CREATOR_TOKEN);
         _spend(bunker, BUYER_TOKEN, 16, abi.encode(address(sameToken)));
-        _spend(sameToken, CREATOR_TOKEN, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
-        _spend(bunker, BUYER_TOKEN, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
+        _spend(sameToken, CREATOR_TOKEN, 14, abi.encode(lockTo, uint32(36 hours), uint128(0)));
+        _spend(bunker, BUYER_TOKEN, 14, abi.encode(lockTo, uint32(36 hours), uint128(0)));
         bytes32 next;
         bytes memory params;
         bytes memory signature;
@@ -957,7 +960,7 @@ contract LaunchpadForkTest is Test {
         bunker.spend(5, next, params, signature);
         // Locked only after the link took effect: still refused (that lock could be a thief's).
         vm.warp(block.timestamp + 1);
-        _spend(buyer, BUYER, 14, abi.encode(address(0xC01D), uint32(36 hours), uint128(0)));
+        _spend(buyer, BUYER, 14, abi.encode(lockTo, uint32(36 hours), uint128(0)));
         vm.expectRevert(OstraVault.Locked.selector);
         bunker.spend(5, next, params, signature);
         // Linked again under the lock, after its delay: the USDG vault was locked first, and the claim pays it.

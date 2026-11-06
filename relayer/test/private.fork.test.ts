@@ -130,7 +130,8 @@ before(async () => {
   const fork = process.env.OSTRA_FORK_RPC || ROBINHOOD_PUBLIC_RPC;
   // The fork keeps the chain's base fee; anvil adds its own suggested priority fee (1 gwei, where Robinhood Chain
   // suggests none), so the fees below are many times the chain's, and the agent's balance is sized for that.
-  anvil = spawn("anvil", ["--fork-url", fork, "--port", String(PORT), "--gas-limit", "60000000"], { stdio: ["ignore", process.env.OSTRA_ANVIL_LOG ? "pipe" : "ignore", "pipe"] });
+  // Robinhood Chain's own code size limit (98,304 bytes), not EIP-170's: the version 5 vault contracts are above it.
+  anvil = spawn("anvil", ["--fork-url", fork, "--port", String(PORT), "--gas-limit", "60000000", "--code-size-limit", "98304"], { stdio: ["ignore", process.env.OSTRA_ANVIL_LOG ? "pipe" : "ignore", "pipe"] });
   let anvilErr = "";
   anvil.stderr?.on("data", (b: Buffer) => {
     anvilErr = (anvilErr + b.toString()).slice(-2_000);
