@@ -13,6 +13,9 @@
 //     its CID with its bytes checked; on the panel, the decision and its reason too;
 //   * an order file that cannot be read: the bot waits (it does not reject the provider over it), and at the late
 //     point of its window decides with what it has instead of staying silent (which would get it slashed);
+//   * a rejection of the bot's own because the delivery could not be read, appealed once the file is served: the
+//     bot's panel accounts keep it;
+//   * a missing file asked of the network once per wait, also across a restart, and never while the pass judges;
 //   * approvals appealed by the client: where the panel gets no answer from its judge, the bot's panel accounts wait,
 //     then at the vote's late point vote for the decision, which stands; a delivery unpinned after the bot read it is
 //     still read from the copy the bot kept, and the approval stands; a delivery none of the bot's accounts ever read
@@ -150,15 +153,14 @@ async function agent(name: string, seed: number) {
 
 test("the bot draws, judges, decides with a pinned reason, settles, and sits on the appeal panel", { timeout: 2_400_000 }, async () => {
   const c = fork.client as PublicClient;
-  // The jobs on mainnet before this test's: the bot reads every job since OstraPad's deployment, as it does on mainnet.
+  // The jobs on mainnet before this test's: the bot here follows only the jobs after the fork (followFrom), and sends
+  // nothing for these.
   const forked = await c.getBlockNumber();
   const onChain = (await getLogsChunked(c, { address: OSTRAPAD, event: PAD_EVENTS.JobCreated, fromBlock: OSTRAPAD_FROM_BLOCK, toBlock: forked })).map((l) => (l.args as { jobId: Hex }).jobId);
-  // Those finished at the fork: nothing is ever sent for them. (One still open is the bot's to settle once the test's
-  // warps pass its expiry, as on mainnet.)
-  const finishedThen = new Set<string>();
+  const finishedAtFork = new Set<string>();
   for (const id of onChain) {
-    const s = (await readPadJob(c, id))?.status;
-    if (s === "Completed" || s === "Rejected" || s === "Expired" || s === "Cancelled") finishedThen.add(id);
+    const st = (await readPadJob(c, id))?.status;
+    if (st === "Completed" || st === "Rejected" || st === "Expired" || st === "Cancelled") finishedAtFork.add(id);
   }
   const provider = await agent("provider", 61);
   const client = await agent("client", 62);
@@ -203,6 +205,8 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   const sender = new Sender(c, transport, botFeePayer, log);
   let clock = Date.now();
   let failNextEvaluatorSend = false;
+  // How often each URI was asked of the network.
+  const fetched = new Map<string, number>();
   const parts = {
     client: c,
     logsClient: c,
@@ -216,11 +220,19 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
     },
     fromFeePayer: (call: Parameters<Sender["fromFeePayer"]>[0]) => sender.fromFeePayer(call),
     judge,
-    fetchBytes: async (uri: string) => ipfs.get(uri) ?? null,
+    fetchBytes: async (uri: string) => {
+      fetched.set(uri, (fetched.get(uri) ?? 0) + 1);
+      logs.push({ event: "test_fetched", fields: { uri } });
+      return ipfs.get(uri) ?? null;
+    },
     pin: upload,
     dataDir: join(root, "bot"),
     log,
     nowMs: () => clock,
+    keepBudgetMs: undefined as number | undefined,
+    // Only this test's jobs: a pool job still open on mainnet would otherwise be drawn to this test's accounts once
+    // the live pool has left, and their windows passed over by the test's time warps (slashing them out of the pool).
+    followFrom: forked + 1n,
   };
   const bot = await PadEvaluator.open(parts);
   // What the bot sent for this test's jobs (one mainnet held still open would add its own).
@@ -280,6 +292,8 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
 
   // Job B: rejected, appealed by the provider; the bot draws the panel and its accounts on it vote.
   const b = (await client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "Another topic" })).jobId as Hex;
+  // B's folder cannot be made (a plain file in its place): its files are held in memory, and it is judged all the same.
+  await writeFile(join(root, "bot", "files", b.toLowerCase()), "not a folder");
   const c1 = await usdg(client.vault);
   await provider.pad.accept(b);
   await client.pad.sweep();
@@ -307,13 +321,18 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   assert.equal(panelCase.decision?.approve, false, "the panel sees the decision");
   assert.equal(panelCase.decision?.reason, "The delivery refuses the order.", "and its reason, read from the pinned file");
   assert.ok((await usdg(client.vault)) >= c1 + 1_000_000n, "the client is refunded the budget");
+  assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === b && l.fields.what === "keep" && /held in memory/.test(String(l.fields.why))));
   const failures = logs.filter((l) => l.event === "pad_send_failed" && l.fields.error !== "the RPC dropped the request (test)");
   assert.equal(failures.length, 0, JSON.stringify(failures));
 
-  // Job C: its order file cannot be read. The bot waits through most of the window, then decides with what it has.
+  // Job C: its order file is served with bytes that are not the order's (a miss, as a file not served). The bot waits
+  // through most of the window, then decides with what is kept. The order is asked of the network once until its wait
+  // after a miss is over, also by a bot started again on the same data (the misses are kept with its state); judging
+  // reads only what is kept, so every network read of a pass comes before its decisions.
   const co = await client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "A third topic" });
   const cid = co.jobId as Hex;
-  ipfs.delete(co.orderUri as string);
+  const orderBytes = ipfs.get(co.orderUri as string) as Uint8Array;
+  ipfs.set(co.orderUri as string, new TextEncoder().encode("not the order"));
   await provider.pad.accept(cid);
   await client.pad.sweep();
   await fork.increaseTime(2);
@@ -322,14 +341,34 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   await bot.tick();
   assert.equal((await readPadJob(c, cid))?.status, "Submitted", "an unreadable order: the bot waits");
   assert.ok(logs.some((l) => l.event === "pad_waiting" && l.fields.jobId === cid));
-  await fork.increaseTime(Number(PAD.EVAL_WINDOW - LATE_MARGIN) + 60);
   await bot.tick();
+  assert.equal(fetched.get(co.orderUri as string), 1, "the missing order asked of the network once, not again before its wait");
+  await (await PadEvaluator.open({ ...parts, evaluators: [] })).tick();
+  assert.equal(fetched.get(co.orderUri as string), 1, "nor by a bot started again on the same data");
+  await fork.increaseTime(Number(PAD.EVAL_WINDOW - LATE_MARGIN) + 60);
+  clock += 2 * 3600_000; // past every wait after a miss: the order is asked for again, in the pass's reading phase
+  const lateFrom = logs.length;
+  await bot.tick();
+  const decidedAt = logs.findIndex((l, i) => i >= lateFrom && l.event === "pad_sent" && l.fields.what === "decide" && l.fields.jobId === cid);
+  assert.ok(decidedAt > 0, JSON.stringify(logs.slice(lateFrom)));
+  assert.equal(fetched.get(co.orderUri as string), 2);
+  assert.ok(!logs.slice(decidedAt).some((l) => l.event === "test_fetched"), "no network read once the pass judges");
   job = await readPadJob(c, cid);
   assert.equal(job?.status, "Decided", "decided at the late point, not left silent");
   assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === cid));
   const late = cases.filter((x) => x.jobId === cid).at(-1) as Case;
   assert.equal(late.order, null);
   assert.ok(late.notes.some((n) => /order file could not be read/.test(n)), JSON.stringify(late.notes));
+  // The offer was found from Ostra's index while the order could not be read; once the order is served, the offer
+  // the order names is read from the provider's listing and replaces it.
+  const cOffer = async () => JSON.parse(await readFile(join(root, "bot", "files", cid.toLowerCase(), "offer.json"), "utf8")) as { offer: { id?: string } | null; source: string };
+  assert.equal((await cOffer()).source, "offer-index");
+  ipfs.set(co.orderUri as string, orderBytes);
+  clock += 2 * 3600_000;
+  await bot.tick(); // the order kept
+  await bot.tick(); // then the offer it names
+  assert.equal((await cOffer()).source, "offer-listing");
+  assert.equal((await cOffer()).offer?.id, "pool-report");
 
   // Jobs D, E and F: approved, then appealed by the client. The panel's judge gives no answer on D. E's delivery file is
   // unpinned after the bot read it: its panel reads the copy the bot kept. F's delivery file is unpinned and the bot's
@@ -390,6 +429,14 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   const voteBy = (await readPadAppeal(c, dj)).voteBy;
   const now = (await c.getBlock()).timestamp;
   await fork.increaseTime(Number(voteBy - LATE_MARGIN - now) + 60);
+  // The first late pass reads nothing (its reading budget spent): F's delivery, not tried since the late point, is
+  // waited for, not taken as a judge with no answer (which would make the panel agree); D's judge gives no answer.
+  parts.keepBudgetMs = 0;
+  await bot.tick();
+  delete parts.keepBudgetMs;
+  assert.equal(sent("vote"), votesBefore + 6, JSON.stringify(logs.slice(-10)));
+  assert.equal((await readPadJob(c, fj))?.status, "Appealed", "F waits for its late read");
+  assert.ok(logs.some((l) => l.event === "pad_waiting" && l.fields.jobId === fj && l.fields.late === true));
   await bot.tick();
   assert.equal(sent("vote"), votesBefore + 9, JSON.stringify(logs.slice(-10)));
   assert.equal((await readPadJob(c, dj))?.status, "Completed", "three votes for the decision: the approval stands");
@@ -398,15 +445,68 @@ test("the bot draws, judges, decides with a pinned reason, settles, and sits on 
   assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === fj && l.fields.verdict === "reject"));
   assert.equal(await usdg(provider.vault), p1 + 2n * padProviderPay(1_000_000n), "the provider is paid for D and E");
 
+  // Job H: rejected by the bot at the late point because its delivery could not be read; the provider serves it
+  // afterwards and appeals. The bot's accounts on the panel keep the rejection: a delivery served only after the
+  // decision is not read against it (without that, Ostra's own panel would overturn Ostra's decision and slash it).
+  const hj = (await client.pad.order({ agentId: agentId.toString(), offer: "pool-report", input: "A seventh topic" })).jobId as Hex;
+  await provider.pad.accept(hj);
+  await client.pad.sweep();
+  await provider.pad.sweep();
+  await fork.increaseTime(2);
+  await bot.tick();
+  const hUri = (await provider.pad.deliver({ jobId: hj, output: "A report on topic 7." })).deliveryUri as string;
+  const hBytes = ipfs.get(hUri) as Uint8Array;
+  ipfs.delete(hUri);
+  await bot.tick();
+  const hJob = (await readPadJob(c, hj)) as NonNullable<Awaited<ReturnType<typeof readPadJob>>>;
+  const hStart = hJob.submittedAt > hJob.assignedAt ? hJob.submittedAt : hJob.assignedAt;
+  await fork.increaseTime(Number(hStart + PAD.EVAL_WINDOW - LATE_MARGIN - (await c.getBlock()).timestamp) + 60);
+  await bot.tick();
+  job = await readPadJob(c, hj);
+  assert.equal(job?.status, "Decided");
+  assert.equal(job?.approved, false, "rejected at the late point: the delivery could not be read");
+  ipfs.set(hUri, hBytes);
+  clock += 2 * 3600_000;
+  await provider.pad.appeal(hj);
+  await fork.increaseTime(2);
+  await bot.tick();
+  await access(join(keptDir(hj), (hJob.deliverable as Hex).toLowerCase()));
+  await bot.tick();
+  assert.equal((await readPadJob(c, hj))?.status, "Rejected", "the bot's panel keeps the bot's rejection, though the delivery is now served");
+  assert.ok(logs.some((l) => l.event === "pad_alert" && l.fields.jobId === hj && l.fields.purpose === "vote" && l.fields.verdict === "reject"));
+
   // Finished jobs are dropped from the passes. A bot started again on the same data: nothing sent twice.
-  await bot.tick(); // D and F finished in the last pass: this one drops them
-  assert.ok(![a, b, dj, ej, fj].some((id) => bot.jobs.includes(id)), "finished jobs dropped");
+  await bot.tick(); // H finished in the last pass: this one drops it
+  assert.ok(![a, b, dj, ej, fj, hj].some((id) => bot.jobs.includes(id)), "finished jobs dropped");
   await assert.rejects(access(keptDir(ej)), "the files kept for a finished job are removed");
-  assert.deepEqual([...bot.seen].sort(), [...onChain, a, b, cid, dj, ej, fj].sort());
-  assert.equal(logs.filter((l) => l.event === "pad_sent" && finishedThen.has(l.fields.jobId as string)).length, 0, "nothing sent for the jobs mainnet had finished already");
+  const state = JSON.parse(await readFile(join(root, "bot", "pad-evaluator.json"), "utf8")) as { misses: Record<string, unknown>; reasons: Record<string, unknown>; unread: Record<string, unknown> };
+  for (const id of [a, b, cid, dj, ej, fj, hj]) {
+    const left = [...Object.keys(state.misses), ...Object.keys(state.reasons), ...Object.keys(state.unread)].filter((k) => k.toLowerCase().startsWith(id.toLowerCase()));
+    assert.deepEqual(left, [], "what the bot kept for a finished job is dropped from its state");
+  }
+  assert.deepEqual([...bot.seen].sort(), [a, b, cid, dj, ej, fj, hj].sort());
+  assert.equal(logs.filter((l) => l.event === "pad_sent" && (onChain as string[]).includes(l.fields.jobId as string)).length, 0, "nothing sent for mainnet's jobs, not followed here");
   const again = await PadEvaluator.open(parts);
-  assert.deepEqual([...again.seen].sort(), [...onChain, a, b, cid, dj, ej, fj].sort());
+  assert.deepEqual([...again.seen].sort(), [a, b, cid, dj, ej, fj, hj].sort());
   const before = logs.length;
   await again.tick();
   assert.equal(logs.slice(before).filter((l) => l.event === "pad_sent").length, 0);
+
+  // The default (no followFrom), as on mainnet: a bot on a new data directory follows every job since OstraPad's
+  // deployment, mainnet's included, and sends nothing for those finished at the fork (its calls only recorded here).
+  const tried: string[] = [];
+  const all = await PadEvaluator.open({
+    ...parts,
+    evaluators: [],
+    followFrom: undefined,
+    dataDir: join(root, "all"),
+    fromFeePayer: async (call: Parameters<Sender["fromFeePayer"]>[0]) => {
+      tried.push(String(call.args[0]));
+      throw new Error("not sent (test)");
+    },
+    log: () => {},
+  });
+  await all.tick();
+  for (const id of [...onChain, a, b, cid, dj, ej, fj, hj]) assert.ok(all.seen.includes(id), `every job since the deployment is seen (${id})`);
+  assert.deepEqual(tried.filter((id) => finishedAtFork.has(id)), [], "nothing for the jobs mainnet had finished at the fork");
 });
