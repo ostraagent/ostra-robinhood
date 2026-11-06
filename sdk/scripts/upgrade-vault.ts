@@ -269,15 +269,31 @@ export function readPrepared(recordPath: string): Prepared {
 /** A vault whose withdrawal lock, in force or waiting, names an address with no code. */
 export type CodelessLock = { vault: Address; withdrawal: Address; waiting: boolean };
 
+/** How long the scan waits for its logs RPC to reach the state RPC's head (the public RPC trailed by 4 blocks on 6 Nov 2026). */
+export const LOGS_CATCH_UP_MS = 60_000;
+
+/**
+ * The state RPC's head, once the logs RPC has reached it: a logs RPC behind it is waited for (polled each second) and
+ * never trusted short of that block; still behind after `timeoutMs`, refused.
+ */
+export async function logsHeadReached(client: PublicClient, logsClient: PublicClient, timeoutMs: number = LOGS_CATCH_UP_MS): Promise<bigint> {
+  const toBlock = await client.getBlockNumber({ cacheTime: 0 });
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const logsHead = await logsClient.getBlockNumber({ cacheTime: 0 });
+    if (logsHead >= toBlock) return toBlock;
+    if (Date.now() >= deadline) throw new Error(`the logs RPC is at block ${logsHead}, still behind the state RPC's ${toBlock} after ${timeoutMs / 1000} s: run the scan again`);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+}
+
 /**
  * Every vault `d`'s factory made (its VaultCreated logs, read through `logsClient`) whose withdrawal lock in force, or
  * whose waiting lock change, names an address with no code: such a lock, chosen under version 4, stays under version 5.
  */
 export async function scanCodelessLocks(client: PublicClient, logsClient: PublicClient, d: Deployment): Promise<{ vaults: number; locked: number; codeless: CodelessLock[] }> {
-  // Every vault up to the head of the RPC the state is read from: a logs RPC behind it is refused, not trusted.
-  const toBlock = await client.getBlockNumber({ cacheTime: 0 });
-  const logsHead = await logsClient.getBlockNumber({ cacheTime: 0 });
-  if (logsHead < toBlock) throw new Error(`the logs RPC is at block ${logsHead}, behind the state RPC's ${toBlock}: run the scan again`);
+  // Every vault up to the head of the RPC the state is read from, once the logs RPC has reached it.
+  const toBlock = await logsHeadReached(client, logsClient);
   const vaults = await listOstraVaults(logsClient, d.vaultFactory, BigInt(d.fromBlock), toBlock);
   const codeless: CodelessLock[] = [];
   let locked = 0;
