@@ -39,6 +39,7 @@ import {
 import { ROBINHOOD_CHAIN_ID } from "./constants.ts";
 import { multicall3Abi } from "./external-abi.ts";
 import { ostraPadAbi } from "./pad-abi.ts";
+import { padCheckKemPublicKey } from "./pad-private.ts";
 
 export { ostraPadAbi } from "./pad-abi.ts";
 
@@ -626,6 +627,11 @@ export type PadOffer = {
   hours: number;
   /** "pool": drawn from the evaluator pool (the provider's record grows); "client": the client judges (no fee, no appeal). */
   evaluator: "pool" | "client";
+  /**
+   * True when the delivery may hold binary attachments (a private job's files, design "Ostrapad: private job" revision
+   * 7): only for an offer the client judges, since no evaluator can check binary bytes against the order.
+   */
+  binary?: true;
 };
 
 export const PAD_MAX_OFFERS = 20;
@@ -643,6 +649,8 @@ export function padOffer(o: unknown): PadOffer {
   const hours = r.hours;
   if (typeof hours !== "number" || !Number.isInteger(hours) || hours < 1 || hours > 168) throw new RangeError(`offer ${id}: hours must be a whole number from 1 to 168`);
   if (r.evaluator !== "pool" && r.evaluator !== "client") throw new RangeError(`offer ${id}: evaluator must be "pool" or "client"`);
+  if (r.binary !== undefined && r.binary !== false && r.binary !== true) throw new RangeError(`offer ${id}: binary must be true or false`);
+  if (r.binary === true && r.evaluator !== "client") throw new RangeError(`offer ${id}: a binary delivery needs an offer the client judges (evaluator "client")`);
   return {
     id,
     title: text(r.title, `offer ${id}: title`, 80) as string,
@@ -651,11 +659,34 @@ export function padOffer(o: unknown): PadOffer {
     price,
     hours,
     evaluator: r.evaluator,
+    ...(r.binary === true ? { binary: true as const } : {}),
   };
 }
 
-/** A provider's listing: its provider vault and offers. */
-export type PadListing = { provider: Address; offers: PadOffer[] };
+/**
+ * A provider's listing: its provider vault and offers, and for private jobs its ML-KEM-768 public key (`kem`, base64 of
+ * its 1,184 bytes) and its posting address (`post`), both derived from its seed (pad-private.ts). A listing without both
+ * takes only public orders.
+ */
+export type PadListing = { provider: Address; offers: PadOffer[]; kem?: string; post?: Address };
+
+/** The listing's ML-KEM-768 public key, checked (length and FIPS 203's modulus check); throws on a malformed one. */
+export function padListingKem(kem: string): Uint8Array {
+  if (typeof kem !== "string" || kem.length !== 1580 || !/^[A-Za-z0-9+/]+={0,2}$/.test(kem)) throw new RangeError("kem must be the base64 of a 1,184-byte ML-KEM-768 public key");
+  const bin = atob(kem);
+  const pk = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) pk[i] = bin.charCodeAt(i);
+  padCheckKemPublicKey(pk);
+  return pk;
+}
+
+/** The base64 of an ML-KEM-768 public key, as a listing carries it. */
+export function padKemBase64(pk: Uint8Array): string {
+  padCheckKemPublicKey(pk);
+  let bin = "";
+  for (const b of pk) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
 
 /** The name of a listing's entry among an ERC-8004 registration file's services. */
 export const PAD_SERVICE_NAME = "Ostrapad";
@@ -666,7 +697,16 @@ export function padServiceEntry(l: PadListing, pad: Address = OSTRAPAD, chainId:
   if (l.offers.length === 0 || l.offers.length > PAD_MAX_OFFERS) throw new RangeError(`a listing has 1 to ${PAD_MAX_OFFERS} offers`);
   const offers = l.offers.map(padOffer);
   if (new Set(offers.map((o) => o.id)).size !== offers.length) throw new RangeError("offer ids must differ");
-  return { name: PAD_SERVICE_NAME, endpoint: `eip155:${chainId}:${getAddress(pad)}`, provider: `eip155:${chainId}:${getAddress(l.provider)}`, offers };
+  if ((l.kem === undefined) !== (l.post === undefined)) throw new RangeError("a listing carries kem and post together, or neither");
+  if (l.kem !== undefined) padListingKem(l.kem);
+  if (l.post !== undefined && !isAddress(l.post, { strict: false })) throw new RangeError("post must be an address");
+  return {
+    name: PAD_SERVICE_NAME,
+    endpoint: `eip155:${chainId}:${getAddress(pad)}`,
+    provider: `eip155:${chainId}:${getAddress(l.provider)}`,
+    offers,
+    ...(l.kem !== undefined && l.post !== undefined ? { kem: l.kem, post: getAddress(l.post) } : {}),
+  };
 }
 
 /**
@@ -696,7 +736,18 @@ export function padListingFromFile(file: unknown, pad: Address = OSTRAPAD, chain
       problems.push((err as Error).message);
     }
   }
-  return { listing: { provider: getAddress(providerText), offers }, problems };
+  // Private jobs: kem and post together, each checked; a listing with either missing or malformed takes public orders.
+  let priv: { kem: string; post: Address } | null = null;
+  if (entry.kem !== undefined || entry.post !== undefined) {
+    try {
+      if (typeof entry.kem !== "string" || typeof entry.post !== "string" || !isAddress(entry.post, { strict: false })) throw new RangeError("kem and post must both be present");
+      padListingKem(entry.kem);
+      priv = { kem: entry.kem, post: getAddress(entry.post) };
+    } catch (err) {
+      problems.push(`private orders: ${(err as Error).message}`);
+    }
+  }
+  return { listing: { provider: getAddress(providerText), offers, ...(priv ?? {}) }, problems };
 }
 
 /** An order: what the client asks of an offer, pinned before the job is created (its sha256 is the job's description). */

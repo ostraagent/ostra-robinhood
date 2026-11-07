@@ -14,6 +14,11 @@ Environment=OSTRA_UPLOADER_SECRETS=/etc/ostra/robinhood/uploader/secrets
 Environment=OSTRA_UPLOADER_LISTEN=127.0.0.1:4800
 Environment=OSTRA_UPLOADER_DAILY_BYTES=200000000
 Environment=OSTRA_UPLOADER_STORE=/var/lib/ostra-uploader/files
+# Ostrapad's encrypted files (private jobs, uploader/src/enc.ts): kept in /var/lib/ostra-uploader/enc, checked against
+# the chain through this RPC (never printed) and against the indexer's private-job routes on this machine.
+Environment=OSTRA_UPLOADER_ENC=/var/lib/ostra-uploader/enc
+Environment=OSTRA_RPC_URL_FILE=/etc/ostra/robinhood-rpc.url
+Environment=OSTRA_UPLOADER_INDEXER=http://127.0.0.1:4900/api/v1/pad/private
 ExecStart=@NODE@ src/main.ts
 Restart=always
 RestartSec=5

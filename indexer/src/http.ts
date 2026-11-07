@@ -31,12 +31,16 @@
 //                                                check): { builder } (published, project_only, not_published or
 //                                                unavailable); 400 bad_address for anything else; never cached
 //                                                (HEY's answers are kept 60 seconds, in hey.ts)
+//   /api/v1/pad/private/...                      Ostrapad private jobs (pad-private.ts): KEM registrations, key wraps,
+//                                                the heartbeat; listing-post, member-posting and files only to a caller
+//                                                on this machine (the uploader). Never cached.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAddress } from "viem";
 import { CANDLE_INTERVALS, type Indexer } from "./indexer.ts";
 import type { HeyBuilders } from "./hey.ts";
 import type { PadIndexer } from "./pad.ts";
+import { PrivateBadRequest, type PadPrivate } from "./pad-private.ts";
 import { TIDE_BODY_MAX, TideBadRequest, type TideApi } from "./tide.ts";
 
 const MAX_LIMIT = 100;
@@ -215,6 +219,54 @@ export async function handleTide(tide: TideApi, req: IncomingMessage, res: Serve
   }
 }
 
+/** A caller on this machine: a loopback socket and no X-Forwarded-For (nginx sets it on everything it passes). */
+function onThisMachine(req: IncomingMessage): boolean {
+  const a = req.socket.remoteAddress ?? "";
+  return req.headers["x-forwarded-for"] === undefined && (a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1");
+}
+
+/** Ostrapad private jobs' routes (pad-private.ts); `route` is what follows /api/v1/pad/private/. */
+export async function handlePrivate(priv: PadPrivate, pad: PadIndexer, req: IncomingMessage, res: ServerResponse, route: string): Promise<void> {
+  const reply = (status: number, body: unknown) => {
+    res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+    res.end(JSON.stringify(body));
+  };
+  const parts = route.split("?")[0]?.split("/") ?? [];
+  const [what, arg] = parts;
+  try {
+    if (req.method === "POST") {
+      if (!((what === "kem" && arg === undefined) || (what === "wraps" && arg !== undefined))) return reply(404, { error: "not_found" });
+      const body = await jsonBody(req, 8_192);
+      if (!body.ok) return reply(body.error === "too_large" ? 413 : 400, { error: body.error });
+      if (typeof body.value !== "object" || body.value === null) return reply(400, { error: "not_an_object" });
+      const v = body.value as Record<string, unknown>;
+      return reply(200, what === "kem" ? await priv.register(v) : await priv.postWrap(arg as string, v));
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") return reply(405, { error: "method_not_allowed" });
+    if (what === "kem" && arg !== undefined && isAddress(arg, { strict: false })) return reply(200, { registrations: priv.registrations(arg as `0x${string}`) });
+    if (what === "wraps" && arg !== undefined && /^0x[0-9a-fA-F]{64}$/.test(arg)) {
+      const j = priv.job(arg as `0x${string}`);
+      return j === null ? reply(404, { error: "not_private" }) : reply(200, j);
+    }
+    if (what === "heartbeat" && arg === undefined) {
+      const url = new URL(req.url ?? "/", "http://indexer.local");
+      const from = Number(url.searchParams.get("from") ?? "0");
+      const to = Number(url.searchParams.get("to") ?? String(Date.now()));
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) return reply(400, { error: "bad_range" });
+      return reply(200, { spans: priv.heartbeat(from, to) });
+    }
+    if (!onThisMachine(req)) return reply(404, { error: "not_found" });
+    if (what === "listing-post" && arg !== undefined && isAddress(arg, { strict: false })) return reply(200, { posts: pad.listingPosts(arg as `0x${string}`) });
+    if (what === "description" && arg !== undefined && /^0x[0-9a-fA-F]{64}$/.test(arg)) return reply(200, { description: pad.row(arg as `0x${string}`)?.description ?? null });
+    if (what === "member-posting" && arg !== undefined && isAddress(arg, { strict: false })) return reply(200, { posting: priv.memberPosting(arg as `0x${string}`) });
+    if (what === "files" && arg === undefined) return reply(200, priv.files());
+    return reply(404, { error: "not_found" });
+  } catch (err) {
+    if (err instanceof PrivateBadRequest) return reply(err.status, { error: err.code, message: err.message });
+    throw err;
+  }
+}
+
 /** A token's builder status from HEY (hey.ts); never cached here, as HEY's answers are private and kept 60 seconds. */
 export async function handleBuilder(hey: HeyBuilders | null, req: IncomingMessage, res: ServerResponse, token: string): Promise<void> {
   const reply = (status: number, body: unknown) => {
@@ -228,9 +280,18 @@ export async function handleBuilder(hey: HeyBuilders | null, req: IncomingMessag
   return builder === null ? reply(404, { error: "not_tracked" }) : reply(200, { builder });
 }
 
-export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null, tide: TideApi | null = null, hey: HeyBuilders | null = null): Server {
+export function createIndexerServer(indexer: Indexer, log: (event: string, fields?: Record<string, unknown>) => void, pad: PadIndexer | null = null, tide: TideApi | null = null, hey: HeyBuilders | null = null, priv: PadPrivate | null = null): Server {
   return createServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0] ?? "/";
+    if (path.startsWith("/api/v1/pad/private/")) {
+      if (priv === null || pad === null) return send(res, 404, { error: "not_found" });
+      handlePrivate(priv, pad, req, res, (req.url ?? "").slice("/api/v1/pad/private/".length)).catch((err: unknown) => {
+        log("request_failed", { path: path.slice(0, 200), reason: (err as Error).message.slice(0, 200) });
+        if (!res.headersSent) send(res, 500, { error: "internal" });
+        else res.end();
+      });
+      return;
+    }
     const b = /^\/api\/v1\/builder\/([^/]{1,64})$/.exec(path);
     if (b !== null) {
       handleBuilder(hey, req, res, b[1] as string).catch((err: unknown) => {

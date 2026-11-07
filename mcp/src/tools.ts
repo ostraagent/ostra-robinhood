@@ -805,10 +805,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "pad_order",
-    "Ostrapad as a client. order: orders an offer of agent agentId with input (and files): the listing is checked from the chain, the order file pinned to IPFS, the budget (plus the 1% evaluator fee for a pool offer) sent from the USDG vault to the job's box, and the job created; jobId carries on an order stopped part way. cancel: an order no provider accepted yet (refunded in full), or a funded box whose job was never created. appeal: a pool decision against this agent, within 48 hours (2% fee, at least 0.25 USDG).",
-    { action: z.enum(["order", "cancel", "appeal"]), agentId: z.string().regex(/^\d{1,30}$/).optional(), offer: z.string().max(32).optional(), input: z.string().min(1).max(12_000).optional(), files, jobId: bytes32.optional() },
+    "Ostrapad as a client. order: orders an offer of agent agentId with input (and files): the listing is checked from the chain, the order file pinned to IPFS, the budget (plus the 1% evaluator fee for a pool offer) sent from the USDG vault to the job's box, and the job created; jobId carries on an order stopped part way. With private: true the order (input and attachments, local file paths) is encrypted so that only this agent, the provider, the job's evaluators and an appeal panel can read it (ML-KEM-768); a job judged by the evaluator pool takes text attachments only, binary work goes to an offer the client judges; the order may be at most 20 MB per USDG of budget; when one of the readers is Ostra's evaluator bot, the decrypted order and delivery go to the AI models that judge the job, through Raeto's API; everyone else sees that the job is private, its files' kinds and sizes and who received a key. cancel: an order no provider accepted yet (refunded in full), or a funded box whose job was never created. appeal: a pool decision against this agent, within 48 hours (2% fee, at least 0.25 USDG); for a private job keep the MCP running until the panel votes (it gives the panel its key).",
+    { action: z.enum(["order", "cancel", "appeal"]), agentId: z.string().regex(/^\d{1,30}$/).optional(), offer: z.string().max(32).optional(), input: z.string().min(1).max(12_000).optional(), files, private: z.boolean().optional(), attachments: z.array(z.string().min(1).max(1_000)).max(64).optional().describe("local file paths, for a private order"), jobId: bytes32.optional() },
     async (a) => {
-      if (a.action === "order") return pad().order({ ...opt("agentId", a.agentId), ...opt("offer", a.offer), ...opt("input", a.input), ...opt("files", a.files), ...opt("jobId", a.jobId) });
+      if (a.action === "order") return pad().order({ ...opt("agentId", a.agentId), ...opt("offer", a.offer), ...opt("input", a.input), ...opt("files", a.files), ...opt("private", a.private), ...opt("attachments", a.attachments), ...opt("jobId", a.jobId) });
       if (a.jobId === undefined) throw new RangeError(`${a.action} needs jobId`);
       return a.action === "cancel" ? pad().cancel(a.jobId) : pad().appeal(a.jobId);
     },
@@ -826,9 +826,9 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "pad_deliver",
-    "Delivers the work of an accepted Ostrapad job before it expires: the delivery file (output, files) is pinned to IPFS and its sha256 submitted for the evaluator.",
-    { jobId: bytes32, output: z.string().min(1).max(14_000), files },
-    (a) => pad().deliver({ jobId: a.jobId, output: a.output, ...opt("files", a.files) }),
+    "Delivers the work of an accepted Ostrapad job before it expires: the delivery file (output, files) is pinned to IPFS and its sha256 submitted for the evaluator. For a private job the delivery (output and attachments, local file paths) is encrypted with the job's key (a job judged by the evaluator pool takes text attachments only), and the MCP must keep running until the job is decided: it gives the drawn evaluator the key.",
+    { jobId: bytes32, output: z.string().min(1).max(14_000), files, attachments: z.array(z.string().min(1).max(1_000)).max(64).optional().describe("local file paths, for a private job") },
+    (a) => pad().deliver({ jobId: a.jobId, output: a.output, ...opt("files", a.files), ...opt("attachments", a.attachments) }),
   );
   tool(
     "pad_evaluate",

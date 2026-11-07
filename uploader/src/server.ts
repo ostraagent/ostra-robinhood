@@ -21,6 +21,10 @@
 //                         the bytes are checked against the CID here and again by every reader, so this server cannot
 //                         change what a CID names
 //
+// Ostrapad's encrypted files (private jobs, enc.ts) are uploaded under /v1/enc/ and served by the same
+// GET /v1/ipfs/<cid>, streamed from disk with Range, never cached (Cache-Control: no-store), and counted per address
+// (IPv4, or IPv6 /64) a day; a caller on this machine is not counted.
+//
 // The web app (https://app.ostraagent.xyz) uploads from the browser: its origin gets CORS and its preflight is
 // answered 204 (merchant/src/cors.ts); the limits below are the same for it.
 //
@@ -32,11 +36,12 @@
 // is kept here is what was pinned, byte for byte.
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { applyCors } from "../../merchant/src/cors.ts";
 import { AGENT_CARD_TYPE, agentCardSvg } from "../../sdk/src/agent-card.ts";
+import { EncError, type EncStore } from "./enc.ts";
 
 export const MAX_IMAGE_BYTES = 1_048_576;
 export const MAX_JSON_BYTES = 16_384;
@@ -410,17 +415,120 @@ function clientAddress(req: IncomingMessage): string {
   return first !== undefined && first !== "" ? first : (req.socket.remoteAddress ?? "unknown");
 }
 
-export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"]): Server {
+/** One byte range of a file of `size` bytes from a Range header: [start, end] inclusive; null for the whole file. Throws 416 on a range it cannot serve. */
+export function byteRange(header: string | undefined, size: number): [number, number] | null {
+  if (header === undefined) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (m === null || (m[1] === "" && m[2] === "")) throw new UploadError(416, "bad_range", "one range, bytes=start-end");
+  let start: number;
+  let end: number;
+  if (m[1] === "") {
+    const n = Number(m[2]);
+    start = Math.max(0, size - n);
+    end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
+  }
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= size) throw new UploadError(416, "bad_range", `the file is ${size} bytes`);
+  return [start, end];
+}
+
+/** Serves a kept encrypted file: streamed from disk, with Range, never cached; its bytes counted per address first. */
+function serveEncrypted(req: IncomingMessage, res: ServerResponse, enc: EncStore, path: string): void {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    throw new UploadError(404, "not_found", "the file is not kept here");
+  }
+  const range = byteRange(typeof req.headers.range === "string" ? req.headers.range : undefined, size);
+  const [start, end] = range ?? [0, size - 1];
+  const length = size === 0 ? 0 : end - start + 1;
+  enc.admitRead(clientAddress(req), req.method === "HEAD" ? 0 : length, onThisMachine(req));
+  res.writeHead(range === null ? 200 : 206, {
+    "content-type": "application/octet-stream",
+    "content-length": String(length),
+    "accept-ranges": "bytes",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    ...(range === null ? {} : { "content-range": `bytes ${start}-${end}/${size}` }),
+  });
+  if (req.method === "HEAD" || length === 0) {
+    res.end();
+    return;
+  }
+  const stream = createReadStream(path, { start, end });
+  stream.on("error", () => res.destroy());
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+
+async function readJson(req: IncomingMessage, max: number): Promise<Record<string, unknown>> {
+  if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) throw new UploadError(415, "unsupported_media_type", "send application/json");
+  let v: unknown;
+  try {
+    v = JSON.parse(Buffer.from(await readBody(req, max)).toString("utf8"));
+  } catch (err) {
+    if (err instanceof UploadError) throw err;
+    throw new UploadError(400, "invalid_json", "the body is not valid JSON");
+  }
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new UploadError(400, "not_an_object", "send a JSON object");
+  return v as Record<string, unknown>;
+}
+
+/** The /v1/enc/ routes (private jobs); true when `path` was one of them. */
+async function encRoute(req: IncomingMessage, res: ServerResponse, enc: EncStore, path: string): Promise<boolean> {
+  if (req.method === "POST" && path === "/v1/enc/uploads") {
+    const b = await readJson(req, 2_048);
+    reply(res, 200, await enc.begin({ size: b.size, sha256: b.sha256, kind: b.kind, jobId: b.jobId, signature: b.signature }, clientAddress(req)));
+    return true;
+  }
+  if (req.method === "POST" && path === "/v1/enc/reserve") {
+    const b = await readJson(req, 2_048);
+    if (typeof b.jobId !== "string" || typeof b.bytes !== "number" || typeof b.seq !== "string" || typeof b.signature !== "string") throw new UploadError(400, "bad_reservation", "send {jobId, bytes, seq, signature}");
+    reply(res, 200, await enc.reserve({ jobId: b.jobId, bytes: b.bytes, seq: b.seq, signature: b.signature }));
+    return true;
+  }
+  const chunk = /^\/v1\/enc\/uploads\/([0-9a-f]{32})\/(\d{1,4})$/.exec(path);
+  if (req.method === "PUT" && chunk !== null) {
+    // The upload and the chunk's size are checked before any of the body is read.
+    const want = enc.expectChunk(chunk[1] as string, Number(chunk[2]));
+    if (Number(req.headers["content-length"] ?? "-1") !== want) throw new UploadError(400, "bad_chunk_size", `chunk ${chunk[2]} is ${want} bytes (send its Content-Length)`);
+    await enc.chunk(chunk[1] as string, Number(chunk[2]), await readBody(req, want));
+    reply(res, 200, { ok: true });
+    return true;
+  }
+  const done = /^\/v1\/enc\/uploads\/([0-9a-f]{32})\/done$/.exec(path);
+  if (req.method === "POST" && done !== null) {
+    reply(res, 200, await enc.done(done[1] as string));
+    return true;
+  }
+  if (req.method === "GET" && path === "/v1/enc/health") {
+    reply(res, 200, enc.health());
+    return true;
+  }
+  return false;
+}
+
+export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"], enc?: EncStore): Server {
   return createServer((req, res) => {
     void (async () => {
       try {
         if (applyCors(req, res)) return;
         const path = new URL(req.url ?? "/", "http://uploader").pathname;
         if (req.method === "GET" && path === "/v1/ipfs/health") return reply(res, 200, u.health());
+        if (path.startsWith("/v1/enc/")) {
+          if (enc === undefined) throw new UploadError(404, "not_found", "this uploader keeps no encrypted files");
+          if (await encRoute(req, res, enc, path)) return;
+          throw new UploadError(404, "not_found", "POST /v1/enc/uploads, PUT /v1/enc/uploads/<id>/<n>, POST /v1/enc/uploads/<id>/done, POST /v1/enc/reserve");
+        }
         const asked = /^\/v1\/ipfs\/([A-Za-z0-9]{1,100})$/.exec(path);
         if ((req.method === "GET" || req.method === "HEAD") && asked !== null) {
           const cid = asked[1] as string;
           if (rawCidDigest(cid) === null) throw new UploadError(404, "not_found", "only a raw CIDv1 (sha2-256, bafkrei...) is served here");
+          const encPath = enc?.path(cid) ?? null;
+          if (encPath !== null && enc !== undefined) return serveEncrypted(req, res, enc, encPath);
           const got = await u.file(cid, { upstream: onThisMachine(req) });
           if ("bytes" in got) {
             const svg = isSvg(got.bytes);
@@ -477,7 +585,7 @@ export function createUploaderServer(u: Uploader, log?: UploaderOptions["log"]):
         log?.("pinned", { kind: image ? "image" : "json", bytes: body.length, cid: out.cid });
         reply(res, 200, out);
       } catch (err) {
-        if (err instanceof UploadError) return reply(res, err.status, { error: err.code, message: err.message });
+        if (err instanceof UploadError || err instanceof EncError) return reply(res, err.status, { error: err.code, message: err.message });
         log?.("error", { message: (err as Error).message });
         reply(res, 500, { error: "internal", message: "the upload failed" });
       }

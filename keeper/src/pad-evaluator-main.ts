@@ -25,16 +25,21 @@
 //   OSTRA_PAD_UPLOADER_URL        the Ostra uploader, for the decisions' reasons (default http://127.0.0.1:4800)
 //   OSTRA_PAD_IPFS_GATEWAYS       the IPFS gateways, comma-separated, in the order they are tried (default the
 //                                 Ostra uploader's /v1/ipfs/, then Pinata's public gateway, then ipfs.io)
+//   OSTRA_PAD_ENC_STORE           the uploader's directory of encrypted files (private jobs), read only (default
+//                                 /var/lib/ostra-uploader/enc/files, the uploader on this host); the accounts' ML-KEM-768
+//                                 keys are derived from their private keys (PAD_KEM_DOMAIN.keeper), no new key file;
+//                                 private jobs' plaintext is kept 0600 under OSTRA_PAD_DATA, which is kept out of backups
 //
 // Stops cleanly on SIGINT and SIGTERM.
 
 import { readFileSync, statSync } from "node:fs";
-import { createPublicClient, getAddress, http, type PublicClient } from "viem";
+import { createPublicClient, getAddress, hexToBytes, http, type Address, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, redact, retryingHttp, robinhoodChain } from "@ostraagent/sdk";
+import { OSTRAPAD, PAD_KEM_DOMAIN, ROBINHOOD_PUBLIC_RPC, assertRobinhoodChain, padKemKeys, padKemSeed, redact, retryingHttp, robinhoodChain, type PadKemKeys } from "@ostraagent/sdk";
 import { Sender } from "./chain.ts";
 import { openFeePayer } from "./keys.ts";
 import { PadEvaluator, failoverJudges, gatewayFetch, judgeProviders, judgeSameApi } from "./pad-evaluator.ts";
+import { httpPrivateIndex, uploadReason } from "./pad-private.ts";
 
 /** After the Ostra uploader (OSTRA_PAD_UPLOADER_URL /v1/ipfs/, the files it pinned and keeps): the public gateways. */
 const PUBLIC_GATEWAYS = ["https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/"];
@@ -67,6 +72,8 @@ async function main(): Promise<void> {
   const indexerUrl = (optional("OSTRA_PAD_INDEXER_URL") ?? "http://127.0.0.1:4900").replace(/\/+$/, "");
   const log = (event: string, fields: Record<string, unknown>) => console.log(scrub(JSON.stringify({ at: new Date().toISOString(), event, ...fields })));
 
+  // Each account's ML-KEM-768 keys for private jobs, derived from its private key (design "Ostrapad: private job").
+  const kem = new Map<Address, PadKemKeys>();
   const evaluators = required("OSTRA_PAD_EVALUATOR_KEYS")
     .split(",")
     .map((p) => p.trim())
@@ -74,7 +81,11 @@ async function main(): Promise<void> {
     .map((path) => {
       const key = secretFile(path);
       if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error(`${path} is not a 0x-prefixed private key`);
-      return privateKeyToAccount(key as `0x${string}`);
+      const account = privateKeyToAccount(key as `0x${string}`);
+      const ikm = hexToBytes(key as `0x${string}`);
+      kem.set(getAddress(account.address), padKemKeys(padKemSeed(ikm, PAD_KEM_DOMAIN.keeper, robinhoodChain.id, OSTRAPAD)));
+      ikm.fill(0);
+      return account;
     });
   if (evaluators.length === 0) throw new Error("OSTRA_PAD_EVALUATOR_KEYS names no key file");
   if (new Set(evaluators.map((a) => a.address)).size !== evaluators.length) throw new Error("OSTRA_PAD_EVALUATOR_KEYS names the same account twice");
@@ -83,6 +94,13 @@ async function main(): Promise<void> {
   const client = createPublicClient({ chain: robinhoodChain, transport, pollingInterval: 1_000 }) as PublicClient;
   await assertRobinhoodChain(client);
   const logsClient = createPublicClient({ chain: robinhoodChain, transport: http(logsUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
+  // Ostra's panel checks a vault evaluator's key registration at the block it arrived in: this RPC must keep old state.
+  try {
+    const head = await client.getBlockNumber({ cacheTime: 0 });
+    await client.getBalance({ address: evaluators[0]!.address, blockNumber: head > 1_000_000n ? head - 1_000_000n : 1n });
+  } catch {
+    log("pad_alert", { what: "rpc", why: "OSTRA_RPC_URL serves no past state: a vault evaluator's key registration cannot be checked, so the panel judges such rejections for no K afresh" });
+  }
   const feePayer = await openFeePayer(required("OSTRA_PAD_SECRETS"));
   const sender = new Sender(client, transport, feePayer, log);
   const uploader = (optional("OSTRA_PAD_UPLOADER_URL") ?? "http://127.0.0.1:4800").replace(/\/+$/, "");
@@ -118,6 +136,13 @@ async function main(): Promise<void> {
     },
     dataDir: required("OSTRA_PAD_DATA"),
     log,
+    private: {
+      store: optional("OSTRA_PAD_ENC_STORE") ?? "/var/lib/ostra-uploader/enc/files",
+      index: httpPrivateIndex(indexerUrl),
+      kem,
+      uploadReason: (account, jobId, file) => uploadReason(uploader, account, robinhoodChain.id, OSTRAPAD, jobId, file),
+      chainId: robinhoodChain.id,
+    },
   });
   log("started", {
     chainId: robinhoodChain.id,

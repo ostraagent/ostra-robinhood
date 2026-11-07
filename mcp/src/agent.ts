@@ -22,7 +22,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
 import { mainnet } from "viem/chains";
-import { LAUNCH_PAIRS, WETH, assertRobinhoodChain, borroStocks, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, OSTRAPAD, WETH, assertRobinhoodChain, borroStocks, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
 import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
 import type { Prover } from "@ostraagent/swap";
@@ -62,6 +62,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import type { McpConfig } from "./config.ts";
 import { checkPrivate, ensurePrivateDir } from "./disk.ts";
+import { PadPrivate } from "./pad-private.ts";
 import { openKeys } from "./keys.ts";
 
 export const SWEEP_SECONDS = 60;
@@ -294,6 +295,23 @@ export class Agent {
             upload: (file) => uploadJson(config.relayerUrl, file),
             indexerUrl: config.padIndexerUrl,
             ...(listingProof === undefined ? {} : { listingProof }),
+            // Private jobs: through Ostra's uploader (the relayer's host) and index; keys from the seed.
+            ...(config.relayerUrl === null || config.padIndexerUrl === null
+              ? {}
+              : {
+                  private: new PadPrivate({
+                    client,
+                    chainId: config.chainId,
+                    pad: OSTRAPAD,
+                    kem: () => keys.padKem(config.chainId, OSTRAPAD),
+                    posting: () => keys.padPosting(config.chainId, OSTRAPAD),
+                    uploaderUrl: config.relayerUrl,
+                    indexerUrl: config.padIndexerUrl,
+                    folder: keys.folder.folder("pad"),
+                    filesDir: config.padFilesDir,
+                    history: createPublicClient({ chain: robinhoodChain, transport: http(config.historyRpcUrl, { retryCount: 3, retryDelay: 1_000 }) }) as PublicClient,
+                  }),
+                }),
           });
     // Ostra Tide: the identity is Ostrapad's (the creator vault and its ERC-8004 id); the vaults linked are every
     // vault of this seed but the private ones (ownVaults' list without them).

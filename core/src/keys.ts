@@ -29,7 +29,7 @@
 
 import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type PrivateKeyAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { WotsKeychain, sha256, utf8, type WotsStore } from "@ostraagent/sdk";
+import { PAD_KEM_DOMAIN, WotsKeychain, padKemKeys, padKemSeed, padPostingAccount, sha256, utf8, type PadKemKeys, type WotsStore } from "@ostraagent/sdk";
 import type { SignatureEscrowClient } from "./escrow.ts";
 import { backupSignerOf, sealSeed } from "./passkey.ts";
 import type { Folder } from "./storage.ts";
@@ -310,6 +310,19 @@ export class Keys<S extends WotsStore = WotsStore> {
    */
   tideSecret(chainId: number, tide: Address): Hex {
     return bytesToHex(sha256([TIDE_LINK_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(tide)]));
+  }
+
+  /**
+   * The agent's ML-KEM-768 key pair for Ostrapad's private jobs on (chain, OstraPad) (sdk pad-private.ts padKemSeed with
+   * the MCP's domain): its public key goes in the agent's listing and KEM registration; the seed recovers it.
+   */
+  padKem(chainId: number, pad: Address): PadKemKeys {
+    return padKemKeys(padKemSeed(this.#master, PAD_KEM_DOMAIN.mcp, chainId, pad));
+  }
+
+  /** The agent's posting key for Ostrapad's private jobs on (chain, OstraPad): it signs wraps, uploads and reservations. */
+  padPosting(chainId: number, pad: Address): PrivateKeyAccount {
+    return padPostingAccount(this.#master, chainId, pad);
   }
 
   /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */

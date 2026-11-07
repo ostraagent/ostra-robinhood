@@ -20,6 +20,7 @@ export * from "./lthash.ts";
 export * from "./messages.ts";
 export * from "./morpho.ts";
 export * from "./pad.ts";
+export * from "./pad-private.ts";
 export * from "./pad-rules.ts";
 export * from "./pad-reputation.ts";
 export * from "./tide.ts";

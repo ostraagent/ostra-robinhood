@@ -80,6 +80,7 @@ import {
   repEntriesAtRoot,
   repEpochAt,
   repVerify,
+  padTermsFromTransaction,
   type Deployment,
   type PadOffer,
   type PadProhibitedId,
@@ -101,10 +102,15 @@ const DETAILS_PER_SYNC = 20;
 /** The blocks read again on the next pass (5 minutes at 10 blocks a second). */
 export const RESCAN_BLOCKS = 3_000n;
 const MAX_JOBS = 20_000;
+/** A job that ended is kept at least this long (seconds): past the uploader's 14 days for its files. */
+const KEEP_ENDED_S = 15 * 86_400;
 /** Listings checked against the content rules in one sync, at most. */
 const MODERATIONS_PER_SYNC = 5;
 /** A listing with no answer from the moderator is checked again this long after. */
 export const RETRY_MODERATION_MS = 10 * 60_000;
+/** A running job's description that could not be read is read again this far apart, at most this many a pass. */
+export const DESCRIPTION_RETRY_MS = 60_000;
+const DESCRIPTIONS_PER_SYNC = 10;
 /**
  * Answered calls to the moderator (it shares the evaluator bot's Raeto credits; a call with no answer is not paid and
  * not counted): at most MODERATION_TRIES answers that are not verdicts for one content in 24 hours (then that content
@@ -134,6 +140,20 @@ export type PadJobRow = {
   acceptedAt: number | null;
   submittedAt: number | null;
   closedAt: number | null;
+  /**
+   * For private jobs (pad-private.ts; absent on jobs read before they were recorded): the order file's sha256 (the
+   * terms' description, from the create transaction; null when it could not be read), the delivery's, the reasons'
+   * (non-zero), each evaluator draw and decision with its block time, and an appeal's appellant and panel.
+   */
+  description?: Hex | null;
+  /** The create transaction (a description that could not be read is read from it again, DESCRIPTION_RETRY_MS apart). */
+  createdTx?: Hex;
+  deliverable?: Hex | null;
+  reasons?: Hex[];
+  draws?: { round: number; evaluator: Address; at: number; block: string }[];
+  decisions?: { evaluator: Address; approved: boolean; at: number; block: string }[];
+  appellant?: Address | null;
+  panel?: { members: Address[]; at: number; block: string } | null;
 };
 
 export type PadAgent = {
@@ -148,6 +168,9 @@ export type PadAgent = {
   provider: Address | null;
   approved: boolean;
   offers: PadOffer[];
+  /** For private jobs: the listing's ML-KEM-768 key (base64) and posting address, both checked; null without both. */
+  kem?: string | null;
+  post?: Address | null;
   problems: string[];
   record: { completed: number; rejected: number; expired: number; clients: number; volume: string; bond: string; active: number; fixedCompleted: number; limit: string } | null;
   /** The provider vault's creation (the factory's VaultCreated): its block time (null: none found), for the vault it
@@ -296,6 +319,8 @@ export class PadIndexer {
   readonly #nowMs: () => number;
   /** When a listing the moderator gave no answer on is checked again (milliseconds), by agent. */
   readonly #moderationRetry = new Map<string, number>();
+  /** When a running job's unread description is read again (milliseconds), by job. */
+  readonly #descriptionRetryAt = new Map<string, number>();
   /** Calls to the moderator: by agent (with the content and its calls with no answer), and all of them (milliseconds). */
   readonly #moderationCalls = new Map<string, { key: Hex; misses: number[]; at: number[] }>();
   #moderationAll: number[] = [];
@@ -313,6 +338,8 @@ export class PadIndexer {
   #verdicts = new Map<string, { epoch: string; valid: boolean; reverted: string | null }>();
   #timer: ReturnType<typeof setTimeout> | null = null;
   #running = false;
+  /** The logs RPC's head as last read, and when (milliseconds): whether the index is caught up. */
+  #head: { block: bigint; atMs: number } | null = null;
 
   /**
    * `hidden`: the accounts the board leaves out (lower case), read when the board is served; null while the list
@@ -374,6 +401,7 @@ export class PadIndexer {
   /** One pass: new agents and jobs from the logs, then some agents' files and records read again. */
   async sync(): Promise<void> {
     const latest = await this.#logs.getBlockNumber({ cacheTime: 0 });
+    this.#head = { block: latest, atMs: this.#nowMs() };
     // Each pass starts RESCAN_BLOCKS back from the head at most (never before where the scan began).
     const back = (scannedTo: string, start: bigint) => {
       const next = BigInt(scannedTo) + 1n;
@@ -436,6 +464,7 @@ export class PadIndexer {
       }
     }
     changed = (await this.#moderateDue()) || changed;
+    changed = (await this.#readDescriptionsAgain()) || changed;
     if (changed) this.#save();
   }
 
@@ -505,9 +534,36 @@ export class PadIndexer {
     return changed;
   }
 
+  /**
+   * The descriptions of running jobs that could not be read at their JobCreated (a trace the RPC refused or timed
+   * out), read again from the create transaction at most every DESCRIPTION_RETRY_MS (review round 9, R9-B2): until then
+   * no wrap can be posted for a private job, and the uploader keeps every order no job names.
+   */
+  async #readDescriptionsAgain(): Promise<boolean> {
+    const now = this.#nowMs();
+    let changed = false;
+    const due = Object.values(this.#state.jobs).filter((j) => j.description === null && j.closedAt === null && j.createdTx !== undefined && now >= (this.#descriptionRetryAt.get(j.id) ?? 0));
+    for (const j of due.slice(0, DESCRIPTIONS_PER_SYNC)) {
+      try {
+        const d = (await padTermsFromTransaction(this.#client, j.createdTx as Hex, j.id, this.#pad))?.description.toLowerCase() as Hex | undefined;
+        if (d !== undefined) {
+          j.description = d;
+          this.#descriptionRetryAt.delete(j.id);
+          this.#log("pad_terms_read", { jobId: j.id });
+          changed = true;
+          continue;
+        }
+      } catch (err) {
+        this.#log("pad_terms_unread", { jobId: j.id, again: true, reason: (err as Error).message.slice(0, 200) });
+      }
+      this.#descriptionRetryAt.set(j.id, now + DESCRIPTION_RETRY_MS);
+    }
+    return changed;
+  }
+
   async #scanJobs(from: bigint, to: bigint): Promise<boolean> {
     let changed = false;
-    const get = (event: (typeof PAD_EVENTS)[keyof typeof PAD_EVENTS]) => this.#logs.getLogs({ address: this.#pad, event: event as never, fromBlock: from, toBlock: to }) as Promise<{ args: Record<string, unknown>; blockNumber: bigint; logIndex: number }[]>;
+    const get = (event: (typeof PAD_EVENTS)[keyof typeof PAD_EVENTS]) => this.#logs.getLogs({ address: this.#pad, event: event as never, fromBlock: from, toBlock: to }) as Promise<{ args: Record<string, unknown>; blockNumber: bigint; logIndex: number; transactionHash: Hex }[]>;
     const times = new Map<bigint, number>();
     const time = async (b: bigint) => {
       let t = times.get(b);
@@ -518,7 +574,7 @@ export class PadIndexer {
       }
       return t;
     };
-    const [created, funded, accepted, submitted, decided, completed, rejected, expired, cancelled, paid, refunded, drawn, appealed] = await Promise.all([
+    const [created, funded, accepted, submitted, decided, completed, rejected, expired, cancelled, paid, refunded, drawn, appealed, panels] = await Promise.all([
       get(PAD_EVENTS.JobCreated),
       get(PAD_EVENTS.JobFunded),
       get(PAD_EVENTS.JobAccepted),
@@ -532,6 +588,7 @@ export class PadIndexer {
       get(PAD_EVENTS.Refunded),
       get(PAD_EVENTS.EvaluatorDrawn),
       get(PAD_EVENTS.AppealOpened),
+      get(PAD_EVENTS.PanelDrawn),
     ]);
     for (const l of created) {
       const a = l.args as { jobId: Hex; client: Address; provider: Address; evaluator: Address };
@@ -539,11 +596,19 @@ export class PadIndexer {
       if (this.#state.jobs[a.jobId] !== undefined) continue;
       const t = await time(l.blockNumber);
       const pool = BigInt(a.evaluator) === 0n;
-      this.#state.jobs[a.jobId] = { id: a.jobId, client: getAddress(a.client), provider: getAddress(a.provider), evaluator: pool ? null : getAddress(a.evaluator), pool, funded: "0", status: "Open", createdAt: t, createdBlock: l.blockNumber.toString(), updatedAt: t, paid: null, refunded: null, acceptedAt: null, submittedAt: null, closedAt: null };
+      // The order file's sha256 is in the terms, not in the event: read from the create transaction (null when it
+      // cannot be read; a private job's files are then kept by the uploader until it can tell, see pad-private.ts).
+      let description: Hex | null = null;
+      try {
+        description = ((await padTermsFromTransaction(this.#client, l.transactionHash, a.jobId, this.#pad))?.description.toLowerCase() as Hex | undefined) ?? null;
+      } catch (err) {
+        this.#log("pad_terms_unread", { jobId: a.jobId, reason: (err as Error).message.slice(0, 200) });
+      }
+      this.#state.jobs[a.jobId] = { id: a.jobId, client: getAddress(a.client), provider: getAddress(a.provider), evaluator: pool ? null : getAddress(a.evaluator), pool, funded: "0", status: "Open", createdAt: t, createdBlock: l.blockNumber.toString(), updatedAt: t, paid: null, refunded: null, acceptedAt: null, submittedAt: null, closedAt: null, description, createdTx: l.transactionHash, deliverable: null, reasons: [], draws: [], decisions: [], appellant: null, panel: null };
       changed = true;
     }
     // Later events of a window, in log order, move a job's status along (a window holds whole blocks).
-    const events: { kind: string; l: { args: Record<string, unknown>; blockNumber: bigint; logIndex: number } }[] = [
+    const events: { kind: string; l: { args: Record<string, unknown>; blockNumber: bigint; logIndex: number; transactionHash: Hex } }[] = [
       ...funded.map((l) => ({ kind: "funded", l })),
       ...accepted.map((l) => ({ kind: "Accepted", l })),
       ...submitted.map((l) => ({ kind: "Submitted", l })),
@@ -556,6 +621,7 @@ export class PadIndexer {
       ...refunded.map((l) => ({ kind: "refunded", l })),
       ...drawn.map((l) => ({ kind: "drawn", l })),
       ...appealed.map((l) => ({ kind: "Appealed", l })),
+      ...panels.map((l) => ({ kind: "panel", l })),
     ].sort((x, y) => (x.l.blockNumber === y.l.blockNumber ? x.l.logIndex - y.l.logIndex : x.l.blockNumber < y.l.blockNumber ? -1 : 1));
     for (const { kind, l } of events) {
       const id = l.args.jobId as Hex;
@@ -566,18 +632,39 @@ export class PadIndexer {
       if (kind === "funded") j.funded = usd(l.args.amount as bigint);
       else if (kind === "paid") j.paid = usd(l.args.amount as bigint);
       else if (kind === "refunded") j.refunded = usd(l.args.amount as bigint);
-      else if (kind === "drawn") j.evaluator = getAddress(l.args.evaluator as Address);
+      else if (kind === "drawn") {
+        j.evaluator = getAddress(l.args.evaluator as Address);
+        const draw = { round: Number(l.args.round), evaluator: j.evaluator, at, block: l.blockNumber.toString() };
+        if (j.draws !== undefined && !j.draws.some((d) => d.block === draw.block && d.round === draw.round)) j.draws.push(draw);
+      } else if (kind === "panel") {
+        if (j.panel !== undefined) j.panel = { members: (l.args.panel as Address[]).map((m) => getAddress(m)), at, block: l.blockNumber.toString() };
+      }
       // A cancel emits JobRejected too: Cancelled stands.
       else if (!(kind === "Rejected" && j.status === "Cancelled")) {
         j.status = kind;
         if (kind === "Accepted") j.acceptedAt = at;
-        else if (kind === "Submitted") j.submittedAt = at;
+        else if (kind === "Submitted") {
+          j.submittedAt = at;
+          if (j.deliverable !== undefined) j.deliverable = (l.args.deliverable as Hex).toLowerCase() as Hex;
+        } else if (kind === "Decided" && j.decisions !== undefined) {
+          const d = { evaluator: getAddress(l.args.evaluator as Address), approved: l.args.approved as boolean, at, block: l.blockNumber.toString() };
+          if (!j.decisions.some((x) => x.block === d.block && x.evaluator === d.evaluator)) j.decisions.push(d);
+        } else if (kind === "Appealed" && j.appellant !== undefined) j.appellant = getAddress(l.args.appellant as Address);
+        const reason = l.args.reason as Hex | undefined;
+        if (reason !== undefined && BigInt(reason) !== 0n && j.reasons !== undefined && !j.reasons.includes(reason.toLowerCase() as Hex)) j.reasons.push(reason.toLowerCase() as Hex);
         else if (kind === "Completed" || kind === "Rejected" || kind === "Expired" || kind === "Cancelled") j.closedAt = at;
       }
       changed = true;
     }
+    // Over MAX_JOBS, the oldest jobs that ended more than KEEP_ENDED_S ago are dropped; a job still running, or ended
+    // within that time, is never dropped (the uploader keeps a private job's files 14 days after it ends, by what this
+    // index says of it).
     const ids = Object.keys(this.#state.jobs) as Hex[];
-    if (ids.length > MAX_JOBS) for (const id of ids.slice(0, ids.length - MAX_JOBS)) delete this.#state.jobs[id];
+    if (ids.length > MAX_JOBS) {
+      const cutoff = Math.floor(this.#nowMs() / 1000) - KEEP_ENDED_S;
+      const over = ids.filter((id) => { const c = this.#state.jobs[id]?.closedAt ?? null; return c !== null && c < cutoff; }).sort((x, y) => (this.#state.jobs[x]?.closedAt ?? 0) - (this.#state.jobs[y]?.closedAt ?? 0));
+      for (const id of over.slice(0, ids.length - MAX_JOBS)) delete this.#state.jobs[id];
+    }
     return changed;
   }
 
@@ -591,6 +678,8 @@ export class PadIndexer {
       a.provider = null;
       a.approved = false;
       a.offers = [];
+      a.kem = null;
+      a.post = null;
       a.problems = ["the identity's owner is not an Ostra vault"];
       a.record = null;
       a.reputation = null;
@@ -606,6 +695,8 @@ export class PadIndexer {
       a.provider = null;
       a.approved = false;
       a.offers = [];
+      a.kem = null;
+      a.post = null;
       a.problems = [];
       a.record = null;
       a.reputation = null;
@@ -613,6 +704,8 @@ export class PadIndexer {
     }
     a.provider = found.listing.provider;
     a.offers = found.listing.offers;
+    a.kem = found.listing.kem ?? null;
+    a.post = found.listing.post ?? null;
     a.problems = found.problems;
     const digest = padListingDigest(id, owner, this.#pad, this.#deployment().chainId);
     let approved = false;
@@ -758,6 +851,30 @@ export class PadIndexer {
   stop(): void {
     this.#running = false;
     if (this.#timer !== null) clearTimeout(this.#timer);
+  }
+
+  /** A job as this index holds it (private jobs' fields included), or undefined. */
+  row(id: Hex): PadJobRow | undefined {
+    return this.#state.jobs[id.toLowerCase() as Hex] ?? this.#state.jobs[id];
+  }
+
+  /** Every job this index holds. */
+  rows(): PadJobRow[] {
+    return Object.values(this.#state.jobs);
+  }
+
+  /**
+   * True when the last pass read the logs to the head and finished within `withinMs` (the uploader removes a private
+   * job's files only then: a job this index has not seen may name any file).
+   */
+  caughtUp(withinMs = 120_000): boolean {
+    return this.#head !== null && BigInt(this.#state.scannedTo) >= this.#head.block && this.#nowMs() - this.#head.atMs <= withinMs;
+  }
+
+  /** Every posting address (`post`) the approved listings of provider vault `provider` publish for private jobs. */
+  listingPosts(provider: Address): Address[] {
+    const p = getAddress(provider);
+    return [...new Set(Object.values(this.#state.agents).filter((a) => a.approved && a.provider === p && a.post !== undefined && a.post !== null).map((a) => a.post as Address))];
   }
 
   /** Listed agents (an approved listing with offers), ranked; `q` matches their name, description and offers. */

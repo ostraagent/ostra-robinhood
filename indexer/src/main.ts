@@ -47,6 +47,7 @@ import { createIndexerServer } from "./http.ts";
 import { Indexer } from "./indexer.ts";
 import { failoverModerator, moderationProviders, type Moderator } from "./moderation.ts";
 import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
+import { PadPrivate } from "./pad-private.ts";
 import { TideApi, tideLinkVerifier, tidePayeeChecker } from "./tide.ts";
 import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
@@ -125,6 +126,11 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   }
   const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri), hidden, moderate });
   log("pad_board", { hiddenFiles: hideFiles.length });
+  // Private jobs (pad-private.ts): records under OSTRA_PAD_PRIVATE (default <state dir>/pad-private), order headers read
+  // from the uploader's store of encrypted files, OSTRA_UPLOADER_ENC_FILES (default /var/lib/ostra-uploader/enc/files).
+  const privateDir = process.env.OSTRA_PAD_PRIVATE || join(dirname(statePath), "pad-private");
+  const priv = pad === null || privateDir === "off" ? null : new PadPrivate({ pad, client, dir: privateDir, store: process.env.OSTRA_UPLOADER_ENC_FILES || "/var/lib/ostra-uploader/enc/files", chainId: record.chainId, log });
+  log("pad_private", { dir: priv === null ? "off" : privateDir });
   const tideLinks = process.env.OSTRA_TIDE_LINKS || join(dirname(statePath), "tide-links.json");
   let tide: TideApi | null = null;
   if (tideLinks !== "off") {
@@ -152,14 +158,16 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
     }
   }
   log("hey", hey === null ? { builder: "off", reason: heyOff } : { builder: "on" });
-  const server = createIndexerServer(indexer, log, pad, tide, hey);
+  const server = createIndexerServer(indexer, log, pad, tide, hey, priv);
   server.listen(port, host, () => log("started", { listen: `${host}:${port}`, statePath, everyMs, scannedTo: indexer.scannedTo.toString(), pad: pad === null ? "off" : padStatePath }));
   indexer.start(everyMs);
   // Ostrapad's index: its own scans, a few seconds apart (its files and records are read again every few minutes).
   pad?.start(Math.max(everyMs, 5_000));
+  priv?.start(60_000);
   const stop = () => {
     indexer.stop();
     pad?.stop();
+    priv?.stop();
     server.close(() => process.exit(0));
   };
   process.on("SIGINT", stop);

@@ -42,17 +42,31 @@
 //     keeps failing (no evaluator can be drawn) leaves the job to settle when its time comes.
 //   * Blocks: OstraPad's drawBlock and panelBlock are block.number, the parent chain's block on Robinhood Chain
 //     (sdk padHead).
+//   * Private jobs (design "Ostrapad: private job", revisions 2 to 9; pad-private.ts): a job whose order is an encrypted
+//     file in the uploader's store on this machine. The bot registers each account's ML-KEM-768 key (derived from the
+//     account's private key) with Ostra's index, reads K from the wraps the index holds for any of its accounts (one
+//     operator: K from one account serves all), then reads the encrypted files straight from the store and keeps only
+//     what the judge needs (pad-private.ts) as plaintext 0600 in the data directory, removed when the job finishes.
+//     A missing wrap is waited for as a missing file is; at the late point a decision without K rejects with a fixed
+//     reason that says nothing of the job. A store file that is not there is absent; one that cannot be read or does
+//     not hash to its name is no answer yet (at the late point a decision still rejects, a vote agrees, and no
+//     Kept.unread is written); a delivery read whole that is malformed or does not decrypt is the provider's fault (a
+//     rejection). On a panel: a rejection is upheld without judging afresh when the rule for a rejection "for no K"
+//     holds (pad-private.ts upholdNoKey); else the panel judges afresh with the K the appellant wrapped for it, and
+//     without one agrees with the decision when the delivery is in the store. Reasons are encrypted under K and
+//     uploaded to the uploader's /v1/enc/, signed by the account (an empty reason when that fails).
 // The accounts' gas: each is topped up from the fee payer when it cannot pay its call (Sender.fromCrank).
 
-import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getAddress, sha256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, getAddress, sha256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
 import {
   ERC8004_IDENTITY_REGISTRY,
   FAILOVER_COOLDOWN_MS,
   OSTRAPAD,
   OSTRAPAD_FROM_BLOCK,
   PAD,
+  PAD_ENC_KIND,
   PAD_EVENTS,
   failover,
   getLogsChunked,
@@ -62,6 +76,7 @@ import {
   padDigestFromCid,
   padHead,
   padListingFromFile,
+  padParseHeader,
   padReasonFile,
   padProhibited,
   padRulesText,
@@ -69,10 +84,32 @@ import {
   readPadAppeal,
   readPadJob,
   type PadAppeal,
+  type PadEncKind,
   type PadJob,
+  type PadKemKeys,
   type PadProhibitedId,
 } from "@ostraagent/sdk";
 import type { Call, Sent } from "./chain.ts";
+import {
+  KEEP_DELIVERY_TEXT_BYTES,
+  KEEP_ORDER_TEXT_BYTES,
+  NO_KEY_REASON,
+  encFileName,
+  encHeader,
+  encPresence,
+  keyFromText,
+  keyFromWraps,
+  keyToText,
+  openEncFile,
+  registrationBody,
+  sealReason,
+  upholdNoKey,
+  upholdSnapshot,
+  type KeptPlain,
+  type PadPrivateIndex,
+  type Presence,
+  type UpholdSnapshot,
+} from "./pad-private.ts";
 
 /** How often the bot runs a pass. */
 export const PAD_TICK_MS = 30_000;
@@ -126,6 +163,13 @@ export const MAX_JUDGE_CALLS = 3;
 const FETCH_TIMEOUT_MS = 20_000;
 const ZERO32: Hex = `0x${"00".repeat(32)}`;
 const FINISHED = new Set(["Completed", "Rejected", "Expired", "Cancelled"]);
+/** A private job's K as kept, and the item its wraps are read under. */
+const KEY_FILE = "key.json";
+const WRAPS = "wraps";
+/** A private job's decrypted file is kept (and its reads tracked) as plain-<digest>; the rule for no K as uphold-<round>. */
+const plainName = (digest: Hex) => `plain-${digest.toLowerCase()}`;
+const upholdName = (round: number) => `uphold-${round}.json`;
+const utf8 = (text: string) => new TextEncoder().encode(text);
 const tokenUriAbi = [{ type: "function", name: "tokenURI", stateMutability: "view", inputs: [{ name: "agentId", type: "uint256" }], outputs: [{ name: "", type: "string" }] }] as const;
 
 /**
@@ -399,10 +443,28 @@ export type PadEvaluatorParts = {
   keepBudgetMs?: number;
   /** The first block whose jobs a new data directory follows (OSTRAPAD_FROM_BLOCK by default: every job). */
   followFrom?: bigint;
+  /** Private jobs (pad-private.ts); without this part a private job's files cannot be read (as an order not served). */
+  private?: PadPrivateParts;
 };
 
-/** A file a gateway did not serve: when it may be read again, how often it was missed, and the chain time of the last try. */
-type Miss = { at: number; misses: number; chain: string };
+export type PadPrivateParts = {
+  /** The uploader's directory of encrypted files on this machine, read only (/var/lib/ostra-uploader/enc/files). */
+  store: string;
+  /** Ostra's index's private records (httpPrivateIndex). */
+  index: PadPrivateIndex;
+  /** Each evaluator account's ML-KEM-768 keys: padKemKeys(padKemSeed(its private key, PAD_KEM_DOMAIN.keeper, chain, OstraPad)). */
+  kem: ReadonlyMap<Address, PadKemKeys>;
+  /** Uploads an encrypted reason (kind 3) signed by the account (pad-private.ts uploadReason); its sha256, or null. */
+  uploadReason: (account: PrivateKeyAccount, jobId: Hex, file: Uint8Array) => Promise<Hex | null>;
+  chainId: number;
+};
+
+/**
+ * A file a gateway did not serve: when it may be read again, how often it was missed, and the chain time of the last
+ * try; `absent`: a private job's file the last try found not there (ENOENT), or no wrap in an index that answered (as
+ * opposed to no answer).
+ */
+type Miss = { at: number; misses: number; chain: string; absent?: boolean };
 
 /**
  * The bot's state on disk. misses: files a gateway did not serve (by job and file), when they may be read again and
@@ -420,6 +482,8 @@ type Kept = {
   misses: Record<string, Miss>;
   reasons: Record<string, Hex>;
   unread: Record<string, Hex>;
+  /** The jobs found private (their order an encrypted file in the uploader's store), until they finish. */
+  priv: Record<string, true>;
 };
 
 /**
@@ -525,6 +589,14 @@ export class PadEvaluator {
   #judging = false;
   /** Saves run one after another (judge calls of several jobs at a time each save). */
   #saving: Promise<void> = Promise.resolve();
+  /** Rejections of private jobs for no K: their reason is the fixed public text, never encrypted. */
+  readonly #plainReasons = new WeakSet<Verdict>();
+  /** Accounts whose KEM key the index holds (registered, or found registered, in this process). */
+  readonly #registered = new Set<Address>();
+  /** When an account's registration last failed (one alert an hour). */
+  readonly #registerAlerted = new Map<Address, number>();
+  /** Store files found with their bytes (encPresence), by digest, with the size and time they had then: hashed again only when those change. */
+  readonly #presence = new Map<string, { p: Presence; size: number; mtimeMs: number }>();
 
   private constructor(p: PadEvaluatorParts, kept: Kept) {
     this.#p = p;
@@ -537,9 +609,9 @@ export class PadEvaluator {
   /** Opens the bot on its data directory, and writes its state once at once: a directory it cannot write fails here, at start. */
   static async open(p: PadEvaluatorParts): Promise<PadEvaluator> {
     await mkdir(p.dataDir, { recursive: true, mode: 0o700 });
-    let kept: Kept = { toBlock: ((p.followFrom ?? OSTRAPAD_FROM_BLOCK) - 1n).toString(), jobs: [], finished: [], done: {}, orders: {}, lookups: {}, calls: {}, misses: {}, reasons: {}, unread: {} };
+    let kept: Kept = { toBlock: ((p.followFrom ?? OSTRAPAD_FROM_BLOCK) - 1n).toString(), jobs: [], finished: [], done: {}, orders: {}, lookups: {}, calls: {}, misses: {}, reasons: {}, unread: {}, priv: {} };
     try {
-      kept = { finished: [], orders: {}, done: {}, lookups: {}, calls: {}, misses: {}, reasons: {}, unread: {}, ...(JSON.parse(await readFile(join(p.dataDir, "pad-evaluator.json"), "utf8")) as Partial<Kept>) } as Kept;
+      kept = { finished: [], orders: {}, done: {}, lookups: {}, calls: {}, misses: {}, reasons: {}, unread: {}, priv: {}, ...(JSON.parse(await readFile(join(p.dataDir, "pad-evaluator.json"), "utf8")) as Partial<Kept>) } as Kept;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
@@ -610,6 +682,12 @@ export class PadEvaluator {
   /** A job's file kept on disk whose bytes match `digest`, as JSON: undefined when none is kept or it is not JSON. */
   async #fromDisk(id: Hex, digest: Hex | null | undefined): Promise<unknown | undefined> {
     if (digest === null || digest === undefined || digest === ZERO32) return undefined;
+    // A private job's file: what was kept of it decrypted (undefined when it was malformed); a reason pinned publicly
+    // (a rejection for no K) is read below as any public file.
+    if (this.#kept.priv[id] === true) {
+      const p = await this.#plain(id, digest);
+      if (p !== undefined) return "plain" in p ? p.plain : undefined;
+    }
     let bytes: Uint8Array | null = await readFile(join(this.#filesOf(id), digest.toLowerCase())).then((b) => new Uint8Array(b), () => null);
     if (bytes === null || sha256(bytes) !== digest) bytes = this.#memFiles.get(`${id.toLowerCase()}|${digest.toLowerCase()}`) ?? null;
     if (bytes === null || sha256(bytes) !== digest) return undefined;
@@ -617,6 +695,178 @@ export class PadEvaluator {
       return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     } catch {
       return undefined;
+    }
+  }
+
+  /** A kept file's text (disk, else memory), or null. */
+  async #keptText(id: Hex, name: string): Promise<string | null> {
+    const text = await readFile(join(this.#filesOf(id), name), "utf8").catch(() => null);
+    if (text !== null) return text;
+    const mem = this.#memFiles.get(`${id.toLowerCase()}|${name}`);
+    return mem === undefined ? null : new TextDecoder().decode(mem);
+  }
+
+  /** True when the job is private (Kept.priv): its order an encrypted order file in the uploader's store. */
+  async #isPrivate(j: PadJob): Promise<boolean> {
+    if (this.#p.private === undefined) return false;
+    if (this.#kept.priv[j.id] === true) return true;
+    const digest = this.#kept.orders[j.id];
+    if (digest === null || digest === undefined || digest === ZERO32) return false;
+    const h = await encHeader(this.#p.private.store, digest);
+    if (h.state !== "ok" || h.header.kind !== PAD_ENC_KIND.order || h.header.order === null) return false;
+    this.#kept.priv[j.id] = true;
+    this.#p.log("pad_private_job", { jobId: j.id });
+    return true;
+  }
+
+  /** A private job's K as kept, or null. */
+  async #key(id: Hex): Promise<ReturnType<typeof keyFromText>> {
+    const text = await this.#keptText(id, KEY_FILE);
+    return text === null ? null : keyFromText(text);
+  }
+
+  /**
+   * Reads K from the index's wraps to any of the bot's accounts, checked against the order's keyCommit (the order
+   * header in the store, else the index's copy of it): true once kept; "absent" when the index answered with no wrap
+   * that opens; false when it gave no answer.
+   */
+  async #fetchKey(j: PadJob): Promise<boolean | "absent"> {
+    const pp = this.#p.private as PadPrivateParts;
+    const rec = await pp.index.job(j.id);
+    if (rec === null) return false;
+    if (rec === "public") return "absent";
+    const digest = this.#kept.orders[j.id];
+    const fromStore = digest === null || digest === undefined ? null : await encHeader(pp.store, digest);
+    let header = fromStore !== null && fromStore.state === "ok" ? fromStore.header : null;
+    if (header === null) {
+      try {
+        header = padParseHeader(new Uint8Array(Buffer.from(rec.header, "base64"))).header;
+      } catch {
+        return false;
+      }
+    }
+    if (header.order === null) return false;
+    const k = keyFromWraps(rec.wraps, pp.kem, header.order.keyCommit);
+    if (k === null) return "absent";
+    const ok = await this.#store(j.id, KEY_FILE, utf8(keyToText({ k, keyCommit: header.order.keyCommit, orderSalt: header.salt, providerPosting: header.order.providerPosting })));
+    k.fill(0);
+    if (ok) this.#p.log("pad_private_key", { jobId: j.id });
+    return ok;
+  }
+
+  /**
+   * Reads a private job's encrypted file from the store with K, checks and decrypts it (pad-private.ts openEncFile) and
+   * keeps what the judge needs, or that it is malformed (the fault of the party that made it): true once kept; "absent"
+   * when the store has no such file; false when it gave no answer (an I/O error, bytes that do not hash to the name).
+   */
+  async #fetchPlain(j: PadJob, digest: Hex, kind: PadEncKind): Promise<boolean | "absent"> {
+    const pp = this.#p.private as PadPrivateParts;
+    const key = await this.#key(j.id);
+    if (key === null) return false;
+    const r = await openEncFile({
+      dir: pp.store,
+      digest,
+      kind,
+      k: key.k,
+      keyCommit: key.keyCommit,
+      job: { id: j.id, client: j.client, provider: j.provider, chainId: pp.chainId },
+      ...(kind === PAD_ENC_KIND.order ? {} : { orderSalt: key.orderSalt }),
+      textBytes: kind === PAD_ENC_KIND.delivery ? KEEP_DELIVERY_TEXT_BYTES : KEEP_ORDER_TEXT_BYTES,
+    });
+    key.k.fill(0);
+    if (r.state === "absent") return "absent";
+    if (r.state === "unknown") {
+      if (r.mismatch === true) this.#p.log("pad_alert", { what: "store", jobId: j.id, digest, why: `a private job's file in the uploader's store ${r.why}` });
+      return false;
+    }
+    if (r.state === "ok" && kind === PAD_ENC_KIND.order && (r.header.order === null || bytesToHex(r.header.order.keyCommit) !== bytesToHex(key.keyCommit))) {
+      this.#p.log("pad_alert", { what: "store", jobId: j.id, digest, why: "the order in the uploader's store commits to another key than the header K was checked against" });
+      return false;
+    }
+    if (r.state === "bad") this.#p.log("pad_private_bad", { jobId: j.id, digest, kind, why: r.why });
+    return this.#store(j.id, plainName(digest), utf8(JSON.stringify(r.state === "ok" ? { plain: r.plain } : { bad: r.why })));
+  }
+
+  /** What was kept of a private job's file: { plain } decrypted, { bad } when malformed; undefined when nothing is kept. */
+  async #plain(id: Hex, digest: Hex | null | undefined): Promise<{ plain: KeptPlain } | { bad: string } | undefined> {
+    if (digest === null || digest === undefined || digest === ZERO32) return undefined;
+    const text = await this.#keptText(id, plainName(digest));
+    if (text === null) return undefined;
+    try {
+      const o = JSON.parse(text) as { plain?: KeptPlain; bad?: unknown };
+      if (typeof o.bad === "string") return { bad: o.bad };
+      return o.plain !== undefined && typeof o.plain === "object" && o.plain !== null ? { plain: o.plain } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The rule for a rejection for no K, from the index once the job is decided (pad-private.ts upholdSnapshot). */
+  async #fetchUphold(j: PadJob): Promise<boolean> {
+    const pp = this.#p.private as PadPrivateParts;
+    const evalStart = j.submittedAt > j.assignedAt ? j.submittedAt : j.assignedAt;
+    // OstraPad's decide sets appealBy = block.timestamp + APPEAL_WINDOW for a pool job: the decision's time.
+    const snap = await upholdSnapshot({ index: pp.index, client: this.#p.client, chainId: pp.chainId, pad: this.#pad, jobId: j.id, round: j.round, evaluator: getAddress(j.evaluator), assignedAt: j.assignedAt, evalStart, decidedAt: j.appealBy - PAD.APPEAL_WINDOW });
+    if (snap === null) return false;
+    this.#p.log("pad_private_rule", { jobId: j.id, round: j.round, holds: snap.base, why: snap.why, wraps: snap.wraps.length });
+    return this.#store(j.id, upholdName(j.round), utf8(JSON.stringify(snap)));
+  }
+
+  async #upholdOf(j: PadJob): Promise<UpholdSnapshot | undefined> {
+    const text = await this.#keptText(j.id, upholdName(j.round));
+    if (text === null) return undefined;
+    try {
+      const o = JSON.parse(text) as UpholdSnapshot;
+      return typeof o.base === "boolean" && Array.isArray(o.wraps) ? o : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Whether a file is in the uploader's store with its bytes: hashed once, and again only when its size or time changes. */
+  async #presenceOf(digest: Hex): Promise<Presence> {
+    const k = digest.toLowerCase();
+    const store = (this.#p.private as PadPrivateParts).store;
+    const st = await stat(join(store, encFileName(digest))).catch(() => null);
+    const cached = this.#presence.get(k);
+    if (st !== null && cached !== undefined && cached.size === st.size && cached.mtimeMs === st.mtimeMs) return cached.p;
+    const got = await encPresence(store, digest);
+    if (got.state === "present" && st !== null) this.#presence.set(k, { p: got, size: st.size, mtimeMs: st.mtimeMs });
+    else this.#presence.delete(k);
+    return got;
+  }
+
+  /** Registers each account's KEM key with the index, unless the index holds it already (revision 7, R6-M3). */
+  async #registerKeys(): Promise<void> {
+    const pp = this.#p.private;
+    if (pp === undefined) return;
+    for (const [addr, account] of this.#mine) {
+      if (this.#registered.has(addr)) continue;
+      const keys = pp.kem.get(addr);
+      if (keys === undefined) continue;
+      const pkHash = sha256(keys.publicKey).toLowerCase();
+      const regs = await pp.index.registrations(addr);
+      const last = regs?.at(-1);
+      if (last !== undefined && last.pkHash.toLowerCase() === pkHash && getAddress(last.posting) === addr) {
+        this.#registered.add(addr);
+        continue;
+      }
+      let got: true | string;
+      if (regs === null) got = "the index gave no answer";
+      else {
+        const issuedAt = await this.#p.client.getBlockNumber({ cacheTime: 0 }).catch(() => null);
+        got = issuedAt === null ? "the chain gave no block number" : await pp.index.register(await registrationBody(account, keys, issuedAt, pp.chainId, this.#pad));
+      }
+      if (got === true) {
+        this.#registered.add(addr);
+        this.#p.log("pad_private_registered", { account: addr, pkHash });
+        continue;
+      }
+      const t = this.#nowMs();
+      if (t - (this.#registerAlerted.get(addr) ?? 0) >= 3600_000) {
+        this.#registerAlerted.set(addr, t);
+        this.#p.log("pad_alert", { what: "kem", account: addr, why: `the account's KEM key is not registered with the index: ${got}` });
+      }
     }
   }
 
@@ -734,38 +984,64 @@ export class PadEvaluator {
   async #fetchFiles(open: readonly PadJob[], deadlines: ReadonlyMap<Hex, bigint>, now: bigint): Promise<void> {
     const until = Date.now() + (this.#p.keepBudgetMs ?? KEEP_BUDGET_MS);
     const t = this.#nowMs();
-    const items: { key: string; deadline: bigint; due: number; read: () => Promise<boolean> }[] = [];
+    const items: { key: string; deadline: bigint; due: number; read: () => Promise<boolean | "absent"> }[] = [];
     for (const j of open) {
       if (!j.pool || !WATCHED.has(j.status)) continue;
       const deadline = deadlines.get(j.id) ?? NO_DEADLINE;
       const lateFrom = deadline === NO_DEADLINE ? null : deadline - LATE_MARGIN;
-      const add = (name: string, read: () => Promise<boolean>) => {
+      const add = (name: string, read: () => Promise<boolean | "absent">) => {
         const m = this.#miss(j.id, name);
         const retriedLate = lateFrom !== null && now >= lateFrom && m !== undefined && BigInt(m.chain) < lateFrom;
         if (m !== undefined && m.at > t && !retriedLate) return;
         items.push({ key: `${j.id.toLowerCase()}|${name}`, deadline, due: m?.at ?? 0, read });
       };
       const digest = this.#kept.orders[j.id];
+      const priv = await this.#isPrivate(j);
       const order = await this.#fromDisk(j.id, digest);
-      if (digest !== null && digest !== undefined && order === undefined) add(digest.toLowerCase(), () => this.#fetchFile(j.id, digest));
-      if (j.deliverable !== ZERO32 && (await this.#fromDisk(j.id, j.deliverable)) === undefined) add(j.deliverable.toLowerCase(), () => this.#fetchFile(j.id, j.deliverable));
       const reason = this.#kept.reasons[`${j.id}:${j.round}`];
-      if (j.status === "Appealed" && reason !== undefined && reason !== ZERO32 && (await this.#fromDisk(j.id, reason)) === undefined) add(reason.toLowerCase(), () => this.#fetchFile(j.id, reason));
+      let orderMissed: boolean;
+      if (priv) {
+        // A private job: K from the index's wraps first, then its files from the store (never through a gateway).
+        const key = await this.#key(j.id);
+        if (key === null) add(WRAPS, () => this.#fetchKey(j));
+        else {
+          if (digest !== null && digest !== undefined && (await this.#plain(j.id, digest)) === undefined) add(plainName(digest), () => this.#fetchPlain(j, digest, PAD_ENC_KIND.order));
+          if (j.deliverable !== ZERO32 && (await this.#plain(j.id, j.deliverable)) === undefined) add(plainName(j.deliverable), () => this.#fetchPlain(j, j.deliverable, PAD_ENC_KIND.delivery));
+        }
+        // The reason under appeal: encrypted in the store (read with K), else pinned publicly (a rejection for no K).
+        if (j.status === "Appealed" && reason !== undefined && reason !== ZERO32 && (await this.#fromDisk(j.id, reason)) === undefined) {
+          if ((await this.#presenceOf(reason)).state !== "absent") {
+            if (key !== null && (await this.#plain(j.id, reason)) === undefined) add(plainName(reason), () => this.#fetchPlain(j, reason, PAD_ENC_KIND.reason));
+          } else add(reason.toLowerCase(), () => this.#fetchFile(j.id, reason));
+        }
+        // The rule for a rejection for no K, read once the job is decided (as early as possible).
+        if ((j.status === "Decided" || j.status === "Appealed") && !j.approved && (await this.#upholdOf(j)) === undefined) add(upholdName(j.round), () => this.#fetchUphold(j));
+        orderMissed =
+          order === undefined &&
+          (digest === null ||
+            (key === null && this.#miss(j.id, WRAPS) !== undefined) ||
+            (digest !== undefined && (this.#miss(j.id, plainName(digest)) !== undefined || (await this.#plain(j.id, digest)) !== undefined)));
+      } else {
+        if (digest !== null && digest !== undefined && order === undefined) add(digest.toLowerCase(), () => this.#fetchFile(j.id, digest));
+        if (j.deliverable !== ZERO32 && (await this.#fromDisk(j.id, j.deliverable)) === undefined) add(j.deliverable.toLowerCase(), () => this.#fetchFile(j.id, j.deliverable));
+        if (j.status === "Appealed" && reason !== undefined && reason !== ZERO32 && (await this.#fromDisk(j.id, reason)) === undefined) add(reason.toLowerCase(), () => this.#fetchFile(j.id, reason));
+        orderMissed = order === undefined && (digest === null || (digest !== undefined && this.#miss(j.id, digest.toLowerCase()) !== undefined));
+      }
       const offer = await this.#offerFromDisk(j.id);
       if (order !== undefined && (offer === undefined || offer.source === OFFER_INDEX)) add(OFFER_LISTING, () => this.#fetchOffer(j, order));
-      else if (order === undefined && offer === undefined && (digest === null || (digest !== undefined && this.#miss(j.id, digest.toLowerCase()) !== undefined))) add(OFFER_INDEX, () => this.#findOffer(j));
+      else if (order === undefined && offer === undefined && orderMissed) add(OFFER_INDEX, () => this.#findOffer(j));
     }
     items.sort((x, y) => (x.deadline < y.deadline ? -1 : x.deadline > y.deadline ? 1 : x.due - y.due));
     let next = 0;
     const worker = async () => {
       while (next < items.length && Date.now() < until) {
         const it = items[next++] as (typeof items)[number];
-        const ok = await it.read().catch(() => false);
-        if (ok) {
+        const got = await it.read().catch(() => false as const);
+        if (got === true) {
           delete this.#kept.misses[it.key];
         } else {
           const misses = (this.#kept.misses[it.key]?.misses ?? 0) + 1;
-          this.#kept.misses[it.key] = { at: this.#nowMs() + Math.min(RETRY_MS * 2 ** (misses - 1), KEEP_MAX_WAIT_MS), misses, chain: now.toString() };
+          this.#kept.misses[it.key] = { at: this.#nowMs() + Math.min(RETRY_MS * 2 ** (misses - 1), KEEP_MAX_WAIT_MS), misses, chain: now.toString(), ...(got === "absent" ? { absent: true } : {}) };
         }
       }
     };
@@ -778,20 +1054,27 @@ export class PadEvaluator {
    */
   async #case(j: PadJob): Promise<{ c: Case; pending: boolean }> {
     const notes: string[] = [];
+    const priv = this.#kept.priv[j.id] === true;
     const orderDigest = this.#kept.orders[j.id] ?? null;
     const order = await this.#fromDisk(j.id, orderDigest);
-    if (order === undefined) notes.push(orderDigest === null ? "the order's digest could not be found in the transaction that created the job" : "the order file could not be read, or its bytes do not match the job's description");
+    const badOrder = priv ? await this.#plain(j.id, orderDigest) : undefined;
+    if (order === undefined) {
+      if (badOrder !== undefined && "bad" in badOrder) notes.push(`the order file is malformed, or does not decrypt under the job's key: ${badOrder.bad.slice(0, 300)}`);
+      else notes.push(orderDigest === null ? "the order's digest could not be found in the transaction that created the job" : "the order file could not be read, or its bytes do not match the job's description");
+    }
     const delivery = await this.#fromDisk(j.id, j.deliverable);
     if (delivery === undefined) notes.push("the delivery file could not be read, or its bytes do not match the job's deliverable");
+    if (priv) notes.push("this is a private job: its order and delivery were decrypted; attachments are given with their text (cut at a limit, marked truncated)");
     // An offer found from Ostra's index while the order could not be read is not used once the order is kept.
     const kept0 = await this.#offerFromDisk(j.id);
     const kept = kept0 !== undefined && order !== undefined && kept0.source === OFFER_INDEX ? undefined : kept0;
     if (kept !== undefined) notes.push(...kept.notes);
     else notes.push("the provider's offer could not be read from its listing");
     const notTried = (name: string) => this.#miss(j.id, name) === undefined;
+    const fileName = (d: Hex) => (priv ? plainName(d) : d.toLowerCase());
     const pending =
-      (orderDigest !== null && order === undefined && notTried(orderDigest.toLowerCase())) ||
-      (j.deliverable !== ZERO32 && delivery === undefined && notTried(j.deliverable.toLowerCase())) ||
+      (orderDigest !== null && order === undefined && badOrder === undefined && notTried(fileName(orderDigest))) ||
+      (j.deliverable !== ZERO32 && delivery === undefined && (priv ? (await this.#plain(j.id, j.deliverable)) === undefined : true) && notTried(fileName(j.deliverable))) ||
       (order !== undefined && kept === undefined && notTried(OFFER_LISTING));
     return { c: { jobId: j.id, budget: usd(j.budget), offer: kept?.offer ?? null, order: order ?? null, delivery: delivery ?? null, notes }, pending };
   }
@@ -887,13 +1170,18 @@ export class PadEvaluator {
 
   async #judgeNow(j: PadJob, purpose: "decide" | "vote", now: bigint, end: bigint): Promise<Verdict | null | "pending"> {
     const late = now >= end - LATE_MARGIN;
+    const priv = this.#kept.priv[j.id] === true && this.#p.private !== undefined;
+    if (priv) {
+      const first = await this.#privateFirst(j, purpose, now, end);
+      if (first !== undefined) return first;
+    }
     const got = await this.#case(j);
     const c = got.c;
     let pending = got.pending;
     if (purpose === "vote") {
       c.decision = await this.#decision(j);
       const rd = this.#kept.reasons[`${j.id}:${j.round}`];
-      if (c.decision.reason === null && rd !== undefined && rd !== ZERO32 && this.#miss(j.id, rd.toLowerCase()) === undefined) pending = true;
+      if (c.decision.reason === null && rd !== undefined && rd !== ZERO32 && this.#miss(j.id, rd.toLowerCase()) === undefined && (!priv || (this.#miss(j.id, plainName(rd)) === undefined && (await this.#plain(j.id, rd)) === undefined))) pending = true;
       // A rejection of the bot's own because the delivery could not be read stands on its panel: a delivery served only
       // after that decision is not read against it (its provider had the whole window to serve it).
       if (this.#kept.unread[`${j.id}:${j.round}`] === j.deliverable) {
@@ -903,6 +1191,14 @@ export class PadEvaluator {
     }
     const judge = purpose === "vote" ? (this.#p.panelJudge === undefined ? this.#p.judge : this.#p.panelJudge) : this.#p.judge;
     const unreadable = c.order === null || c.delivery === null;
+    // A private job's delivery read whole but malformed, or not decrypting under the job's key: the provider's fault.
+    if (priv && c.delivery === null) {
+      const d = await this.#plain(j.id, j.deliverable);
+      if (d !== undefined && "bad" in d) {
+        this.#p.log("pad_alert", { purpose, jobId: j.id, ...(purpose === "vote" ? { verdict: "reject" } : { decided: "rejected" }), why: `the private delivery is malformed: ${d.bad.slice(0, 200)}` });
+        return { approve: false, reason: `Rejected: the delivery file is malformed, or does not decrypt under the job's key (${d.bad.slice(0, 300)}).` };
+      }
+    }
     if (!late) {
       if (unreadable || pending) {
         this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: c.notes, ...(pending ? { pending: true } : {}) });
@@ -923,15 +1219,23 @@ export class PadEvaluator {
       // Read at the late point first (the reading phase reads it again whatever its wait): until then, and until the
       // window's final hour, it is waited for. A rejection after a read at the late point that missed is kept for the
       // bot's own panel (Kept.unread).
-      const m = this.#miss(j.id, j.deliverable.toLowerCase());
+      const m = this.#miss(j.id, priv ? plainName(j.deliverable) : j.deliverable.toLowerCase());
       const triedLate = m !== undefined && BigInt(m.chain) >= end - LATE_MARGIN;
       if (!triedLate && now < end - FINAL_MARGIN) {
         this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: c.notes, late: true });
         return "pending";
       }
+      // A private job's file the store gave no answer for (an I/O error, bytes that do not hash to the name) is not a
+      // delivery that could not be read: a vote agrees with the decision, and a decision's rejection is not kept for
+      // the bot's own panel (revision 7, minor 2).
+      const noAnswer = priv && m?.absent !== true;
+      if (noAnswer && purpose === "vote") {
+        this.#p.log("pad_alert", { purpose, jobId: j.id, voted: "agreed", why: "the uploader's store gave no answer for the private delivery by the vote's late point", notes: c.notes });
+        return null;
+      }
       this.#p.log("pad_alert", { purpose, jobId: j.id, ...(purpose === "vote" ? { verdict: "reject" } : { decided: "rejected" }), why: "the delivery could not be read before the window's end", notes: c.notes });
       const v = { approve: false, reason: "Rejected: the delivery file could not be read, or its bytes did not match the job's deliverable, before the evaluation window ended." };
-      if (purpose === "decide" && triedLate) this.#unreadRejections.add(v);
+      if (purpose === "decide" && triedLate && !noAnswer) this.#unreadRejections.add(v);
       return v;
     }
     const v = judge === null ? null : await this.#ask(judge, c, `${purpose}:${j.id}:${j.round}`, true);
@@ -947,7 +1251,91 @@ export class PadEvaluator {
     return { approve: false, reason: "Rejected: the delivery could not be confirmed against the order before the evaluation window ended." };
   }
 
-  async #reason(j: PadJob, v: Verdict): Promise<Hex> {
+  /**
+   * A private job's steps before its case is judged: a verdict, null (no verdict yet, or a vote that agrees) or
+   * "pending"; undefined to judge its case (K is kept). On a panel a rejection is upheld under the rule for no K
+   * (pad-private.ts upholdNoKey), else judged afresh with K; without K the vote agrees with the decision when the
+   * delivery is in the store, and rejects at the late point when it is not. A decision without K waits for its wrap
+   * (read again at the late point), then from the late point rejects with the fixed reason (never before it: revision 7).
+   */
+  async #privateFirst(j: PadJob, purpose: "decide" | "vote", now: bigint, end: bigint): Promise<Verdict | null | "pending" | undefined> {
+    const late = now >= end - LATE_MARGIN;
+    const pp = this.#p.private as PadPrivateParts;
+    const key = await this.#key(j.id);
+    if (purpose === "vote") {
+      // A rejection of the bot's own because the delivery was not in the store stands (the case's rule, below).
+      if (this.#kept.unread[`${j.id}:${j.round}`] === j.deliverable) return undefined;
+      if (!j.approved) {
+        const snap = await this.#upholdOf(j);
+        if (snap === undefined) {
+          if (!late) {
+            this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: ["the index's records for the rule on rejections for no K are not read yet"] });
+            return this.#miss(j.id, upholdName(j.round)) === undefined ? "pending" : null;
+          }
+          this.#p.log("pad_alert", { purpose, jobId: j.id, why: "the index gave no answer for the rule on rejections for no K by the vote's late point: judged afresh" });
+        } else {
+          const r = upholdNoKey(snap, key?.k ?? null, key?.keyCommit ?? null, { chainId: pp.chainId, pad: this.#pad, jobId: j.id, round: j.round, evaluator: getAddress(j.evaluator) });
+          if (r.uphold) {
+            this.#p.log("pad_private_upheld", { jobId: j.id, round: j.round, why: r.why });
+            return { approve: false, reason: `Upheld: a rejection for no key, ${r.why}.` };
+          }
+          this.#p.log("pad_private_afresh", { jobId: j.id, round: j.round, why: r.why });
+        }
+      }
+      if (key !== null) return undefined;
+      const pr = await this.#presenceOf(j.deliverable);
+      if (pr.state === "absent") {
+        if (!late) return null;
+        this.#p.log("pad_alert", { purpose, jobId: j.id, verdict: "reject", why: "the private delivery is not in the uploader's store by the vote's late point" });
+        return { approve: false, reason: "Rejected: the delivery file is not in Ostra's store." };
+      }
+      if (pr.state === "unknown" && pr.mismatch === true) this.#p.log("pad_alert", { what: "store", jobId: j.id, digest: j.deliverable, why: `a private job's file in the uploader's store ${pr.why}` });
+      if (!late) {
+        this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: ["no key wrapped for the panel yet"] });
+        return null;
+      }
+      // The appellant wraps K for the panel: a panel without it does not overturn (revision 3, R2-B1).
+      this.#p.log("pad_alert", { purpose, jobId: j.id, voted: "agreed", why: pr.state === "present" ? "the appellant wrapped no key for the panel; the delivery is in the store" : `the appellant wrapped no key for the panel; the store gave no answer for the delivery (${pr.why})` });
+      return null;
+    }
+    if (key !== null) return undefined;
+    const m = this.#miss(j.id, WRAPS);
+    if (!late) {
+      this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: ["no key wrapped for the bot's accounts yet"] });
+      return m === undefined ? "pending" : null;
+    }
+    const triedLate = m !== undefined && BigInt(m.chain) >= end - LATE_MARGIN;
+    if (!triedLate && now < end - FINAL_MARGIN) {
+      this.#p.log("pad_waiting", { purpose, jobId: j.id, notes: ["no key wrapped for the bot's accounts yet"], late: true });
+      return "pending";
+    }
+    this.#p.log("pad_alert", { purpose, jobId: j.id, decided: "rejected", why: m?.absent === true ? "no key was wrapped for the bot's accounts by the late point" : "the index gave no answer for the job's wraps by the late point" });
+    const v = { approve: false, reason: NO_KEY_REASON };
+    this.#plainReasons.add(v);
+    return v;
+  }
+
+  /**
+   * The decision's reason, its digest (zero when it could not be kept: the decision is still sent). A private job's
+   * reason is encrypted under K and uploaded signed by the deciding account; a rejection for no K is the fixed text,
+   * pinned publicly; nothing of a private job is ever pinned publicly otherwise.
+   */
+  async #reason(j: PadJob, v: Verdict, account: PrivateKeyAccount): Promise<Hex> {
+    if (this.#kept.priv[j.id] === true && this.#p.private !== undefined && !this.#plainReasons.has(v)) {
+      const key = await this.#key(j.id);
+      if (key === null) return ZERO32;
+      try {
+        const file = sealReason(key.k, j.id, v.approve, v.reason);
+        const digest = await this.#p.private.uploadReason(account, j.id, file);
+        if (digest === null) this.#p.log("pad_alert", { what: "reason", jobId: j.id, why: "the encrypted reason could not be uploaded: the decision is sent with an empty reason" });
+        return digest ?? ZERO32;
+      } catch (err) {
+        this.#p.log("pad_alert", { what: "reason", jobId: j.id, why: `the encrypted reason could not be made: ${((err as Error).message ?? String(err)).split("\n")[0]}` });
+        return ZERO32;
+      } finally {
+        key.k.fill(0);
+      }
+    }
     try {
       const uri = await this.#p.pin(padReasonFile(j.id, v.approve, v.reason));
       return uri === null ? ZERO32 : (padDigestFromCid(uri) ?? ZERO32);
@@ -981,6 +1369,7 @@ export class PadEvaluator {
       this.#pinned.clear();
       this.#memFullAlerted = false;
       await this.#refresh();
+      await this.#registerKeys().catch((err: unknown) => this.#p.log("pad_alert", { what: "kem", why: `the KEM keys could not be registered: ${((err as Error).message ?? String(err)).split("\n")[0]}` }));
       const head = await padHead(this.#p.client);
       const still: Hex[] = [];
       const open: PadJob[] = [];
@@ -993,6 +1382,7 @@ export class PadEvaluator {
         if (FINISHED.has(j.status)) {
           if (!this.#kept.finished.includes(id)) this.#kept.finished.push(id);
           delete this.#kept.orders[id];
+          delete this.#kept.priv[id];
           for (const k of Object.keys(this.#kept.calls)) if (k.includes(`:${id}:`)) delete this.#kept.calls[k];
           for (const m of [this.#retryAt, this.#noVerdict]) for (const k of [...m.keys()]) if (k.includes(`:${id}:`)) m.delete(k);
           for (const k of Object.keys(this.#kept.done)) if (k.includes(`:${id}:`)) delete this.#kept.done[k];
@@ -1066,7 +1456,7 @@ export class PadEvaluator {
     if (j.status === "Submitted" && mine !== undefined && j.pool && now < evalStart + PAD.EVAL_WINDOW && this.#kept.done[`decide:${j.id}:${j.round}`] === undefined) {
       const v = await this.#verdict(j, "decide", now, evalStart + PAD.EVAL_WINDOW);
       // The reason file pinned here, several jobs at a time, so that sending the decisions is all that is left.
-      if (v !== null && v !== "pending") this.#pinned.set(`${j.id}:${j.round}`, await this.#reason(j, v));
+      if (v !== null && v !== "pending") this.#pinned.set(`${j.id}:${j.round}`, await this.#reason(j, v, mine));
       return;
     }
     const a = this.#appeals.get(j.id);
@@ -1098,7 +1488,7 @@ export class PadEvaluator {
       if (v === null || v === "pending") return;
       if (v.category !== undefined) this.#p.log("pad_prohibited", { jobId: j.id, category: v.category });
       if (v.refusedBy !== undefined) this.#p.log("pad_judge_refused", { jobId: j.id, refusedBy: v.refusedBy, approve: v.approve });
-      const reason = this.#pinned.get(`${j.id}:${j.round}`) ?? (await this.#reason(j, v));
+      const reason = this.#pinned.get(`${j.id}:${j.round}`) ?? (await this.#reason(j, v, mine));
       if (await this.#send("decide", j, () => this.#p.fromEvaluator(mine, call("decide", [j.id, v.approve, reason])))) {
         this.#kept.done[key] = v.approve ? "approved" : "rejected";
         if (this.#unreadRejections.has(v)) this.#kept.unread[`${j.id}:${j.round}`] = j.deliverable;

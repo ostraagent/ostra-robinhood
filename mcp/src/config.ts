@@ -34,6 +34,14 @@
 //                         goes into such a vault). Never printed
 //   OSTRA_RAETO_URL       Raeto's API (default https://api.raeto.cc; "off":
 //                         the raeto tool refuses to run)
+//   OSTRA_PAD_FILES       where the attachments of private Ostrapad jobs are written
+//                         (default ~/ostra-pad-files, outside OSTRA_HOME)
+//   OSTRA_HISTORY_RPC_URL Robinhood Chain RPC serving past state, for a private pool
+//                         job's check of a vault evaluator's key registration at the
+//                         block it arrived in (default, on the packaged mainnet
+//                         deployment, Ostra's RPC proxy https://rpc.ostraagent.xyz,
+//                         which reads from an archive node: the public RPC keeps no
+//                         old state; elsewhere the RPC above)
 //   OSTRA_PAD_INDEXER_URL Ostra's Ostrapad index, for pad_search and a swap's
 //                         builder status from HEY Research Lab (default, on
 //                         the packaged mainnet deployment, the web app's host
@@ -101,6 +109,8 @@ async function proverConfig(env: NodeJS.ProcessEnv): Promise<ProverConfig | null
 
 /** Ostra's Ostrapad index on mainnet: the indexer under the web app's host (/api/v1/pad/...). */
 export const PAD_INDEXER_URL = "https://app.ostraagent.xyz";
+/** Ostra's RPC proxy on mainnet (rpc-proxy/, an archive node behind it): past state for private pool jobs' key checks. */
+export const HISTORY_RPC_URL = "https://rpc.ostraagent.xyz";
 
 /** The Ethereum RPC the strategies read USDe's price through by default (a public one; OSTRA_ETH_RPC_URL replaces it). */
 export const ETHEREUM_PUBLIC_RPC = "https://ethereum-rpc.publicnode.com";
@@ -113,6 +123,10 @@ export type McpConfig = Config & {
   raetoUrl: string | null;
   /** Ostra's Ostrapad index, or null (OSTRA_PAD_INDEXER_URL=off, or not the packaged deployment and unset). */
   padIndexerUrl: string | null;
+  /** Where the attachments of private Ostrapad jobs are written, one folder per job (OSTRA_PAD_FILES; default ~/ostra-pad-files, outside OSTRA_HOME). */
+  padFilesDir: string;
+  /** The RPC private pool jobs read past state through (OSTRA_HISTORY_RPC_URL). */
+  historyRpcUrl: string;
   /** Ostra Swap's contracts, or null (its tools then refuse to run). */
   swap: SwapDeployment | null;
   /** The RPC Ostra Swap searches events through. */
@@ -183,6 +197,8 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     ethRpcUrl,
     raetoUrl,
     padIndexerUrl,
+    padFilesDir: env.OSTRA_PAD_FILES !== undefined && env.OSTRA_PAD_FILES !== "" ? env.OSTRA_PAD_FILES : join(homedir(), "ostra-pad-files"),
+    historyRpcUrl: env.OSTRA_HISTORY_RPC_URL !== undefined && env.OSTRA_HISTORY_RPC_URL !== "" ? env.OSTRA_HISTORY_RPC_URL : services !== null ? HISTORY_RPC_URL : (rpcUrl ?? ROBINHOOD_PUBLIC_RPC),
     swap,
     logsRpcUrl,
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",
