@@ -1,31 +1,35 @@
 // The payment wallet through the MCP server, as an agent runs it, against Robinhood Chain mainnet and one of
-// Autonomo's gateways (decided 8 Nov 2026: a real payment of 0.01 USDG to token-price): the server (src/server.ts, or
-// an installed npm package's bundle named by OSTRA_CHECK_MCP) is spawned over stdio on OSTRA_CHECK_HOME, an agent whose
-// vault holds USDG. Every payment is real.
+// Autonomo's gateways (decided 8 Nov 2026: a real payment of 0.01 USDG to one of them; token-price's own example,
+// /price/autonomo, answers 404 since 8 Nov, $AUTONOMO having launched more than its ~13 days ago, so the default is
+// new-launches): the server (src/server.ts, or an installed npm package's bundle named by OSTRA_CHECK_MCP) is spawned
+// over stdio on OSTRA_CHECK_HOME, an agent whose vault holds USDG. Every payment is real.
 //
-//   1. The server lists the payment wallet's tools; autonomo_catalog lists Autonomo's gateways, token-price among them;
-//      open_vault finds the vault; it holds the run's USDG (else the script prints `FUND <vault> <base units> <USDG>`
-//      and waits for it).
-//   2. payment_wallet_setup with OSTRA_CHECK_TOP_UP (default 0.05 USDG): the wallet holds it, on chain.
-//   3. pay OSTRA_CHECK_URL (default Autonomo's token-price) with maxPrice OSTRA_CHECK_MAX_PRICE (default 0.01): answered
-//      200, paid from the wallet; the settlement the seller names landed, moving the price from the wallet to the
-//      payTo payment_wallet_status recorded.
+//   1. The server lists the payment wallet's tools; autonomo_catalog lists Autonomo's gateways, the default call among
+//      them; open_vault finds the vault; when the wallet has less free than maxPrice, the vault holds what a top-up
+//      needs (else the script prints `FUND <vault> <base units> <USDG>` and waits for it).
+//   2. payment_wallet_setup, with OSTRA_CHECK_TOP_UP (default 0.05 USDG) when the wallet has less free than maxPrice:
+//      the wallet has at least maxPrice free.
+//   3. pay OSTRA_CHECK_URL (default Autonomo's new-launches) with maxPrice OSTRA_CHECK_MAX_PRICE (default 0.01):
+//      answered 200, paid from the wallet; the settlement the seller names landed, moving the price from the wallet to
+//      the payTo payment_wallet_status recorded.
 //   4. With OSTRA_CHECK_WITHDRAW=on (once the relayer serves a payment wallet's withdrawal): payment_wallet_withdraw,
 //      the wallet's balance back in the vault.
 //
 // Environment: OSTRA_CHECK_HOME (required, kept), OSTRA_CHECK_MCP, OSTRA_CHECK_URL, OSTRA_CHECK_MAX_PRICE,
-// OSTRA_CHECK_TOP_UP, OSTRA_CHECK_WITHDRAW, OSTRA_CHECK_FUND_SECONDS (default 3600), and what the server reads
+// OSTRA_CHECK_TOP_UP, OSTRA_CHECK_WITHDRAW, OSTRA_CHECK_FUND_SECONDS (default 3600), OSTRA_CHECK_OWN_LIST (the list of
+// Ostra's own vaults the Tide scorer reads, OSTRA_STATS_OWN: the check's vault is added to it before any spend, so its
+// activity never counts as an agent's), and what the server reads
 // (OSTRA_DEPLOYMENT, OSTRA_RPC_URL or OSTRA_RPC_URL_FILE, OSTRA_RELAYER_URL, ...), passed on as they are. The RPC URL
 // is never printed.
 
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createPublicClient, formatUnits, getAddress, http, parseEventLogs, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { ROBINHOOD_PUBLIC_RPC, USDG, redact, robinhoodChain, usdgAbi } from "@ostraagent/sdk";
 
-const TOKEN_PRICE = "https://autonomo.fun/x/token-price/price/autonomo";
+const NEW_LAUNCHES = "https://autonomo.fun/x/new-launches/launches?limit=10";
 /** The relayer channel a new vault opens to pay its first spend (core RELAYER_CHANNEL_DEPOSIT), and gas. */
 const RELAYER_ROOM = 1_000_000n + 50_000n;
 const TOOL_TIMEOUT_MS = 600_000;
@@ -74,7 +78,7 @@ async function call(client: Client, name: string, args: Record<string, unknown> 
 async function main(): Promise<void> {
   const home = required("OSTRA_CHECK_HOME");
   const entry = process.env.OSTRA_CHECK_MCP || fileURLToPath(new URL("../src/server.ts", import.meta.url));
-  const target = process.env.OSTRA_CHECK_URL || TOKEN_PRICE;
+  const target = process.env.OSTRA_CHECK_URL || NEW_LAUNCHES;
   const maxPrice = process.env.OSTRA_CHECK_MAX_PRICE || "0.01";
   const topUp = process.env.OSTRA_CHECK_TOP_UP || "0.05";
   const withdraw = (process.env.OSTRA_CHECK_WITHDRAW || "off") === "on";
@@ -102,12 +106,26 @@ async function main(): Promise<void> {
     const listed = (catalog.json.gateways as { slug: string; example: string; priceUsdg: string }[] | undefined) ?? [];
     check(catalog.ok && listed.length > 0, "autonomo_catalog lists Autonomo's gateways", listed.map((g) => `${g.slug} ${g.priceUsdg}`));
     if (process.env.OSTRA_CHECK_URL === undefined || process.env.OSTRA_CHECK_URL === "") {
-      check(listed.some((g) => g.example === TOKEN_PRICE), "the catalog names token-price's call", TOKEN_PRICE);
+      check(listed.some((g) => g.example === NEW_LAUNCHES), "the catalog names new-launches' call", NEW_LAUNCHES);
     }
     const opened = await call(client, "open_vault");
     check(opened.ok && typeof opened.json.vault === "string", "open_vault finds the vault", opened.ok ? { vault: opened.json.vault } : opened.text);
     const vault = getAddress(opened.json.vault as string);
-    const fund = parseUnits(topUp, 6) + RELAYER_ROOM;
+    const ownList = process.env.OSTRA_CHECK_OWN_LIST;
+    if (ownList !== undefined && ownList !== "") {
+      const listed = (await readFile(ownList, "utf8")).split("\n").some((line) => line.trim().toLowerCase().startsWith(vault.toLowerCase()));
+      if (!listed) {
+        const text = await readFile(ownList, "utf8");
+        await appendFile(ownList, `${text === "" || text.endsWith("\n") ? "" : "\n"}${vault}\tautonomo-check (Ostra's own test vault)\n`);
+      }
+      const now = (await readFile(ownList, "utf8")).split("\n").some((line) => line.trim().toLowerCase().startsWith(vault.toLowerCase()));
+      check(now, "the vault is on the list of Ostra's own vaults", { list: ownList, added: !listed });
+    }
+    // A top-up only when the wallet has less free than maxPrice (a run after an earlier one needs none).
+    const before = await call(client, "payment_wallet_status");
+    check(before.ok, "payment_wallet_status answers", before.ok ? { available: before.json.available, reserved: before.json.reserved } : before.text);
+    const needTopUp = parseUnits(String(before.json.available ?? "0"), 6) < parseUnits(maxPrice, 6);
+    const fund = needTopUp ? parseUnits(topUp, 6) + RELAYER_ROOM : 0n;
     let held = await balance(vault);
     if (held < fund) {
       console.log(`FUND ${vault} ${fund - held} ${usdg(fund - held)} USDG: send at least ${usdg(fund - held)} USDG to the vault ${vault} on Robinhood Chain; waiting up to ${fundSeconds} s`);
@@ -119,16 +137,16 @@ async function main(): Promise<void> {
     }
     check(held >= fund, "the vault holds the run's USDG", { vault, holds: usdg(held), needs: usdg(fund) });
 
-    // 2. The wallet, topped up from the vault.
-    const setup = await call(client, "payment_wallet_setup", { amount: topUp });
+    // 2. The wallet, topped up from the vault when it needs it.
+    const setup = await call(client, "payment_wallet_setup", { amount: needTopUp ? topUp : "0" });
     check(setup.ok && typeof setup.json.address === "string", "payment_wallet_setup answers the wallet", setup.ok ? setup.json : setup.text);
     const wallet = getAddress(setup.json.address as string);
     const w0 = await balance(wallet);
-    check(w0 >= parseUnits(topUp, 6), "the wallet holds the top-up on chain", { wallet, holds: usdg(w0), toppedUp: setup.json.toppedUp ?? null });
+    check(parseUnits(String(setup.json.available ?? "0"), 6) >= parseUnits(maxPrice, 6) && w0 >= parseUnits(maxPrice, 6), "the wallet has maxPrice free, on chain", { wallet, holds: usdg(w0), available: setup.json.available, toppedUp: setup.json.toppedUp ?? null });
 
     // 3. The paid call.
     const paid = await call(client, "pay", { url: target, maxPrice });
-    check(paid.ok && paid.json.status === 200 && typeof paid.json.paid === "string", "pay: answered 200, paid from the wallet", paid.ok ? { status: paid.json.status, paid: paid.json.paid, wallet: paid.json.wallet, note: paid.json.note } : paid.text);
+    check(paid.ok && paid.json.status === 200 && typeof paid.json.paid === "string", "pay: answered 200, paid from the wallet", paid.ok ? { status: paid.json.status, paid: paid.json.paid, wallet: paid.json.wallet, note: paid.json.note, body: String(paid.json.body).slice(0, 300) } : paid.text);
     console.log(`BODY ${String(paid.json.body).slice(0, 400)}`);
     const price = parseUnits(paid.json.paid as string, 6);
     check(price > 0n && price <= parseUnits(maxPrice, 6), "pay: the price is within maxPrice", { paid: paid.json.paid, maxPrice });
