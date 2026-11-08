@@ -1,0 +1,24 @@
+# Ostra's standing-order and Priors-repay fallback on Robinhood Chain: runs a version 5 vault's due standing order or
+# repays its Priors loan when the vault's own MCP is offline, free of charge and within a daily gas budget
+# (keeper/src/order-runner.ts). Its environment file and directories are made by keeper/scripts/setup-order-runner.ts.
+# Installed with the release that finalizes the version 5 record, with @NODE@ replaced by the path of node.
+[Unit]
+Description=Ostra order runner on Robinhood Chain: version 5 standing orders and Priors repays while a vault's MCP is offline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/ostra-robinhood/keeper
+EnvironmentFile=/etc/ostra/robinhood/order-runner.env
+ExecStart=@NODE@ src/order-runner-main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/ostra/robinhood
+
+[Install]
+WantedBy=multi-user.target

@@ -38,8 +38,9 @@ const npx = arg.endsWith(".tgz") ? ["-y", `--package=${resolve(arg)}`, "ostra-mc
 const source = await readFile(new URL("../src/tools.ts", import.meta.url), "utf8");
 const removedList = /REMOVED_LAUNCHPAD_TOOLS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(source);
 if (removedList === null) throw new Error("src/tools.ts has no REMOVED_LAUNCHPAD_TOOLS list");
-const removed = new Set([...(removedList[1] as string).matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string));
-const expected = new Set([...source.matchAll(/tool\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string));
+// Tool names are lower case letters, digits (v5_status) and underscores.
+const removed = new Set([...(removedList[1] as string).matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1] as string));
+const expected = new Set([...source.matchAll(/tool\(\s*"([a-z0-9_]+)"/g)].map((m) => m[1] as string));
 for (const n of removed) if (expected.has(n)) throw new Error(`src/tools.ts still registers the removed tool ${n}`);
 
 const root = await mkdtemp(join(tmpdir(), "ostra-mcp-smoke-"));

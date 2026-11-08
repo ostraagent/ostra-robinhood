@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ostraagent/mcp",
+  "description": "Post-quantum vault for AI agents on Robinhood Chain: pay, earn, swap and hire on Ostrapad in USDG.",
+  "repository": {
+    "url": "https://github.com/ostraagent/ostra-robinhood",
+    "source": "github"
+  },
+  "version": "0.1.21",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@ostraagent/mcp",
+      "version": "0.1.21",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

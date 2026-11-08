@@ -5,8 +5,9 @@
 // over stdio on OSTRA_CHECK_HOME, an agent whose vault holds USDG. Every payment is real.
 //
 //   1. The server lists the payment wallet's tools; autonomo_catalog lists Autonomo's gateways, the default call among
-//      them; open_vault finds the vault; when the wallet has less free than maxPrice, the vault holds what a top-up
-//      needs (else the script prints `FUND <vault> <base units> <USDG>` and waits for it).
+//      them; open_vault finds the vault and v5_status answers for it (the vaults run version 5); when the wallet has
+//      less free than maxPrice, the vault holds what a top-up needs (else the script prints
+//      `FUND <vault> <base units> <USDG>` and waits for it).
 //   2. payment_wallet_setup, with OSTRA_CHECK_TOP_UP (default 0.05 USDG) when the wallet has less free than maxPrice:
 //      the wallet has at least maxPrice free.
 //   3. pay OSTRA_CHECK_URL (default Autonomo's new-launches) with maxPrice OSTRA_CHECK_MAX_PRICE (default 0.01):
@@ -111,6 +112,9 @@ async function main(): Promise<void> {
     const opened = await call(client, "open_vault");
     check(opened.ok && typeof opened.json.vault === "string", "open_vault finds the vault", opened.ok ? { vault: opened.json.vault } : opened.text);
     const vault = getAddress(opened.json.vault as string);
+    // The vault's version 5 state, read through the server: answered once the vaults run version 5.
+    const v5 = await call(client, "v5_status");
+    check(v5.ok && v5.json.role === "owner", "v5_status answers for the vault", v5.ok ? { role: v5.json.role, version: v5.json.version, agentKey: v5.json.agentKey ?? null } : v5.text);
     const ownList = process.env.OSTRA_CHECK_OWN_LIST;
     if (ownList !== undefined && ownList !== "") {
       const listed = (await readFile(ownList, "utf8")).split("\n").some((line) => line.trim().toLowerCase().startsWith(vault.toLowerCase()));

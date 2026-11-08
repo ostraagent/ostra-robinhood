@@ -29,11 +29,20 @@ const MAINNET_CHAIN_ID = 4663;
 const SERVICES = { relayerUrl: "https://relayer.ostraagent.xyz", keeperUrl: "https://keeper.ostraagent.xyz", aggregatorUrl: "https://aggregator.ostraagent.xyz", aiUrl: "https://ai.ostraagent.xyz" };
 const WORKSPACE = ["@ostraagent/core", "@ostraagent/sdk", "@ostraagent/swap"];
 
-type Manifest = { name: string; version: string; description?: string; dependencies?: Record<string, string> };
+type Manifest = { name: string; version: string; mcpName?: string; description?: string; dependencies?: Record<string, string> };
 const manifest = async (p: string) => JSON.parse(await readFile(here(p), "utf8")) as Manifest;
 
 const mcp = await manifest("package.json");
 if (mcp.description === undefined || mcp.description === "") throw new Error("package.json has no description");
+// The Official MCP Registry checks the published package.json names the server (server.json's name).
+if (mcp.mcpName === undefined || !/^io\.github\.ostraagent\/[a-z0-9-]+$/.test(mcp.mcpName)) throw new Error("package.json has no mcpName in the io.github.ostraagent namespace");
+// server.json (published to the Official MCP Registry by mcp-publisher) names this package at this version.
+type ServerJson = { name?: string; version?: string; packages?: { registryType?: string; identifier?: string; version?: string }[] };
+const server = JSON.parse(await readFile(here("server.json"), "utf8")) as ServerJson;
+const npmEntry = server.packages?.length === 1 ? server.packages[0] : undefined;
+if (server.name !== mcp.mcpName || server.version !== mcp.version || npmEntry?.registryType !== "npm" || npmEntry.identifier !== mcp.name || npmEntry.version !== mcp.version) {
+  throw new Error(`server.json does not name ${mcp.name}@${mcp.version} as ${mcp.mcpName}`);
+}
 // The third-party dependencies of the MCP server, the core, the SDK and Ostra Swap's SDK, one version each.
 const dependencies: Record<string, string> = {};
 for (const m of [mcp, await manifest("../core/package.json"), await manifest("../sdk/package.json"), await manifest("../../ostra-swap/sdk/package.json")]) {
@@ -108,6 +117,7 @@ await writeFile(
     {
       name: mcp.name,
       version: mcp.version,
+      mcpName: mcp.mcpName,
       // The description is package.json's: one text for the workspace and npm.
       description: mcp.description,
       keywords: ["mcp", "model-context-protocol", "ai-agent", "robinhood-chain", "post-quantum", "privacy", "wots", "usdg", "x402", "launchpad"],
