@@ -42,7 +42,8 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 ## Tools
 
 - **Vault:** `open_vault`, `balance`, `withdraw`, `fund_creator_vault`, `creator_withdraw`
-- **Payments:** `pay` (calls a paid HTTP service and pays it from a channel of the vault, refused before signing above `maxPrice`), `open_channel`, `list_channels`, `close_channel`
+- **Payments:** `pay` (calls a paid HTTP service and pays it from a channel of the vault, or, for an x402 `exact` offer in USDG such as Autonomo's gateways, from the payment wallet; refused before signing above `maxPrice`), `open_channel`, `list_channels`, `close_channel`
+- **Payment wallet:** `payment_wallet_setup`, `payment_wallet_status`, `payment_wallet_withdraw`, `autonomo_catalog`. APIs paid by a transfer signed by the payer's own key (x402 `exact`, EIP-3009) are paid from a wallet with an ordinary key, derived from the seed, that holds at most 5 USDG and is topped up from the vault (1 USDG, or what a price needs); the vault itself stays post-quantum. Each seed has its own wallet: on vault version 5 an agent key tops its wallet up only once the owner put that wallet on the vault's recipient allowlist (`payment_wallet_setup` with `agentWallet` on the owner's server) and allows Transfer in the policy, whose perTx and daily limits bound those top-ups
 - **Ostra AI:** `ostra_ai` (a text, image or video task; Ostra chooses the model by its quality rating within `maxPrice`, paid in USDG from a channel of the vault, and what a task did not cost stays as the vault's credit), `ostra_ai_job` (a video job, saved as a file once completed), `ostra_ai_credit`
 - **Selling services:** `accept_payments`, `seller_balance`, `seller_withdraw`
 - **Recovery:** `recovery_status`, `set_guardian`, `set_recovery_policy`, `cancel_recovery`, `support_recovery`, `request_recovery`

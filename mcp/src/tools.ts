@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AGENT_ACTION_NAMES, AI_TASK_KINDS, ALLOW_KIND_NAMES, MAX_UPLOAD_IMAGE_BYTES, RELAYER_CHANNEL_DEPOSIT, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, uploadImage, venueByName } from "@ostraagent/core";
+import { AGENT_ACTION_NAMES, AI_TASK_KINDS, ALLOW_KIND_NAMES, MAX_UPLOAD_IMAGE_BYTES, RELAYER_CHANNEL_DEPOSIT, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, readAutonomoGateways, uploadImage, venueByName } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
@@ -262,7 +262,21 @@ export function registerTools(server: McpServer, agent: Agent): void {
     creatorVault: await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
     relayer: agent.config.relayerUrl !== null,
   }));
-  tool("withdraw", "Sends USDG from the vault to an address.", { destination: address, amount: usdg }, (a) => agent.buyer.withdraw(a.destination, a.amount));
+  // The payment wallet holds at most 5 USDG, which only its own top-ups keep to: withdraw and pay orders refuse this
+  // server's own wallet (an agent key's wallet, on the owner's server, is the owner's to fund as it decides).
+  const notPaymentWallet = async (destination: string, what: string): Promise<void> => {
+    let wallet: string;
+    try {
+      wallet = await agent.paymentWallet.address();
+    } catch {
+      return;
+    }
+    if (destination.toLowerCase() === wallet.toLowerCase()) throw new Error(`${destination} is this vault's payment wallet: ${what} does not fill it (payment_wallet_setup and pay top it up within its limit); nothing was signed`);
+  };
+  tool("withdraw", "Sends USDG from the vault to an address.", { destination: address, amount: usdg }, async (a) => {
+    await notPaymentWallet(a.destination, "withdraw");
+    return agent.buyer.withdraw(a.destination, a.amount);
+  });
 
   // --- channels and payments ------------------------------------------------------------------------
   tool(
@@ -275,9 +289,29 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("close_channel", "Closes a channel on the payer path (requestClose, then finalizeWithdraw after the grace period); call again to continue.", { channel: bytes32 }, (a) => agent.channels.close(a.channel));
   tool(
     "pay",
-    "Sends an HTTP request; when the route answers 402 with an x402 batch-settlement offer in USDG from an Ostra seller, pays it from a channel of the vault (opening one when needed) and returns the answer. Refused before anything is signed when the price is above maxPrice.",
+    "Sends an HTTP request; when the route answers 402 with an x402 batch-settlement offer in USDG from an Ostra seller, pays it from a channel of the vault (opening one when needed) and returns the answer. A route whose offer is x402 exact in USDG on Robinhood Chain (a transfer signed by the payer's own key, such as Autonomo's gateways: autonomo_catalog) is paid from the vault's payment wallet (payment_wallet_setup), topped up from the vault when it holds too little. Refused before anything is signed when the price is above maxPrice.",
     { url: z.string().url(), method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"), headers: z.record(z.string(), z.string()).optional(), body: z.string().max(1_000_000).optional(), maxPrice: usdg, deposit: usdg.optional() },
     (a) => agent.payments.pay({ url: a.url, method: a.method, maxPrice: a.maxPrice, ...(a.headers === undefined ? {} : { headers: a.headers }), ...(a.body === undefined ? {} : { body: a.body }), ...(a.deposit === undefined ? {} : { deposit: a.deposit }) }),
+  );
+
+  tool(
+    "payment_wallet_setup",
+    "Sets up the vault's payment wallet, which pays APIs whose x402 offer is exact in USDG (a transfer signed by the payer's own key, such as Autonomo's gateways): an ordinary key from the seed, never holding more than 5 USDG, topped up from the vault (1 USDG, or what a price needs), so the vault itself stays post-quantum. A first top-up of amount (default 1 USDG while less is free in it, none with agentWallet; 0 for none). Each seed has its own wallet: an agent key's server (vault version 5) reports its wallet here, and the owner puts it on the vault's recipient allowlist by calling this tool with agentWallet on the owner's server (under the withdrawal lock after its delay); the agent key's top-ups also need Transfer in the policy, and its answer names what is missing. Call again to continue.",
+    { amount: usdg.optional(), agentWallet: address.optional() },
+    (a) => agent.paymentWallet.setup(a.amount, a.agentWallet),
+  );
+  tool("payment_wallet_status", "The vault's payment wallet: its address, balance, what its signed authorizations still valid may take, what is free, its limit, on version 5 what the agent key's top-ups need, and its last payments.", {}, () => agent.paymentWallet.status());
+  tool(
+    "payment_wallet_withdraw",
+    "Sends USDG from the payment wallet back to the vault (default: all that is free, the balance less what authorizations still valid may take), by a transfer authorization the wallet signs: through the relayer, paid from the vault's relayer channel, or without it by this server's fee payer.",
+    { amount: usdg.optional() },
+    (a) => agent.paymentWallet.withdraw(a.amount),
+  );
+  tool(
+    "autonomo_catalog",
+    "Autonomo's gateways: APIs sold per call in USDG on Robinhood Chain (autonomo.fun/x/<slug>), with each one's name, what it does, how to call it (example: the gateway URL plus its usage path; fill in its <...> part), the price Autonomo lists, whether it is verified, and its 30-day track record. Call one with pay (url, maxPrice): it is paid from the payment wallet (payment_wallet_setup), at the price its 402 offer asks within maxPrice.",
+    {},
+    () => readAutonomoGateways(),
   );
 
   // --- Ostra AI ---------------------------------------------------------------------------------------
@@ -627,7 +661,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
       endAt: z.string().optional().describe("an ISO date after which it no longer runs"),
     },
     async (a) => {
-      if (a.kind === "pay") return agent.v5.setOrder({ ...a, target: a.target });
+      if (a.kind === "pay") {
+        await notPaymentWallet(a.target, "a pay order");
+        return agent.v5.setOrder({ ...a, target: a.target });
+      }
       const v = venueByName(a.target);
       if (v.token !== USDG) throw new RangeError(`${a.target} holds ${v.symbol}, not the vault's USDG: a sweep or refill order names spark or raeto_usdg`);
       return agent.v5.setOrder({ ...a, target: v.address, venueKind: v.kind });

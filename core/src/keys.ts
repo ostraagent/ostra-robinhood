@@ -4,7 +4,8 @@
 //     on-chain nonce, the approval count or the leaf's number);
 //   * the secp256k1 voucher key of every channel (from its salt), the one-time
 //     depositor key and the deposit id of every shield deposit (from its
-//     number), and the seller's merchant and crank keys;
+//     number), the seller's merchant and crank keys, and each vault's payment
+//     wallet (from the vault's address; payment-wallet.ts);
 //   * the secrets of the agent's notes in Ostra Swap's private pool: its sk,
 //     each shield's rho (from the shield's number) and each spend's change
 //     and output rho (from the note spent), so that the seed recovers whose
@@ -53,6 +54,7 @@ const CREATOR_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/CREATOR-VAULT/EVM/v1");
 const NOTE_SECRET_DOMAIN = utf8("OSTRA/MCP/SWAP-NOTE/EVM/v1");
 const TIDE_LINK_DOMAIN = utf8("OSTRA/MCP/TIDE-LINK/EVM/v1");
 const AGENT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/AGENT-KEY/EVM/v1");
+const PAYMENT_WALLET_DOMAIN = utf8("OSTRA/MCP/PAYMENT-WALLET/EVM/v1");
 
 /** secp256k1 group order: a private key must be in 1..n-1. */
 const SECP256K1_N = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141n;
@@ -279,6 +281,15 @@ export class Keys<S extends WotsStore = WotsStore> {
    */
   channelVoucherSigner(chainId: number, token: Address, salt: Hex): PrivateKeyAccount {
     return accountFromSecret(sha256([VOUCHER_KEY_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), saltBytes(salt)]));
+  }
+
+  /**
+   * The payment wallet of `vault` on (chain, token) (decided 8 Nov 2026, payment-wallet.ts): a plain secp256k1 account
+   * holding a small balance from the vault to pay APIs whose offer is a transfer signed by the payer's own key (x402
+   * exact, EIP-3009). The seed and the vault's address recover it.
+   */
+  paymentWalletSigner(chainId: number, token: Address, vault: Address): PrivateKeyAccount {
+    return accountFromSecret(sha256([PAYMENT_WALLET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), tokenBytes(vault)]));
   }
 
   /**

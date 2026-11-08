@@ -39,6 +39,14 @@
 //                 the snapshot digest authorizes (an ApproveHash spend in the
 //                 same request, or earlier)
 //
+// and of USDG (decided 8 Nov 2026):
+//
+//   transferWithAuthorization(from, to, value, validAfter, validBefore, nonce,
+//                 v, r, s)   EIP-3009, the v, r, s form: a payment wallet's
+//                 withdrawal back into its vault (core payment-wallet.ts),
+//                 read as authorizedTransfer; gate.ts relays it alone, into an
+//                 Ostra vault in its token that pays for it
+//
 // and of Ostra Swap (ostra-swap src/*.sol, decided 21 Oct 2026):
 //
 //   OstraRouter.executeEscrow(order, hub, legIn, legOut), announce(order),
@@ -74,6 +82,7 @@ import {
   ostraVaultFactoryAbi,
   ostraVestingAbi,
   relayCalls,
+  usdgAbi,
   relayRequestHash,
   relayTransaction,
   vaultAddress,
@@ -125,6 +134,8 @@ export type ParsedCall =
   | { fn: "pad"; to: Address; name: string; args: readonly unknown[] }
   /** OstraReputation.snapshot: the vault whose record it appends, and its identity commitment. */
   | { fn: "repSnapshot"; to: Address; vault: Address; idc: Hex }
+  /** An ERC-20's EIP-3009 transferWithAuthorization (v, r, s): `from` signed the transfer of `value` to `recipient`. */
+  | { fn: "authorizedTransfer"; to: Address; from: Address; recipient: Address; value: bigint }
   | { fn: null; to: Address; selector: Hex };
 
 export type RelayTx = {
@@ -165,6 +176,7 @@ for (const [abi, names] of [
   [ostraPrivatePoolAbi, [["privateSwap", "privateSwap"], ["unshield", "privateUnshield"], ["shieldFromEscrow", "shieldFromEscrow"]]],
   [ostraPadAbi, PAD_RELAYED_FUNCTIONS.map((n) => [n, "pad"] as const)],
   [ostraReputationAbi, [["snapshot", "repSnapshot"]]],
+  [usdgAbi, [["transferWithAuthorization", "authorizedTransfer"]]],
 ] as const) {
   for (const [name, as] of names) {
     const item = (abi as readonly { type: string; name?: string }[]).find((x) => x.type === "function" && x.name === name);
@@ -205,6 +217,8 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
       return { fn: "pad", to, name: decoded.functionName, args: a };
     case "repSnapshot":
       return { fn: "repSnapshot", to, vault: getAddress(a[0] as Address), idc: (a[1] as Hex).toLowerCase() as Hex };
+    case "authorizedTransfer":
+      return { fn: "authorizedTransfer", to, from: getAddress(a[0] as Address), recipient: getAddress(a[1] as Address), value: a[2] as bigint };
     case "launchFromVault": {
       const launch = a[0] as LaunchParams;
       return { fn: "launchFromVault", to, launch, dev: a[1] as DevBuyTerms, nextKeyRoot: a[2] as Hex, signature: a[3] as Hex, vault: getAddress(launch.creatorVault) };
@@ -305,8 +319,9 @@ function spendLeafCall(c: ParsedCall, d: Deployment): SpendLeafCall | null {
 
 /**
  * The vault a call acts for: the one createVault makes, the vault a spend,
- * close request or withdrawal is sent to, or the creator vault a
- * vault-funded launch spends from; null for the pool's calls and the
+ * close request or withdrawal is sent to, the creator vault a vault-funded
+ * launch spends from, or the vault a USDG transferWithAuthorization pays into
+ * (a payment wallet's withdrawal); null for the pool's calls and the
  * launchpad's public calls (claims, releases), which act for nobody.
  */
 export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
@@ -314,6 +329,7 @@ export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
   if (created !== null) return created.vault;
   if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery" || c.fn === "tripVenue" || c.fn === "runOrder" || c.fn === "repayDue") return c.to;
   if (c.fn === "launchFromVault") return c.vault;
+  if (c.fn === "authorizedTransfer") return c.recipient;
   return null;
 }
 

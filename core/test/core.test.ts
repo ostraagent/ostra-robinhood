@@ -35,6 +35,8 @@ import {
   decodeVaultSetCrankKeyMessage,
   decodeVaultSpendHeader,
   decodeVaultTransferMessage,
+  exactOfferProblem,
+  parseAutonomoGateways,
   formatEth,
   formatTokenAmount,
   fromBase64Url,
@@ -109,6 +111,13 @@ test("key derivations: separate per vault kind, chain, token and index; secp256k
   assert.notEqual(k.shieldDepositId(ROBINHOOD_CHAIN_ID, USDG, 0n), k.shieldDepositId(ROBINHOOD_CHAIN_ID, USDG, 1n));
   assert.match(k.merchantKey(ROBINHOOD_CHAIN_ID, USDG), /^0x[0-9a-f]{64}$/);
   assert.notEqual(k.selfCrankSigner(ROBINHOOD_CHAIN_ID, USDG).address, accountFromSecret(new Uint8Array(32).fill(9)).address);
+  // The payment wallet: one per vault, chain and token, the same from the same seed.
+  const wallet = k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1)).address;
+  assert.equal(wallet, keys().paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1)).address);
+  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa2)).address);
+  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID + 1, USDG, A(0xa1)).address);
+  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, A(1), A(0xa1)).address);
+  assert.notEqual(wallet, k.selfCrankSigner(ROBINHOOD_CHAIN_ID, USDG).address);
   assert.equal(isPrivateKey(new Uint8Array(32)), false);
   assert.equal(isPrivateKey(new Uint8Array(32).fill(0xff)), false);
   assert.equal(isPrivateKey(new Uint8Array(32).fill(1)), true);
@@ -325,4 +334,60 @@ test("relayerSpendPlan replays reserve's payment: channel room first, then a new
   const two = big.debt + big.openCost + 1_200_000n + big.openCost + 1_200_000n;
   assert.equal(relayerSpendPlan({ ...big, balance: two }), true);
   assert.equal(relayerSpendPlan({ ...big, balance: two - 1n }), false);
+});
+
+test("the payment wallet pays x402 exact offers in USDG on Robinhood Chain by EIP-3009 only", () => {
+  const network = `eip155:${ROBINHOOD_CHAIN_ID}`;
+  // Autonomo's token-price offer, as its 402 named it on 8 Nov 2026.
+  const offer = {
+    scheme: "exact",
+    network,
+    amount: "10000",
+    asset: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    payTo: "0xc66181e50aF128ffEe6048E8d4097bDC84776313",
+    maxTimeoutSeconds: 300,
+    extra: { name: "Global Dollar", version: "1" },
+  } as never;
+  const o = offer as { [k: string]: unknown };
+  assert.equal(exactOfferProblem(offer, network, USDG), null);
+  assert.equal(exactOfferProblem({ ...o, asset: String(o.asset).toLowerCase() } as never, network, USDG), null);
+  assert.equal(exactOfferProblem({ ...o, extra: { name: "Global Dollar", version: "1", assetTransferMethod: "eip3009" } } as never, network, USDG), null);
+  assert.match(exactOfferProblem({ ...o, scheme: "batch-settlement" } as never, network, USDG) ?? "", /^batch-settlement/);
+  assert.match(exactOfferProblem({ ...o, network: "eip155:8453" } as never, network, USDG) ?? "", /on eip155:8453/);
+  assert.match(exactOfferProblem({ ...o, asset: A(0xe8) } as never, network, USDG) ?? "", /in 0x/);
+  assert.match(exactOfferProblem({ ...o, extra: { name: "Global Dollar", version: "1", assetTransferMethod: "permit2" } } as never, network, USDG) ?? "", /through permit2/);
+  assert.match(exactOfferProblem({ ...o, extra: {} } as never, network, USDG) ?? "", /EIP-712 name and version/);
+});
+
+test("Autonomo's gateway list: the gateways priced in USDG under autonomo.fun, each with how to call it", () => {
+  // The first two entries of https://autonomo.fun/api/v1/gateways as it answered on 8 Nov 2026, and two that are refused.
+  const body = {
+    data: [
+      {"slug":"token-price","name":"Token Price","description":"show live $autonomo token price, just an example of an api","url":"https://autonomo.fun/x/token-price","usage":"/price/autonomo","price":{"autonomo":100,"usdg":0.01},"project":"https://autonomo.fun/projects/token-price","verified":true,"trackRecord":{"windowDays":30,"new":true,"outsidePayers":1,"repeatPayers":1,"privateCalls":0,"paidCalls":38,"settledCalls":35,"refusedCalls":4,"failedCalls":0,"successRate":1,"medianMs":3379,"liveSince":"2026-10-28T12:40:15.245Z"}},
+      {"slug":"new-launches","name":"New Launches","description":"Newest token launches on Robinhood Chain: name, age, buys, sells, market cap and bonding curve progress for each new token.","url":"https://autonomo.fun/x/new-launches","usage":"/launches?limit=10","price":{"autonomo":100,"usdg":0.01},"project":"https://autonomo.fun/projects/new-launches","verified":true,"trackRecord":{"windowDays":30,"new":true,"outsidePayers":2,"repeatPayers":1,"privateCalls":0,"paidCalls":24,"settledCalls":22,"refusedCalls":2,"failedCalls":0,"successRate":1,"medianMs":2516,"liveSince":"2026-10-29T02:26:00.553Z"}},
+      { slug: "elsewhere", name: "Elsewhere", url: "https://example.com/x/elsewhere", usage: "/a", price: { usdg: 0.01 } },
+      { slug: "no-usdg", name: "No USDG", url: "https://autonomo.fun/x/no-usdg", usage: "/a", price: { autonomo: 100 } },
+      { slug: "plain", name: "Plain", url: "http://autonomo.fun/x/plain", usage: "/a", price: { usdg: 0.01 } },
+      { slug: "other-path", name: "Other path", url: "https://autonomo.fun/y/other-path", usage: "/a", price: { usdg: 0.01 } },
+      { slug: "fragment", name: "Fragment", url: "https://autonomo.fun/x/fragment#", usage: "/a", price: { usdg: 0.01 } },
+      { slug: "no-slash", name: "No slash", url: "https://autonomo.fun/x/no-slash", usage: "a", price: { usdg: 0.01 } },
+    ],
+  };
+  const { gateways, skipped, cut } = parseAutonomoGateways(body);
+  assert.equal(skipped, 6);
+  assert.equal(cut, 0);
+  assert.deepEqual(gateways.map((g) => [g.slug, g.example, g.priceUsdg, g.verified]), [
+    ["token-price", "https://autonomo.fun/x/token-price/price/autonomo", "0.01", true],
+    ["new-launches", "https://autonomo.fun/x/new-launches/launches?limit=10", "0.01", true],
+  ]);
+  assert.deepEqual(gateways[0]!.trackRecord, { windowDays: 30, paidCalls: 38, settledCalls: 35, failedCalls: 0, successRate: 1, medianMs: 3379, outsidePayers: 1, repeatPayers: 1, liveSince: "2026-10-28T12:40:15.245Z" });
+  assert.throws(() => parseAutonomoGateways({}), /no data array/);
+  // At most 50 gateways, descriptions cut to 500 characters, prices never as an exponent.
+  const many = Array.from({ length: 60 }, (_, i) => ({ slug: `g${i}`, name: `G${i}`, description: "d".repeat(900), url: `https://autonomo.fun/x/g${i}`, usage: "/a", price: { usdg: 0.0000001 + i } }));
+  const big = parseAutonomoGateways({ data: many });
+  assert.equal(big.gateways.length, 50);
+  assert.equal(big.cut, 10);
+  assert.equal(big.gateways[0]!.description.length, 500);
+  assert.equal(big.gateways[0]!.priceUsdg, "0");
+  assert.equal(big.gateways[1]!.priceUsdg, "1");
 });

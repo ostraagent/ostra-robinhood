@@ -264,3 +264,12 @@ test("OstraReputation.snapshot is read with its vault and idc; its other functio
   const tx = decodeRelayRequest({ calls: [{ to: rep, data: encodeFunctionData({ abi: ostraReputationAbi, functionName: "snapshot", args: [vault, idc] }) }] });
   assert.deepEqual(classify(tx, d, at(0xee)), { kind: "other", vaults: [] });
 });
+
+test("USDG's transferWithAuthorization (v, r, s) is read as an authorized transfer that acts for the vault it pays into; transfer stays unknown", () => {
+  const nonce = `0x${"5c".repeat(32)}` as Hex;
+  const data = encodeFunctionData({ abi: usdgAbi, functionName: "transferWithAuthorization", args: [at(0xab01), vault, 250_000n, 0n, 1_900_000_000n, nonce, 27, root, next] });
+  assert.deepEqual(parseCall({ to: d.token, data }), { fn: "authorizedTransfer", to: d.token, from: at(0xab01), recipient: vault, value: 250_000n });
+  // Read by its selector on any contract (the policy keeps only USDG's): it acts for its recipient.
+  assert.deepEqual(classify(decodeRelayRequest({ calls: [{ to: d.token, data }] }), d, relayerVault), { kind: "other", vaults: [vault] });
+  assert.throws(() => parseCall({ to: d.token, data: data.slice(0, 74) as Hex }, 1), /calls\[1\]: malformed transferWithAuthorization calldata/);
+});

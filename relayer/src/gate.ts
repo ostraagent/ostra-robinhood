@@ -19,7 +19,9 @@
 //      configured OstraReputation, for an Ostra vault in the relayer's token whose EIP-1271 approval of its snapshot
 //      digest (rebuilt here from the vault's nonce and the current epoch, read from the contract) holds on chain or is
 //      given by that vault's ApproveHash spend earlier in the request, without the withdrawal lock (reputation proofs,
-//      specified on 2 Nov 2026). Vaults in another token
+//      specified on 2 Nov 2026); USDG's transferWithAuthorization (EIP-3009, the v, r, s form) alone, into an Ostra
+//      vault in the relayer's token that the request names as its payer (a payment wallet's withdrawal back into its
+//      vault, decided 8 Nov 2026: the vault it pays into pays for it, with a voucher of its own channel). Vaults in another token
 //      (a WETH or listed pair token vault: a pair's creator vault or the
 //      token vault trading its pools; a
 //      vault holding a token the launchpad launched, launchpad.poolOf) spend
@@ -475,8 +477,10 @@ const STOCK_TOKENS: ReadonlySet<Address> = new Set([...LAUNCH_PAIRS.filter((p) =
  * breaker reason holds), and with no payer named nobody's credit is.
  */
 export function creditVaultOf(parsed: readonly ParsedCall[], vaults: readonly Address[], payer: Address | null): { creditVault: Address | null; actsFor: boolean } {
-  // A standing order's run and a due repay are anyone's to send too (version 5): the same rule as a trip.
-  const trips = parsed.some((c) => c.fn === "tripVenue" || c.fn === "runOrder" || c.fn === "repayDue");
+  // A standing order's run and a due repay are anyone's to send too (version 5): the same rule as a trip. So is a USDG
+  // transferWithAuthorization into a vault: whoever holds the signed authorization can send it, so the vault it pays
+  // into pays for it only with a voucher of its own channel, never from its credit alone.
+  const trips = parsed.some((c) => c.fn === "tripVenue" || c.fn === "runOrder" || c.fn === "repayDue" || c.fn === "authorizedTransfer");
   const creditVault = payer ?? (vaults.length === 1 && !trips ? (vaults[0] as Address) : null);
   return { creditVault, actsFor: creditVault !== null && !trips && vaults.length === 1 && vaults[0] === creditVault };
 }
@@ -1008,6 +1012,17 @@ export class RelayerGate {
           const p = await dividendProblem(i, id);
           if (p !== null) return p;
         }
+        continue;
+      }
+      // USDG's transferWithAuthorization: a payment wallet's withdrawal back into its vault (core payment-wallet.ts). Only
+      // USDG's (its code is the token's), alone, into an Ostra vault in the relayer's token that pays for it (the
+      // request's payer): nobody else's vault pays for a transfer into a vault, and nothing but USDG's code runs.
+      if (c.fn === "authorizedTransfer") {
+        if (c.to !== token) return `calls[${i}]: transferWithAuthorization on ${c.to} is not relayed: only ${token}'s`;
+        if (tx.parsed.length !== 1) return `calls[${i}]: a transferWithAuthorization is relayed alone`;
+        if (request.payer !== c.recipient) return `calls[${i}]: a transferWithAuthorization is relayed into the vault that pays for it: the request's payer must be its recipient ${c.recipient}`;
+        const v = await readVault(this.#o.client, d, c.recipient);
+        if (v === null || v.token !== token) return `calls[${i}]: a transferWithAuthorization is relayed into an Ostra vault in ${token}; ${c.recipient} is not one`;
         continue;
       }
       if (c.fn === null || !VAULT_FNS.has(c.fn)) return `calls[${i}]: ${name} on ${c.to} is not relayed`;

@@ -18,6 +18,8 @@ export * from "./launchpad.ts";
 export * from "./pad.ts";
 export * from "./passkey.ts";
 export * from "./pay.ts";
+export * from "./payment-wallet.ts";
+export * from "./autonomo.ts";
 export * from "./publish.ts";
 export * from "./raeto.ts";
 export * from "./pending.ts";

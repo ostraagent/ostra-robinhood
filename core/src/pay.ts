@@ -18,6 +18,11 @@
 // A channel `pay` opened lives SESSION_MAX_AGE_SECONDS; the server's sweep
 // closes it after that (close_channel), and what was not claimed comes back
 // to the vault.
+//
+// A route that offers no such offer but x402 `exact` in USDG on Robinhood
+// Chain (EIP-3009, as Autonomo's gateways do; decided 8 Nov 2026) is paid from
+// the vault's payment wallet (payment-wallet.ts), when this agent has one: a
+// small balance behind an ordinary key, topped up from the vault.
 
 import { getAddress, isAddress, type Address, type Hex, type PublicClient } from "viem";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
@@ -28,6 +33,7 @@ import { readChannel, readVault } from "@ostraagent/sdk";
 import { formatTokenAmount, parseTokenAmount } from "./amount.ts";
 import { BATCH_MAX_WITHDRAW_DELAY_SECONDS, SESSION_MAX_AGE_SECONDS, type Config } from "./config.ts";
 import { payCapacity, type ChannelRecord, type ChannelService, type PayChannelState } from "./channels.ts";
+import { exactOfferProblem, type PaymentWallet } from "./payment-wallet.ts";
 import type { VaultService } from "./vault.ts";
 
 /** Deposit of a channel `pay` opens to a seller, unless the price or the caller asks for more (1 USDG). */
@@ -60,6 +66,8 @@ export type PayResult = {
   channel: Hex | null;
   /** Unused deposit of the channel after this payment. */
   channelLeft: string | null;
+  /** Paid from the payment wallet (an x402 exact offer): its address, and what is free in it after this payment. */
+  wallet?: { address: Address; left: string };
   contentType: string | null;
   body: string;
   truncated: boolean;
@@ -81,13 +89,15 @@ export class PayService {
   readonly #config: Config;
   readonly #vault: VaultService;
   readonly #channels: ChannelService;
+  readonly #wallet: PaymentWallet | null;
   #queue: Promise<unknown> = Promise.resolve();
 
-  constructor(client: PublicClient, config: Config, vault: VaultService, channels: ChannelService) {
+  constructor(client: PublicClient, config: Config, vault: VaultService, channels: ChannelService, wallet: PaymentWallet | null = null) {
     this.#client = client;
     this.#config = config;
     this.#vault = vault;
     this.#channels = channels;
+    this.#wallet = wallet;
   }
 
   #serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -207,7 +217,14 @@ export class PayService {
       const token = this.#config.deployment.token;
       const offer = required.accepts.find((r) => offerProblem(r, this.#config.x402Network, token) === null);
       if (offer === undefined) {
-        const offered = required.accepts.map((r) => offerProblem(r, this.#config.x402Network, token)).join("; ");
+        const exact = required.accepts.find((r) => exactOfferProblem(r, this.#config.x402Network, token) === null);
+        if (exact !== undefined) {
+          if (this.#wallet === null) throw new Error(`${input.url} is paid by a USDG transfer signed by the payer's own key (x402 exact), which this agent pays from a payment wallet: there is none here; nothing was paid`);
+          const w = await this.#wallet.payExact({ url: input.url, required, offer: exact, maxPrice, send: (headers) => this.#fetch(input, headers) });
+          const out = await this.#answer(w.answer, w.paid, null, w.note, input.maxBodyChars);
+          return { ...out, wallet: { address: w.address, left: formatTokenAmount(w.left) } };
+        }
+        const offered = required.accepts.map((r) => (r.scheme === "exact" ? exactOfferProblem(r, this.#config.x402Network, token) : offerProblem(r, this.#config.x402Network, token))).join("; ");
         throw new Error(`${input.url} offers no payment this agent makes (${offered}); nothing was paid`);
       }
       if (!/^[1-9][0-9]*$/.test(offer.amount)) throw new Error(`the offer's amount ${offer.amount} is not a positive integer; nothing was paid`);

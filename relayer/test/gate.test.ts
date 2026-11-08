@@ -274,3 +274,63 @@ test("a tripVenue never acts for the tripped vault: its credit is not used witho
   assert.deepEqual(creditVaultOf(finish, [vault], null), { creditVault: vault, actsFor: true });
   assert.deepEqual(creditVaultOf(finish, [vault, venue], null), { creditVault: null, actsFor: false });
 });
+
+test("a USDG transferWithAuthorization never acts for the vault it pays into: that vault pays only with a voucher of its own channel", () => {
+  const vault = getAddress("0x00000000000000000000000000000000000aa009");
+  const wallet = getAddress("0x00000000000000000000000000000000000ab009");
+  const usdg = getAddress("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");
+  const withdrawal = [{ fn: "authorizedTransfer" as const, to: usdg, from: wallet, recipient: vault, value: 1n }];
+  assert.deepEqual(creditVaultOf(withdrawal, [vault], null), { creditVault: null, actsFor: false });
+  assert.deepEqual(creditVaultOf(withdrawal, [vault], vault), { creditVault: vault, actsFor: false });
+});
+
+test("USDG's transferWithAuthorization is relayed only on USDG, alone, with its recipient as the request's payer", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { encodeFunctionData } = await import("viem");
+  const { ostraVaultFactoryAbi, parseDeployment, usdgAbi } = await import("@ostraagent/sdk");
+  const { Ledger } = await import("../src/ledger.ts");
+  const { RelayerGate } = await import("../src/gate.ts");
+  const dir = await mkdtemp(join(tmpdir(), "ostra-gate-eip3009-"));
+  try {
+    const at = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
+    const d = parseDeployment({
+      version: 1,
+      chainId: 4663,
+      token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      batchSettlement: "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
+      vaultImplementation: at(1),
+      vaultBeacon: at(2),
+      vaultFactory: at(3),
+      poolImplementation: at(4),
+      poolBeacon: at(5),
+      pool: at(6),
+      splitFactory: at(7),
+      beaconOwner: at(8),
+      fromBlock: "1",
+    });
+    const vault = at(0xa1);
+    const r = `0x${"11".repeat(32)}` as const;
+    const twa = encodeFunctionData({ abi: usdgAbi, functionName: "transferWithAuthorization", args: [at(0xab), vault, 5n, 0n, 1_900_000_000n, r, 27, r, r] });
+    const ask = async (body: unknown) => {
+      const gate = new RelayerGate({ deployment: d, ledger: await Ledger.open(dir), merchant: { token: d.token }, sender: { address: at(0xee) } } as never);
+      return (await gate.relay({ body: JSON.stringify(body), req: { headers: {} } as never, ip: "127.0.0.1" })) as { status: number; body: { error: string; message: string } };
+    };
+    // Another contract's function of the same selector: refused.
+    const elsewhere = await ask({ calls: [{ to: at(0xb8), data: twa }] });
+    assert.equal(elsewhere.status, 422);
+    assert.equal(elsewhere.body.message, `calls[0]: transferWithAuthorization on ${at(0xb8)} is not relayed: only ${d.token}'s`);
+    // With another call in the same request: refused.
+    const create = encodeFunctionData({ abi: ostraVaultFactoryAbi, functionName: "createVault", args: [d.token, r, at(0)] });
+    const twoCalls = await ask({ calls: [{ to: d.token, data: twa }, { to: d.vaultFactory, data: create }] });
+    assert.equal(twoCalls.status, 422);
+    assert.equal(twoCalls.body.message, "calls[0]: a transferWithAuthorization is relayed alone");
+    // Without the recipient as the payer (here no payer): refused before anything is read from the chain.
+    const unpaid = await ask({ calls: [{ to: d.token, data: twa }] });
+    assert.equal(unpaid.status, 422);
+    assert.equal(unpaid.body.message, `calls[0]: a transferWithAuthorization is relayed into the vault that pays for it: the request's payer must be its recipient ${vault}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

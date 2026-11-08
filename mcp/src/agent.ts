@@ -38,7 +38,9 @@ import {
   LocalSender,
   PRIVATE_SWAP_DIR,
   PadService,
+  PAYMENT_WALLET_DIR,
   PayService,
+  PaymentWallet,
   PrivateBalanceService,
   RaetoService,
   RelayerClient,
@@ -118,6 +120,8 @@ export class Agent {
   readonly buyer: VaultService;
   readonly channels: ChannelService;
   readonly payments: PayService;
+  /** The vault's payment wallet: pays x402 exact offers in USDG (payment-wallet.ts). */
+  readonly paymentWallet: PaymentWallet;
   readonly seller: VaultService;
   readonly creator: VaultService;
   readonly creatorRelayer: RelayerClient | null;
@@ -186,7 +190,8 @@ export class Agent {
     this.v5 = new V5Service({ client, logsClient: v5Logs, config, buyer: this.buyer, sender: this.sender });
     this.relayer?.attachBuyerVault(this.buyer);
     this.channels = new ChannelService(client, config, keys, this.buyer, this.sender);
-    this.payments = new PayService(client, config, this.buyer, this.channels);
+    this.paymentWallet = new PaymentWallet({ client, config, keys, buyer: this.buyer, v5: this.v5, sender: this.sender, folder: keys.folder.folder(PAYMENT_WALLET_DIR) });
+    this.payments = new PayService(client, config, this.buyer, this.channels, this.paymentWallet);
     this.ai = config.aiUrl === null ? null : new AiService(config, this.payments, this.buyer);
     this.seller = new VaultService(client, transport, config, keys, this.sender, "seller");
     this.creatorRelayer = config.relayerUrl === null ? null : new RelayerClient(client, config, p.creatorKeys, config.relayerUrl);
