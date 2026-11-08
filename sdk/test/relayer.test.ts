@@ -219,10 +219,10 @@ test("the gas floors of a relay transaction's vault spends: Morpho, Guard and Su
   }
   // Any other kind word starts with the ERC4626 floor, as OstraVaultModuleV4._minGas gives it.
   assert.equal(spendFloorGas(VAULT_ACTION.ENTER, `0x${"00".repeat(31)}07${"00".repeat(96)}`), BigInt(VAULT_ERC4626_MIN_GAS));
-  // The op is the op word's last byte, the one OstraVault routes by: 5 and above go to OstraVaultModuleV4 (which
-  // refuses all but 5 and 6), below 5 to OstraVaultModule.
-  for (const op of ["05", "06", "07", "ff"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_EXIT_MIN_GAS), op);
-  for (const op of ["00", "04"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_MIN_GAS), op);
+  // The op is the op word's last byte, the one OstraVault routes by: 7 and 8 go to OstraVaultModuleV5.guardSpend
+  // (version 5), any other from 5 up to OstraVaultModuleV4 (which refuses all but 5 and 6), below 5 to OstraVaultModule.
+  for (const op of ["05", "06", "09", "ff"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_EXIT_MIN_GAS), op);
+  for (const op of ["00", "04", "07", "08"]) assert.equal(spendFloorGas(VAULT_ACTION.GUARD, `0x${"00".repeat(63)}${op}${"00".repeat(64)}`), BigInt(VAULT_GUARD_MIN_GAS), op);
   // No floor: SetVenue, Forward, Transfer, a call that is no spend.
   assert.deepEqual(floor(spend(VAULT_ACTION.SET_VENUE, setVenueParams({ kind: VENUE_KIND.ERC4626, venue: SPARK_SAVINGS_USDG, enabled: true }))), []);
   assert.deepEqual(floor(spend(VAULT_ACTION.FORWARD, forwardParams({ token: USDG, amount: 1n }))), []);

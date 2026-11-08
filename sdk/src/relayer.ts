@@ -99,6 +99,7 @@ import {
   ostraVaultFactoryAbi,
   ostraVaultModuleAbi,
   ostraVaultModuleV4Abi,
+  ostraVaultModuleV5Abi,
   ostraVestingAbi,
 } from "./abi.ts";
 import {
@@ -113,6 +114,7 @@ import {
   VAULT_GUARD_EXIT_MIN_GAS,
   VAULT_GUARD_MIN_GAS,
   VAULT_MORPHO_MIN_GAS,
+  VAULT_PRIORS_MIN_GAS,
   VAULT_RAETO_STOCK_MIN_GAS,
   VAULT_RAETO_USDG_MIN_GAS,
   VAULT_SWAP_GAS,
@@ -304,6 +306,7 @@ const OSTRA_ERRORS = [
   ostraVaultAbi,
   ostraVaultModuleAbi,
   ostraVaultModuleV4Abi,
+  ostraVaultModuleV5Abi,
   ostraVaultFactoryAbi,
   ostraPoolAbi,
   ostraLaunchpadAbi,
@@ -410,7 +413,8 @@ export async function simulateRelay(
 
 /**
  * The swapGas each vault Swap among the calls of the relay transaction `tx`
- * (one call, or Multicall3 aggregate3) signed. A call with the spend selector
+ * (one call, or Multicall3 aggregate3) signed, by the owner's key (spend) or
+ * the agent key (spendAsAgent). A call with either selector
  * that does not decode, or a Swap whose params do not, counts
  * VAULT_SWAP_GAS.MAX.
  */
@@ -426,7 +430,7 @@ export function swapGasOf(tx: { to: Address; data: Hex }): bigint[] {
   }
   const out: bigint[] = [];
   for (const data of calls) {
-    if (data.slice(0, 10).toLowerCase() !== SPEND_SELECTOR) continue;
+    if (!isSpendSelector(data)) continue;
     let spend: { args: readonly unknown[] };
     try {
       spend = decodeFunctionData({ abi: ostraVaultAbi, data }) as typeof spend;
@@ -455,20 +459,25 @@ export function reservedSwapGas(tx: { to: Address; data: Hex }): bigint {
   return swaps + floorGasOf(tx).reduce((a, g) => a + g, 0n);
 }
 
-/** The vault spends among the calls of the relay transaction `tx` that decode: their action and params. */
-function spendsOf(tx: { to: Address; data: Hex }): { action: number; params: Hex }[] {
-  const out: { action: number; params: Hex }[] = [];
+/** The vault spends among the calls of the relay transaction `tx` that decode (spend and spendAsAgent): their action and params, and whether the agent key signed. */
+function spendsOf(tx: { to: Address; data: Hex }): { action: number; params: Hex; byAgent: boolean }[] {
+  const out: { action: number; params: Hex; byAgent: boolean }[] = [];
   for (const c of relayedCalls(tx)) {
-    if (c.data.slice(0, 10).toLowerCase() !== SPEND_SELECTOR) continue;
+    if (!isSpendSelector(c.data)) continue;
     let args: readonly unknown[];
     try {
       args = decodeFunctionData({ abi: ostraVaultAbi, data: c.data }).args as readonly unknown[];
     } catch {
       continue;
     }
-    out.push({ action: Number(args[0]), params: args[2] as Hex });
+    out.push({ action: Number(args[0]), params: args[2] as Hex, byAgent: c.data.slice(0, 10).toLowerCase() === SPEND_AS_AGENT_SELECTOR });
   }
   return out;
+}
+
+/** The agent key's Exit: it runs in OstraVaultModuleV5.agentExit, which checks no gas floor (a failed one reverts). */
+function agentExit(s: { action: number; byAgent: boolean }): boolean {
+  return s.byAgent && s.action === VAULT_ACTION.EXIT;
 }
 
 /**
@@ -479,6 +488,7 @@ function spendsOf(tx: { to: Address; data: Hex }): { action: number; params: Hex
 export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
   const out: bigint[] = [];
   for (const s of spendsOf(tx)) {
+    if (agentExit(s)) continue;
     const floor = spendFloorGas(s.action, s.params);
     if (floor !== 0n) out.push(floor);
   }
@@ -494,7 +504,7 @@ export function floorGasOf(tx: { to: Address; data: Hex }): bigint[] {
  */
 export function unpricedFloorGas(tx: { to: Address; data: Hex }): bigint {
   if (escrowCalls(tx) > 0) return 0n;
-  return spendsOf(tx).reduce((a, s) => (catalogVenueSpend(s.action, s.params) ? a + spendFloorGas(s.action, s.params) : a), 0n);
+  return spendsOf(tx).reduce((a, s) => (!agentExit(s) && catalogVenueSpend(s.action, s.params) ? a + spendFloorGas(s.action, s.params) : a), 0n);
 }
 
 /** The part of a spend's gas floor (spendFloorGas) the relayer prices: all of it, none for a catalog venue spend. */
@@ -532,13 +542,19 @@ export function catalogVenueSpend(action: number, params: Hex): boolean {
  * OstraVault sends it to OstraVaultModuleV4 by; the module runs ops 5 and 6 and refuses the rest)
  * VAULT_GUARD_EXIT_MIN_GAS; an Enter or an Exit the floor of the kind in its first
  * word (OstraVaultModuleV4._minGas: VAULT_RAETO_USDG_MIN_GAS, VAULT_RAETO_STOCK_MIN_GAS, any other kind
- * VAULT_ERC4626_MIN_GAS). Params too short for the word read are priced as the vault would run them if they were
- * zero: the vault refuses them anyway.
+ * VAULT_ERC4626_MIN_GAS). Version 5 (OstraVaultModuleV5): a Guard spend whose op byte is 7 or 8 (the vault sends it to
+ * OstraVaultModuleV5.guardSpend) VAULT_GUARD_MIN_GAS; a Priors spend (35 to 46) VAULT_PRIORS_MIN_GAS. Params too short
+ * for the word read are priced as the vault would run them if they were zero: the vault refuses them anyway.
  */
 export function spendFloorGas(action: number, params: Hex): bigint {
   const word = (i: number) => (params.length >= 2 + 64 * (i + 1) ? BigInt(`0x${params.slice(2 + 64 * i, 2 + 64 * (i + 1))}`) : 0n);
   if (action >= VAULT_ACTION.LEND && action <= VAULT_ACTION.REPAY) return BigInt(VAULT_MORPHO_MIN_GAS);
-  if (action === VAULT_ACTION.GUARD) return BigInt((word(1) & 0xffn) >= BigInt(GUARD_OP.EXIT) ? VAULT_GUARD_EXIT_MIN_GAS : VAULT_GUARD_MIN_GAS);
+  if (action === VAULT_ACTION.GUARD) {
+    const op = word(1) & 0xffn;
+    if (op === BigInt(GUARD_OP.AGENT_STOP) || op === BigInt(GUARD_OP.CLEAR_CRANK)) return BigInt(VAULT_GUARD_MIN_GAS);
+    return BigInt(op >= BigInt(GUARD_OP.EXIT) ? VAULT_GUARD_EXIT_MIN_GAS : VAULT_GUARD_MIN_GAS);
+  }
+  if (action >= VAULT_ACTION.PRIORS_BORROW && action <= VAULT_ACTION.ROOT_CLAIM_FEES) return BigInt(VAULT_PRIORS_MIN_GAS);
   if (action === VAULT_ACTION.SUPPORT_RECOVERY) return BigInt(VAULT_GUARD_MIN_GAS);
   if (action === VAULT_ACTION.ENTER || action === VAULT_ACTION.EXIT) {
     const kind = word(0);
@@ -646,6 +662,14 @@ export function relayGasCap(gas: bigint): bigint {
 }
 
 const SPEND_SELECTOR = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "function" && x.name === "spend") as Parameters<typeof toFunctionSelector>[0]).toLowerCase();
+/** OstraVault.spendAsAgent (version 5): the same arguments as spend, signed by the agent key. */
+export const SPEND_AS_AGENT_SELECTOR: Hex = toFunctionSelector(ostraVaultAbi.find((x) => x.type === "function" && x.name === "spendAsAgent") as Parameters<typeof toFunctionSelector>[0]).toLowerCase() as Hex;
+
+/** Whether `data` calls OstraVault.spend or OstraVault.spendAsAgent (by selector). */
+function isSpendSelector(data: Hex): boolean {
+  const selector = data.slice(0, 10).toLowerCase();
+  return selector === SPEND_SELECTOR || selector === SPEND_AS_AGENT_SELECTOR;
+}
 
 /**
  * The gas the relay transaction `tx` is priced at when it used `gasUsed` simulated and its L1 data component is `l1`
@@ -724,10 +748,11 @@ export function failedSwaps(logs: readonly Log[], vaults: readonly Address[]): F
 }
 
 /**
- * A vault's version 3 or 4 spend that failed and moved nothing (OstraVaultModule's MorphoFailed, Guarded with ok false
- * from either module, or OstraVaultModuleV4's VenueFailed for an Enter or an Exit).
+ * A vault's version 3, 4 or 5 spend that failed and moved nothing (OstraVaultModule's MorphoFailed, Guarded with ok
+ * false from any module, OstraVaultModuleV4's VenueFailed for an Enter or an Exit, or OstraVaultModuleV5's PriorsFailed
+ * for a Priors spend signed by the owner's key).
  */
-export type FailedModuleSpend = { vault: Address; kind: "morpho" | "guard" | "venue"; action: number; reason: Hex };
+export type FailedModuleSpend = { vault: Address; kind: "morpho" | "guard" | "venue" | "priors"; action: number; reason: Hex };
 
 const MORPHO_FAILED_TOPIC = toEventSelector(
   ostraVaultModuleAbi.find((x) => x.type === "event" && x.name === "MorphoFailed") as Parameters<typeof toEventSelector>[0],
@@ -736,11 +761,14 @@ const GUARDED_TOPIC = toEventSelector(ostraVaultModuleAbi.find((x) => x.type ===
 const VENUE_FAILED_TOPIC = toEventSelector(
   ostraVaultModuleV4Abi.find((x) => x.type === "event" && x.name === "VenueFailed") as Parameters<typeof toEventSelector>[0],
 );
+const PRIORS_FAILED_TOPIC = toEventSelector(
+  ostraVaultModuleV5Abi.find((x) => x.type === "event" && x.name === "PriorsFailed") as Parameters<typeof toEventSelector>[0],
+);
 
 /**
- * The Morpho, Guard, SupportRecovery, Enter and Exit spends among `logs` that failed, by the emitting vault (the
- * modules' events are a vault's, through delegatecall; OstraVaultModuleV4 emits OstraVaultModule's Guarded). Only
- * events of addresses in `vaults` count.
+ * The Morpho, Guard, SupportRecovery, Enter, Exit and Priors spends among `logs` that failed, by the emitting vault
+ * (the modules' events are a vault's, through delegatecall; OstraVaultModuleV4 and OstraVaultModuleV5 emit
+ * OstraVaultModule's Guarded). Only events of addresses in `vaults` count.
  */
 export function failedModuleSpends(logs: readonly Log[], vaults: readonly Address[]): FailedModuleSpend[] {
   const ours = new Set(vaults.map((v) => getAddress(v)));
@@ -760,21 +788,25 @@ export function failedModuleSpends(logs: readonly Log[], vaults: readonly Addres
       const e = decodeEventLog({ abi: ostraVaultModuleV4Abi, eventName: "VenueFailed", topics: log.topics as [Hex, ...Hex[]], data: log.data });
       const args = e.args as { action: number; reason: Hex };
       out.push({ vault: getAddress(log.address), kind: "venue", action: Number(args.action), reason: args.reason });
+    } else if (topic === PRIORS_FAILED_TOPIC.toLowerCase()) {
+      const e = decodeEventLog({ abi: ostraVaultModuleV5Abi, eventName: "PriorsFailed", topics: log.topics as [Hex, ...Hex[]], data: log.data });
+      const args = e.args as { action: number; reason: Hex };
+      out.push({ vault: getAddress(log.address), kind: "priors", action: Number(args.action), reason: args.reason });
     }
   }
   return out;
 }
 
-/** The errors of OstraVault, OstraVaultModule and OstraVaultModuleV4 by selector, and the two of Solidity itself. */
+/** The errors of OstraVault and its modules (version 3 to 5) by selector, and the two of Solidity itself. */
 const VAULT_ERROR_NAMES = new Map<string, string>();
-for (const item of [...ostraVaultAbi, ...ostraVaultModuleAbi, ...ostraVaultModuleV4Abi] as readonly { type: string; name?: string; inputs?: readonly { type: string }[] }[]) {
+for (const item of [...ostraVaultAbi, ...ostraVaultModuleAbi, ...ostraVaultModuleV4Abi, ...ostraVaultModuleV5Abi] as readonly { type: string; name?: string; inputs?: readonly { type: string }[] }[]) {
   if (item.type !== "error" || item.name === undefined) continue;
   VAULT_ERROR_NAMES.set(toFunctionSelector(`${item.name}(${(item.inputs ?? []).map((i) => i.type).join(",")})`).toLowerCase(), item.name);
 }
 VAULT_ERROR_NAMES.set("0x08c379a0", "Error(string), a check of Morpho, of the Vault V2 or of the venue");
 VAULT_ERROR_NAMES.set("0x4e487b71", "Panic");
 
-/** The reason a failed version 3 or 4 spend carries (FailedModuleSpend.reason, the revert's first 4 bytes), readable. */
+/** The reason a failed version 3, 4 or 5 spend carries (FailedModuleSpend.reason, the revert's first 4 bytes), readable. */
 export function moduleFailureText(reason: Hex): string {
   if (reason === "0x" || /^0x0{8}$/.test(reason)) return "a revert without a reason (out of gas, or a call to code that is not there)";
   return VAULT_ERROR_NAMES.get(reason.slice(0, 10).toLowerCase()) ?? `a revert with ${reason.slice(0, 10)}`;

@@ -651,6 +651,7 @@ export class VenueService {
       gas,
       moves,
       what,
+      preview: { action, params },
       build: async ({ v, vault: at, keychain, chainId }) => {
         const again = await this.#simulate(at, action, params, what);
         if (again + SPEND_GAS_HEADROOM + floor > gas) throw new QuoteError("spend_fails", `${what} needs more gas now than it was reserved for; call again; nothing was signed`);

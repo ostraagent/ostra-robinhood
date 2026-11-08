@@ -9,6 +9,11 @@
 //                          vault's on-chain nonce: "OSTRA/VAULT/EVM/v1" ||
 //                          chainid || vault || nonce || nextKeyRoot || action
 //                          || params (sdk vaultSpendMessage)
+//   OstraVault.spendAsAgent  the agent key's (version 5), at the vault's agent
+//                          nonce: "OSTRA/VAULT/EVM/AGENT/v1" || chainid ||
+//                          vault || agentNonce || nextKeyRoot || action ||
+//                          params (sdk agentSpendMessage), against the agent
+//                          root (agentKey())
 //   OstraPool.spendLeaf    "OSTRA/LEAF/EVM/v1" || chainid || pool || batchId ||
 //                          leafIndex || destination || the pool's leafAmount
 //   OstraPool.approveBatch "OSTRA/APPROVE/EVM/v1" || chainid || pool || key ||
@@ -47,6 +52,7 @@ import {
   SPEND_PARAMS_LENGTHS,
   VAULT_ACTION,
   WOTS_SIGNATURE_LEN,
+  agentSpendMessage,
   approvalMessage,
   decodeSwapParams,
   devBuyParams,
@@ -69,11 +75,13 @@ export const PRUNE_SWEEP_MS = 600_000;
 
 export type Log = (event: string, fields?: Record<string, unknown>) => void;
 
-export type WotsKind = "vault" | "approval" | "leaf";
+export type WotsKind = "vault" | "agent" | "approval" | "leaf";
 
 /** A WOTS signature in a request, with what its message is built from. */
 export type WotsClaim = (
   | { kind: "vault"; account: Address; nextKeyRoot: Hex; action: VaultAction; params: Hex }
+  /** A spend of the vault's agent key (spendAsAgent, version 5). */
+  | { kind: "agent"; account: Address; nextKeyRoot: Hex; action: VaultAction; params: Hex }
   | { kind: "approval"; account: Address; key: Hex; batchId: bigint; state: Hex; nextKeyRoot: Hex }
   | { kind: "leaf"; account: Address; batchId: bigint; leafIndex: number; destination: Address }
 ) & { call: { to: Address; data: Hex }; signature: Hex };
@@ -82,6 +90,8 @@ export type WotsClaim = (
 export type KeyState =
   /** recoveryKeyRoot: the new key root of a recovery waiting in the vault's current round, which may sign too. */
   | { kind: "vault"; keyRoot: Hex; nonce: bigint; recoveryKeyRoot?: Hex }
+  /** The vault's agent key (agentKey(): its root and agent nonce). */
+  | { kind: "agent"; keyRoot: Hex; nonce: bigint }
   | { kind: "approval"; keyRoot: Hex; pending: boolean }
   | { kind: "leaf"; keyRoot: Hex; leafAmount: bigint; spent: boolean };
 
@@ -91,7 +101,7 @@ export type SignatureRecord = {
   kind: WotsKind;
   /** The vault (vault) or the pool (approval, leaf). */
   account: string;
-  /** The vault's nonce the spend was checked at. */
+  /** The vault's nonce (agent: its agent nonce) the spend was checked at. */
   nonce?: string;
   /** The deposit key (approval). */
   depositKey?: string;
@@ -134,7 +144,7 @@ export function wotsClaims(parsed: readonly ParsedCall[], calls: readonly { to: 
           throw new Error(`calls[${i}]: malformed Swap params: ${(err as Error).message}`);
         }
       }
-      out.push({ kind: "vault", account: c.to, nextKeyRoot: c.nextKeyRoot, action: c.action as VaultAction, params: c.params, call, signature: sig(c.signature, "spend") });
+      out.push({ kind: c.byAgent ? "agent" : "vault", account: c.to, nextKeyRoot: c.nextKeyRoot, action: c.action as VaultAction, params: c.params, call, signature: sig(c.signature, c.byAgent ? "agent spend" : "spend") });
     } else if (c.fn === "launchFromVault" && d.launchpad !== undefined && c.to === d.launchpad.devBuy) {
       let params: Hex;
       try {
@@ -157,6 +167,9 @@ function claimMessage(claim: WotsClaim, state: KeyState, chainId: number): Uint8
   if (claim.kind !== state.kind) throw new Error(`a ${claim.kind} signature read against ${state.kind} state`);
   if (claim.kind === "vault" && state.kind === "vault") {
     return vaultSpendMessage({ chainId, vault: claim.account, nonce: state.nonce, nextKeyRoot: claim.nextKeyRoot, action: claim.action, params: claim.params });
+  }
+  if (claim.kind === "agent" && state.kind === "agent") {
+    return agentSpendMessage({ chainId, vault: claim.account, agentNonce: state.nonce, nextKeyRoot: claim.nextKeyRoot, action: claim.action, params: claim.params });
   }
   if (claim.kind === "leaf" && state.kind === "leaf") {
     return leafMessage({ chainId, pool: claim.account, batchId: claim.batchId, leafIndex: claim.leafIndex, destination: claim.destination, leafAmount: state.leafAmount });
@@ -189,7 +202,7 @@ export function escrowRecord(claim: WotsClaim, state: KeyState | null, block: bi
     keyRoot: lower(recovered),
     kind: claim.kind,
     account: getAddress(claim.account),
-    ...(state.kind === "vault" ? { nonce: state.nonce.toString() } : {}),
+    ...(state.kind === "vault" || state.kind === "agent" ? { nonce: state.nonce.toString() } : {}),
     ...(claim.kind === "approval" ? { depositKey: lower(claim.key), batchId: claim.batchId.toString() } : {}),
     ...(claim.kind === "leaf" ? { batchId: claim.batchId.toString(), leafIndex: claim.leafIndex } : {}),
     message: bytesToHex(message),
@@ -210,9 +223,9 @@ function liveRoot(state: KeyState, keyRoot: string): boolean {
 export function keyUsed(record: SignatureRecord, state: KeyState | null): boolean {
   if (state === null || state.kind !== record.kind) return true;
   // A later spend of a request that signed several of the vault's spends: its key comes once those before it land.
-  if (state.kind === "vault" && state.nonce < BigInt(record.nonce ?? "0")) return false;
+  if ((state.kind === "vault" || state.kind === "agent") && state.nonce < BigInt(record.nonce ?? "0")) return false;
   if (!liveRoot(state, record.keyRoot)) return true;
-  if (state.kind === "vault") return state.nonce.toString() !== record.nonce;
+  if (state.kind === "vault" || state.kind === "agent") return state.nonce.toString() !== record.nonce;
   if (state.kind === "approval") return !state.pending;
   return state.spent;
 }
@@ -220,18 +233,19 @@ export function keyUsed(record: SignatureRecord, state: KeyState | null): boolea
 /** What to read for a claim or a record. */
 export type KeyTarget =
   | { kind: "vault"; account: Address }
+  | { kind: "agent"; account: Address }
   | { kind: "approval"; account: Address; depositKey: Hex }
   | { kind: "leaf"; account: Address; batchId: bigint; leafIndex: number };
 
 export function claimTarget(c: WotsClaim): KeyTarget {
-  if (c.kind === "vault") return { kind: "vault", account: c.account };
+  if (c.kind === "vault" || c.kind === "agent") return { kind: c.kind, account: c.account };
   if (c.kind === "approval") return { kind: "approval", account: c.account, depositKey: c.key };
   return { kind: "leaf", account: c.account, batchId: c.batchId, leafIndex: c.leafIndex };
 }
 
 export function recordTarget(r: SignatureRecord): KeyTarget {
   const account = getAddress(r.account);
-  if (r.kind === "vault") return { kind: "vault", account };
+  if (r.kind === "vault" || r.kind === "agent") return { kind: r.kind, account };
   if (r.kind === "approval") return { kind: "approval", account, depositKey: r.depositKey as Hex };
   return { kind: "leaf", account, batchId: BigInt(r.batchId ?? "0"), leafIndex: r.leafIndex ?? 0 };
 }
@@ -252,6 +266,9 @@ export async function readKeyStates(client: PublicClient, d: Deployment, targets
       const before = contracts.length;
       if (t.kind === "vault") {
         for (const fn of ["token", "initialKeyRoot", "initialCrank", "keyRoot", "nonce", "recoveryRound", "pendingRecovery"]) contracts.push({ address: t.account, abi: ostraVaultAbi, functionName: fn });
+      } else if (t.kind === "agent") {
+        // A vault before version 5 has no agentKey(): its read fails, and the claim reads as null.
+        for (const fn of ["token", "initialKeyRoot", "initialCrank", "agentKey"]) contracts.push({ address: t.account, abi: ostraVaultAbi, functionName: fn });
       } else if (t.kind === "approval") {
         contracts.push({ address: t.account, abi: ostraPoolAbi, functionName: "getDeposit", args: [t.depositKey] });
       } else {
@@ -276,6 +293,11 @@ export async function readKeyStates(client: PublicClient, d: Deployment, targets
         const [pendingRound, executableAt, newKeyRoot] = pending;
         const recovery = executableAt !== 0n && pendingRound === round ? { recoveryKeyRoot: newKeyRoot } : {};
         out.push(expected === getAddress(t.account) && getAddress(token) !== zeroAddress ? { kind: "vault", keyRoot, nonce, ...recovery } : null);
+      } else if (t.kind === "agent") {
+        const [token, initialKeyRoot, initialCrank, key] = r.map((x) => x.result) as [Address, Hex, Address, readonly [Hex, bigint, bigint, bigint, boolean]];
+        const expected = vaultAddress({ factory: d.vaultFactory, beacon: d.vaultBeacon, token, initialKeyRoot, initialCrank });
+        const [root, agentNonce] = key;
+        out.push(expected === getAddress(t.account) && getAddress(token) !== zeroAddress && !/^0x0{64}$/.test(root) ? { kind: "agent", keyRoot: root, nonce: agentNonce } : null);
       } else if (t.kind === "approval") {
         const dep = r[0]?.result as { status: number; approvalKeyRoot: Hex };
         const status = DEPOSIT_STATUS[dep.status];
@@ -302,11 +324,12 @@ export async function escrowRecords(client: PublicClient, d: Deployment, claims:
   const states = await readKeyStates(client, d, claims.map(claimTarget), block);
   const next = new Map<string, KeyState>();
   return claims.map((c, i) => {
-    const chained = c.kind === "vault" ? next.get(lower(c.account)) : undefined;
+    const chain = c.kind === "vault" || c.kind === "agent" ? `${c.kind}:${lower(c.account)}` : null;
+    const chained = chain === null ? undefined : next.get(chain);
     const record = escrowRecord(c, chained ?? states[i] ?? null, block, now, d.chainId);
-    if (c.kind === "vault") {
-      if (record !== null) next.set(lower(c.account), { kind: "vault", keyRoot: c.nextKeyRoot, nonce: BigInt(record.nonce ?? "0") + 1n });
-      else next.delete(lower(c.account));
+    if (chain !== null && (c.kind === "vault" || c.kind === "agent")) {
+      if (record !== null) next.set(chain, { kind: c.kind, keyRoot: c.nextKeyRoot, nonce: BigInt(record.nonce ?? "0") + 1n });
+      else next.delete(chain);
     }
     return record;
   });

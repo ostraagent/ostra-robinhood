@@ -27,6 +27,8 @@ import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
 import type { Prover } from "@ostraagent/swap";
 import {
+  AGENT_KEY_DIR,
+  AgentKey,
   AiService,
   BorroService,
   BreakerService,
@@ -50,6 +52,7 @@ import {
   TradingService,
   SignatureEscrowClient,
   UnshieldService,
+  V5Service,
   VaultService,
   repProverOf,
   VenueService,
@@ -147,6 +150,10 @@ export class Agent {
   readonly tide: TideService | null;
   /** Reputation proofs of the USDG vault's OstraPad record (OstraReputation; its tools say when it is not deployed). */
   readonly reputation: ReputationService;
+  /** Version 5 of the USDG vault (core v5.ts): its policy, allowlists, agent key, standing orders and Priors. */
+  readonly v5: V5Service;
+  /** OSTRA_AGENT_OF: the agent key of the vault this server is the agent of (the buyer vault is that vault), else null. */
+  readonly agentKey: AgentKey | null;
   readonly #tokenVaults = new Map<Address, VaultService>();
   readonly #privates = new Map<bigint, PrivateVaultContext>();
   readonly #log: Log;
@@ -172,6 +179,11 @@ export class Agent {
     this.relayer = config.relayerUrl === null ? null : new RelayerClient(client, config, keys, config.relayerUrl);
     this.sender = this.relayer ?? this.local;
     this.buyer = new VaultService(client, transport, config, keys, this.sender, "buyer");
+    // OSTRA_AGENT_OF: the buyer vault is the other seed's vault, and its spends are signed by its agent key.
+    const v5Logs = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
+    this.agentKey = config.agentOf === null ? null : new AgentKey({ client, logsClient: v5Logs, config, keys, vault: config.agentOf, folder: keys.folder.folder(AGENT_KEY_DIR) });
+    if (this.agentKey !== null) this.buyer.actAsAgent(this.agentKey);
+    this.v5 = new V5Service({ client, logsClient: v5Logs, config, buyer: this.buyer, sender: this.sender });
     this.relayer?.attachBuyerVault(this.buyer);
     this.channels = new ChannelService(client, config, keys, this.buyer, this.sender);
     this.payments = new PayService(client, config, this.buyer, this.channels);
@@ -535,6 +547,10 @@ export class Agent {
         const pad = this.pad;
         await step("ostrapad", async () => (await pad.sweep()).failed);
       }
+      // Version 5: the vault's due standing orders and Priors repays, through this server's sender (decided 8 Nov 2026:
+      // the vault's own MCP runs them; Ostra's keeper only stands in while it is offline).
+      // Only the owner's server runs them: the agent's would send the same runs again.
+      if (this.agentKey === null) await step("standing orders and repays", async () => (await this.v5.runDue()).ran.filter((r) => r.error !== undefined));
       // Strategy 1's exits each minute (decided by Edu on 25 Oct 2026): a cash vault that fails its checks is left at once.
       await step("cash exits", async () => {
         const r = await this.strategy.exitCheck();

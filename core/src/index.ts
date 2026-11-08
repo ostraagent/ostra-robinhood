@@ -3,6 +3,7 @@
 // Folder interface (storage.ts) and the keys through Keys (keys.ts).
 
 export * from "./ai.ts";
+export * from "./agent-key.ts";
 export * from "./amount.ts";
 export * from "./borro.ts";
 export * from "./breaker.ts";
@@ -35,6 +36,7 @@ export * from "./swap.ts";
 export * from "./tide.ts";
 export * from "./trading.ts";
 export * from "./unshield.ts";
+export * from "./v5.ts";
 export * from "./vault.ts";
 export * from "./venues.ts";
 export * from "./wallet-swap.ts";

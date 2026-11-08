@@ -259,6 +259,8 @@ export type GateOptions = {
   log: Log;
   /** How long a quote may take (QUOTE_DEADLINE_MS; shorter in tests). */
   quoteDeadlineMs?: number;
+  /** How long an agent key's open may stay unpaid before it becomes the vault's debt (AGENT_OPEN_TAKEOVER_MS; shorter in tests). */
+  agentOpenTakeoverMs?: number;
 };
 
 export type RelayInput = { body: string; req: IncomingMessage; ip: string };
@@ -364,7 +366,9 @@ export class QuoteError extends Error {
 /**
  * The spends of a request that can fail without reverting, moving nothing and using the spend: a vault Swap
  * (SwapFailed), from version 3 a Morpho spend (Lend to Repay: MorphoFailed), a Guard and a SupportRecovery
- * (Guarded with ok false), and from version 4 an Enter and an Exit (VenueFailed); the vaults they spend from.
+ * (Guarded with ok false), from version 4 an Enter and an Exit (VenueFailed), and from version 5 a Priors spend of the
+ * owner's key (PriorsFailed); the vaults they spend from. The agent key's Morpho spends and Enters land as failures
+ * too (its Swaps, Exits and Priors spends revert instead), so they are read the same way.
  */
 const LANDING_ACTIONS: ReadonlySet<number> = new Set([
   VAULT_ACTION.SWAP,
@@ -378,6 +382,18 @@ const LANDING_ACTIONS: ReadonlySet<number> = new Set([
   VAULT_ACTION.GUARD,
   VAULT_ACTION.ENTER,
   VAULT_ACTION.EXIT,
+  VAULT_ACTION.PRIORS_BORROW,
+  VAULT_ACTION.PRIORS_REPAY,
+  VAULT_ACTION.PRIORS_CONSENT,
+  VAULT_ACTION.PRIORS_LEAVE,
+  VAULT_ACTION.ROOT_ENROLL,
+  VAULT_ACTION.ROOT_ADD_STAKE,
+  VAULT_ACTION.ROOT_SPONSOR,
+  VAULT_ACTION.ROOT_VOUCH,
+  VAULT_ACTION.ROOT_UNVOUCH,
+  VAULT_ACTION.ROOT_FREEZE,
+  VAULT_ACTION.ROOT_UNLOCK,
+  VAULT_ACTION.ROOT_CLAIM_FEES,
 ]);
 function swapVaults(tx: RelayTx): Address[] {
   return tx.parsed.flatMap((c) => (c.fn === "spend" && LANDING_ACTIONS.has(c.action) ? [c.to] : []));
@@ -459,7 +475,8 @@ const STOCK_TOKENS: ReadonlySet<Address> = new Set([...LAUNCH_PAIRS.filter((p) =
  * breaker reason holds), and with no payer named nobody's credit is.
  */
 export function creditVaultOf(parsed: readonly ParsedCall[], vaults: readonly Address[], payer: Address | null): { creditVault: Address | null; actsFor: boolean } {
-  const trips = parsed.some((c) => c.fn === "tripVenue");
+  // A standing order's run and a due repay are anyone's to send too (version 5): the same rule as a trip.
+  const trips = parsed.some((c) => c.fn === "tripVenue" || c.fn === "runOrder" || c.fn === "repayDue");
   const creditVault = payer ?? (vaults.length === 1 && !trips ? (vaults[0] as Address) : null);
   return { creditVault, actsFor: creditVault !== null && !trips && vaults.length === 1 && vaults[0] === creditVault };
 }
@@ -473,8 +490,19 @@ const LAUNCHED_VAULT_ACTIONS: readonly number[] = [
 /** A vault of another ERC-20 (with Ostra Swap): its Transfer (to an order's escrow, or out) and its withdrawal lock. */
 const OTHER_VAULT_ACTIONS: readonly number[] = [VAULT_ACTION.TRANSFER, VAULT_ACTION.SET_WITHDRAWAL_LOCK, VAULT_ACTION.CANCEL_PENDING_CHANGES];
 
+/** How long an open of a vault's agent key may stay unpaid before it becomes the vault's debt (#takeOverStaleAgentOpen). */
+export const AGENT_OPEN_TAKEOVER_MS = 15 * 60_000;
+
+/** The vaults a classified request acts for (the one of a lone kind, or each of `other`). */
+function classifiedVaults(c: Classified, leafVault: Address | null): Address[] {
+  if (c.kind === "other") return [...c.vaults];
+  if (c.kind === "spend_leaf") return leafVault === null ? [] : [leafVault];
+  if (c.kind === "unshield_vault" || c.kind === "create_vault") return [];
+  return [c.ix.vault];
+}
+
 const POOL_FNS = new Set(["spendLeaf", "approveBatch", "depositWithAuthorization", "cancelDeposit", "closeDeposit"]);
-const VAULT_FNS = new Set(["spend", "requestClose", "finalizeWithdraw", "finishRecovery", "tripVenue"]);
+const VAULT_FNS = new Set(["spend", "runOrder", "repayDue", "requestClose", "finalizeWithdraw", "finishRecovery", "tripVenue"]);
 
 export class RelayerGate {
   readonly #o: GateOptions;
@@ -649,8 +677,15 @@ export class RelayerGate {
     }
     // An open to the relayer that was relayed before payment is paid by sending it again.
     if (classified.kind === "open_relayer_channel") {
-      const pending = this.#o.ledger.view().opens[classified.ix.vault];
-      if (pending !== undefined && pending.hash === tx.hash) return this.#payOpen(tx, classified.ix.vault, pending.txHash, BigInt(pending.amount), input);
+      const openVault = classified.ix.vault;
+      const pending = this.#o.ledger.view().opens[openVault];
+      if (pending !== undefined && pending.hash === tx.hash) return this.#serialized("debts", () => this.#payOpenOnce(tx, openVault, pending.txHash, BigInt(pending.amount), input));
+      // An agent key's open taken over as the vault's debt (#takeOverStaleAgentOpen): sent again with a voucher of the
+      // channel it opened, it still pays, the whole debt.
+      const view = this.#o.ledger.view();
+      const taken = view.agentTakeovers?.[openVault];
+      const debt = view.debts[openVault];
+      if (taken !== undefined && taken.hash === tx.hash && debt !== undefined) return this.#serialized("debts", () => this.#payOpenOnce(tx, openVault, taken.txHash, BigInt(debt.amount), input));
     }
 
     // A spendLeaf relayed before payment acts for the vault it pays into.
@@ -682,7 +717,11 @@ export class RelayerGate {
     let openProblem: string | null = null;
     if (classified.kind === "open_relayer_channel") openProblem = await this.#termsProblem(classified.ix);
 
-    const early = this.#refusedUpfront(classified, input.ip, leafVault, openProblem);
+    // An open the vault's agent key left unpaid would otherwise hold every request of the vault, its owner's too (only
+    // the agent's voucher key can pay it): once stale it becomes the vault's debt, which any channel of the vault pays.
+    for (const v of classifiedVaults(classified, leafVault)) await this.#takeOverStaleAgentOpen(v);
+    const byAgent = tx.parsed.some((c) => c.fn === "spend" && c.byAgent);
+    const early = this.#refusedUpfront(classified, input.ip, leafVault, openProblem, byAgent);
     if (early !== null) return early;
 
     // A request counts in one window: a new quote in the fresh one, one already quoted in the other.
@@ -753,8 +792,30 @@ export class RelayerGate {
     }
   }
 
+  /**
+   * An open of `vault`'s relayer channel its agent key signed (version 5) and left unpaid for AGENT_OPEN_TAKEOVER_MS:
+   * what it owes becomes the vault's debt, as a recovery takes an old key's open over (#finishRecovery), so that the
+   * owner's own channel pays it with its first voucher.
+   */
+  async #takeOverStaleAgentOpen(vault: Address): Promise<void> {
+    const open = this.#o.ledger.view().opens[vault];
+    if (open === undefined || open.byAgent !== true || Date.now() - open.at < (this.#o.agentOpenTakeoverMs ?? AGENT_OPEN_TAKEOVER_MS)) return;
+    await this.#o.ledger.update((data) => {
+      const now = data.opens[vault];
+      if (now === undefined || now.hash !== open.hash) return;
+      const d = data.debts[vault];
+      // The open's amount already carries the debt the vault had then.
+      const owed = BigInt(now.amount);
+      const had = BigInt(d?.amount ?? "0");
+      data.debts[vault] = { amount: (owed > had ? owed : had).toString(), txs: [...(d?.txs ?? []), now.hash] };
+      delete data.opens[vault];
+      data.agentTakeovers = { ...(data.agentTakeovers ?? {}), [vault]: { at: Date.now(), hash: now.hash, txHash: now.txHash } };
+    });
+    this.#o.log("unpaid_agent_open_taken_over", { vault, channel: open.channel, open: open.hash, amount: open.amount });
+  }
+
   /** The answer to a request the relayer's rules refuse before any simulation, or null. */
-  #refusedUpfront(classified: Classified, ip: string, leafVault: Address | null, openProblem: string | null): Answer | null {
+  #refusedUpfront(classified: Classified, ip: string, leafVault: Address | null, openProblem: string | null, byAgent = false): Answer | null {
     const view = this.#o.ledger.view();
     if (classified.kind === "spend_leaf") return this.#openUnpaid(view.opens[leafVault as Address], leafVault as Address);
     // Not refused for an open of the vault left unpaid: the old seed's (a thief's, or a device lost) can never be
@@ -770,6 +831,12 @@ export class RelayerGate {
     if (classified.kind === "open_relayer_channel") {
       const pending = view.opens[classified.ix.vault];
       if (pending !== undefined) return json(403, { error: "open_unpaid", message: `pay for the open of channel ${pending.channel} first: send that request again with a voucher` });
+      // An agent key's open while the vault owes for an open its agent key left unpaid (taken over as its debt): never
+      // relayed before payment again until that debt is paid, or an agent could have the relayer pay for opens it never
+      // pays, one after the other. The vault's channels (the agent's earlier one, or the owner's) pay the debt first.
+      if (byAgent && view.debts[classified.ix.vault] !== undefined && view.agentTakeovers?.[classified.ix.vault] !== undefined) {
+        return json(403, { error: "vault_in_debt", message: `vault ${classified.ix.vault} owes the relayer: a channel of the vault pays that first, before its agent key opens another` });
+      }
       return openProblem === null ? null : json(400, { error: "not_relayer_terms", message: openProblem });
     }
     for (const v of classified.vaults) {
@@ -1212,7 +1279,10 @@ export class RelayerGate {
           const rest = BigInt(d.amount) - BigInt(quote.amount);
           const txs = d.txs.filter((h) => h !== tx.hash);
           if (rest > 0n && txs.length > 0) data.debts[vault] = { amount: rest.toString(), txs };
-          else delete data.debts[vault];
+          else {
+            delete data.debts[vault];
+            if (data.agentTakeovers !== undefined) delete data.agentTakeovers[vault];
+          }
         }
       });
       return json(409, { error: "not_sent", message: (err as Error).message });
@@ -1303,7 +1373,10 @@ export class RelayerGate {
           const rest = BigInt(d.amount) - BigInt(quote.amount);
           const txs = d.txs.filter((h) => h !== tx.hash);
           if (rest > 0n && txs.length > 0) data.debts[vault] = { amount: rest.toString(), txs };
-          else delete data.debts[vault];
+          else {
+            delete data.debts[vault];
+            if (data.agentTakeovers !== undefined) delete data.agentTakeovers[vault];
+          }
         }
       });
       return json(409, { error: "not_sent", message: (err as Error).message });
@@ -1331,7 +1404,8 @@ export class RelayerGate {
       return json(409, { error: "not_sent", message: (err as Error).message });
     }
     await this.#o.ledger.update((data) => {
-      data.opens[ix.vault] = { hash: tx.hash, txHash: landed.txHash, channel, amount: owed.toString(), at: Date.now(), calls: tx.calls.map((c) => ({ to: c.to, data: c.data })) };
+      const byAgent = tx.parsed.some((c) => c.fn === "spend" && c.byAgent);
+      data.opens[ix.vault] = { hash: tx.hash, txHash: landed.txHash, channel, amount: owed.toString(), at: Date.now(), calls: tx.calls.map((c) => ({ to: c.to, data: c.data })), ...(byAgent ? { byAgent: true } : {}) };
     });
     this.#o.log("relayer_channel_opened", { request: tx.hash, vault: ix.vault, channel, txHash: landed.txHash, gasUsed: landed.gasUsed, effectiveGasPrice: landed.effectiveGasPrice, owed });
     return json(200, {
@@ -1342,6 +1416,16 @@ export class RelayerGate {
     });
   }
 
+  /**
+   * #payOpen under the "debts" lock: two requests that pay the same open at once (different vouchers) are taken one
+   * after the other, and the second is answered as paid already.
+   */
+  async #payOpenOnce(tx: RelayTx, vault: Address, txHash: string, owed: bigint, input: RelayInput): Promise<Answer> {
+    const done = this.#o.ledger.view().paid[tx.hash];
+    if (done !== undefined) return json(200, { txHash: done.txHash, paid: done.amount, repeated: true });
+    return this.#payOpen(tx, vault, txHash, owed, input);
+  }
+
   async #payOpen(tx: RelayTx, vault: Address, txHash: string, owed: bigint, input: RelayInput): Promise<Answer> {
     const outcome = await this.#o.merchant.payment(input.req, { description: RELAY_DESCRIPTION, amount: owed });
     if (outcome.kind === "respond") return fromInstructions(outcome.response);
@@ -1350,6 +1434,7 @@ export class RelayerGate {
     await this.#o.ledger.update((data) => {
       delete data.opens[vault];
       delete data.debts[vault];
+      if (data.agentTakeovers !== undefined) delete data.agentTakeovers[vault];
       data.paid[tx.hash] = { txHash, amount: owed.toString(), at: Date.now() };
     });
     this.#o.log("relayer_channel_paid", { request: tx.hash, vault, amount: owed, channel: outcome.channelId });

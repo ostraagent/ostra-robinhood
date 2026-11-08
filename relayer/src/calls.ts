@@ -8,6 +8,10 @@
 //
 //   OstraVaultFactory.createVault(token, initialKeyRoot, initialCrank)
 //   OstraVault.spend(action, nextKeyRoot, params, signature)    WOTS
+//   OstraVault.spendAsAgent(action, nextKeyRoot, params, signature)  WOTS, the
+//                 agent key's spend (version 5): read as a spend with byAgent
+//   OstraVault.runOrder(id), repayDue(loanId)   version 5: anyone may send them;
+//                 a standing order the policy bounds, a loan the vault owes
 //     OpenChannel (action 1) params abi.encode(payerAuthorizer, receiver,
 //                 receiverAuthorizer, withdrawDelay, salt, amount)
 //   OstraVault.requestClose(config, amount, deadline, signature)
@@ -84,7 +88,11 @@ import {
 /** A call of the request, read by its function. */
 export type ParsedCall =
   | { fn: "createVault"; to: Address; token: Address; initialKeyRoot: Hex; initialCrank: Address }
-  | { fn: "spend"; to: Address; action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }
+  /** OstraVault.spend, or with byAgent OstraVault.spendAsAgent (version 5: the agent key's message and nonce). */
+  | { fn: "spend"; to: Address; action: number; nextKeyRoot: Hex; params: Hex; signature: Hex; byAgent: boolean }
+  /** OstraVault.runOrder and repayDue (version 5): anyone's, judged by the vault's policy. */
+  | { fn: "runOrder"; to: Address; id: bigint }
+  | { fn: "repayDue"; to: Address; loanId: bigint }
   | { fn: "requestClose"; to: Address; config: ChannelConfig; amount: bigint; deadline: bigint; signature: Hex }
   | { fn: "finalizeWithdraw"; to: Address; config: ChannelConfig }
   /** OstraVault.finishRecovery: anyone may finish a recovery past its delay. */
@@ -133,7 +141,19 @@ export type RelayTx = {
 const KNOWN = new Map<Hex, { abi: readonly unknown[]; as: string }>();
 for (const [abi, names] of [
   [ostraVaultFactoryAbi, [["createVault", "createVault"]]],
-  [ostraVaultAbi, [["spend", "spend"], ["requestClose", "requestClose"], ["finalizeWithdraw", "finalizeWithdraw"], ["finishRecovery", "finishRecovery"], ["tripVenue", "tripVenue"]]],
+  [
+    ostraVaultAbi,
+    [
+      ["spend", "spend"],
+      ["spendAsAgent", "spendAsAgent"],
+      ["runOrder", "runOrder"],
+      ["repayDue", "repayDue"],
+      ["requestClose", "requestClose"],
+      ["finalizeWithdraw", "finalizeWithdraw"],
+      ["finishRecovery", "finishRecovery"],
+      ["tripVenue", "tripVenue"],
+    ],
+  ],
   [ostraPoolAbi, [["spendLeaf", "spendLeaf"], ["approveBatch", "approveBatch"], ["depositWithAuthorization", "depositWithAuthorization"], ["cancelDeposit", "cancelDeposit"], ["closeDeposit", "closeDeposit"]]],
   [ostraDevBuyAbi, [["launchFromVault", "launchFromVault"]]],
   [ostraAirdropAbi, [["claim", "airdropClaim"], ["close", "airdropClose"]]],
@@ -216,7 +236,12 @@ export function parseCall(call: RelayCall, index = 0): ParsedCall {
     case "createVault":
       return { fn: "createVault", to, token: getAddress(a[0] as Address), initialKeyRoot: a[1] as Hex, initialCrank: getAddress(a[2] as Address) };
     case "spend":
-      return { fn: "spend", to, action: Number(a[0]), nextKeyRoot: a[1] as Hex, params: a[2] as Hex, signature: a[3] as Hex };
+    case "spendAsAgent":
+      return { fn: "spend", to, action: Number(a[0]), nextKeyRoot: a[1] as Hex, params: a[2] as Hex, signature: a[3] as Hex, byAgent: known.as === "spendAsAgent" };
+    case "runOrder":
+      return { fn: "runOrder", to, id: a[0] as bigint };
+    case "repayDue":
+      return { fn: "repayDue", to, loanId: a[0] as bigint };
     case "requestClose":
       return { fn: "requestClose", to, config: toConfig(a[0] as never), amount: a[1] as bigint, deadline: a[2] as bigint, signature: a[3] as Hex };
     case "finalizeWithdraw":
@@ -287,7 +312,7 @@ function spendLeafCall(c: ParsedCall, d: Deployment): SpendLeafCall | null {
 export function vaultOf(c: ParsedCall, d: Deployment): Address | null {
   const created = createVaultCall(c, d);
   if (created !== null) return created.vault;
-  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery" || c.fn === "tripVenue") return c.to;
+  if (c.fn === "spend" || c.fn === "requestClose" || c.fn === "finalizeWithdraw" || c.fn === "finishRecovery" || c.fn === "tripVenue" || c.fn === "runOrder" || c.fn === "repayDue") return c.to;
   if (c.fn === "launchFromVault") return c.vault;
   return null;
 }

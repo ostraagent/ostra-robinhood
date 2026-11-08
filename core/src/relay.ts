@@ -420,7 +420,8 @@ export function openChannelCall(calls: readonly RelayCall[], vault: Address, tok
     } catch {
       continue;
     }
-    if (decoded.functionName !== "spend") continue;
+    // The owner's spend, or the agent key's (version 5: a vault's agent opens its relayer channel with its own key).
+    if (decoded.functionName !== "spend" && decoded.functionName !== "spendAsAgent") continue;
     const [action, , params] = decoded.args as readonly [number, Hex, Hex, Hex];
     if (action !== VAULT_ACTION.OPEN_CHANNEL) continue;
     const open = decodeOpenChannelParams(params);

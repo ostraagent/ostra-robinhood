@@ -52,6 +52,7 @@ const PRIVATE_VAULT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/PRIVATE-VAULT/EVM/v1");
 const CREATOR_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/CREATOR-VAULT/EVM/v1");
 const NOTE_SECRET_DOMAIN = utf8("OSTRA/MCP/SWAP-NOTE/EVM/v1");
 const TIDE_LINK_DOMAIN = utf8("OSTRA/MCP/TIDE-LINK/EVM/v1");
+const AGENT_KEYCHAIN_DOMAIN = utf8("OSTRA/MCP/AGENT-KEY/EVM/v1");
 
 /** secp256k1 group order: a private key must be in 1..n-1. */
 const SECP256K1_N = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_fffe_baae_dce6_af48_a03b_bfd2_5e8c_d036_4141n;
@@ -135,6 +136,15 @@ export function privateVaultKeychainId(chainId: number, token: Address, index: b
  */
 export function creatorKeychainId(chainId: number, token: Address): Uint8Array {
   return sha256([CREATOR_KEYCHAIN_DOMAIN, chainBytes(chainId), tokenBytes(token)]);
+}
+
+/**
+ * Keychain id of the agent key of `vault` (version 5) for this chain: an agent's seed signs for the vault another seed
+ * owns, so the id names the vault itself, never a token. One index rises across every agent key the owner installs
+ * (agent-key.ts AgentKey): the vault's agent nonce and generation are not the key's index.
+ */
+export function agentKeychainId(chainId: number, vault: Address): Uint8Array {
+  return sha256([AGENT_KEYCHAIN_DOMAIN, chainBytes(chainId), tokenBytes(vault)]);
 }
 
 /** What a Keys holds: the master seed and fee payer key, the WOTS store, and where records are kept. */
@@ -234,6 +244,11 @@ export class Keys<S extends WotsStore = WotsStore> {
   /** Keychain of the creator vault for (chain, token) (key index = the vault's on-chain nonce). */
   creatorKeychain(chainId: number, token: Address): WotsKeychain {
     return this.#keychain(creatorKeychainId(chainId, token));
+  }
+
+  /** Keychain of this seed's agent key of `vault` (version 5; agent-key.ts keeps which index is next). */
+  agentKeychain(chainId: number, vault: Address): WotsKeychain {
+    return this.#keychain(agentKeychainId(chainId, vault));
   }
 
   /** Keychain of private vault `index` (key index = the vault's on-chain nonce). */

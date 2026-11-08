@@ -22,6 +22,7 @@ import {
   VAULT_ACTION,
   VAULT_V3,
   VAULT_V4,
+  VAULT_V5,
   approveHashParams,
   borroStock,
   borroStocks,
@@ -176,6 +177,7 @@ export class BorroService {
       gas,
       moves,
       what,
+      preview: { action, params },
       build: async ({ v, vault: at, keychain, chainId }) => {
         const again = await this.#simulate(at, action, params, what);
         // What it uses now, with the floor and the headroom, still fits what was reserved (its margin absorbs the rest).
@@ -496,6 +498,12 @@ export class BorroService {
       if (own.includes(withdrawal) || withdrawal === at) throw new Error("the withdrawal address is one of this agent's own vaults: the same seed controls it, so a stolen seed would reach it too; nothing was signed");
       const code = await this.#p.client.getCode({ address: withdrawal });
       if (code === undefined || code === "0x") {
+        // Version 5 refuses a new withdrawal address with no code (OstraVault WithdrawalHasNoCode): only the one already
+        // in force may stay, so that its lock can still be tightened.
+        const self = await readVaultGuard(this.#p.client, at);
+        if (self.version >= VAULT_V5 && withdrawal !== self.lock.withdrawal) {
+          throw new Error(`${withdrawal} has no code: from version ${VAULT_V5} a vault's withdrawal address must be a contract (an Ostra vault with its own lock, or a multisig), so a wallet key is never the last line of defence; nothing was signed`);
+        }
         warning = `${withdrawal} has no code: the vault takes it for a wallet (the chain cannot tell a wallet from an Ostra vault not created yet); it must be a wallet whose key is not on this device`;
       } else {
         const other = await readVault(this.#p.client, this.#p.config.deployment, withdrawal);

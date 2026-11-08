@@ -48,6 +48,13 @@
 //                         https://app.ostraagent.xyz; "off": pad_search
 //                         refuses, an agent's listing is still read by its id,
 //                         and swaps answer without builder)
+//   OSTRA_AGENT_OF        a version 5 vault another seed owns: this server runs
+//                         as its agent (decided 8 Nov 2026). Its seed signs
+//                         only with the vault's agent key, which the owner
+//                         installs from agent_key_request (agent_key_set), and
+//                         every spend is held to the vault's policy; it never
+//                         holds the owner's seed. Unset: the owner of its own
+//                         vault, as before
 //   OSTRA_SWAP_ANSWER_MS  how long ostra_swap and trading buy and sell wait
 //                         for their swap before answering "pending" while it
 //                         goes on (milliseconds, 1 to 600000; default 40000,
@@ -71,6 +78,7 @@ import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getAddress, isAddress, type Address } from "viem";
 import { ROBINHOOD_PUBLIC_RPC, parseDeployment } from "@ostraagent/sdk";
 import { parseSwapDeployment, type SwapDeployment } from "@ostraagent/swap";
 import { RAETO_API, X402_NETWORK, type Config } from "@ostraagent/core";
@@ -137,6 +145,8 @@ export type McpConfig = Config & {
   prover: ProverConfig | null;
   /** How long a swap is waited for before its call answers "pending" (OSTRA_SWAP_ANSWER_MS), in ms. */
   swapAnswerMs: number;
+  /** The vault this server is the agent of (OSTRA_AGENT_OF), or null: it owns its own vault. */
+  agentOf: Address | null;
 };
 
 /** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
@@ -147,6 +157,13 @@ function swapAnswerMs(env: NodeJS.ProcessEnv): number {
   if (v === undefined || v === "") return DEFAULT_SWAP_ANSWER_MS;
   if (!/^[1-9][0-9]{0,5}$/.test(v) || Number(v) > 600_000) throw new Error("OSTRA_SWAP_ANSWER_MS is a whole number of milliseconds from 1 to 600000");
   return Number(v);
+}
+
+function agentOf(env: NodeJS.ProcessEnv): Address | null {
+  const v = env.OSTRA_AGENT_OF;
+  if (v === undefined || v === "") return null;
+  if (!isAddress(v, { strict: false })) throw new Error("OSTRA_AGENT_OF is the address of the version 5 vault this server is the agent of");
+  return getAddress(v);
 }
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
@@ -203,6 +220,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     logsRpcUrl,
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",
     swapAnswerMs: swapAnswerMs(env),
+    agentOf: agentOf(env),
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,

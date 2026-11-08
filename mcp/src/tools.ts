@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AI_TASK_KINDS, MAX_UPLOAD_IMAGE_BYTES, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, uploadImage, venueByName } from "@ostraagent/core";
+import { AGENT_ACTION_NAMES, AI_TASK_KINDS, ALLOW_KIND_NAMES, MAX_UPLOAD_IMAGE_BYTES, RELAYER_CHANNEL_DEPOSIT, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, uploadImage, venueByName } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
@@ -535,6 +535,158 @@ export function registerTools(server: McpServer, agent: Agent): void {
     "Withdraws the EIP-1271 approval of a 32-byte hash by the vault (USDG) or by the agent's vault of a Borro stock (vault_lock status lists them); at once, under the lock too; lands as done when there is none. No tool approves a hash it is given: USDG takes the vault's EIP-1271 answer as a permit or a transfer authorization of its funds, so the vault only approves digests this server builds and checks itself (Raeto's login message, OstraBreaker's limits, Ostrapad's actions).",
     { hash: bytes32, asset: borroAsset.optional().describe("USDG (default) or a Borro stock's ticker") },
     (a) => agent.borro.withdrawApproval(a.asset ?? "USDG", a.hash as `0x${string}`),
+  );
+
+  // --- version 5: the policy, allowlists, agent key, standing orders and Priors ---------------------------
+  const owner = (what: string) => {
+    if (agent.agentKey !== null) throw new Error(`${what} is the vault owner's: this server is the agent of ${agent.agentKey.vault} (OSTRA_AGENT_OF), whose owner runs it`);
+  };
+  const actionName = z.enum(Object.keys(AGENT_ACTION_NAMES) as [string, ...string[]]);
+  const allowKind = z.enum(Object.keys(ALLOW_KIND_NAMES) as [string, ...string[]]);
+  const agentId = z.string().regex(/^[0-9]{1,78}$/, "an ERC-8004 agent id (decimal)");
+  tool(
+    "v5_status",
+    "Version 5 of the vault: the policy in force and one waiting (with when it takes effect), what the budget has left, the agent key (root, nonce, from, expiry, in force), the allowlist, the standing orders that can still run and the Priors loans the vault owes. As the agent of another seed's vault (OSTRA_AGENT_OF), that vault's.",
+    {},
+    async () => ({ role: agent.agentKey === null ? "owner" : "agent", ...(await agent.v5.status()) }),
+  );
+  tool(
+    "policy_set",
+    "Sets the vault's policy: what its agent key may do and the bounds of the agent key, the standing orders and every Priors spend. Each field left out keeps its value. actions: the actions the agent key may use (names); perTx and daily (USDG): the most one agent spend or order run, and the budget that refills each day; maxDebt (USDG), maxTermSeconds, maxFeeBps (per 30 days), coverBps (open principal at most this share of the vault's escrowed Ostrapad budgets; 0: none needed), repayLeadSeconds, repayVenue: Priors borrowing; vouchPerAgent, vouchTotal (USDG), maxPremiumBps: the vault's Priors root. Tighter in every field: in force at once; anything looser waits the withdrawal lock's delay (said in the answer). The owner's.",
+    {
+      actions: z.array(actionName).optional(),
+      perTx: usdg.optional(),
+      daily: usdg.optional(),
+      maxDebt: usdg.optional(),
+      maxTermSeconds: z.number().int().min(0).max(365 * 86_400).optional(),
+      maxFeeBps: z.number().int().min(0).max(10_000).optional(),
+      coverBps: z.number().int().min(0).max(10_000).optional(),
+      repayLeadSeconds: z.number().int().min(0).max(7 * 86_400).optional(),
+      repayVenue: z.union([z.literal("none"), z.enum(VENUES.filter((v) => v.kind !== 2).map((v) => v.name) as [string, ...string[]])]).optional().describe("the venue a short repay exits first (spark or raeto_usdg), or none"),
+      vouchPerAgent: usdg.optional(),
+      vouchTotal: usdg.optional(),
+      maxPremiumBps: z.number().int().min(0).max(200).optional(),
+    },
+    async (a) => {
+      owner("policy_set");
+      const { repayVenue, ...rest } = a;
+      const venue = repayVenue === undefined ? undefined : repayVenue === "none" ? null : (() => { const v = venueByName(repayVenue); return { kind: v.kind, venue: v.address }; })();
+      return agent.v5.setPolicy({ ...rest, ...(venue === undefined ? {} : { repayVenue: venue }) });
+    },
+  );
+  tool(
+    "allow_set",
+    "Puts an entry on the vault's allowlist or takes it off. kind: recipient (a Transfer's recipient, a PAY order's, a Swap's other than the vault), channel (a channel receiver: the relayer's split for an agent to pay the relayer), pool (a Uniswap v4 PoolId), lend (a Morpho Vault V2), sponsor (a Priors root's agent id), borrower (an agent id the vault's Priors root may give a line). On: after the withdrawal lock's delay under the lock (said in the answer), else at once; off: at once. The owner's.",
+    { kind: allowKind, value: z.string().min(1).max(66), allowed: z.boolean() },
+    async (a) => {
+      owner("allow_set");
+      return agent.v5.setAllow(a.kind, a.value, a.allowed);
+    },
+  );
+  tool(
+    "agent_key_request",
+    "As the agent of another seed's vault (OSTRA_AGENT_OF): a fresh agent key root for the vault's owner to install with agent_key_set, and what the owner sets up so that this agent can pay the relayer from the vault: the relayer's split on the allowlist (allow_set channel), open_channel in the policy's actions, and a perTx of at least the relayer channel's deposit. Each call hands out a new key; one installed before is never handed out again.",
+    {},
+    async () => {
+      if (agent.agentKey === null) throw new Error("this server owns its vault; agent_key_request is for a server started as another vault's agent (OSTRA_AGENT_OF)");
+      const r = await agent.agentKey.request();
+      const facts = agent.relayer === null ? null : await agent.relayer.facts();
+      return {
+        ...r,
+        forTheOwner: {
+          install: `agent_key_set with root ${r.root} and the days it lasts (at most 90)`,
+          policy: "policy_set with the actions this agent may use; open_channel among them for it to pay the relayer",
+          ...(facts === null ? {} : { allowRelayer: `allow_set channel ${facts.split}`, perTxAtLeast: formatTokenAmount(RELAYER_CHANNEL_DEPOSIT) }),
+        },
+      };
+    },
+  );
+  tool(
+    "agent_key_set",
+    "Installs the vault's agent key: the root its agent's server gave (agent_key_request) for `days` (1 to 90). Under the withdrawal lock it may sign from the lock's delay on. Refuses a root the vault had before and the vault's own key. Installing another key ends the one before and the orders it set. The owner's.",
+    { root: bytes32, days: z.number().min(1).max(90) },
+    async (a) => {
+      owner("agent_key_set");
+      return agent.v5.setAgentKey(a.root, a.days);
+    },
+  );
+  tool("agent_key_revoke", "Ends the vault's agent key at once, and the standing orders it set. The owner's.", {}, async () => {
+    owner("agent_key_revoke");
+    return agent.v5.revokeAgentKey();
+  });
+  tool(
+    "order_set",
+    "A standing order of the vault, run by this server's sweep when due (Ostra's keeper stands in while it is offline, within limits): pay (amount USDG to an allowlisted recipient every intervalSeconds, runs times), sweep (above threshold USDG, at most amount into a venue) or refill (below threshold USDG, at most amount back from a venue). Each run counts against the policy's perTx and daily budget and needs the action in the policy (pay: transfer; sweep: enter; refill: exit). As the agent, with set_order in the policy.",
+    {
+      kind: z.enum(["pay", "sweep", "refill"]),
+      target: z.string().min(1).describe("pay: the recipient's address; sweep and refill: a venue's name (spark, raeto_usdg)"),
+      amount: usdg,
+      threshold: usdg.optional(),
+      intervalSeconds: z.number().int().min(3_600).max(365 * 86_400),
+      runs: z.number().int().min(1).max(100_000).optional(),
+      endAt: z.string().optional().describe("an ISO date after which it no longer runs"),
+    },
+    async (a) => {
+      if (a.kind === "pay") return agent.v5.setOrder({ ...a, target: a.target });
+      const v = venueByName(a.target);
+      if (v.token !== USDG) throw new RangeError(`${a.target} holds ${v.symbol}, not the vault's USDG: a sweep or refill order names spark or raeto_usdg`);
+      return agent.v5.setOrder({ ...a, target: v.address, venueKind: v.kind });
+    },
+  );
+  tool(
+    "order_cancel",
+    "Cancels standing order id (v5_status lists them), or every order with id 0 (the owner only). As the agent: one order the agent key set.",
+    { id: z.number().int().min(0) },
+    (a) => agent.v5.cancelOrder(BigInt(a.id)),
+  );
+  tool(
+    "priors_borrow",
+    "Borrows USDG from Priors for the vault's ERC-8004 agent, paid into the vault: within the policy (maxDebt, maxTermSeconds, maxFeeBps) and from a sponsor on the allowlist; with the policy's coverBps, covered by the vault's escrowed Ostrapad jobs (picked here, largest budgets first). The fee is paid in full however early the loan is repaid. This server repays it when due (repayLeadSeconds before), or priors_repay.",
+    { agentId, amount: usdg, termSeconds: z.number().int().min(1).max(365 * 86_400), maxFee: usdg },
+    async (a) => {
+      const jobs = agent.pad === null ? [] : (((await agent.pad.jobs()).jobs as { role?: string; id?: string }[]) ?? []).filter((j) => j.role === "provider" && typeof j.id === "string").map((j) => j.id as `0x${string}`);
+      return agent.v5.priorsBorrow({ agentId: BigInt(a.agentId), amount: a.amount, termSeconds: a.termSeconds, maxFee: a.maxFee, candidates: jobs });
+    },
+  );
+  tool("priors_repay", "Repays Priors loan loanId (v5_status lists the vault's) in full from the vault.", { loanId: z.string().regex(/^[0-9]{1,78}$/) }, (a) => agent.v5.priorsRepay(BigInt(a.loanId)));
+  tool(
+    "priors_consent",
+    "The vault's agent consents to Priors sponsor sponsorId (on the allowlist) opening it a line, up to maxPremiumBps (at most the policy's maxFeeBps and 200), for days (at most 30; under the lock from its delay on).",
+    { agentId, sponsorId: agentId, maxPremiumBps: z.number().int().min(0).max(200), days: z.number().min(0.01).max(30) },
+    (a) => agent.v5.priorsConsent({ agentId: BigInt(a.agentId), sponsorId: BigInt(a.sponsorId), maxPremiumBps: a.maxPremiumBps, days: a.days }),
+  );
+  tool("priors_leave", "The vault's agent leaves its Priors sponsor.", { agentId }, (a) => agent.v5.priorsLeave(BigInt(a.agentId)));
+  tool(
+    "priors_root",
+    "The vault's Priors root (a vault whose agent is enrolled as a root): enroll and add_stake (assets USDG), vouch and unvouch (a line of amount USDG for agentId, on the allowlist as borrower, within the policy's vouchPerAgent and vouchTotal), freeze (frozen true; the agent key may only freeze), unlock (shares), claim_fees.",
+    {
+      action: z.enum(["enroll", "add_stake", "vouch", "unvouch", "freeze", "unlock", "claim_fees"]),
+      rootId: agentId.optional(),
+      agentId: agentId.optional(),
+      amount: usdg.optional(),
+      frozen: z.boolean().optional(),
+      shares: z.string().regex(/^[0-9]{1,78}$/).optional(),
+    },
+    async (a) => {
+      const need = <T>(v: T | undefined, name: string): T => {
+        if (v === undefined) throw new RangeError(`${a.action} takes ${name}`);
+        return v;
+      };
+      switch (a.action) {
+        case "enroll":
+        case "add_stake":
+          return agent.v5.root({ action: a.action, rootId: BigInt(need(a.rootId, "rootId")), assets: need(a.amount, "amount") });
+        case "vouch":
+        case "unvouch":
+          return agent.v5.root({ action: a.action, rootId: BigInt(need(a.rootId, "rootId")), agentId: BigInt(need(a.agentId, "agentId")), amount: need(a.amount, "amount") });
+        case "freeze":
+          return agent.v5.root({ action: "freeze", agentId: BigInt(need(a.agentId, "agentId")), frozen: need(a.frozen, "frozen") });
+        case "unlock":
+          return agent.v5.root({ action: "unlock", rootId: BigInt(need(a.rootId, "rootId")), shares: BigInt(need(a.shares, "shares")) });
+        case "claim_fees":
+          return agent.v5.root({ action: "claim_fees", rootId: BigInt(need(a.rootId, "rootId")) });
+      }
+    },
   );
   const venueName = z.enum(VENUES.map((v) => v.name) as [string, ...string[]]);
   tool(

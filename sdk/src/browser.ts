@@ -31,4 +31,5 @@ export * from "./strategy.ts";
 export * from "./relayer.ts";
 export * from "./reputation.ts";
 export * from "./venues.ts";
+export * from "./vault-v5.ts";
 export * from "./wots.ts";

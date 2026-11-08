@@ -756,12 +756,16 @@ export type GuardCall =
   | { op: typeof GUARD_OP.REDEEM; vault: Address; shares: bigint }
   | { op: typeof GUARD_OP.WITHDRAW_COLLATERAL; marketId: Hex; shares: bigint }
   | { op: typeof GUARD_OP.EXIT; kind: VenueKind; venue: Address; amount: bigint }
-  | { op: typeof GUARD_OP.EXIT_SWEEP; kind: VenueKind; venue: Address; amount: bigint; expected: Address };
+  | { op: typeof GUARD_OP.EXIT_SWEEP; kind: VenueKind; venue: Address; amount: bigint; expected: Address }
+  | { op: typeof GUARD_OP.AGENT_STOP }
+  | { op: typeof GUARD_OP.CLEAR_CRANK };
 
 /** The params of OstraVault.guard for `c`. */
 export function guardCallParams(c: GuardCall): Hex {
   switch (c.op) {
     case GUARD_OP.CANCEL:
+    case GUARD_OP.AGENT_STOP:
+    case GUARD_OP.CLEAR_CRANK:
       return "0x";
     case GUARD_OP.REVOKE_HASH:
       return encodeAbiParameters([{ type: "bytes32" }], [nonZero32(c.hash, "hash")]);
@@ -786,7 +790,7 @@ export function guardCallParams(c: GuardCall): Hex {
  * its guardian or withdrawal address. Ops 5 and 6 (version 4, run in OstraVaultModuleV4): arg
  * bytes32(uint256(kind) << 160 | uint160(venue)); op 5's amount is the amount (0 for all of the position), op 6's
  * the expected withdrawal address as a uint160 (op 6 through a Guard spend always takes the whole position, so its
- * GuardCall amount must be 0).
+ * GuardCall amount must be 0). Ops 7 and 8 (version 5, run in OstraVaultModuleV5.guardSpend): arg and amount zero.
  */
 export function guardParams(vault: Address, c: GuardCall): Hex {
   let arg: Hex = ZERO32;

@@ -74,6 +74,8 @@ import {
   signVaultSupportRecovery,
   signVaultTransfer,
   setCrankParams,
+  decodeOpenChannelParams,
+  decodeTransferParams,
   transferParams,
   usdgAbi,
   WotsKeyMismatchError,
@@ -84,8 +86,11 @@ import {
   type RelayCall,
   type SignedSpend,
   type VaultState,
-  type WotsKeychain,
+  WotsKeychain,
+  randomBytes32,
+  type WotsStore,
 } from "@ostraagent/sdk";
+import type { AgentKey } from "./agent-key.ts";
 import { formatEth, formatTokenAmount, parseTokenAmount, TOKEN_DECIMALS } from "./amount.ts";
 import { chainTime, ethBalance, tokenBalance, tokenDecimals } from "./chain.ts";
 import { VAULT_SOFT_LIMIT, type Config } from "./config.ts";
@@ -240,6 +245,8 @@ export type VaultOperation = {
   moves?: bigint;
   /** What the operation is, for messages. */
   what: string;
+  /** The vault spend it signs, when known before it is built: in agent mode checked before anything is paid for it. */
+  preview?: { action: number; params: Hex };
   build: (a: { v: VaultState; vault: Address; keychain: WotsKeychain; chainId: number }) => Promise<RelayCall[]>;
 };
 
@@ -256,6 +263,9 @@ export function spendGas(calls: readonly RelayCall[]): bigint {
 export function spendCall(vault: Address, s: { action: number; nextKeyRoot: Hex; params: Hex; signature: Hex }): RelayCall {
   return { to: vault, data: encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [s.action, s.nextKeyRoot, s.params, s.signature] }) };
 }
+
+/** A keychain that keeps nothing: the throwaway owner key an operation is built with in agent mode. */
+const NO_STORE: WotsStore = { load: async () => undefined, saveIfAbsent: async () => true };
 
 /** The gas a lone finishRecovery is checked for when the local fee payer sends it. */
 const FINISH_RECOVERY_GAS = 150_000n;
@@ -283,6 +293,8 @@ export class VaultService {
   #refill: ((need: bigint) => Promise<unknown>) | null = null;
   /** The refill running now: a payment that comes while it runs waits for it, then reads the balance again. */
   #refilling: Promise<void> | null = null;
+  /** Agent mode (version 5, OSTRA_AGENT_OF): the vault is another seed's, and every spend is signed by its agent key. */
+  #agent: AgentKey | null = null;
 
   constructor(client: PublicClient, transport: Transport, config: Config, keys: Keys, sender: Sender, kind: VaultKind = "buyer", privateIndex: bigint | null = null, vaultToken: Address | null = null) {
     if ((kind === "private") !== (privateIndex !== null)) throw new Error("a private vault, and only a private vault, has an index");
@@ -308,6 +320,40 @@ export class VaultService {
             ? keys.creatorKeychain(config.chainId, token)
             : keys.privateVaultKeychain(config.chainId, token, privateIndex as bigint);
     this.#initCrank = kind === "seller" ? null : zeroAddress;
+  }
+
+  /**
+   * Agent mode: this buyer vault is `agent.vault`, another seed's version 5 vault, and every spend is signed by its
+   * agent key (agent-key.ts). Operations are built as owner spends with a throwaway owner key and each spend is
+   * signed again by the agent key (AgentKey.convert), checked and simulated as the agent spend first. What the agent
+   * key may never do (the crank, guardians, recovery, a new vault) is refused here.
+   */
+  actAsAgent(agent: AgentKey): void {
+    if (this.kind !== "buyer") throw new Error("only the buyer vault acts as an agent of another vault");
+    this.#agent = agent;
+  }
+
+  /** The agent key this vault spends with (agent mode), else null. */
+  get agentKey(): AgentKey | null {
+    return this.#agent;
+  }
+
+  #notAgent(what: string): void {
+    if (this.#agent !== null) throw new Error(`${what} is the vault owner's: an agent key never does it; nothing was signed`);
+  }
+
+  /** The keychain and vault state an operation signs with: this seed's, or in agent mode a throwaway owner key at `v`'s nonce. */
+  #signing(v: VaultState): { keychain: WotsKeychain; v: VaultState } {
+    if (this.#agent === null) return { keychain: this.#keychain, v };
+    const throwaway = new WotsKeychain(randomBytes32(), randomBytes32(), NO_STORE);
+    const { keyIndex: _ignored, ...rest } = v as VaultState & { keyIndex?: bigint };
+    return { keychain: throwaway, v: { ...rest, keyRoot: bytesToHex(throwaway.keyRoot(v.nonce)) } };
+  }
+
+  /** The calls to send: as built, or in agent mode each spend signed again by the agent key. */
+  async #final(calls: RelayCall[], what: string, sender: Sender): Promise<RelayCall[]> {
+    if (this.#agent === null) return calls;
+    return this.#agent.convert(calls, what, await sender.payer());
   }
 
   /** Seller vault: the crank it is (or will be) created with, which is part of its address. */
@@ -394,6 +440,7 @@ export class VaultService {
   }
 
   async vaultAddress(): Promise<Address> {
+    if (this.#agent !== null) return this.#agent.vault;
     const adopted = await this.#adoptedVault();
     if (adopted !== null) return adopted;
     if (this.#initCrank === null) throw new Error(this.#missing());
@@ -591,6 +638,7 @@ export class VaultService {
 
   open(): Promise<OpenVaultResult> {
     return this.#serial(async () => {
+      this.#notAgent("creating the vault");
       if (this.kind !== "token" && this.#inUsdg()) await this.#checkToken();
       const vault = await this.vaultAddress();
       const token = this.token;
@@ -657,6 +705,8 @@ export class VaultService {
   /** The spend signed under `nonce` and not landed: this device's record, or the relayer escrow's (keys.ts). */
   /** The spend this seed signed under the vault's nonce and has not seen land: kept at the key's index. */
   async #pending(v: VaultState): Promise<{ message: string; signature: string } | null> {
+    // Agent mode: this seed's records of the vault are its agent key's (AgentKey.signedNow), never owner spends.
+    if (this.#agent !== null) return null;
     const record = await this.#keychain.signed(v.keyIndex ?? v.nonce);
     if (record === undefined) return null;
     // A key of an earlier index signed for an earlier nonce, before a recovery came back to it: not this nonce's.
@@ -671,6 +721,8 @@ export class VaultService {
    */
   spendSlot(): Promise<{ nonce: bigint; keyIndex: bigint; pending: { action: number; params: Hex } | null } | null> {
     return this.#serial(async () => {
+      // Agent mode: the agent nonce and the agent key's index (the vault's own nonce never moves for an agent spend).
+      if (this.#agent !== null) return this.#agent.slot();
       const vault = await this.vaultAddress().catch(() => null);
       if (vault === null) return null;
       const v = await this.#read(vault);
@@ -687,6 +739,7 @@ export class VaultService {
    */
   signedAt(slot: { nonce: bigint; keyIndex: bigint }): Promise<{ action: number; params: Hex } | null> {
     return this.#serial(async () => {
+      if (this.#agent !== null) return this.#agent.signedAt(slot);
       const vault = getAddress(await this.vaultAddress());
       const record = await this.#keychain.signed(slot.keyIndex);
       if (record === undefined) return null;
@@ -708,7 +761,20 @@ export class VaultService {
       let pendingChannelOpen: PendingChannelOpen | null = null;
       let pendingCrankChange: PendingCrankChange | null = null;
       let pendingOperation: { action: number } | undefined;
-      if (v !== null) {
+      if (v !== null && this.#agent !== null) {
+        // Agent mode: the spend the agent key signed and that has not landed.
+        const p = await this.#agent.signedNow(await this.#agent.state()).catch(() => null);
+        if (p !== null && p.action === VAULT_ACTION.TRANSFER) {
+          const t = decodeTransferParams(p.params);
+          pendingWithdrawal = { destination: getAddress(t.to), amount: formatTokenAmount(t.amount) };
+        } else if (p !== null && p.action === VAULT_ACTION.OPEN_CHANNEL) {
+          const o = decodeOpenChannelParams(p.params);
+          const config = vaultChannelConfig(vault, token, o);
+          pendingChannelOpen = { channel: computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex, receiver: o.receiver, receiverAuthorizer: o.receiverAuthorizer, deposit: formatTokenAmount(o.amount), voucherKey: o.payerAuthorizer };
+        } else if (p !== null) {
+          pendingOperation = { action: p.action };
+        }
+      } else if (v !== null) {
         const p = await this.#pending(v);
         if (p !== null) {
           const message = fromHex(p.message);
@@ -761,6 +827,7 @@ export class VaultService {
    * there is one (see pending.ts). Returns what was sent, or null.
    */
   async #sendPending(vault: Address, v: VaultState, sender: Sender, reservation: Reservation | null): Promise<ResentSpend | null> {
+    if (this.#agent !== null) return this.#sendAgentPending(vault, sender, reservation);
     const p = await this.#pending(v);
     if (p === null) return null;
     const message = fromHex(p.message);
@@ -808,6 +875,31 @@ export class VaultService {
     const s = decodeVaultSpendMessage(message);
     const txHash = await sender.send([spendCall(vault, { action: s.action, nextKeyRoot: s.nextKeyRoot, params: s.params, signature })], { reservation, allowFailedSwaps: true });
     return { operation: "vault_spend", txHash, action: s.action };
+  }
+
+  /** Agent mode: the spend the agent key signed and that never landed, sent again when it still can (AgentKey.pending). */
+  async #sendAgentPending(vault: Address, sender: Sender, reservation: Reservation | null): Promise<ResentSpend | null> {
+    const agent = this.#agent as AgentKey;
+    const p = await agent.pending(await agent.state(), await sender.payer());
+    if (p === null) return null;
+    // Sent as it was signed even if it lands as a failure (a Morpho spend, an Enter): landing frees the key.
+    const options: SendOptions = { reservation, allowFailedSwaps: true };
+    if (p.action === VAULT_ACTION.TRANSFER) {
+      const t = decodeTransferParams(p.params);
+      await this.#notFrozen(t.to, "the destination of a withdrawal signed earlier,");
+      const txHash = await sender.send([p.call], options);
+      return { operation: "withdraw", txHash, destination: getAddress(t.to), amount: formatTokenAmount(t.amount) };
+    }
+    if (p.action === VAULT_ACTION.OPEN_CHANNEL) {
+      const open = decodeOpenChannelParams(p.params);
+      const config = vaultChannelConfig(vault, this.#config.deployment.token, open);
+      const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
+      if (this.#onChannelOpening !== null) await this.#onChannelOpening({ open, config, channel });
+      const txHash = await sender.send([p.call], options);
+      return { operation: "open_channel", txHash, channel, receiverAuthorizer: open.receiverAuthorizer, deposit: formatTokenAmount(open.amount) };
+    }
+    const txHash = await sender.send([p.call], options);
+    return { operation: "vault_spend", txHash, action: p.action };
   }
 
   /**
@@ -899,6 +991,8 @@ export class VaultService {
    * left as they were.
    */
   async #presign(vault: Address, sender: Sender, action: number, params: Hex, what: string): Promise<void> {
+    // Agent mode: the agent spend itself is checked and simulated when it is signed (AgentKey.sign).
+    if (this.#agent !== null) return;
     const version = Number(await this.#client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "VERSION" }));
     if (version < VAULT_V3) return;
     let logs: Awaited<ReturnType<typeof simulateVaultSpend>>["logs"];
@@ -924,6 +1018,8 @@ export class VaultService {
    * the nonce. Without the lock the new key's first spend finishes it, as before.
    */
   async #finishRecoveryFirst(sender: Sender): Promise<void> {
+    // The agent key never finishes the owner's recovery (spendAsAgent is refused while one is under way).
+    if (this.#agent !== null) return;
     const vault = await this.vaultAddress().catch(() => null);
     if (vault === null) return;
     const v = await readVault(this.#client, this.#config.deployment, vault);
@@ -963,6 +1059,7 @@ export class VaultService {
   /** What sending the spend signed under the vault's current nonce needs: its gas and the ETH it sends (none signed: nothing). */
   async #pendingCost(): Promise<{ gas: bigint; extraWei: bigint }> {
     const none = { gas: 0n, extraWei: 0n };
+    if (this.#agent !== null) return none;
     const vault = await this.vaultAddress().catch(() => null);
     if (vault === null) return none;
     const v = await this.#read(vault);
@@ -985,6 +1082,13 @@ export class VaultService {
    */
   operate(op: VaultOperation, via?: Sender): Promise<VaultOperationResult> {
     return this.#serial(async () => {
+      // Agent mode: the policy's checks first, before a relayer channel is opened (an agent spend too) to pay for it. An
+      // operation that cannot say its spend before it is built (Ostra Swap's escrow, Ostrapad, Tide, the private notes)
+      // is not one the agent key signs: it would pay for a channel first and be refused after.
+      if (this.#agent !== null) {
+        if (op.preview === undefined) throw new Error(`${op.what} is not signed by an agent key here (only withdrawals, channel payments, the venues, Borro, the vault's version 5 spends and Priors are); nothing was signed`);
+        await this.#agent.precheck(op.preview.action, op.preview.params, op.what);
+      }
       const vault = await this.vaultAddress();
       if ((await this.#read(vault)) === null) throw new Error(this.#missing());
       const chosen = via ?? this.#sender;
@@ -998,7 +1102,8 @@ export class VaultService {
           if (resent !== null) {
             return { status: "resent_pending", resent, vaultNonce: (v.nonce + 1n).toString(), note: `an earlier signed vault operation had not landed and was sent now; ${op.what} was not, call again for it` };
           }
-          const calls = await op.build({ v, vault, keychain: this.#keychain, chainId: this.#config.chainId });
+          const signing = this.#signing(v);
+          const calls = await this.#final(await op.build({ v: signing.v, vault, keychain: signing.keychain, chainId: this.#config.chainId }), op.what, sender);
           let txHash: Hash;
           try {
             txHash = await sender.send(calls, { reservation, ...(op.value === undefined ? {} : { value: op.value }) });
@@ -1029,6 +1134,8 @@ export class VaultService {
       const destination = getAddress(destinationText);
       if (destination === zeroAddress) throw new RangeError("the destination must not be the zero address");
       if (destination === getAddress(await this.vaultAddress())) throw new Error("the destination is the vault itself");
+      // Agent mode: the policy's checks first, before a relayer channel is opened (an agent spend too) to pay for it.
+      if (this.#agent !== null) await this.#agent.precheck(VAULT_ACTION.TRANSFER, transferParams({ to: destination, amount }), "the withdrawal");
       await this.refillFor(amount, destination);
     }
     return this.#serial(async () => {
@@ -1068,10 +1175,12 @@ export class VaultService {
         if (balance < amount) throw this.#short(balance, formatTokenAmount(amount));
 
         await this.#presign(vault, sender, VAULT_ACTION.TRANSFER, transferParams({ to: destination, amount }), "the withdrawal");
-        const signed: SignedSpend = await signVaultTransfer(this.#keychain, v, { chainId: this.#config.chainId, to: destination, amount });
+        const signing = this.#signing(v);
+        const signed: SignedSpend = await signVaultTransfer(signing.keychain, signing.v, { chainId: this.#config.chainId, to: destination, amount });
+        const calls = await this.#final([spendCall(vault, signed)], "the withdrawal", sender);
         let txHash: Hash;
         try {
-          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+          txHash = await sender.send(calls, { reservation });
         } catch (err) {
           throw new Error(`${(err as Error).message}\nthe signed withdrawal is kept; the next withdraw or open_channel call sends it again before anything else`);
         }
@@ -1087,6 +1196,7 @@ export class VaultService {
    * earlier and not landed is sent instead, and this channel is not opened.
    */
   async openChannel(open: OpenChannelParams, beforeSign: (opening: ChannelOpening) => Promise<void>): Promise<VaultChannelOpenResult> {
+    if (this.#agent !== null) await this.#agent.precheck(VAULT_ACTION.OPEN_CHANNEL, openChannelParams(open), "the channel open");
     if (this.kind !== "seller") {
       const vault = await this.vaultAddress();
       const ownVault = getAddress(open.receiverAuthorizer) === vault || getAddress(open.receiver) === vault;
@@ -1120,11 +1230,13 @@ export class VaultService {
         const opening = { open, config, channel };
         await this.#presign(vault, sender, VAULT_ACTION.OPEN_CHANNEL, openChannelParams(open), "the channel open");
         await beforeSign(opening);
-        const signed = await signVaultOpenChannel(this.#keychain, v, { chainId: this.#config.chainId, open });
+        const signing = this.#signing(v);
+        const signed = await signVaultOpenChannel(signing.keychain, signing.v, { chainId: this.#config.chainId, open });
+        const calls = await this.#final([spendCall(vault, signed)], "the channel open", sender);
         if (this.#onChannelOpening !== null) await this.#onChannelOpening(opening);
         let txHash: Hash;
         try {
-          txHash = await sender.send([spendCall(vault, signed)], { reservation });
+          txHash = await sender.send(calls, { reservation });
         } catch (err) {
           throw new Error(`${(err as Error).message}\nthe signed channel open is kept; the next open_channel or withdraw call sends it again before anything else`);
         }
@@ -1153,7 +1265,8 @@ export class VaultService {
     const vault = await this.vaultAddress();
     const v = await this.#read(vault);
     if (v === null) throw new Error(this.#missing());
-    if ((await this.#pending(v)) !== null) {
+    const held = this.#agent === null ? (await this.#pending(v)) !== null : (await this.#agent.signedNow(await this.#agent.state())) !== null;
+    if (held) {
       throw new PendingSpendUnpaidError("a vault operation signed earlier waits to be sent and no channel to the relayer has deposit left to pay for it", {
         owner: this,
         queued: () => this.#serial(() => this.#sendPendingOnCredit()),
@@ -1169,9 +1282,11 @@ export class VaultService {
     const config = vaultChannelConfig(vault, this.#config.deployment.token, open);
     const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
     await this.#presign(vault, this.#sender, VAULT_ACTION.OPEN_CHANNEL, openChannelParams(open), "the relayer channel open");
-    const signed = await signVaultOpenChannel(this.#keychain, v, { chainId: this.#config.chainId, open });
+    const signing = this.#signing(v);
+    const signed = await signVaultOpenChannel(signing.keychain, signing.v, { chainId: this.#config.chainId, open });
+    const calls = await this.#final([spendCall(vault, signed)], "the relayer channel open", this.#sender);
     if (this.#onChannelOpening !== null) await this.#onChannelOpening({ open, config, channel });
-    await this.#sender.send([spendCall(vault, signed)], {});
+    await this.#sender.send(calls, {});
   }
 
   /**
@@ -1182,6 +1297,7 @@ export class VaultService {
    */
   setCrankKey(crankText: Address, via?: Sender): Promise<CrankChangeResult> {
     return this.#serial(async () => {
+      this.#notAgent("the vault's crank");
       if (!isAddress(crankText, { strict: false })) throw new RangeError("a crank is an address");
       const crank = getAddress(crankText);
       const target = crank === zeroAddress ? null : crank;
@@ -1255,6 +1371,7 @@ export class VaultService {
     via?: Sender,
   ): Promise<RecoverySpendResult> {
     return this.#serial(async () => {
+      this.#notAgent(spend.what);
       const vault = await this.vaultAddress();
       if ((await this.#read(vault)) === null) throw new Error(this.#missing());
       const chosen = via ?? this.#sender;

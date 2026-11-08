@@ -81,7 +81,8 @@ export type Quote = {
 export type Paid = { txHash: string; amount: string; at: number; token?: string };
 export type Debt = { amount: string; txs: string[] };
 /** `calls`: the relayed open's request, sent again with the first voucher to pay it. */
-export type PendingOpen = { hash: string; txHash: string; channel: string; amount: string; at: number; calls: { to: string; data: string }[] };
+/** byAgent: opened by the vault's agent key (version 5; its voucher key is the agent's, which the owner does not hold). */
+export type PendingOpen = { hash: string; txHash: string; channel: string; amount: string; at: number; calls: { to: string; data: string }[]; byAgent?: boolean };
 
 type LedgerData = {
   version: 1;
@@ -91,6 +92,11 @@ type LedgerData = {
   opens: Record<string, PendingOpen>;
   credits: Record<string, string>;
   createVaults: Record<string, number[]>;
+  /**
+   * Per vault: an open its agent key left unpaid and that was taken over as its debt (gate.ts; absent before version
+   * 5): when, its request and its transaction. The same request sent again with a voucher still pays it.
+   */
+  agentTakeovers?: Record<string, { at: number; hash: string; txHash: string }>;
   /** Tokens private spends paid fees in, which sweep.ts sells to ETH (absent in ledgers from before 21 Oct 2026). */
   feeTokens?: string[];
   /** Per nullifier (lowercase hex): the private spends of that note that reverted when relayed in the last 24 hours (private.ts). */

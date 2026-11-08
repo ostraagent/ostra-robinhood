@@ -5,6 +5,7 @@
 // build (../out). Accounts are anvil's well-known development keys.
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   createPublicClient,
@@ -19,12 +20,12 @@ import {
   type WalletClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { upgradeableBeaconAbi } from "../src/abi.ts";
+import { ostraVaultAbi, upgradeableBeaconAbi } from "../src/abi.ts";
 import { robinhoodChain } from "../src/chain.ts";
-import { ROBINHOOD_PUBLIC_RPC, USDG } from "../src/constants.ts";
+import { ROBINHOOD_PUBLIC_RPC, USDG, VAULT_V5 } from "../src/constants.ts";
 import { redact } from "../src/chain.ts";
 import { deployLaunchpad, deployOstra } from "../src/deploy.ts";
-import type { Deployment } from "../src/deployment.ts";
+import { parseDeployment, type Deployment } from "../src/deployment.ts";
 
 /** anvil's default development accounts 0..3 (public test keys, never used outside a local fork). */
 const DEV_KEYS = [
@@ -211,4 +212,30 @@ export async function vaultBeaconAtRecord(fork: Fork, d: Deployment): Promise<st
   await rpc(fork.url, "anvil_stopImpersonatingAccount", [owner]);
   if ((await read()) !== getAddress(d.vaultImplementation)) throw new Error("the vault beacon is not at the record's implementation after the upgrade");
   return "upgraded on the fork as scheduled";
+}
+
+/**
+ * The live deployment record `recordPath` at version 5: the record itself once upgrade-vault.ts finalize has written
+ * its vaultModuleV5, else with the OstraVaultModuleV5 and the implementation upgrade-vault.ts prepare deployed on
+ * mainnet (the state file <record>.vault-v5.json it keeps until finalize). Each must have code on the fork, and the
+ * implementation must be version 5 bound to that module. The vault beacon is brought to it with vaultBeaconAtRecord.
+ */
+export async function liveAtV5(fork: Fork, recordPath: string): Promise<Deployment> {
+  const live = parseDeployment(JSON.parse(readFileSync(recordPath, "utf8")));
+  let d = live;
+  if (live.vaultModuleV5 === undefined) {
+    const statePath = `${recordPath}.vault-v5.json`;
+    if (!existsSync(statePath)) throw new Error(`${recordPath} is not at version 5 and has no ${statePath} from upgrade-vault.ts prepare`);
+    const steps = JSON.parse(readFileSync(statePath, "utf8")) as { moduleV5?: { address?: string }; implementation?: { address?: string } };
+    if (steps.moduleV5?.address === undefined || steps.implementation?.address === undefined) throw new Error(`${statePath} does not name both version 5 contracts`);
+    d = parseDeployment({ ...JSON.parse(readFileSync(recordPath, "utf8")), vaultImplementation: steps.implementation.address, vaultModuleV5: steps.moduleV5.address });
+  }
+  for (const address of [d.vaultImplementation, d.vaultModuleV5 as Address]) {
+    if (((await fork.client.getCode({ address })) ?? "0x") === "0x") throw new Error(`${address} has no code on the fork`);
+  }
+  const version = Number(await fork.client.readContract({ address: d.vaultImplementation, abi: ostraVaultAbi, functionName: "VERSION" }));
+  if (version !== VAULT_V5) throw new Error(`${d.vaultImplementation} is version ${version}, not ${VAULT_V5}`);
+  const moduleV5 = getAddress((await fork.client.readContract({ address: d.vaultImplementation, abi: ostraVaultAbi, functionName: "MODULE_V5" })) as Address);
+  if (moduleV5 !== getAddress(d.vaultModuleV5 as Address)) throw new Error(`${d.vaultImplementation} is bound to module V5 ${moduleV5}, not ${d.vaultModuleV5}`);
+  return d;
 }

@@ -28,6 +28,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { getAddress, parseAbi, type Address } from "viem";
 import { STEAKHOUSE_USDG, USDG, deployBreaker, usdgAbi, type Deployment } from "@ostraagent/sdk";
 import { OUT_DIR, deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
+import { createSafe } from "@ostraagent/sdk/test/safe";
 import { splitLogsClient } from "../../core/test/split-logs.ts";
 
 let fork: Fork;
@@ -254,7 +255,13 @@ test("the MCP server's Borro and withdrawal lock tools: markets, a USDG loan to 
     assert.ok(off.ok && off.json.lockedSince === "0", off.text);
     const missing = await call(client, "vault_lock", { action: "set" });
     assert.ok(!missing.ok && /takes withdrawal, delaySeconds and dailyLimit/.test(missing.text), missing.text);
-    const withdrawal = fork.accounts[3]!.address;
+    // Version 5 refuses a withdrawal address with no code (OstraVault WithdrawalHasNoCode), and the MCP refuses it
+    // before anything is signed. The withdrawal address here is a real Safe (1.4.1, sdk test/safe.ts) owned by a
+    // development account.
+    const plain = await call(client, "vault_lock", { action: "set", withdrawal: fork.accounts[2]!.address, delaySeconds: 129_600, dailyLimit: "5" });
+    assert.ok(!plain.ok && /has no code: from version 5/.test(plain.text) && /nothing was signed/.test(plain.text), plain.text);
+    const withdrawal = await createSafe(fork, fork.accounts[0]!, fork.accounts[3]!.address, 7n);
+    assert.ok(((await fork.client.getCode({ address: withdrawal })) ?? "0x") !== "0x", "the withdrawal Safe has code");
     // Strategies: the check runs for anyone (exits are never gated), a plan only for an agent registered in ERC-8004.
     const checked = await call(client, "strategy_check", { execute: true }, 600_000);
     assert.ok(checked.ok && Array.isArray(checked.json.findings), checked.text);
