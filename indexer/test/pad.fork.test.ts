@@ -12,10 +12,11 @@
 // checked again while it stays the same, and one changed to prohibited work leaves the listings and the board, its
 // reason kept with the agent. The model is not reached here (a rule stands in for it, as the evaluator bot's fork test
 // does for its judge): scripts/pad-moderation-check.ts checks the real API. The client decides with a reason: the
-// job's page on the board (boardJob) shows the decision with that reason, read from its reason file.
+// job's page on the board (boardJob) shows the decision with that reason, read from its reason file. A version 4 state
+// with rows read before private jobs existed is read again once and gets every job's decisions.
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -303,4 +304,33 @@ test("the index serves listed agents ranked with their record, jobs with status 
   // A state written and read back: the same listing.
   const again = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson });
   assert.equal(again.listings({ limit: 50 }).total, base.listed + 1);
+
+  // A version 4 state whose jobs were read before private jobs existed (Ostra's index on 9 Nov 2026): those rows have
+  // none of the fields added then. Read again from OstraPad's first block once, each job gets the decisions, votes,
+  // draws and appeal the fresh index holds, and keeps no description (pad-private.ts: read before private jobs).
+  const ADDED = ["description", "createdTx", "deliverable", "reasons", "draws", "decisions", "appellant", "panel", "votes", "appealOutcome"];
+  const fresh = JSON.parse(await readFile(join(root, "pad-state.json"), "utf8"));
+  const old = structuredClone(fresh);
+  old.version = 4;
+  old.reasonFiles = {};
+  for (const j of Object.values<Record<string, unknown>>(old.jobs)) for (const k of ADDED) delete j[k];
+  await writeFile(join(root, "pad-v4.json"), JSON.stringify(old));
+  const migrated = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-v4.json"), log: () => {}, readFile: readJson, hidden: () => new Set() });
+  await migrated.sync();
+  await migrated.readReasons();
+  const m = JSON.parse(await readFile(join(root, "pad-v4.json"), "utf8"));
+  assert.equal(m.version, 5);
+  assert.equal(Object.keys(m.jobs).length, Object.keys(fresh.jobs).length);
+  for (const [jobId, j] of Object.entries<Record<string, unknown>>(fresh.jobs)) {
+    const r = m.jobs[jobId] as Record<string, unknown>;
+    for (const k of ["status", "funded", "paid", "refunded", "acceptedAt", "submittedAt", "closedAt", "decisions", "votes", "draws", "appellant", "panel"]) assert.deepEqual(r[k], j[k] ?? null, `${jobId} ${k}`);
+    assert.deepEqual(r.appealOutcome ?? null, j.appealOutcome ?? null, `${jobId} appealOutcome`);
+    assert.equal("description" in r || "deliverable" in r || "reasons" in r, false, `${jobId} stays a job read before private jobs`);
+  }
+  assert.ok(Object.values<{ decisions: unknown[] }>(m.jobs).filter((j) => j.decisions.length > 0).length >= 1);
+  assert.deepEqual(migrated.boardJob(id)!.judging, page.judging);
+  // A version 5 state is read as it is: not read again from the first block.
+  const kept5 = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-v4.json"), log: () => {}, readFile: readJson, hidden: () => new Set() });
+  assert.deepEqual(kept5.boardJob(id)!.judging, page.judging);
+  assert.equal(kept5.stats().scannedTo, m.scannedTo, "a version 5 state keeps the block it was read to");
 });

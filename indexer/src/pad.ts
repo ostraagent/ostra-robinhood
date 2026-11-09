@@ -62,7 +62,8 @@
 // boardJob() serves one job of the board with its decisions, their reasons, and the appeal: who appealed (the client
 // or the provider), the deadline to appeal, the vote, the outcome; no job on the board carries an evaluator's, a
 // drawn evaluator's or a panel member's account. A state of version 3 is read again from OstraPad's first block, once,
-// so the decisions and appeals of jobs read before they were kept are filled in.
+// so the decisions and appeals of jobs read before they were kept are filled in (a state of version 4 too: it passed
+// over the jobs read before private jobs, which had no decisions list).
 //
 // The logs are read up to the logs RPC's own head (the other RPC's head can be ahead of the blocks the logs RPC has:
 // those blocks would be passed over for good), and the last RESCAN_BLOCKS are read again on the next pass, as the
@@ -178,8 +179,9 @@ export type PadJobRow = {
   closedAt: number | null;
   /**
    * For private jobs (pad-private.ts; absent on jobs read before they were recorded): the order file's sha256 (the
-   * terms' description, from the create transaction; null when it could not be read), the delivery's, the reasons'
-   * (non-zero), each evaluator draw and decision with its block time, and an appeal's appellant and panel.
+   * terms' description, from the create transaction; null when it could not be read), the delivery's, and the reasons'
+   * (non-zero). Each evaluator draw and decision with its block time, and an appeal's appellant and panel, are kept for
+   * every job (state version 5 gave them to the jobs read before).
    */
   description?: Hex | null;
   /** The create transaction (a description that could not be read is read from it again, DESCRIPTION_RETRY_MS apart). */
@@ -265,7 +267,7 @@ export type PadReputationView = {
  */
 export type PadReasonFile = { kind: "public"; job: Hex; approve: boolean; reason: string } | { kind: "sealed" } | { kind: "invalid"; why: string };
 
-export type PadIndexState = { version: 4; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow>; reasonFiles: Record<Hex, PadReasonFile> };
+export type PadIndexState = { version: 5; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow>; reasonFiles: Record<Hex, PadReasonFile> };
 
 /** A job on the board: who judges it as a kind; no evaluator's, drawn evaluator's or panel member's account. */
 export type PadBoardJob = Omit<PadJobRow, "createdBlock" | "updatedAt" | "evaluator" | "votes" | "decisions" | "draws" | "panel"> & { judgedBy: "pool" | "client" | "fixed"; agentId: string | null; agentName: string | null };
@@ -501,14 +503,26 @@ export class PadIndexer {
     this.#moderate = o.moderate ?? null;
     this.#nowMs = o.nowMs ?? Date.now;
     const d = o.deployment();
-    const fresh: PadIndexState = { version: 4, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {}, reasonFiles: {} };
+    const fresh: PadIndexState = { version: 5, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {}, reasonFiles: {} };
     if (existsSync(this.#statePath)) {
       const saved = JSON.parse(readFileSync(this.#statePath, "utf8")) as { version: number; chainId: number; pad: Address } & Omit<PadIndexState, "version">;
       const same = saved.chainId === d.chainId && getAddress(saved.pad) === this.#pad;
-      if (same && saved.version === 4) this.#state = saved as PadIndexState;
-      // Version 3 kept no decision's reason and no appeal's vote or outcome: its jobs' events are read again from
-      // OstraPad's first block, once (its jobs and agents stay; reading an event again gives the same state).
-      else if (same && saved.version === 3) this.#state = { ...(saved as Omit<PadIndexState, "version" | "reasonFiles">), version: 4, scannedTo: fresh.scannedTo, reasonFiles: {} };
+      if (same && saved.version === 5) this.#state = saved as PadIndexState;
+      // Version 3 kept no decision's reason and no appeal's vote or outcome, and its jobs read before private jobs
+      // existed have no decisions, draws or appeal at all; version 4 read the events again but passed those jobs over.
+      // Every job gets its decisions, votes, draws and appeal fields, and the events are read again from OstraPad's
+      // first block, once (its jobs, agents and reason files stay; reading an event again gives the same state). Its
+      // description, delivery and reasons stay absent: pad-private.ts reads that as a job read before private jobs.
+      else if (same && (saved.version === 3 || saved.version === 4)) {
+        for (const j of Object.values(saved.jobs)) {
+          j.decisions ??= [];
+          j.votes ??= [];
+          j.draws ??= [];
+          if (j.appellant === undefined) j.appellant = null;
+          if (j.panel === undefined) j.panel = null;
+        }
+        this.#state = { ...(saved as Omit<PadIndexState, "version" | "reasonFiles">), version: 5, scannedTo: fresh.scannedTo, reasonFiles: (saved as { reasonFiles?: Record<Hex, PadReasonFile> }).reasonFiles ?? {} };
+      }
       // Version 2 kept no job times: its jobs are read again from OstraPad's first block (its agents stay).
       else if (same && saved.version === 2) this.#state = { ...fresh, vaultsScannedTo: saved.vaultsScannedTo, agents: Object.fromEntries(Object.entries(saved.agents).map(([k, a]) => [k, { ...a, providerCreated: null }])) };
       else this.#state = fresh;
@@ -857,7 +871,8 @@ export class PadIndexer {
         else if (kind === "Submitted") {
           j.submittedAt = at;
           if (j.deliverable !== undefined) j.deliverable = (l.args.deliverable as Hex).toLowerCase() as Hex;
-        } else if (kind === "Decided" && j.decisions !== undefined) {
+        } else if (kind === "Decided") {
+          j.decisions ??= [];
           const named = l.args.reason as Hex;
           const d = { evaluator: getAddress(l.args.evaluator as Address), approved: l.args.approved as boolean, at, block: l.blockNumber.toString(), reason: BigInt(named) === 0n ? null : (named.toLowerCase() as Hex) };
           const seen = j.decisions.find((x) => x.block === d.block && x.evaluator === d.evaluator);
