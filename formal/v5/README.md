@@ -62,7 +62,7 @@ memory safety property (no undefined behavior) for each function it reaches.
 | 1. The agent key's authority | P1 to P5, and 46 memory safety properties | 51 proved, 0 refuted (7 Nov 2026) |
 | 2. The budget | P6 to P9 | 4 proved, 0 refuted (7 Nov 2026) |
 | 3. Standing orders | P10 to P14 | 5 proved, 0 refuted (9 Nov 2026) |
-| 4. Changes under the lock | P15 to P19 | pending |
+| 4. Changes under the lock | P15 to P19 | 5 proved, 0 refuted (9 Nov 2026) |
 
 Run 1 also proved that the state `model_init` leaves is reachable and that every operation, called on a reachable
 state with any arguments, leaves a reachable state; so P1 to P5 hold for every state that `model_init` followed by a
@@ -83,5 +83,13 @@ runs 1 and 2 still holds. In P10, `lastRun + interval` never wraps: in every rea
 `lastRun` stay below 2^62, and `interval` is at most `MAX_ORDER_INTERVAL`. In P11, a PAY order's `runsLeft` stays at
 least 1 while the order exists, so its `uint32_t` decrement never wraps, and order ids are never reused. In P13, no
 operation lowers `agentGen` and it never wraps, so an order the agent key set never runs again once a later operation
-that ends that key succeeds. The assumptions are those of run 1. The project now has 60 properties proved and none
-refuted.
+that ends that key succeeds. The assumptions are those of run 1. After run 3 the project had 60 properties proved and
+none refuted.
+
+Run 4 (task `e100c3bf-31fe-4613-9cac-96eeada15f9e`) proved P15 to P19, and every result of runs 1 to 3 still holds. In
+P15, `now + lockDelay` never wraps: in every reachable state `now` stays below 2^62, and while the lock is on
+`lockDelay` stays between `MIN_LOCK_DELAY` and `MAX_LOCK_DELAY`. P16 is proved for each operation other than
+`model_warp`, one by one. P18 rests on facts proved for every reachable state: time never goes back, each ended epoch
+ended no later than `now`, and an entry of the current epoch that still waits waits no longer than `waitingUntil`; the
+agent key cannot set the allowlist at all. The assumptions are those of run 1. The project now has 65 properties proved
+and none refuted.
