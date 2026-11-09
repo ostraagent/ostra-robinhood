@@ -61,7 +61,7 @@ memory safety property (no undefined behavior) for each function it reaches.
 |---|---|---|
 | 1. The agent key's authority | P1 to P5, and 46 memory safety properties | 51 proved, 0 refuted (7 Nov 2026) |
 | 2. The budget | P6 to P9 | 4 proved, 0 refuted (7 Nov 2026) |
-| 3. Standing orders | P10 to P14 | pending |
+| 3. Standing orders | P10 to P14 | 5 proved, 0 refuted (9 Nov 2026) |
 | 4. Changes under the lock | P15 to P19 | pending |
 
 Run 1 also proved that the state `model_init` leaves is reachable and that every operation, called on a reachable
@@ -75,4 +75,13 @@ Run 2 first proved exactly what the arithmetic helpers return (`sat_add` and `sa
 min(floor(dt * rate / 86400), 2^64 - 1), `budget_used` is what is used minus that refill, or 0) and proved the
 operations again against those values; every result of run 1 still holds. P6 and P7 hold from any state, reachable or
 not; P8 and P9 for every reachable state. P8's PAY run rests on a fact proved for every reachable state: no stored
-order pays the vault itself, since `set_order` refuses it. The project now has 55 properties proved and none refuted.
+order pays the vault itself, since `set_order` refuses it. After run 2 the project had 55 properties proved and none
+refuted.
+
+Run 3 (task `f48ce993-7610-4bf4-b907-3a8e85bb61e4`) proved P10 to P14 for every reachable state, and every result of
+runs 1 and 2 still holds. In P10, `lastRun + interval` never wraps: in every reachable state `now` and each order's
+`lastRun` stay below 2^62, and `interval` is at most `MAX_ORDER_INTERVAL`. In P11, a PAY order's `runsLeft` stays at
+least 1 while the order exists, so its `uint32_t` decrement never wraps, and order ids are never reused. In P13, no
+operation lowers `agentGen` and it never wraps, so an order the agent key set never runs again once a later operation
+that ends that key succeeds. The assumptions are those of run 1. The project now has 60 properties proved and none
+refuted.
