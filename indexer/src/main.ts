@@ -49,7 +49,7 @@ import { failoverModerator, moderationProviders, type Moderator } from "./modera
 import { PadIndexer, hiddenListFromFiles } from "./pad.ts";
 import { PadPrivate } from "./pad-private.ts";
 import { TideApi, tideLinkVerifier, tidePayeeChecker } from "./tide.ts";
-import { IPFS_GATEWAYS, ImageStore, IpfsReader } from "./ipfs.ts";
+import { IPFS_GATEWAYS, ImageStore, IpfsReader, parseIpfsUri } from "./ipfs.ts";
 import { SOURCIFY_API, Sourcify } from "./sourcify.ts";
 
 function privateFile(path: string, what: string): string {
@@ -124,12 +124,18 @@ async function run(o: { recordPath: string; rpcUrl: string; host: string; port: 
   } else {
     log("pad_moderation", { host: null });
   }
-  const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri), hidden, moderate });
+  // Reason files are read as bytes: an encrypted (private) one is told from one no gateway returned.
+  const readBytes = async (uri: string, maxBytes: number) => {
+    const p = parseIpfsUri(uri);
+    return p === null ? null : reader.bytes(p.cid, p.path, maxBytes);
+  };
+  const pad = padStatePath === "off" ? null : new PadIndexer({ client, logsClient, deployment, statePath: padStatePath, log, readFile: (uri) => reader.json(uri), readBytes, hidden, moderate });
   log("pad_board", { hiddenFiles: hideFiles.length });
   // Private jobs (pad-private.ts): records under OSTRA_PAD_PRIVATE (default <state dir>/pad-private), order headers read
   // from the uploader's store of encrypted files, OSTRA_UPLOADER_ENC_FILES (default /var/lib/ostra-uploader/enc/files).
   const privateDir = process.env.OSTRA_PAD_PRIVATE || join(dirname(statePath), "pad-private");
   const priv = pad === null || privateDir === "off" ? null : new PadPrivate({ pad, client, dir: privateDir, store: process.env.OSTRA_UPLOADER_ENC_FILES || "/var/lib/ostra-uploader/enc/files", chainId: record.chainId, log });
+  if (pad !== null && priv !== null) pad.setPrivate((jobId) => priv.job(jobId) !== null);
   log("pad_private", { dir: priv === null ? "off" : privateDir });
   const tideLinks = process.env.OSTRA_TIDE_LINKS || join(dirname(statePath), "tide-links.json");
   let tide: TideApi | null = null;

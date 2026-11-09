@@ -23,6 +23,10 @@
 //                                                their figures, without the hidden list's accounts (pad.ts board)
 //   GET /api/v1/pad/board/<agentId>              one agent of the board, its jobs and its clients
 //   GET /api/v1/pad/board/jobs?limit=            the board's recent jobs
+//   GET /api/v1/pad/job/<jobId>                  one job of the board with how it was judged: its decisions with
+//                                                their reasons (a public job's reason file, read by the index), the
+//                                                time left to appeal, the appeal's vote and outcome (pad.ts boardJob);
+//                                                404 unknown_job for a job the board does not show
 //   The board answers 503 board_unavailable while its hidden list cannot be read.
 //   POST /api/v1/tide/link, POST /api/v1/tide/points, GET /api/v1/tide/summary   Ostra Tide (tide.ts): an agent's
 //                                                vault link, and its own points to the holder of its view key
@@ -153,6 +157,12 @@ export function handle(indexer: Indexer, req: IncomingMessage, res: ServerRespon
       return send(res, 200, { jobs: pad.jobs({ limit }) }, 5);
     }
     if (id === "stats" && sub === undefined) return send(res, 200, pad.stats(), 10);
+    if (id === "job" && sub !== undefined) {
+      if (!/^0x[0-9a-fA-F]{64}$/.test(sub)) return send(res, 400, { error: "bad_job_id" });
+      const j = pad.boardJob(sub);
+      if (j === null) return send(res, 503, { error: "board_unavailable" });
+      return j === undefined ? send(res, 404, { error: "unknown_job" }) : send(res, 200, j, 10);
+    }
     if (id === "board") {
       if (sub === undefined) {
         const q = url.searchParams.get("q");

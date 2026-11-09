@@ -11,7 +11,8 @@
 // index with a moderator: no listing is served before its content has a verdict, an allowed one is served and not
 // checked again while it stays the same, and one changed to prohibited work leaves the listings and the board, its
 // reason kept with the agent. The model is not reached here (a rule stands in for it, as the evaluator bot's fork test
-// does for its judge): scripts/pad-moderation-check.ts checks the real API.
+// does for its judge): scripts/pad-moderation-check.ts checks the real API. The client decides with a reason: the
+// job's page on the board (boardJob) shows the decision with that reason, read from its reason file.
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -157,11 +158,14 @@ test("the index serves listed agents ranked with their record, jobs with status 
   const id = o.jobId as Hex;
   await provider.pad.accept(id);
   await provider.pad.deliver({ jobId: id, output: "A report." });
-  await client.pad.decide({ jobId: id, approve: true });
+  const because = "The report covers the token's contract, issuer and supply.";
+  await client.pad.decide({ jobId: id, approve: true, reason: because });
 
   let hidden: Set<string> | null = new Set();
   const index = new PadIndexer({ client: fork.client as PublicClient, deployment: () => d, statePath: join(root, "pad-state.json"), log: () => {}, readFile: readJson, hidden: () => hidden });
   await index.sync();
+  // Reason files are read off the scan, on their own pass (start() runs it on a timer).
+  await index.readReasons();
   const l = index.listings({ limit: 50 });
   assert.equal(l.total, base.listed + 1, JSON.stringify(l));
   const a = l.agents.find((x) => x.agentId === agentId.toString())!;
@@ -211,10 +215,24 @@ test("the index serves listed agents ranked with their record, jobs with status 
   const detail = index.boardAgent(agentId.toString())!;
   assert.equal(detail.jobs.length, 1);
   assert.deepEqual(detail.clientsOf, [{ client: client.vault, orders: 1, completed: 1, rejected: 0, judged: 1, rejectionRate: 0 }]);
+  assert.equal(row.appealed, 0);
+  // The job's page: its decision by the client, with the reason the client gave, final, no appeal.
+  const page = index.boardJob(id)!;
+  assert.ok(page !== undefined && page !== null);
+  assert.deepEqual(page.judging, { decisions: [{ approved: true, at: page.judging.decisions[0]!.at, by: "client", reason: because, reasonState: "public" }], appealBy: null, appeal: null });
+  assert.equal(page.final, true);
+  assert.equal(page.private, false);
+  assert.equal("votes" in page || "evaluator" in page || "decisions" in page || "draws" in page || "panel" in page, false, "the job's page names no judge's account");
+  for (const j of [...index.boardJobs({ limit: 100 })!, ...index.boardAgent(agentId.toString())!.jobs]) {
+    for (const k of ["evaluator", "votes", "decisions", "draws", "panel"]) assert.equal(k in j, false, `a job on the board carries ${k}: no judge's or panel's account is the board's to show`);
+  }
+  assert.equal(index.boardJob(id.toUpperCase().replace("0X", "0x"))?.id, id, "a job id in any case");
+  assert.equal(index.boardJob(`0x${"00".repeat(32)}`), undefined);
   assert.ok(board.stats.completed >= 1 && board.stats.listed === board.total);
   // A hidden client: its job leaves the board, the agent stays with no figures.
   hidden = new Set([client.vault.toLowerCase()]);
   assert.equal(index.boardJobs({ limit: 100 })!.some((j) => j.id === id), false);
+  assert.equal(index.boardJob(id), undefined, "a hidden client's job has no page on the board");
   const quiet = index.board({ limit: 100 })!.agents.find((x) => x.agentId === agentId.toString())!;
   assert.equal(quiet.completed, 0);
   assert.equal(quiet.successRate, null);
@@ -230,6 +248,7 @@ test("the index serves listed agents ranked with their record, jobs with status 
   assert.equal(index.board(), null);
   assert.equal(index.boardAgent(agentId.toString()), null);
   assert.equal(index.boardJobs(), null);
+  assert.equal(index.boardJob(id), null);
   // The listings (MCP's pad_search, the evaluator bot) do not use the list.
   assert.equal(index.listings({ provider: provider.vault }).total, 1);
 

@@ -49,6 +49,21 @@
 // evaluator bot's credits; a check with no answer is not paid and not counted). Without a moderator, listings are
 // served unchecked (as before the rules).
 //
+// Decisions' reasons (design "Ostrapad: alasan keputusan evaluator", decided by Edu on 9 Nov 2026): each decision
+// keeps the reason its Decided event names (the sha256 of an ostrapad-decision-v1 file, or none). The file is read by
+// that digest (a raw CID, checked against its bytes) on its own timer, off the scan (readReasons: a few files a pass,
+// the newest decisions first, within REASONS_PASS_MS), and kept by digest as what it is, whatever job names it: a
+// decision file (its job, approve and text), sealed (bytes that are not JSON: a private job's encrypted reason), or
+// invalid (JSON that is not a decision file core could write); a file that cannot be read now is read again later,
+// further apart each time. Whether a decision shows a file's text is decided per decision, when served: only a public
+// file whose job and approve are that decision's (reasonState), so no job can borrow or spoil another's reason. A job
+// pad-private.ts knows as private is never read. The appeal's votes and outcome (overturned, upheld, or lapsed with no
+// panel) come from Voted, AppealResolved and AppealLapsed; the board serves the votes counted, never who voted.
+// boardJob() serves one job of the board with its decisions, their reasons, and the appeal: who appealed (the client
+// or the provider), the deadline to appeal, the vote, the outcome; no job on the board carries an evaluator's, a
+// drawn evaluator's or a panel member's account. A state of version 3 is read again from OstraPad's first block, once,
+// so the decisions and appeals of jobs read before they were kept are filled in.
+//
 // The logs are read up to the logs RPC's own head (the other RPC's head can be ahead of the blocks the logs RPC has:
 // those blocks would be passed over for good), and the last RESCAN_BLOCKS are read again on the next pass, as the
 // evaluator bot does (keeper pad-evaluator.ts); reading a block again gives the same state. A state of version 1
@@ -61,6 +76,8 @@ import {
   ERC8004_IDENTITY_REGISTRY,
   OSTRAPAD,
   OSTRAPAD_FROM_BLOCK,
+  PAD,
+  PAD_ENC_KIND,
   PAD_EVENTS,
   REP_DAY_SECONDS,
   getLogsChunked,
@@ -71,6 +88,9 @@ import {
   padListingEntry,
   padListingFromFile,
   padListingScope,
+  padCidFromDigest,
+  padEncryptedLength,
+  padParseHeader,
   padReputationFromEntry,
   padReputationProofFromParts,
   readPadProvider,
@@ -91,6 +111,9 @@ const agentRegisteredEvent = parseAbiItem("event AgentRegistered(uint256 indexed
 const tokenUriAbi = [{ type: "function", name: "tokenURI", stateMutability: "view", inputs: [{ name: "agentId", type: "uint256" }], outputs: [{ name: "", type: "string" }] }] as const;
 const erc1271Abi = [{ type: "function", name: "isValidSignature", stateMutability: "view", inputs: [{ name: "hash", type: "bytes32" }, { name: "signature", type: "bytes" }], outputs: [{ name: "", type: "bytes4" }] }] as const;
 const EIP1271_MAGIC = "0x1626ba7e";
+/** OstraPad's appeal events the sdk's PAD_EVENTS does not list (OstraPad.sol). */
+const votedEvent = parseAbiItem("event Voted(bytes32 indexed jobId, address indexed member, bool agree)");
+const appealLapsedEvent = parseAbiItem("event AppealLapsed(bytes32 indexed jobId)");
 
 const WINDOW_START = 200_000n;
 const WINDOW_MIN = 500n;
@@ -121,6 +144,19 @@ export const MODERATION_TRIES = 3;
 export const MODERATIONS_PER_AGENT_DAY = 4;
 export const MODERATIONS_PER_DAY = 100;
 const DAY_MS = 86_400_000;
+/**
+ * Reason files read in one pass, at most, and no new read started after REASONS_PASS_MS; one not readable now is read
+ * again after RETRY_REASON_MS, doubling up to REASON_RETRY_MAX_MS.
+ */
+const REASONS_PER_PASS = 10;
+const REASONS_PASS_MS = 30_000;
+export const RETRY_REASON_MS = 60_000;
+const REASON_RETRY_MAX_MS = 6 * 3_600_000;
+/** The largest reason file read (the indexer's JSON limit, over the uploader's 16,384-byte pins). */
+const REASON_MAX_BYTES = 65_536;
+/** core's limit on a reason's text (sdk padReasonFile). */
+const REASON_MAX_CHARS = 4_000;
+const FINAL_STATUSES = new Set(["Completed", "Rejected", "Expired", "Cancelled"]);
 
 export type PadJobRow = {
   id: Hex;
@@ -151,9 +187,13 @@ export type PadJobRow = {
   deliverable?: Hex | null;
   reasons?: Hex[];
   draws?: { round: number; evaluator: Address; at: number; block: string }[];
-  decisions?: { evaluator: Address; approved: boolean; at: number; block: string }[];
+  /** Each decision with the reason its Decided event names (the sha256 of its reason file; null: none). */
+  decisions?: { evaluator: Address; approved: boolean; at: number; block: string; reason?: Hex | null }[];
   appellant?: Address | null;
   panel?: { members: Address[]; at: number; block: string } | null;
+  /** The appeal panel's votes (Voted), and the appeal's outcome: overturned or upheld (AppealResolved), lapsed (AppealLapsed). */
+  votes?: { member: Address; agree: boolean; block: string }[];
+  appealOutcome?: { result: "overturned" | "upheld" | "lapsed"; at: number } | null;
 };
 
 export type PadAgent = {
@@ -218,10 +258,35 @@ export type PadReputationView = {
   verifiedAt: number;
 };
 
-export type PadIndexState = { version: 3; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow> };
+/**
+ * A reason file as read, by digest, whatever job names it: a decision file (its own job, approve and text), sealed
+ * (bytes that are not JSON: a private job's encrypted reason), or invalid (JSON that is not a decision file). Never
+ * read again once kept.
+ */
+export type PadReasonFile = { kind: "public"; job: Hex; approve: boolean; reason: string } | { kind: "sealed" } | { kind: "invalid"; why: string };
 
-/** A job on the board: who judges it as a kind, not as an address (the judge's account is not the board's to show). */
-export type PadBoardJob = Omit<PadJobRow, "createdBlock" | "updatedAt" | "evaluator"> & { judgedBy: "pool" | "client" | "fixed"; agentId: string | null; agentName: string | null };
+export type PadIndexState = { version: 4; chainId: number; pad: Address; scannedTo: string; vaultsScannedTo: string; agents: Record<string, PadAgent>; jobs: Record<Hex, PadJobRow>; reasonFiles: Record<Hex, PadReasonFile> };
+
+/** A job on the board: who judges it as a kind; no evaluator's, drawn evaluator's or panel member's account. */
+export type PadBoardJob = Omit<PadJobRow, "createdBlock" | "updatedAt" | "evaluator" | "votes" | "decisions" | "draws" | "panel"> & { judgedBy: "pool" | "client" | "fixed"; agentId: string | null; agentName: string | null };
+
+/**
+ * One job of the board with how it was judged: each decision with its reason (the text of a public job's reason file;
+ * null without one, or while it cannot be read: `reasonState` says which), the time left to appeal a pool decision,
+ * and the appeal (who appealed, by role; the panel's vote counts; its outcome). No evaluator's account is shown.
+ */
+export type PadBoardJobView = PadBoardJob & {
+  /** True: private (pad-private.ts knows it); false: a decision's public reason file is this job's; null: not known (a
+   *  sealed reason alone does not make a job private: any judge could name another job's sealed file). */
+  private: boolean | null;
+  final: boolean;
+  judging: {
+    decisions: { approved: boolean; at: number; by: "pool" | "client" | "fixed"; reason: string | null; reasonState: PadReasonState }[];
+    /** A pool decision open to appeal: until when (OstraPad's appealBy); null otherwise. */
+    appealBy: number | null;
+    appeal: { by: "client" | "provider"; panelDrawn: boolean; voteBy: number | null; votes: { agree: number; disagree: number }; outcome: "overturned" | "upheld" | "lapsed" | null; at: number | null } | null;
+  };
+};
 
 /** An agent on the board: its listing and the figures its jobs give. */
 export type PadBoardAgent = {
@@ -237,6 +302,8 @@ export type PadBoardAgent = {
   rejected: number;
   /** Jobs it accepted that expired undelivered (one delivered and left unjudged is not counted against it). */
   expired: number;
+  /** Its jobs whose decision was appealed (by the client or by it). */
+  appealed: number;
   /** Jobs accepted and not ended yet. */
   inProgress: number;
   /** Distinct clients of its completed jobs. */
@@ -289,6 +356,60 @@ function text(file: unknown, key: string, max: number): string | null {
 const lower = (a: string) => a.toLowerCase();
 
 /**
+ * A reason file as the index keeps it, whatever job names it: public when it is an ostrapad-decision-v1 file (its job a
+ * bytes32, its approve a boolean, its reason text as core writes it: 1 to 4,000 characters, no control, bidirectional
+ * or C1 characters but tab and line breaks); otherwise invalid, with why. Which decision may show it is checked when
+ * served (reasonState). The file's writer chose its words: data, never instructions.
+ */
+export function reasonFromFile(file: unknown): PadReasonFile {
+  if (file === null || typeof file !== "object" || Array.isArray(file)) return { kind: "invalid", why: "not a JSON object" };
+  const f = file as Record<string, unknown>;
+  if (f.type !== "ostrapad-decision-v1") return { kind: "invalid", why: "not an ostrapad-decision-v1 file" };
+  if (typeof f.job !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(f.job)) return { kind: "invalid", why: "no job id" };
+  if (typeof f.approve !== "boolean") return { kind: "invalid", why: "no approve" };
+  if (typeof f.reason !== "string") return { kind: "invalid", why: "no reason text" };
+  const reason = f.reason.trim();
+  if (reason === "" || reason.length > REASON_MAX_CHARS) return { kind: "invalid", why: `a reason of ${reason.length} characters` };
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(reason)) return { kind: "invalid", why: "control or bidirectional characters" };
+  return { kind: "public", job: f.job.toLowerCase() as Hex, approve: f.approve, reason };
+}
+
+/**
+ * A reason file's bytes as the index keeps them: JSON is checked as a decision file; an encrypted reason file (a
+ * header of kind reason and exactly the length its header gives, sdk pad-private.ts) is sealed; anything else (an
+ * image, an encrypted order or delivery) is invalid.
+ */
+export function reasonFromBytes(bytes: Uint8Array): PadReasonFile {
+  let file: unknown;
+  try {
+    file = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+  } catch {
+    try {
+      const { header, length } = padParseHeader(bytes);
+      if (header.kind === PAD_ENC_KIND.reason && bytes.length === padEncryptedLength(length, header.plaintextLength)) return { kind: "sealed" };
+    } catch {
+      // not an encrypted file
+    }
+    return { kind: "invalid", why: "neither a decision file nor an encrypted reason" };
+  }
+  return reasonFromFile(file);
+}
+
+export type PadReasonState = "public" | "none" | "unread" | "invalid" | "private";
+
+/**
+ * What one decision shows of the file its event names: its text only when the file is a decision for this job with
+ * this decision's approve (a file named by another job's decision, or with the other verdict, is invalid here).
+ */
+export function reasonState(f: PadReasonFile | undefined, digest: Hex | null, jobId: Hex, approved: boolean): PadReasonState {
+  if (digest === null) return "none";
+  if (f === undefined) return "unread";
+  if (f.kind === "sealed") return "private";
+  if (f.kind === "invalid") return "invalid";
+  return f.job === jobId.toLowerCase() && f.approve === approved ? "public" : "invalid";
+}
+
+/**
  * Whether a verify answer is kept for the epoch: a valid proof, or RepVerifier's genuine rejection (both final for
  * these exact inputs). Never a refusal of the inputs (UnknownRoot can heal as a lagging node catches up with the
  * tree; NotCanonical and BadThresholds are cheap to ask again) nor an answer without a verdict (unverifiable).
@@ -313,6 +434,8 @@ export class PadIndexer {
   readonly #statePath: string;
   readonly #log: (event: string, fields?: Record<string, unknown>) => void;
   readonly #readFile: (uri: string) => Promise<unknown>;
+  /** A file's bytes by its ipfs:// URI (checked against a raw CID), at most `maxBytes`; null when none could be read. */
+  readonly #readBytes: ((uri: string, maxBytes: number) => Promise<Uint8Array | null>) | null;
   readonly #pad: Address;
   readonly #hidden: () => ReadonlySet<string> | null;
   readonly #moderate: Moderator | null;
@@ -321,6 +444,10 @@ export class PadIndexer {
   readonly #moderationRetry = new Map<string, number>();
   /** When a running job's unread description is read again (milliseconds), by job. */
   readonly #descriptionRetryAt = new Map<string, number>();
+  /** A reason file not readable yet: when it is read again (milliseconds) and the wait after that, by digest. */
+  readonly #reasonRetry = new Map<Hex, { at: number; wait: number }>();
+  /** Whether a job is private (pad-private.ts): its reason file is sealed and never read here. */
+  #isPrivate: (jobId: Hex) => boolean = () => false;
   /** Calls to the moderator: by agent (with the content and its calls with no answer), and all of them (milliseconds). */
   readonly #moderationCalls = new Map<string, { key: Hex; misses: number[]; at: number[] }>();
   #moderationAll: number[] = [];
@@ -337,6 +464,7 @@ export class PadIndexer {
   /** Verdicts of OstraReputation.verify for the epoch (cacheableVerdict: valid, or RepVerifier's rejection), by proof, inputs, challenge and recipient. */
   #verdicts = new Map<string, { epoch: string; valid: boolean; reverted: string | null }>();
   #timer: ReturnType<typeof setTimeout> | null = null;
+  #reasonTimer: ReturnType<typeof setTimeout> | null = null;
   #running = false;
   /** The logs RPC's head as last read, and when (milliseconds): whether the index is caught up. */
   #head: { block: bigint; atMs: number } | null = null;
@@ -353,6 +481,8 @@ export class PadIndexer {
     statePath: string;
     log: (event: string, fields?: Record<string, unknown>) => void;
     readFile: (uri: string) => Promise<unknown>;
+    /** Reason files are read as bytes with it (a sealed one is told from one that cannot be read); readFile without it. */
+    readBytes?: (uri: string, maxBytes: number) => Promise<Uint8Array | null>;
     pad?: Address;
     hidden?: () => ReadonlySet<string> | null;
     moderate?: Moderator | null;
@@ -365,16 +495,20 @@ export class PadIndexer {
     this.#statePath = o.statePath;
     this.#log = o.log;
     this.#readFile = o.readFile;
+    this.#readBytes = o.readBytes ?? null;
     this.#pad = getAddress(o.pad ?? OSTRAPAD);
     this.#hidden = o.hidden ?? (() => null);
     this.#moderate = o.moderate ?? null;
     this.#nowMs = o.nowMs ?? Date.now;
     const d = o.deployment();
-    const fresh: PadIndexState = { version: 3, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {} };
+    const fresh: PadIndexState = { version: 4, chainId: d.chainId, pad: this.#pad, scannedTo: (OSTRAPAD_FROM_BLOCK - 1n).toString(), vaultsScannedTo: (BigInt(d.fromBlock) - 1n).toString(), agents: {}, jobs: {}, reasonFiles: {} };
     if (existsSync(this.#statePath)) {
       const saved = JSON.parse(readFileSync(this.#statePath, "utf8")) as { version: number; chainId: number; pad: Address } & Omit<PadIndexState, "version">;
       const same = saved.chainId === d.chainId && getAddress(saved.pad) === this.#pad;
-      if (same && saved.version === 3) this.#state = saved as PadIndexState;
+      if (same && saved.version === 4) this.#state = saved as PadIndexState;
+      // Version 3 kept no decision's reason and no appeal's vote or outcome: its jobs' events are read again from
+      // OstraPad's first block, once (its jobs and agents stay; reading an event again gives the same state).
+      else if (same && saved.version === 3) this.#state = { ...(saved as Omit<PadIndexState, "version" | "reasonFiles">), version: 4, scannedTo: fresh.scannedTo, reasonFiles: {} };
       // Version 2 kept no job times: its jobs are read again from OstraPad's first block (its agents stay).
       else if (same && saved.version === 2) this.#state = { ...fresh, vaultsScannedTo: saved.vaultsScannedTo, agents: Object.fromEntries(Object.entries(saved.agents).map(([k, a]) => [k, { ...a, providerCreated: null }])) };
       else this.#state = fresh;
@@ -466,6 +600,72 @@ export class PadIndexer {
     changed = (await this.#moderateDue()) || changed;
     changed = (await this.#readDescriptionsAgain()) || changed;
     if (changed) this.#save();
+  }
+
+  /** Tells the index which jobs are private (pad-private.ts, made after it): their reasons are never read. */
+  setPrivate(isPrivate: (jobId: Hex) => boolean): void {
+    this.#isPrivate = isPrivate;
+  }
+
+  /** Whether pad-private.ts knows the job as private (its record unreadable: not known as private). */
+  #knownPrivate(id: Hex): boolean {
+    try {
+      return this.#isPrivate(id);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * One pass over the reason files the decisions name and the index has not kept yet (start() runs it on its own timer,
+   * off the scan): the newest decisions first, REASONS_PER_PASS at most, none started after REASONS_PASS_MS. Each file
+   * read is kept by digest as what it is (reasonFromBytes); one not readable now is read again later, further apart
+   * each time. Saves the state when a file was kept; true then.
+   */
+  async readReasons(): Promise<boolean> {
+    const now = this.#nowMs();
+    const due = new Map<Hex, { job: Hex; at: number }>();
+    for (const j of Object.values(this.#state.jobs)) {
+      for (const d of j.decisions ?? []) {
+        const digest = d.reason ?? null;
+        if (digest === null || this.#state.reasonFiles[digest] !== undefined) continue;
+        if ((this.#reasonRetry.get(digest)?.at ?? 0) > now) continue;
+        if ((due.get(digest)?.at ?? -1) >= d.at) continue;
+        // Asked only of a job with a reason left to read (pad-private.ts reads its record from disk).
+        if (this.#knownPrivate(j.id)) break;
+        due.set(digest, { job: j.id, at: d.at });
+      }
+    }
+    const list = [...due].sort((x, y) => y[1].at - x[1].at).slice(0, REASONS_PER_PASS);
+    let changed = false;
+    for (const [digest, { job }] of list) {
+      if (this.#nowMs() - now > REASONS_PASS_MS) break;
+      let got: PadReasonFile | null = null;
+      try {
+        const uri = padCidFromDigest(digest);
+        if (this.#readBytes !== null) {
+          const bytes = await this.#readBytes(uri, REASON_MAX_BYTES);
+          got = bytes === null ? null : reasonFromBytes(bytes);
+        } else {
+          const file = await this.#readFile(uri);
+          got = file === null ? null : reasonFromFile(file);
+        }
+      } catch {
+        got = null;
+      }
+      if (got === null) {
+        const wait = Math.min(REASON_RETRY_MAX_MS, (this.#reasonRetry.get(digest)?.wait ?? RETRY_REASON_MS / 2) * 2);
+        this.#reasonRetry.set(digest, { at: this.#nowMs() + wait, wait });
+        this.#log("pad_reason_unread", { jobId: job, digest, retryInMs: wait });
+        continue;
+      }
+      this.#reasonRetry.delete(digest);
+      this.#state.reasonFiles[digest] = got;
+      this.#log("pad_reason_read", { jobId: job, digest, kind: got.kind });
+      changed = true;
+    }
+    if (changed) this.#save();
+    return changed;
   }
 
   /** An approved listing with offers (before the content rules). */
@@ -563,7 +763,7 @@ export class PadIndexer {
 
   async #scanJobs(from: bigint, to: bigint): Promise<boolean> {
     let changed = false;
-    const get = (event: (typeof PAD_EVENTS)[keyof typeof PAD_EVENTS]) => this.#logs.getLogs({ address: this.#pad, event: event as never, fromBlock: from, toBlock: to }) as Promise<{ args: Record<string, unknown>; blockNumber: bigint; logIndex: number; transactionHash: Hex }[]>;
+    const get = (event: (typeof PAD_EVENTS)[keyof typeof PAD_EVENTS] | typeof votedEvent | typeof appealLapsedEvent) => this.#logs.getLogs({ address: this.#pad, event: event as never, fromBlock: from, toBlock: to }) as Promise<{ args: Record<string, unknown>; blockNumber: bigint; logIndex: number; transactionHash: Hex }[]>;
     const times = new Map<bigint, number>();
     const time = async (b: bigint) => {
       let t = times.get(b);
@@ -574,7 +774,7 @@ export class PadIndexer {
       }
       return t;
     };
-    const [created, funded, accepted, submitted, decided, completed, rejected, expired, cancelled, paid, refunded, drawn, appealed, panels] = await Promise.all([
+    const [created, funded, accepted, submitted, decided, completed, rejected, expired, cancelled, paid, refunded, drawn, appealed, panels, voted, resolved, lapsed] = await Promise.all([
       get(PAD_EVENTS.JobCreated),
       get(PAD_EVENTS.JobFunded),
       get(PAD_EVENTS.JobAccepted),
@@ -589,6 +789,9 @@ export class PadIndexer {
       get(PAD_EVENTS.EvaluatorDrawn),
       get(PAD_EVENTS.AppealOpened),
       get(PAD_EVENTS.PanelDrawn),
+      get(votedEvent),
+      get(PAD_EVENTS.AppealResolved),
+      get(appealLapsedEvent),
     ]);
     for (const l of created) {
       const a = l.args as { jobId: Hex; client: Address; provider: Address; evaluator: Address };
@@ -604,7 +807,7 @@ export class PadIndexer {
       } catch (err) {
         this.#log("pad_terms_unread", { jobId: a.jobId, reason: (err as Error).message.slice(0, 200) });
       }
-      this.#state.jobs[a.jobId] = { id: a.jobId, client: getAddress(a.client), provider: getAddress(a.provider), evaluator: pool ? null : getAddress(a.evaluator), pool, funded: "0", status: "Open", createdAt: t, createdBlock: l.blockNumber.toString(), updatedAt: t, paid: null, refunded: null, acceptedAt: null, submittedAt: null, closedAt: null, description, createdTx: l.transactionHash, deliverable: null, reasons: [], draws: [], decisions: [], appellant: null, panel: null };
+      this.#state.jobs[a.jobId] = { id: a.jobId, client: getAddress(a.client), provider: getAddress(a.provider), evaluator: pool ? null : getAddress(a.evaluator), pool, funded: "0", status: "Open", createdAt: t, createdBlock: l.blockNumber.toString(), updatedAt: t, paid: null, refunded: null, acceptedAt: null, submittedAt: null, closedAt: null, description, createdTx: l.transactionHash, deliverable: null, reasons: [], draws: [], decisions: [], appellant: null, panel: null, votes: [], appealOutcome: null };
       changed = true;
     }
     // Later events of a window, in log order, move a job's status along (a window holds whole blocks).
@@ -622,6 +825,9 @@ export class PadIndexer {
       ...drawn.map((l) => ({ kind: "drawn", l })),
       ...appealed.map((l) => ({ kind: "Appealed", l })),
       ...panels.map((l) => ({ kind: "panel", l })),
+      ...voted.map((l) => ({ kind: "voted", l })),
+      ...resolved.map((l) => ({ kind: "resolved", l })),
+      ...lapsed.map((l) => ({ kind: "lapsed", l })),
     ].sort((x, y) => (x.l.blockNumber === y.l.blockNumber ? x.l.logIndex - y.l.logIndex : x.l.blockNumber < y.l.blockNumber ? -1 : 1));
     for (const { kind, l } of events) {
       const id = l.args.jobId as Hex;
@@ -638,7 +844,12 @@ export class PadIndexer {
         if (j.draws !== undefined && !j.draws.some((d) => d.block === draw.block && d.round === draw.round)) j.draws.push(draw);
       } else if (kind === "panel") {
         if (j.panel !== undefined) j.panel = { members: (l.args.panel as Address[]).map((m) => getAddress(m)), at, block: l.blockNumber.toString() };
-      }
+      } else if (kind === "voted") {
+        const v = { member: getAddress(l.args.member as Address), agree: l.args.agree as boolean, block: l.blockNumber.toString() };
+        j.votes ??= [];
+        if (!j.votes.some((x) => x.block === v.block && x.member === v.member)) j.votes.push(v);
+      } else if (kind === "resolved") j.appealOutcome = { result: (l.args.overturned as boolean) ? "overturned" : "upheld", at };
+      else if (kind === "lapsed") j.appealOutcome = { result: "lapsed", at };
       // A cancel emits JobRejected too: Cancelled stands.
       else if (!(kind === "Rejected" && j.status === "Cancelled")) {
         j.status = kind;
@@ -647,12 +858,17 @@ export class PadIndexer {
           j.submittedAt = at;
           if (j.deliverable !== undefined) j.deliverable = (l.args.deliverable as Hex).toLowerCase() as Hex;
         } else if (kind === "Decided" && j.decisions !== undefined) {
-          const d = { evaluator: getAddress(l.args.evaluator as Address), approved: l.args.approved as boolean, at, block: l.blockNumber.toString() };
-          if (!j.decisions.some((x) => x.block === d.block && x.evaluator === d.evaluator)) j.decisions.push(d);
+          const named = l.args.reason as Hex;
+          const d = { evaluator: getAddress(l.args.evaluator as Address), approved: l.args.approved as boolean, at, block: l.blockNumber.toString(), reason: BigInt(named) === 0n ? null : (named.toLowerCase() as Hex) };
+          const seen = j.decisions.find((x) => x.block === d.block && x.evaluator === d.evaluator);
+          // A decision read before reasons were kept takes its reason when its event is read again.
+          if (seen === undefined) j.decisions.push(d);
+          else if (seen.reason === undefined) seen.reason = d.reason;
         } else if (kind === "Appealed" && j.appellant !== undefined) j.appellant = getAddress(l.args.appellant as Address);
         const reason = l.args.reason as Hex | undefined;
         if (reason !== undefined && BigInt(reason) !== 0n && j.reasons !== undefined && !j.reasons.includes(reason.toLowerCase() as Hex)) j.reasons.push(reason.toLowerCase() as Hex);
-        else if (kind === "Completed" || kind === "Rejected" || kind === "Expired" || kind === "Cancelled") j.closedAt = at;
+        // Every job that ends has its end time, whatever reason its event names (a lapsed reveal's rejection names one).
+        if (kind === "Completed" || kind === "Rejected" || kind === "Expired" || kind === "Cancelled") j.closedAt = at;
       }
       changed = true;
     }
@@ -664,6 +880,9 @@ export class PadIndexer {
       const cutoff = Math.floor(this.#nowMs() / 1000) - KEEP_ENDED_S;
       const over = ids.filter((id) => { const c = this.#state.jobs[id]?.closedAt ?? null; return c !== null && c < cutoff; }).sort((x, y) => (this.#state.jobs[x]?.closedAt ?? 0) - (this.#state.jobs[y]?.closedAt ?? 0));
       for (const id of over.slice(0, ids.length - MAX_JOBS)) delete this.#state.jobs[id];
+      // The reason files no kept job's decision names go with them.
+      const named = new Set(Object.values(this.#state.jobs).flatMap((j) => (j.decisions ?? []).map((d) => d.reason ?? null)));
+      for (const digest of Object.keys(this.#state.reasonFiles) as Hex[]) if (!named.has(digest)) delete this.#state.reasonFiles[digest];
     }
     return changed;
   }
@@ -834,7 +1053,10 @@ export class PadIndexer {
     return Number(block.timestamp);
   }
 
-  /** Runs sync every `everyMs` until stop(); a failed pass is logged and the next one tried. */
+  /**
+   * Runs sync every `everyMs` until stop(), and readReasons on its own timer as often (a slow file never holds the scan
+   * back); a failed pass is logged and the next one tried.
+   */
   start(everyMs: number): void {
     this.#running = true;
     const tick = async () => {
@@ -845,12 +1067,22 @@ export class PadIndexer {
       }
       if (this.#running) this.#timer = setTimeout(() => void tick(), everyMs);
     };
+    const reasons = async () => {
+      try {
+        await this.readReasons();
+      } catch (err) {
+        this.#log("pad_reasons_failed", { reason: (err as Error).message.slice(0, 300) });
+      }
+      if (this.#running) this.#reasonTimer = setTimeout(() => void reasons(), everyMs);
+    };
     void tick();
+    this.#reasonTimer = setTimeout(() => void reasons(), everyMs);
   }
 
   stop(): void {
     this.#running = false;
     if (this.#timer !== null) clearTimeout(this.#timer);
+    if (this.#reasonTimer !== null) clearTimeout(this.#reasonTimer);
   }
 
   /** A job as this index holds it (private jobs' fields included), or undefined. */
@@ -950,6 +1182,7 @@ export class PadIndexer {
       completed: completed.length,
       rejected,
       expired,
+      appealed: mine.filter((j) => j.appellant !== undefined && j.appellant !== null).length,
       inProgress: mine.filter((j) => j.acceptedAt !== null && j.closedAt === null).length,
       clients: new Set(completed.map((j) => j.client)).size,
       earned: usd(completed.reduce((s, j) => s + units(j.paid), 0n)),
@@ -964,7 +1197,7 @@ export class PadIndexer {
   }
 
   static #boardJob(j: PadJobRow, byProvider: Map<Address, PadAgent>): PadBoardJob {
-    const { createdBlock: _b, updatedAt: _u, evaluator, ...rest } = j;
+    const { createdBlock: _b, updatedAt: _u, evaluator, votes: _v, decisions: _d, draws: _w, panel: _p, ...rest } = j;
     const a = byProvider.get(j.provider);
     return { ...rest, judgedBy: j.pool ? "pool" : evaluator === j.client ? "client" : "fixed", agentId: a?.agentId ?? null, agentName: a?.name ?? null };
   }
@@ -1026,6 +1259,44 @@ export class PadIndexer {
       jobs: mine.slice(0, 50).map((j) => PadIndexer.#boardJob(j, byProvider)),
       clientsOf: [...clients.values()].sort((x, y) => y.orders - x.orders || (x.client < y.client ? -1 : 1)),
     };
+  }
+
+  /**
+   * One job of the board with how it was judged (PadBoardJobView): undefined when the board does not show it, null
+   * without the hidden list.
+   */
+  boardJob(jobId: string): PadBoardJobView | undefined | null {
+    const b = this.#board();
+    if (b === null) return null;
+    const id = jobId.toLowerCase();
+    const j = b.jobs.find((x) => x.id.toLowerCase() === id);
+    if (j === undefined) return undefined;
+    const byProvider = new Map(b.agents.map((x) => [x.provider as Address, x]));
+    const known = this.#knownPrivate(j.id);
+    const decisions = (j.decisions ?? []).map((d) => {
+      const by: "pool" | "client" | "fixed" = j.pool ? "pool" : d.evaluator === j.client ? "client" : "fixed";
+      const digest = d.reason ?? null;
+      const f = digest === null ? undefined : this.#state.reasonFiles[digest];
+      const state = known ? "private" : reasonState(f, digest, j.id, d.approved);
+      return { approved: d.approved, at: d.at, by, reason: state === "public" && f?.kind === "public" ? f.reason : null, reasonState: state };
+    });
+    const isPrivate = known ? true : decisions.some((d) => d.reasonState === "public") ? false : null;
+    const last = j.decisions?.at(-1);
+    const appealBy = j.pool && j.status === "Decided" && last !== undefined ? last.at + Number(PAD.APPEAL_WINDOW) : null;
+    const appellant = j.appellant ?? null;
+    const votes = j.votes ?? [];
+    const appeal =
+      appellant === null
+        ? null
+        : {
+            by: appellant === j.client ? ("client" as const) : ("provider" as const),
+            panelDrawn: j.panel !== undefined && j.panel !== null,
+            voteBy: j.panel !== undefined && j.panel !== null ? j.panel.at + Number(PAD.VOTE_WINDOW) : null,
+            votes: { agree: votes.filter((v) => v.agree).length, disagree: votes.filter((v) => !v.agree).length },
+            outcome: j.appealOutcome?.result ?? null,
+            at: j.appealOutcome?.at ?? null,
+          };
+    return { ...PadIndexer.#boardJob(j, byProvider), private: isPrivate, final: FINAL_STATUSES.has(j.status), judging: { decisions, appealBy, appeal } };
   }
 
   /** The board's recent jobs, newest first; null without the hidden list. */
