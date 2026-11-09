@@ -65,6 +65,8 @@ Keep the file and the passphrase off the machine. On a new machine, run `npx -y 
 
 Every spend is simulated before its one-time key signs it. When a tool refuses, the error says whether it refused before anything was signed.
 
+The version 5 tools (the policy, the allowlists, the agent key, standing orders and Priors) run on vault v5, whose upgrade went through the same 72-hour timelock and has executed ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0xc3d758f6ab4e6c7823b8d7a9f1f5590037c0acfc11bf6a3b091c13ed5cc671cd)).
+
 The venue tools and the treasury run on vault v4, whose upgrade went through the same 72-hour timelock and has executed ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0x7d5770707ec47b1706fe69f9588d1ca93c50f925dd2802db04051c9c468780a0)).
 
 The withdrawal lock, Borro, strategy, OstraBreaker and Raeto tools need vault v3, which every vault runs: its upgrade waited on-chain behind the same 72-hour timelock ([the scheduling transaction](https://robinhoodchain.blockscout.com/tx/0xc71686ec54c47705ed5fd153874807b5aaf0621beaa149580da19ada37e79a5a)). Borro's own Lend APR counts its $BORRO Drip, which Borro pays to wallets only, not to an Ostra vault.
