@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -303,6 +303,10 @@ test("the remote gateway's OAuth: connect proved by the owner's key, sessions, a
   assert.equal(existsSync(`/proc/${pid}/root${join(root, "home-id.key")}`), false, "nor the homes' key");
   assert.equal(existsSync(`/proc/${pid}/root${join(root, homeDir, "mcp.log")}`), false, "nor its own log (the gateway writes it)");
   assert.equal(existsSync(`/proc/${pid}/root${ownerHome}`), false, "nor anything else of the host");
+  // A system file that is a link (here /etc/localtime; /etc/resolv.conf under systemd-resolved) is seen at its own path.
+  for (const f of ["/etc/localtime", "/etc/resolv.conf"]) if (existsSync(f)) assert.ok(existsSync(`/proc/${pid}/root${f}`), `it sees ${f}`);
+  if (existsSync("/etc/localtime")) assert.ok(lstatSync("/etc/localtime").isSymbolicLink(), "the test needs /etc/localtime to be a link");
+  assert.match(readFileSync(`/proc/${pid}/status`, "utf8"), /^CapEff:\s+0+$/m, "it has no capabilities, whoever runs the gateway");
 
   const names = (await a.listTools()).tools.map((t) => t.name);
   assert.ok(names.includes("withdraw") && names.includes("policy_set"));

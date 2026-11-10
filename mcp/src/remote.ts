@@ -201,13 +201,22 @@ async function main(): Promise<void> {
   /** The home id of an OAuth grant's vault. */
   const vaultUserId = (vault: Address) => `v${createHmac("sha256", hidKey).update(getAddress(vault)).digest("hex").slice(0, 40)}`;
 
-  /** What a sandbox sees read only besides its home: the system's, the node binary's prefix, the code, the files named in the environment. */
+  /**
+   * What a sandbox sees read only besides its home: the system's, the node binary's prefix, the code, the files named in
+   * the environment, at their real paths. A path named that is a link (/etc/resolv.conf, which systemd-resolved makes a
+   * link into /run) is also seen at its own path as what it points to (sandboxLinks), unless a folder bound above it
+   * shows the link itself already.
+   */
   const sandboxRo: string[] = [];
+  const sandboxLinks: string[] = [];
   if (sandbox) {
     const probe = spawnSync("bwrap", ["--version"], { encoding: "utf8" });
     if (probe.status !== 0) throw new Error("OSTRA_REMOTE_SANDBOX=bwrap needs bubblewrap (bwrap) on PATH");
     const add = (p: string) => {
-      if (existsSync(p)) sandboxRo.push(realpathSync(p));
+      if (!existsSync(p)) return;
+      const real = realpathSync(p);
+      sandboxRo.push(real);
+      if (p !== real) sandboxLinks.push(p);
     };
     for (const p of SYSTEM_RO) add(p);
     add(dirname(dirname(realpathSync(process.execPath))));
@@ -221,11 +230,12 @@ async function main(): Promise<void> {
     for (const p of (process.env.OSTRA_REMOTE_SANDBOX_RO ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "")) add(p);
     // Never the homes: no path read only may be, hold, or lie in the root.
     const r = realpathSync(root);
-    for (const p of sandboxRo) if (p === r || p.startsWith(`${r}/`) || r.startsWith(p === "/" ? "/" : `${p}/`)) throw new Error(`the sandbox would see ${p}, which is, holds or lies in ${root} (the homes): move it, or the homes`);
+    for (const p of [...sandboxRo, ...sandboxLinks]) if (p === r || p.startsWith(`${r}/`) || r.startsWith(p === "/" ? "/" : `${p}/`)) throw new Error(`the sandbox would see ${p}, which is, holds or lies in ${root} (the homes): move it, or the homes`);
   }
   /** A sandbox's arguments: the home's home/ and pad-files/ read and write, nothing else of <root> (its log stays outside). */
   const sandboxArgs = (dir: string): string[] => {
-    const a: string[] = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
+    // No capabilities inside, whoever runs the gateway (bwrap started by root otherwise keeps all of root's).
+    const a: string[] = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
     // /bin, /lib, /lib64 and /sbin as the system has them: links into /usr, or directories.
     for (const top of ["/bin", "/sbin", "/lib", "/lib64", "/lib32"]) {
       if (!existsSync(top)) continue;
@@ -235,6 +245,13 @@ async function main(): Promise<void> {
     const seen = new Set<string>();
     for (const p of sandboxRo) {
       if (seen.has(p)) continue;
+      seen.add(p);
+      a.push("--ro-bind", p, p);
+    }
+    // bwrap mounts what a link points to at the link's path; never inside a folder bound already (there the link is
+    // seen as it is, and its target at its real path).
+    for (const p of sandboxLinks) {
+      if (seen.has(p) || sandboxRo.some((d) => p.startsWith(d === "/" ? "/" : `${d}/`))) continue;
       seen.add(p);
       a.push("--ro-bind", p, p);
     }

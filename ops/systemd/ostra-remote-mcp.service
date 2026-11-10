@@ -1,0 +1,36 @@
+# Ostra's remote MCP gateway (mcp/src/remote.ts): the agent's MCP server over Streamable HTTP for Claude's custom
+# connectors, at https://mcp.ostraagent.xyz behind nginx (ops/nginx/ostra-robinhood.conf). Installed with @NODE@
+# replaced by the path of node.
+#
+# It runs as its own user, ostra-mcp (a system user with no login), never root: each session's server is started in
+# a bubblewrap sandbox, and bwrap started by an unprivileged user sandboxes it in a user namespace with no privilege
+# at all (remote.ts also drops every capability inside). ostra-mcp reads the code (it needs to pass through
+# /srv/apps/ostra-robinhood, which is root's 0700: an ACL lets it through, no more) and the deployment records; it
+# writes only its state directory: the homes (each user's agent seed), the OAuth database and the homes' id key.
+[Unit]
+Description=Ostra remote MCP gateway: the agent's MCP server for Claude's custom connectors
+After=network-online.target
+Wants=network-online.target
+# A gateway that fails at once five times in five minutes stays down (systemctl status says why) instead of looping.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ostra-mcp
+Group=ostra-mcp
+WorkingDirectory=/srv/apps/ostra-robinhood/mcp
+EnvironmentFile=/etc/ostra/robinhood/remote-mcp.env
+ExecStart=@NODE@ src/remote.ts
+Restart=always
+RestartSec=5
+StateDirectory=ostra-remote-mcp
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

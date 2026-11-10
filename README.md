@@ -448,6 +448,11 @@ upgrade is signed by its rotating WOTS key and waits 72 hours in public.
   published ranges, nginx serves only connections from them (any other is closed), takes the client
   address from CF-Connecting-IP on those alone and passes it to the relayer and the RPC proxy for
   their rates, and serves TLS with a Cloudflare origin certificate whose key was made on the VPS.
+- The remote MCP gateway (`mcp/src/remote.ts`) serves the agent's MCP server to Claude's custom
+  connectors at mcp.ostraagent.xyz, in the same nginx file: `ops/systemd/ostra-remote-mcp.service`
+  runs it as its own user (ostra-mcp, not root) with `ops/systemd/ostra-remote-mcp.env`, each
+  session's server in a bubblewrap sandbox with no capability, its homes in
+  `/var/lib/ostra-remote-mcp`.
 
 ## Security
 
