@@ -31,6 +31,8 @@ import { AGENT_ACTION_NAMES, ALLOW_KIND_NAMES, VENUES } from "@ostraagent/core";
 import { getLogsChunked, readV5, readVault, type Deployment } from "@ostraagent/sdk";
 
 const REQUEST_SECONDS = 600;
+/** A request the page keeps waiting (the owner adding USDG to the vault) lives at most this long from /authorize. */
+const REQUEST_MAX_SECONDS = 7_200;
 const CODE_SECONDS = 60;
 const ACCESS_SECONDS = 3_600;
 const REFRESH_SECONDS = 30 * 86_400;
@@ -358,6 +360,7 @@ export class RemoteAuth {
       else if (path === "/connect/agent-key" && req.method === "POST") await this.#connectAgentKey(req, res);
       else if (path === "/connect/complete" && req.method === "POST") await this.#connectComplete(req, res);
       else if (path === "/connect/cancel" && req.method === "POST") await this.#connectCancel(req, res);
+      else if (path === "/connect/extend" && req.method === "POST") await this.#connectExtend(req, res);
       else if (path === "/approve/request" && req.method === "GET") this.#approvalInfo(res, url);
       else if (path === "/approve/done" && req.method === "POST") await this.#approvalDone(req, res);
       else return false;
@@ -433,6 +436,17 @@ export class RemoteAuth {
     return `${this.#secureCookie ? "__Host-" : ""}ostra-connect-${request}`;
   }
 
+  /** The binding cookie of request `id`, for `seconds` more (0: gone): it lives as long as its request. */
+  #cookie(id: string, binding: string, seconds: number): string {
+    return `${this.#cookieName(id)}=${binding}; Path=/; Max-Age=${Math.max(0, seconds)}; HttpOnly; SameSite=Lax${this.#secureCookie ? "; Secure" : ""}`;
+  }
+
+  /** The cookie of the request `req` carries, its life set to `seconds` more. */
+  #cookieAgain(req: IncomingMessage, id: string, seconds: number): Record<string, string> {
+    const binding = cookies(req).get(this.#cookieName(id));
+    return binding === undefined ? {} : { "set-cookie": this.#cookie(id, binding, seconds) };
+  }
+
   #authorize(res: ServerResponse, url: URL): void {
     const q = url.searchParams;
     const client = this.#client(q.get("client_id"));
@@ -461,8 +475,7 @@ export class RemoteAuth {
     this.#db
       .prepare("INSERT INTO requests (id, client_id, redirect_uri, code_challenge, resource, state, binding, created, expires, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')")
       .run(id, client.id, redirect, challenge, resource, state, sha(binding), now(), now() + REQUEST_SECONDS);
-    const cookie = `${this.#cookieName(id)}=${binding}; Path=/; Max-Age=${REQUEST_SECONDS}; HttpOnly; SameSite=Lax${this.#secureCookie ? "; Secure" : ""}`;
-    res.writeHead(302, { location: `${this.#o.appUrl}/connect?request=${id}`, "set-cookie": cookie, ...SECURITY_HEADERS });
+    res.writeHead(302, { location: `${this.#o.appUrl}/connect?request=${id}`, "set-cookie": this.#cookie(id, binding, REQUEST_SECONDS), ...SECURITY_HEADERS });
     res.end();
   }
 
@@ -614,13 +627,15 @@ export class RemoteAuth {
       this.#db.prepare("UPDATE requests SET status = 'failed' WHERE id = ? AND status = 'issuing'").run(r.id);
       throw err;
     }
-    // The owner has REQUEST_SECONDS from now to sign it (a cancel meanwhile stands: the root is not given).
+    // The owner has REQUEST_SECONDS from now to sign it, within REQUEST_MAX_SECONDS from /authorize (a cancel
+    // meanwhile stands: the root is not given).
     const issued = this.#db
-      .prepare("UPDATE requests SET status = 'issued', root = ?, from_block = ?, expires = ? WHERE id = ? AND status = 'issuing'")
-      .run(key.root.toLowerCase(), fromBlock.toString(), now() + REQUEST_SECONDS, r.id);
+      .prepare("UPDATE requests SET status = 'issued', root = ?, from_block = ?, expires = MAX(expires, ?) WHERE id = ? AND status = 'issuing'")
+      .run(key.root.toLowerCase(), fromBlock.toString(), Math.min(now() + REQUEST_SECONDS, r.created + REQUEST_MAX_SECONDS), r.id);
     if (issued.changes !== 1) throw new HttpError(409, "conflict", "this connection request was cancelled");
     this.#o.log("connect_key_issued", { request: r.id, user: this.#o.homeId(vault), index: key.index });
-    json(res, 200, { root: key.root, vault, maxDays: 90 });
+    const life = this.#db.prepare("SELECT expires FROM requests WHERE id = ?").get(r.id) as { expires: number };
+    json(res, 200, { root: key.root, vault, maxDays: 90 }, this.#cookieAgain(req, r.id, life.expires - now()));
   }
 
   async #connectComplete(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -629,7 +644,7 @@ export class RemoteAuth {
     // Done, its code not redeemed yet: the same answer again to the browser it is bound to (its first answer was lost).
     if (r.status === "done" && r.redirect !== null) {
       const code = this.#db.prepare("SELECT 1 FROM codes WHERE request_id = ? AND grant_id IS NULL AND expires > ?").get(r.id, now());
-      if (code !== undefined) return json(res, 200, { redirect: r.redirect, again: true });
+      if (code !== undefined) return json(res, 200, { redirect: r.redirect, again: true }, this.#cookieAgain(req, r.id, CODE_SECONDS));
     }
     if (r.status !== "issued" || r.vault === null || r.root === null || r.from_block === null) throw new HttpError(409, "conflict", `this connection request is ${r.status}`);
     const vault = getAddress(r.vault);
@@ -679,7 +694,22 @@ export class RemoteAuth {
     to.searchParams.set("iss", this.#o.publicUrl);
     this.#db.prepare("UPDATE requests SET redirect = ? WHERE id = ?").run(to.toString(), r.id);
     this.#o.log("connect_done", { request: r.id, user: this.#o.homeId(vault), kept });
-    json(res, 200, { redirect: to.toString(), agentKeyFrom: v5 === null ? null : new Date(Number(v5.agentKey.from) * 1000).toISOString(), kept });
+    // The cookie lives on while the code does (the same answer again, if this one is lost).
+    json(res, 200, { redirect: to.toString(), agentKeyFrom: v5 === null ? null : new Date(Number(v5.agentKey.from) * 1000).toISOString(), kept }, this.#cookieAgain(req, r.id, CODE_SECONDS));
+  }
+
+  /**
+   * The page waits for the owner (USDG on its way to the vault): the request lives REQUEST_SECONDS more, never past
+   * REQUEST_MAX_SECONDS from /authorize.
+   */
+  async #connectExtend(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const b = await this.#jsonBody(req);
+    const r = this.#request(req, b.request);
+    if (r.status !== "open" && r.status !== "issued") throw new HttpError(409, "conflict", `this connection request is ${r.status}`);
+    const until = Math.min(now() + REQUEST_SECONDS, r.created + REQUEST_MAX_SECONDS);
+    this.#db.prepare("UPDATE requests SET expires = ? WHERE id = ? AND status IN ('open', 'issued') AND expires < ?").run(until, r.id, until);
+    const expires = Math.max(until, r.expires);
+    json(res, 200, { expiresAt: new Date(expires * 1000).toISOString() }, this.#cookieAgain(req, r.id, expires - now()));
   }
 
   async #connectCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -692,7 +722,7 @@ export class RemoteAuth {
     to.searchParams.set("error_description", "the vault's owner declined");
     if (r.state !== null) to.searchParams.set("state", r.state);
     to.searchParams.set("iss", this.#o.publicUrl);
-    json(res, 200, { redirect: to.toString() });
+    json(res, 200, { redirect: to.toString() }, this.#cookieAgain(req, r.id, 0));
   }
 
   // --- the web app's /approve page -----------------------------------------------------------------------------------

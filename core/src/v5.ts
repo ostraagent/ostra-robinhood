@@ -316,7 +316,8 @@ export class V5Service {
 
   async #logs(vault: Address, name: string): Promise<Log[]> {
     const from = await this.fromBlock();
-    const head = await this.#p.logsClient.getBlockNumber();
+    // The head now, never viem's cached one: a change this service just made must be among the logs read.
+    const head = await this.#p.logsClient.getBlockNumber({ cacheTime: 0 });
     return (await getLogsChunked(this.#p.logsClient, { address: vault, event: event(name), fromBlock: from, toBlock: head })) as unknown as Log[];
   }
 

@@ -263,7 +263,12 @@ test("the remote gateway's OAuth: connect proved by the owner's key, sessions, a
   assert.equal((await fetch(`${url}/connect/agent-key`, { method: "POST", headers: { origin: APP, "content-type": "application/json" }, body: JSON.stringify({ request: c0.request, vault }) })).status, 403);
   const info = (await (await c0.page(`/connect/request?id=${c0.request}`)).json()) as { client: string; redirectHost: string; status: string };
   assert.deepEqual([info.client, info.redirectHost, info.status], ["Claude", `127.0.0.1:${cbPort}`, "open"]);
+  // The page waits for USDG on its way: the request lives on, at most two hours from /authorize.
+  const ext = await c0.page("/connect/extend", { request: c0.request });
+  assert.equal(ext.status, 200);
+  assert.ok(new Date(((await ext.json()) as { expiresAt: string }).expiresAt).getTime() > Date.now() + 500_000);
   assert.match(((await (await c0.page("/connect/cancel", { request: c0.request })).json()) as { redirect: string }).redirect, /error=access_denied/);
+  assert.equal((await c0.page("/connect/extend", { request: c0.request })).status, 409, "a cancelled request is not kept");
 
   // The owner's policy and allowlist, as the page sets them before the first key.
   assert.equal((await owner.v5.setPolicy({ actions: ["transfer", "open_channel"], perTx: "5", daily: "20" })).status, "sent");
