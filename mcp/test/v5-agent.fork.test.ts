@@ -119,7 +119,8 @@ test("an owner and its agent: policy, allowlist, agent key, agent spends within 
   const d = await liveAtV5(fork, LIVE_DEPLOYMENT);
   const record = join(dir, "robinhood-v5.json");
   writeFileSync(record, `${JSON.stringify(d, null, 2)}\n`);
-  assert.equal(await vaultBeaconAtRecord(fork, d), "upgraded on the fork as scheduled");
+  // Version 5 went live on mainnet on 9 Nov 2026: a fork after that has it already.
+  assert.ok(["upgraded on the fork as scheduled", "on mainnet already"].includes(await vaultBeaconAtRecord(fork, d)));
   await checkDeployment(fork.client, d);
   const base = join(dir, "robinhood");
   const port = 30_000 + Math.floor(Math.random() * 20_000);

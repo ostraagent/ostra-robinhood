@@ -55,6 +55,10 @@
 //                         every spend is held to the vault's policy; it never
 //                         holds the owner's seed. Unset: the owner of its own
 //                         vault, as before
+//   OSTRA_FILES_ONLY_IN   a folder: tools that read a local file by its path (pad attachments, upload_image)
+//                         read only regular files inside it (the remote gateway sets each child's
+//                         OSTRA_PAD_FILES here, so that one user's session never reads another's files).
+//                         Unset: any path, as before
 //   OSTRA_SWAP_ANSWER_MS  how long ostra_swap and trading buy and sell wait
 //                         for their swap before answering "pending" while it
 //                         goes on (milliseconds, 1 to 600000; default 40000,
@@ -147,6 +151,8 @@ export type McpConfig = Config & {
   swapAnswerMs: number;
   /** The vault this server is the agent of (OSTRA_AGENT_OF), or null: it owns its own vault. */
   agentOf: Address | null;
+  /** The one folder local files may be read from (OSTRA_FILES_ONLY_IN), or null: any path. */
+  filesOnlyIn: string | null;
 };
 
 /** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
@@ -221,6 +227,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     privateLocalSpends: env.OSTRA_PRIVATE_LOCAL_SPENDS === "yes",
     swapAnswerMs: swapAnswerMs(env),
     agentOf: agentOf(env),
+    filesOnlyIn: env.OSTRA_FILES_ONLY_IN !== undefined && env.OSTRA_FILES_ONLY_IN !== "" ? env.OSTRA_FILES_ONLY_IN : null,
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,

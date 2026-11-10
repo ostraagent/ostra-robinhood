@@ -7,8 +7,8 @@
 // pair (ETH: WETH, which a vault holds).
 
 import { randomBytes } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { join, sep } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -139,6 +139,19 @@ export function registerTools(server: McpServer, agent: Agent): void {
     if (agent.privateBalance === null) throw new Error("Ostra Swap is not configured here (OSTRA_SWAP_DEPLOYMENT)");
     return agent.privateBalance;
   };
+  /** A local file a tool reads, by its path: under OSTRA_FILES_ONLY_IN (a remote gateway's child), only a regular file inside that folder. */
+  const localFile = async (p: string): Promise<string> => {
+    const only = agent.config.filesOnlyIn;
+    if (only === null) return p;
+    const root = await realpath(only);
+    const real = await realpath(p).catch(() => {
+      throw new RangeError(`${p}: no such file here`);
+    });
+    if (real !== root && !real.startsWith(`${root}${sep}`)) throw new RangeError(`${p}: only files under ${only} can be read here; nothing was signed`);
+    if (!(await stat(real)).isFile()) throw new RangeError(`${p} is not a file`);
+    return real;
+  };
+  const localFiles = async (paths: string[] | undefined): Promise<string[] | undefined> => (paths === undefined ? undefined : Promise.all(paths.map(localFile)));
   const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
   const rpcUrls = [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])];
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
@@ -997,7 +1010,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
     "Ostrapad as a client. order: orders an offer of agent agentId with input (and files): the listing is checked from the chain, the order file pinned to IPFS, the budget (plus the 1% evaluator fee for a pool offer) sent from the USDG vault to the job's box, and the job created; jobId carries on an order stopped part way. With private: true the order (input and attachments, local file paths) is encrypted so that only this agent, the provider, the job's evaluators and an appeal panel can read it (ML-KEM-768); a job judged by the evaluator pool takes text attachments only, binary work goes to an offer the client judges; the order may be at most 20 MB per USDG of budget; when one of the readers is Ostra's evaluator bot, the decrypted order and delivery go to the AI models that judge the job, through Raeto's API; everyone else sees that the job is private, its files' kinds and sizes and who received a key. cancel: an order no provider accepted yet (refunded in full), or a funded box whose job was never created. appeal: a pool decision against this agent, within 48 hours (2% fee, at least 0.25 USDG); for a private job keep the MCP running until the panel votes (it gives the panel its key).",
     { action: z.enum(["order", "cancel", "appeal"]), agentId: z.string().regex(/^\d{1,30}$/).optional(), offer: z.string().max(32).optional(), input: z.string().min(1).max(12_000).optional(), files, private: z.boolean().optional(), attachments: z.array(z.string().min(1).max(1_000)).max(64).optional().describe("local file paths, for a private order"), jobId: bytes32.optional() },
     async (a) => {
-      if (a.action === "order") return pad().order({ ...opt("agentId", a.agentId), ...opt("offer", a.offer), ...opt("input", a.input), ...opt("files", a.files), ...opt("private", a.private), ...opt("attachments", a.attachments), ...opt("jobId", a.jobId) });
+      if (a.action === "order") {
+        const attachments = await localFiles(a.attachments);
+        return pad().order({ ...opt("agentId", a.agentId), ...opt("offer", a.offer), ...opt("input", a.input), ...opt("files", a.files), ...opt("private", a.private), ...opt("attachments", attachments), ...opt("jobId", a.jobId) });
+      }
       if (a.jobId === undefined) throw new RangeError(`${a.action} needs jobId`);
       return a.action === "cancel" ? pad().cancel(a.jobId) : pad().appeal(a.jobId);
     },
@@ -1017,7 +1033,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
     "pad_deliver",
     "Delivers the work of an accepted Ostrapad job before it expires: the delivery file (output, files) is pinned to IPFS and its sha256 submitted for the evaluator. For a private job the delivery (output and attachments, local file paths) is encrypted with the job's key (a job judged by the evaluator pool takes text attachments only), and the MCP must keep running until the job is decided: it gives the drawn evaluator the key.",
     { jobId: bytes32, output: z.string().min(1).max(14_000), files, attachments: z.array(z.string().min(1).max(1_000)).max(64).optional().describe("local file paths, for a private job") },
-    (a) => pad().deliver({ jobId: a.jobId, output: a.output, ...opt("files", a.files), ...opt("attachments", a.attachments) }),
+    async (a) => {
+      const attachments = await localFiles(a.attachments);
+      return pad().deliver({ jobId: a.jobId, output: a.output, ...opt("files", a.files), ...opt("attachments", attachments) });
+    },
   );
   tool(
     "pad_evaluate",
@@ -1104,9 +1123,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
     `Pins an image file on this machine (PNG, JPEG, WebP or GIF, at most ${MAX_UPLOAD_IMAGE_BYTES} bytes) to IPFS through the Ostra uploader and returns its ipfs:// URI, for the files of an Ostrapad order or delivery.`,
     { path: z.string().min(1).max(4_096) },
     async (a) => {
-      const s = await stat(a.path);
+      const path = await localFile(a.path);
+      const s = await stat(path);
       if (!s.isFile() || s.size === 0 || s.size > MAX_UPLOAD_IMAGE_BYTES) throw new RangeError(`${a.path} must be a file of 1 to ${MAX_UPLOAD_IMAGE_BYTES} bytes`);
-      return { uri: await uploadImage(agent.config.relayerUrl, new Uint8Array(await readFile(a.path))) };
+      return { uri: await uploadImage(agent.config.relayerUrl, new Uint8Array(await readFile(path))) };
     },
   );
   tool(
