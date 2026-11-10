@@ -268,6 +268,15 @@ export class BorroService {
     const { vault, stock, decimals } = this.#vaultOf(what);
     const assets = amountText(amount, decimals, "amount");
     const target = stock === null ? BORRO_USDG_VAULT : stock.vault;
+    // A stock vault that holds the stock but was never created (it was sent to its address: an Ostra Swap buy, an
+    // unshield, a transfer) is created first, paid by the buyer vault.
+    if (stock !== null) {
+      const s = await vault.state();
+      if (!s.exists) {
+        if (s.balance < assets) throw new Error(`the ${stock.symbol} vault ${s.vault} holds ${formatUnitsAmount(s.balance, decimals)} ${stock.symbol}, less than ${amount}; nothing was signed`);
+        await vault.open();
+      }
+    }
     await this.#address(vault, stock === null ? "USDG" : stock.symbol);
     const preview = (await this.#p.client.readContract({ address: target, abi: vaultV2Abi, functionName: "previewDeposit", args: [assets] })) as bigint;
     const r = await this.#spend(vault, VAULT_ACTION.LEND, lendParams({ vault: target, assets, minShares: less(preview, BORRO_PREVIEW_SLIPPAGE_BPS) }), `Borro lend of ${amount} ${what.toUpperCase()}`, assets);
@@ -335,6 +344,18 @@ export class BorroService {
     const data = encodeFunctionData({ abi: ostraVaultAbi, functionName: "spend", args: [action, keccak256(toHex("OSTRA/STRATEGY/NEXT-ROOT")), params, standInSignature()] });
     const [l1, gasPrice] = await Promise.all([l1DataGas(this.#p.client, at, data), this.#p.gasPrice === undefined ? this.#p.client.getGasPrice() : this.#p.gasPrice()]);
     const gas = gasUsed + pricedFloorGas(action, params) + l1;
+    const ethUsd = await (this.#p.ethUsd ?? chainlinkEthUsd(this.#p.client))();
+    return { gas, usdg: weiToTokenUnits(withMargin(gas * gasPrice), ethUsd, TOKEN_DECIMALS) };
+  }
+
+  /**
+   * What creating `vault` costs now, priced as spendCostAt prices a spend (the gas a createVault is given, with its L1
+   * data): a token vault that holds its token but was never created is created by the spend that first uses it.
+   */
+  async creationCost(vault: VaultService): Promise<{ gas: bigint; usdg: bigint }> {
+    const call = await vault.createCall();
+    const [l1, gasPrice] = await Promise.all([l1DataGas(this.#p.client, call.to, call.data), this.#p.gasPrice === undefined ? this.#p.client.getGasPrice() : this.#p.gasPrice()]);
+    const gas = vault.createGas() + l1;
     const ethUsd = await (this.#p.ethUsd ?? chainlinkEthUsd(this.#p.client))();
     return { gas, usdg: weiToTokenUnits(withMargin(gas * gasPrice), ethUsd, TOKEN_DECIMALS) };
   }

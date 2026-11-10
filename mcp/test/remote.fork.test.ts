@@ -223,6 +223,8 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
     assert.ok("relayerChannels" in bal && !("policy" in bal), JSON.stringify(r2).slice(0, 300));
     assert.ok(typeof bal.creatorVault === "object" && bal.creatorVault !== null);
     assert.match(String(bal.keys), /remote MCP gateway/);
+    // The agent's token vaults holding tokens (0.1.22), read on the gateway too: none here.
+    assert.deepEqual(bal.tokenVaults, []);
     assert.ok(!("backupReminder" in (bal.vault as Record<string, unknown>)) && !("backupExported" in (bal.vault as Record<string, unknown>)));
     assert.ok(!JSON.stringify(r2).includes("backup export"));
   }

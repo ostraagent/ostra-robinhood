@@ -997,6 +997,27 @@ export class SwapService {
   }
 
   /**
+   * Every token the swaps kept here name (in or out: the open, split and finished records; no chain read), so the
+   * agent's vaults of tokens it bought are found again (balance lists those that hold some).
+   */
+  async recordTokens(): Promise<Address[]> {
+    const out = new Set<Address>();
+    for (const name of await this.#p.folder.list()) {
+      if ((!name.startsWith(ORDER_PREFIX) && !name.startsWith(SPLIT_PREFIX) && !name.startsWith(DONE_PREFIX)) || !name.endsWith(".json")) continue;
+      const text = await this.#p.folder.read(name);
+      if (text === undefined) continue;
+      let r: { tokenIn?: unknown; tokenOut?: unknown };
+      try {
+        r = JSON.parse(text) as { tokenIn?: unknown; tokenOut?: unknown };
+      } catch {
+        continue;
+      }
+      for (const t of [r.tokenIn, r.tokenOut]) if (typeof t === "string" && /^0x[0-9a-fA-F]{40}$/.test(t)) out.add(getAddress(t));
+    }
+    return [...out];
+  }
+
+  /**
    * The agent's orders kept here: those not finished (signed or about to be, or landed and being finished; oldest
    * first) and the finished ones (newest first, at most `limit`). With `order`, that order alone in either list.
    */

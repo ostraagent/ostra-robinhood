@@ -580,7 +580,7 @@ export class StrategyService {
 
   /**
    * What the agent's vaults hold for the strategies: USDG, cash vault shares, and per Borro stock its vault, what it
-   * holds (less the trading capital's tokens) and its position.
+   * holds (less the trading capital's tokens) and its position (null for a vault not created yet that holds none).
    */
   async holdings(): Promise<{
     buyer: Address;
@@ -607,10 +607,12 @@ export class StrategyService {
       try {
         const vault = getAddress(await this.#p.tokenVault(s.token).vaultAddress());
         const exists = (await readVault(this.#p.client, d, vault)) !== null;
-        const held = exists ? await tokenBalance(this.#p.client, s.token, vault) : 0n;
+        // A stock vault not created yet may hold the stock (sent to its address: an Ostra Swap buy, an unshield, a
+        // transfer): it counts, and the carry's first step (the lend) creates the vault.
+        const held = await tokenBalance(this.#p.client, s.token, vault);
         const capital = traded.get(getAddress(s.token)) ?? 0n;
         const balance = held > capital ? held - capital : 0n;
-        const position = exists ? await readBorroPosition(this.#p.client, vault, s) : null;
+        const position = exists || balance > 0n ? await readBorroPosition(this.#p.client, vault, s) : null;
         stocks.push({ stock: s, vault, exists, balance, position });
       } catch (e) {
         errors.push(`${s.symbol}: ${(e as Error).message.split("\n")[0]}`);
@@ -772,14 +774,16 @@ export class StrategyService {
       const marketClosed = await this.#nyseClosed(now);
       const buyerLocked = (await readVaultGuard(this.#p.client, h.buyer)).lockedSince !== 0n;
       for (const s of h.stocks) {
-        if (CARRY_OPEN_OF_LLTV_BPS[s.stock.symbol] === undefined || !s.exists || s.position === null) continue;
+        // A stock vault not created yet but holding the stock (holdings) has a position read at its address.
+        if (CARRY_OPEN_OF_LLTV_BPS[s.stock.symbol] === undefined || s.position === null) continue;
         const p = s.position;
         if (s.balance === 0n && p.shares === 0n && p.collateral === 0n) continue;
         if (!p.listed) {
           notes.push(`${s.stock.symbol} carry not opened: Borro no longer lists its market`);
           continue;
         }
-        const guard = await readVaultGuard(this.#p.client, s.vault);
+        // A vault not created yet is neither locked nor linked (it is created at the latest version by the lend).
+        const guard = s.exists ? await readVaultGuard(this.#p.client, s.vault) : { lockedSince: 0n, linkedVault: null };
         if (guard.lockedSince !== 0n && !buyerLocked) {
           notes.push(`${s.stock.symbol} carry not opened: the stock vault is locked and the USDG vault is not (lock the USDG vault first, vault_lock)`);
           continue;
@@ -808,8 +812,11 @@ export class StrategyService {
         const own: Step[] = [];
         let c = 0n;
         if (s.balance > 0n) {
-          const x = await this.#cost(s.stock.symbol, VAULT_ACTION.LEND, lendParams({ vault: s.stock.vault, assets: s.balance, minShares: 0n }), `the ${s.stock.symbol} lend`, false);
-          own.push({ kind: "lend_stock", what: s.stock.symbol, amount: s.balance.toString(), urgent: false, notBefore: t0, cost: x.toString(), reason: `lend the ${formatUnitsAmount(s.balance, 18)} ${s.stock.symbol} to Borro's ${s.stock.symbol} vault` });
+          // Not created yet: the lend creates the vault first (its price added), and its own gas is the one measured.
+          const create = s.exists ? 0n : (await this.#p.borro.creationCost(this.#p.tokenVault(s.stock.token))).usdg;
+          const x = create + (await this.#cost(s.stock.symbol, VAULT_ACTION.LEND, lendParams({ vault: s.stock.vault, assets: s.balance, minShares: 0n }), `the ${s.stock.symbol} lend`, !s.exists));
+          const reason = `lend the ${formatUnitsAmount(s.balance, 18)} ${s.stock.symbol} to Borro's ${s.stock.symbol} vault`;
+          own.push({ kind: "lend_stock", what: s.stock.symbol, amount: s.balance.toString(), urgent: false, notBefore: t0, cost: x.toString(), reason: s.exists ? reason : `${reason}, after creating the agent's ${s.stock.symbol} vault ${s.vault}, which holds it but was never created` });
           c += x;
         }
         if (s.balance > 0n || p.shares > 0n) {
@@ -818,7 +825,7 @@ export class StrategyService {
           c += x;
         }
         if (guard.linkedVault !== h.buyer) {
-          const x = await this.#cost(s.stock.symbol, VAULT_ACTION.SET_LINKED_VAULT, setLinkedVaultParams(h.buyer), `the ${s.stock.symbol} vault's link`, false);
+          const x = await this.#cost(s.stock.symbol, VAULT_ACTION.SET_LINKED_VAULT, setLinkedVaultParams(h.buyer), `the ${s.stock.symbol} vault's link`, !s.exists);
           own.push({ kind: "link", what: s.stock.symbol, amount: "0", urgent: false, notBefore: t0, cost: x.toString(), reason: "link the stock vault to the USDG vault (a loan is paid only to the linked vault)" });
           c += x;
         }
@@ -1278,8 +1285,12 @@ export class StrategyService {
       if (def.kind !== VENUE_KIND.RAETO_STOCK) continue;
       const opted = a.settings.stockVaults.includes(def.symbol);
       const vault = getAddress(await this.#p.tokenVault(def.token).vaultAddress());
-      if ((await venues.version(vault)) < VAULT_V4) {
-        if (opted) notes.push(`${def.symbol}: the agent's ${def.symbol} vault ${vault} ${(await venues.version(vault)) === 0 ? "does not exist yet" : "runs below version 4"}: nothing for Raeto's ${def.symbol} vault`);
+      // An opted-in vault not created yet that holds the stock (sent to its address: an Ostra Swap buy, an unshield, a
+      // transfer) is planned as a new vault (the latest version): the enable creates it first, its price added.
+      const version = await venues.version(vault);
+      const uncreated = version === 0 && opted && (await tokenBalance(this.#p.client, def.token, vault)) > 0n;
+      if (version < VAULT_V4 && !uncreated) {
+        if (opted) notes.push(`${def.symbol}: the agent's ${def.symbol} vault ${vault} ${version === 0 ? `does not exist yet and holds no ${def.symbol}` : "runs below version 4"}: nothing for Raeto's ${def.symbol} vault`);
         continue;
       }
       const st = await venues.state(def, vault);
@@ -1287,6 +1298,7 @@ export class StrategyService {
       const r = await venues.realized(def);
       const book = await venues.stockBook(def);
       const sc = await venueCosts(def, st);
+      if (uncreated) sc.enable += (await this.#p.borro.creationCost(this.#p.tokenVault(def.token))).usdg;
       const held = await tokenBalance(this.#p.client, def.token, vault);
       const capital = traded.get(getAddress(def.token)) ?? 0n;
       const idle = held > capital ? held - capital : 0n;
@@ -1313,7 +1325,7 @@ export class StrategyService {
         else if (amount < book.minDeposit) note = `${formatUnitsAmount(amount, 18)} ${def.symbol} is under its minimum deposit of ${formatUnitsAmount(book.minDeposit, 18)}`;
         else if (minStock === null || amount < minStock) note = `${formatUnitsAmount(amount, 18)} ${def.symbol} (${usd(value(amount))} USDG) is under its break-even${be === null ? " (its credits rate is not known or not positive)" : ` of ${usd(be)} USDG of stock`} at today's gas (a round trip ${usd(rt)} USDG): it stays in the vault`;
         else {
-          enable(def, st, sc.enable, `${formatUnitsAmount(amount, 18)} ${def.symbol}`);
+          enable(def, st, sc.enable, `${formatUnitsAmount(amount, 18)} ${def.symbol}${uncreated ? ` (the ${def.symbol} vault ${vault} holds it but was never created: the enable creates it first, its price included)` : ""}`);
           push({ kind: "enter_venue", what: def.name, vault: def.address, amount: amount.toString(), minAmount: minStock.toString(), urgent: false, notBefore: a.t0, cost: sc.enter.toString(), reason: `${formatUnitsAmount(amount, 18)} ${def.symbol} (${usd(value(amount))} USDG) into Raeto's ${def.symbol} vault: credits at ${pct(r.rate ?? 0n)} of its value a year, over its break-even of ${usd(be as bigint)} USDG; the stock stays the vault's` });
           credits30 += yieldOver(value(amount), r.rate ?? 0n, STEP_HORIZON);
           note = "entered";
@@ -1453,7 +1465,11 @@ export class StrategyService {
     const stock = borroStocks().find((x) => x.symbol === s.what);
     if (stock === undefined) throw new RangeError(`${s.what} is not a Borro stock`);
     const vault = await this.#p.tokenVault(stock.token).vaultAddress();
-    if (s.kind === "link") return (await readVaultGuard(this.#p.client, vault)).linkedVault === buyer ? 1n : 0n;
+    if (s.kind === "link") {
+      // A stock vault not created yet (the lend before this step creates it) is not linked.
+      if ((await readVault(this.#p.client, this.#p.config.deployment, vault)) === null) return 0n;
+      return (await readVaultGuard(this.#p.client, vault)).linkedVault === buyer ? 1n : 0n;
+    }
     const p = await readBorroPosition(this.#p.client, vault, stock);
     if (s.kind === "lend_stock") return p.shares;
     if (s.kind === "post_collateral") return p.collateral;
@@ -1509,7 +1525,12 @@ export class StrategyService {
       case "set_venue": {
         const venues = this.#venues();
         const def = venueByName(s.what);
-        const vf = await venues.venueOf(def, getAddress(await venues.vaultFor(def).vaultAddress()));
+        const at = getAddress(await venues.vaultFor(def).vaultAddress());
+        // The enable creates a stock vault that holds the stock but was never created; one that holds none is not created.
+        if ((await readVault(this.#p.client, this.#p.config.deployment, at)) === null && (await tokenBalance(this.#p.client, def.token, at)) === 0n) {
+          return { landed: true, skipped: `the ${def.symbol} vault was never created and holds no ${def.symbol}: nothing to enable ${def.title} for` };
+        }
+        const vf = await venues.venueOf(def, at);
         const now = await chainTime(this.#p.client);
         if (vf.inForce) return { landed: true, skipped: `${def.title} is in force already` };
         if (vf.enabled && vf.from > now) return { landed: true, skipped: `${def.title} is enabled and takes effect at ${new Date(Number(vf.from) * 1000).toISOString()}` };
@@ -1582,7 +1603,10 @@ export class StrategyService {
       case "link": {
         if (before === 1n) return { landed: true, skipped: "already linked" };
         const stock = borroStocks().find((x) => x.symbol === s.what) as BorroStock;
-        const g = await readVaultGuard(this.#p.client, await this.#p.tokenVault(stock.token).vaultAddress());
+        const at = await this.#p.tokenVault(stock.token).vaultAddress();
+        // The lend before this step creates a vault that was never created; when it lent nothing, there is no vault to link.
+        if ((await readVault(this.#p.client, this.#p.config.deployment, at)) === null) return { landed: true, skipped: `the ${s.what} vault was never created (nothing was lent from it): no link` };
+        const g = await readVaultGuard(this.#p.client, at);
         if (g.pendingLink !== null && g.pendingLink.vault === getAddress(buyer)) return { landed: false, note: `the link to the USDG vault takes effect at ${new Date(Number(g.pendingLink.at) * 1000).toISOString()} (the lock's delay): call again then` };
         result = await this.#p.borro.setLink(s.what, buyer);
         break;

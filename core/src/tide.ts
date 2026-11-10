@@ -3,7 +3,9 @@
 //
 //   link       The score counts what the agent pays and holds in all its vaults only once they are linked: each
 //              existing vault of the agent (the buyer vault, the seller vault, the vault of each pair's token and each
-//              Borro stock, each pair's creator vault; never a private vault) approves its member digest, and then the
+//              Borro stock, each pair's creator vault; never a private vault), and each token vault that holds its
+//              token but was never created (an Ostra Swap buy, an unshield or a transfer sent it to the vault's
+//              address; link creates it first, decided by Edu on 10 Nov 2026), approves its member digest, and then the
 //              identity vault (the creator vault holding the ERC-8004 identity) approves the set digest over the list
 //              of those that did (sdk tide.ts). The digests hold a secret derived from the seed, so the approvals are
 //              hashes nobody else can tie to the agent or to each other: they add no tie between the vaults on chain
@@ -14,8 +16,9 @@
 //              is not asked again (a record per digest); a vault whose approval could not be sent is left out of the set
 //              this time (calling link again adds it). Calls run one at a time.
 //              The OSTRA vault paid (decided by Edu on 1 Nov 2026: the agent only updates and links, it never swaps or
-//              opens a vault for its share): an existing OSTRA vault of the list (the OSTRA token vault before a pair's
-//              creator vault in OSTRA), which approved its member digest; when the list has none (the agent has no
+//              opens a vault for its share; an OSTRA vault that holds OSTRA is created as above, an empty one never):
+//              an existing OSTRA vault of the list (the OSTRA token vault before a pair's creator vault in OSTRA),
+//              which approved its member digest; when the list has none (the agent has no
 //              OSTRA vault, or its approval was not sent this time), its OSTRA token vault as its seed derives it,
 //              outside the list (the address, and the createVault params the index checks it against), which is not
 //              created here: Ostra creates it at payout, only when the agent has a share. The set digest names it as
@@ -178,12 +181,16 @@ export class TideService {
     const { agentId, vault: identity } = await this.#agent();
     const chainId = this.#p.config.chainId;
     const services = await this.#p.vaults();
-    const members: { vs: VaultService; vault: Address; token: Address }[] = [];
+    // `create`: a token vault that holds its token but was never created (it was sent to its address: an Ostra Swap
+    // buy, an unshield, a transfer), created right before its approval (decided by Edu on 10 Nov 2026: what it holds
+    // counts like any vault's); an empty vault not created is never created here.
+    const members: { vs: VaultService; vault: Address; token: Address; create: boolean }[] = [];
     for (const vs of services) {
       const vault = await vs.vaultAddress().catch(() => null);
       if (vault === null || getAddress(vault) === identity || members.some((m) => m.vault === getAddress(vault))) continue;
-      if (!(await vs.state()).exists) continue;
-      members.push({ vs, vault: getAddress(vault), token: getAddress(vs.token) });
+      const s = await vs.state();
+      if (!s.exists && !(vs.kind === "token" && s.balance > 0n)) continue;
+      members.push({ vs, vault: getAddress(vault), token: getAddress(vs.token), create: !s.exists });
     }
     if (members.length + 1 > TIDE_MAX_LINKED_VAULTS) throw new Error(`the agent has ${members.length + 1} vaults, more than a link lists (${TIDE_MAX_LINKED_VAULTS}); nothing was signed`);
     // The agent's OSTRA token vault as its seed creates it, created or not, and the params that create it: the payee,
@@ -227,7 +234,7 @@ export class TideService {
     let first = true;
     for (const m of order) {
       const digest = tideMemberDigest({ chainId, agentId, vault: m.vault, secret });
-      if (sent[digest] !== undefined || (await this.#approved(m.vault, digest))) {
+      if (!m.create && (sent[digest] !== undefined || (await this.#approved(m.vault, digest)))) {
         steps.push({ vault: m.vault, tx: sent[digest]?.tx ?? "", status: "approved before" });
         approved.push(m);
         continue;
@@ -236,6 +243,7 @@ export class TideService {
       first = false;
       let step: { vault: Address; tx: string; status: string };
       try {
+        if (m.create) await m.vs.open();
         step = await this.#approve(m.vs, m.vault, digest, "Ostra Tide link approval");
       } catch (err) {
         step = { vault: m.vault, tx: "", status: `not sent: ${(err as Error).message.slice(0, 300)}` };

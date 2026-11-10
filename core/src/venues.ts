@@ -310,8 +310,12 @@ export class VenueService {
     return venueReasonNames(await venueReasons(this.#p.client, def.kind, def.address, r));
   }
 
-  /** OstraVault.venueOf: the owner's last SetVenue, an Enter landed once, in force now, and from when (unix seconds). */
+  /**
+   * OstraVault.venueOf: the owner's last SetVenue, an Enter landed once, in force now, and from when (unix seconds). A
+   * vault not created yet (a stock vault that holds stock sent to its address) has none of them.
+   */
   async venueOf(def: VenueDef, vault: Address): Promise<{ enabled: boolean; entered: boolean; inForce: boolean; from: bigint }> {
+    if ((await readVault(this.#p.client, this.#p.config.deployment, vault)) === null) return { enabled: false, entered: false, inForce: false, from: 0n };
     const [enabled, entered, inForce, from] = (await this.#p.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "venueOf", args: [def.kind, def.address] })) as readonly [boolean, boolean, boolean, bigint];
     return { enabled, entered, inForce, from };
   }
@@ -379,7 +383,7 @@ export class VenueService {
   /** What `def` holds for `vault` now, and what the breaker finds there. */
   async state(def: VenueDef, vault: Address): Promise<VenueState> {
     const c = this.#p.client;
-    const [enabled, entered, inForce, from] = (await c.readContract({ address: vault, abi: ostraVaultAbi, functionName: "venueOf", args: [def.kind, def.address] })) as readonly [boolean, boolean, boolean, bigint];
+    const { enabled, entered, inForce, from } = await this.venueOf(def, vault);
     const rec = await this.record(vault, def);
     let position = 0n;
     let shares = 0n;
@@ -680,6 +684,13 @@ export class VenueService {
   async setVenue(name: string, enabled: boolean): Promise<VaultOperationResult & { effectiveAt?: string; note?: string }> {
     const def = venueByName(name);
     const what = `${enabled ? "enable" : "disable"} ${def.title}`;
+    // A stock vault that holds the stock but was never created (it was sent to its address: an Ostra Swap buy, an
+    // unshield, a transfer) is created first for an enable, paid by the buyer vault.
+    const vs = this.vaultFor(def);
+    if (enabled && vs !== this.#p.buyer) {
+      const s = await vs.state();
+      if (!s.exists && s.balance > 0n) await vs.open();
+    }
     const vault = await this.#ready(def, what);
     const [on, entered, inForce, from] = (await this.#p.client.readContract({ address: vault, abi: ostraVaultAbi, functionName: "venueOf", args: [def.kind, def.address] })) as readonly [boolean, boolean, boolean, bigint];
     if (!enabled && !on) throw new Error(`${def.title} is not enabled for ${vault}; nothing was signed`);

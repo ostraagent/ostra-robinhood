@@ -106,8 +106,8 @@ test("NVDA on Borro: lend, collateral, a loan into the USDG vault, repay, take b
   await fork.dealUsdg(buyer, 1_000_000_000n);
   const stockVault = (await a.tokenVault(nvda.token).open()).vault;
   await fork.dealToken(stockVault, nvda.token, 10n * 10n ** 18n);
-  // deployOstra makes version 4 vaults, which keep every version 3 spend.
-  assert.equal(Number(await client.readContract({ address: buyer, abi: ostraVaultAbi, functionName: "VERSION" })), 4);
+  // deployOstra makes version 5 vaults (the latest), which keep every version 3 spend.
+  assert.equal(Number(await client.readContract({ address: buyer, abi: ostraVaultAbi, functionName: "VERSION" })), 5);
 
   const markets = (await a.borro.markets()) as { symbol: string; listed: boolean; throughBorroBuilders: boolean }[];
   assert.equal(markets.length, 12);

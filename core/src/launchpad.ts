@@ -619,7 +619,11 @@ export class LaunchpadService {
     });
   }
 
-  /** Sends `amount` of `token` from the agent's token vault to `destination`. */
+  /**
+   * Sends `amount` of `token` from the agent's token vault to `destination`. A token vault that holds the tokens but
+   * was never created (they were sent to its address: an Ostra Swap buy, an unshield, a transfer) is created first,
+   * paid by the buyer vault.
+   */
   async transferToken(a: { token: string; destination: string; amount: string }): Promise<VaultOperationResult> {
     const token = address(a.token, "token");
     const destination = address(a.destination, "destination");
@@ -630,10 +634,10 @@ export class LaunchpadService {
     const amount = parseUnitsAmount(a.amount, decimals);
     if (amount === 0n) throw new RangeError("amount must be greater than zero");
     const s = await v.state();
-    if (!s.exists) throw new Error(`this agent has no vault in ${token}`);
     if (s.balance < amount) throw new Error(`the vault in ${token} holds ${formatUnitsAmount(s.balance, decimals)}, less than ${a.amount}`);
     if (destination === s.vault) throw new Error("the destination is the vault itself");
     await this.#notStranded(destination, token, "the transfer");
+    if (!s.exists) await v.open();
     return this.#simulatedSpend(v, this.#buyerSender, VAULT_ACTION.TRANSFER, transferParams({ to: destination, amount }), "token transfer");
   }
 
@@ -642,16 +646,20 @@ export class LaunchpadService {
     return this.tokenVault(dividendToken).vaultAddress();
   }
 
-  /** Claims the dividends the agent's token vault for `token` earned, into the agent's vault of the dividend token. */
+  /**
+   * Claims the dividends the agent's token vault for `token` earned, into the agent's vault of the dividend token. A
+   * token vault that earned them but was never created (its tokens were sent to its address) is created first, paid by
+   * the buyer vault.
+   */
   async claimDividends(tokenText: string): Promise<VaultOperationResult & { recipient?: Address }> {
     const pool = await this.#pool(tokenText);
     const dividendToken = getAddress(pool.config.dividendToken);
     if (dividendToken === zeroAddress) throw new Error(`the pool of ${pool.token} pays no dividends`);
     const v = this.tokenVault(pool.token);
     const s = await v.state();
-    if (!s.exists) throw new Error(`this agent has no vault in ${pool.token}`);
     const owed = (await this.#client.readContract({ address: pool.token, abi: ostraTokenAbi, functionName: "dividendOf", args: [s.vault] })) as bigint;
     if (owed === 0n) throw new Error(`the vault in ${pool.token} has no dividends to claim now; nothing was signed`);
+    if (!s.exists) await v.open();
     const recipient = await this.#vaultFor(dividendToken);
     const r = await this.#simulatedSpend(v, this.#buyerSender, VAULT_ACTION.CLAIM_DIVIDEND, claimDividendParams(recipient), "dividend claim");
     return { ...r, recipient };

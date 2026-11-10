@@ -371,7 +371,7 @@ export class VaultService {
   #missing(): string {
     if (this.kind === "private") return `private vault ${this.privateIndex} does not exist yet; it is created on its first use`;
     if (this.kind === "creator") return `this agent has no creator vault${this.#inUsdg() ? "" : ` in ${this.token}`} yet; open it before a launch names it`;
-    if (this.kind === "token") return `this agent has no vault in ${this.token} yet; buying the token creates it`;
+    if (this.kind === "token") return `this agent has no vault in ${this.token} yet; tokens sent to its address wait there, and the first tool that spends them creates it`;
     return this.kind === "buyer" ? "this agent has no vault yet; call open_vault first" : "this agent has no seller vault yet; call accept_payments first";
   }
 

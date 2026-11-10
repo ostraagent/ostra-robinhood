@@ -20,9 +20,9 @@
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createPublicClient, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
+import { createPublicClient, erc20Abi, getAddress, http, isAddress, type Address, type PublicClient, type Transport } from "viem";
 import { mainnet } from "viem/chains";
-import { LAUNCH_PAIRS, OSTRAPAD, WETH, assertRobinhoodChain, borroStocks, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
+import { LAUNCH_PAIRS, OSTRAPAD, WETH, assertRobinhoodChain, borroStocks, readVault, retryingHttp, robinhoodChain, type FileWotsStore } from "@ostraagent/sdk";
 import { cliProver } from "@ostraagent/swap/cli-prover";
 import { sha256Hex, wasmProver, type ProverWasmGlue } from "@ostraagent/swap/wasm-prover";
 import type { Prover } from "@ostraagent/swap";
@@ -58,6 +58,7 @@ import {
   VaultService,
   repProverOf,
   VenueService,
+  formatUnitsAmount,
   uploadJson,
   type Keys,
   type PrivateVaultContext,
@@ -371,6 +372,39 @@ export class Agent {
       this.#tokenVaults.set(t, v);
     }
     return v;
+  }
+
+  /**
+   * The agent's token vaults that hold their token (USDG's vault aside): of WETH, OSTRA and each listed stock token, and
+   * of each token its swaps named. A vault not created yet is listed too (its tokens were sent to its address: an Ostra
+   * Swap buy, an unshield, a transfer): the first tool that spends from it creates it.
+   */
+  async tokenVaultHoldings(): Promise<{ token: Address; symbol: string | null; vault: Address; balance: string; exists: boolean }[]> {
+    const symbols = new Map<Address, string>();
+    for (const p of LAUNCH_PAIRS) if (p.kind !== "usdg") symbols.set(p.kind === "eth" ? WETH : getAddress(p.address), p.kind === "eth" ? "WETH" : p.symbol);
+    for (const b of borroStocks()) if (!symbols.has(getAddress(b.token))) symbols.set(getAddress(b.token), b.symbol);
+    const tokens = new Set<Address>(symbols.keys());
+    if (this.swap !== null) for (const t of await this.swap.recordTokens()) tokens.add(t);
+    tokens.delete(getAddress(this.config.deployment.token));
+    const list = [...tokens];
+    const vaults = await Promise.all(list.map(async (t) => getAddress(await this.vaultFor(t).vaultAddress())));
+    const balances = await this.client.multicall({ contracts: list.map((t, i) => ({ address: t, abi: erc20Abi, functionName: "balanceOf" as const, args: [vaults[i] as Address] })), allowFailure: true, batchSize: 0 });
+    const held: { token: Address; vault: Address; units: bigint }[] = [];
+    list.forEach((token, i) => {
+      const r = balances[i];
+      if (r !== undefined && r.status === "success" && (r.result as bigint) > 0n) held.push({ token, vault: vaults[i] as Address, units: r.result as bigint });
+    });
+    if (held.length === 0) return [];
+    const decimals = await this.client.multicall({ contracts: held.map((h) => ({ address: h.token, abi: erc20Abi, functionName: "decimals" as const })), allowFailure: true, batchSize: 0 });
+    const out = [];
+    for (const [i, h] of held.entries()) {
+      const d = decimals[i];
+      // A token whose decimals cannot be read is shown in base units.
+      const units = d !== undefined && d.status === "success" ? Number(d.result) : null;
+      const exists = (await readVault(this.client, this.config.deployment, h.vault)) !== null;
+      out.push({ token: h.token, symbol: symbols.get(h.token) ?? null, vault: h.vault, balance: units === null ? `${h.units} base units` : formatUnitsAmount(h.units, units), exists });
+    }
+    return out;
   }
 
   /**

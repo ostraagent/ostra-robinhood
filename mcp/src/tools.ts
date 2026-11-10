@@ -280,13 +280,25 @@ export function registerTools(server: McpServer, agent: Agent): void {
   };
   const HOSTED_KEYS =
     "this server runs on Ostra's remote MCP gateway: its seed is kept there and never exported (it holds this agent's key, and the vaults and wallet made from it, such as the creator vault below, funded from the owner's vault only as the owner's policy and allowlist permit); the owner's own seed and its backup stay with the owner (the Ostra web app or the owner's MCP server)";
-  tool("balance", "The vault's balance, nonce, any operation signed and not landed, the relayer channels, and the creator vault.", {}, async () => ({
-    vault: unhosted(await agent.buyer.status()),
-    relayerChannels: agent.relayer === null ? null : await agent.relayer.channels(),
-    creatorVault: await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
-    relayer: agent.config.relayerUrl !== null,
-    ...(agent.config.hosted ? { keys: HOSTED_KEYS } : {}),
-  }));
+  tool(
+    "balance",
+    "The vault's balance, nonce, any operation signed and not landed, the relayer channels, the creator vault, and the agent's vaults of other tokens that hold some (WETH, OSTRA, stock tokens, tokens bought through Ostra Swap).",
+    {},
+    async () => {
+      const tokenVaults = await agent.tokenVaultHoldings().catch((e: Error) => `could not be read now: ${e.message.split("\n")[0]}`);
+      return {
+        vault: unhosted(await agent.buyer.status()),
+        relayerChannels: agent.relayer === null ? null : await agent.relayer.channels(),
+        creatorVault: await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
+        tokenVaults,
+        ...(Array.isArray(tokenVaults) && tokenVaults.some((v) => !v.exists)
+          ? { tokenVaultsNote: "a vault with exists false holds tokens sent to its address but is not created yet: the first tool that spends from it (transfer_token, ostra_swap, sell, claim_dividends, borro_lend, venue_set, private_shield, tide with link) creates it first, its fee paid like the vault's other transactions" }
+          : {}),
+        relayer: agent.config.relayerUrl !== null,
+        ...(agent.config.hosted ? { keys: HOSTED_KEYS } : {}),
+      };
+    },
+  );
   // The payment wallet holds at most 5 USDG, which only its own top-ups keep to: withdraw and pay orders refuse this
   // server's own wallet (an agent key's wallet, on the owner's server, is the owner's to fund as it decides).
   const notPaymentWallet = async (destination: string, what: string): Promise<void> => {
@@ -421,7 +433,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "ostra_swap",
-    `Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault. A swap not done within ${answerMs / 1_000} s answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. ${BUILDER_RULES}`,
+    `Swaps on Ostra Swap from the agent's vault of tokenIn to its vault of tokenOut, as an escrow order of OstraRouter: the vault signs one transfer into the order's escrow and the relayer executes it in the same transaction. The router pays at least minOut or sends the input back; where the tokens go is fixed by the escrow's address. A swap that moves the price more than maxImpactBps (default 1%) is split into up to 16 parts 60 seconds apart, each its own escrow order quoted again right before it is signed: a part waits while it would move the price more than the limit or pay less than the first part's quote less the slippage. The first part runs now and the next ones while the MCP server runs (ostra_swap_split); what is not swapped by the deadline stays in the vault. A swap not done within ${answerMs / 1_000} s answers status "pending" and goes on: do not send it again; ostra_swap_orders tells how it ended. The vault of tokenOut need not exist: the tokens wait at its address, balance lists them, and the first tool that spends from it creates it. ${BUILDER_RULES}`,
     { tokenIn: swapToken, tokenOut: swapToken, amount: units.describe("in tokenIn"), slippageBps: slippage, maxImpactBps: maxImpact },
     (a) => {
       const tokenIn = tokenAddress(a.tokenIn);
@@ -475,7 +487,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "private_unshield",
-    "Pays `amount` of a token out of a private note to an address, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note; the change stays private. The default destination is the agent's vault of that token, which an observer can link to the vault that shielded. With toPrivateVault (USDG only), it pays a new private vault of the agent instead, its own post-quantum vault found again from the seed (private_recover), which private_withdraw spends from. The amount is public, so a round amount, or a note split over several unshields, is harder to match to its shield.",
+    "Pays `amount` of a token out of a private note to an address, with a zero-knowledge proof made on this machine. The Ostra relayer sends it and is paid from the note; the change stays private. The default destination is the agent's vault of that token, which an observer can link to the vault that shielded (it need not exist: the tokens wait at its address, balance lists them, and the first tool that spends from it creates it). With toPrivateVault (USDG only), it pays a new private vault of the agent instead, its own post-quantum vault found again from the seed (private_recover), which private_withdraw spends from. The amount is public, so a round amount, or a note split over several unshields, is harder to match to its shield.",
     { token: swapToken, amount: units, destination: address.optional(), toPrivateVault: z.boolean().optional() },
     (a) => notes().unshield({ token: tokenAddress(a.token), amount: a.amount, ...opt("destination", a.destination), ...opt("toPrivateVault", a.toPrivateVault) }),
   );
@@ -523,7 +535,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("borro_position", "The agent's Borro positions: USDG lent from the vault; per stock vault its lent shares, collateral, debt and how close the debt is to liquidation.", {}, () => agent.borro.positions());
   tool(
     "borro_lend",
-    "Lends USDG (from the vault) or a stock (from the agent's vault of that stock) into Borro's Morpho vault of it, through Borro's builder program with Ostra's code when Borro lists that vault there. The shares stay in the agent's vault.",
+    "Lends USDG (from the vault) or a stock (from the agent's vault of that stock) into Borro's Morpho vault of it, through Borro's builder program with Ostra's code when Borro lists that vault there. The shares stay in the agent's vault. A stock vault that holds the stock but was never created (it was sent to its address) is created first, its fee paid like the vault's other transactions.",
     { asset: borroAsset, amount: units },
     (a) => agent.borro.lend(a.asset, a.amount),
   );
@@ -797,7 +809,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   );
   tool(
     "venue_set",
-    "Enables a venue for the agent's vault of its token (USDG, or the stock), or disables it (that stops only new Enters). An enable takes effect at once, or under the withdrawal lock after the lock's delay (the owner, a guardian or the withdrawal address can drop it meanwhile). Refused before the vault runs version 4.",
+    "Enables a venue for the agent's vault of its token (USDG, or the stock), or disables it (that stops only new Enters). An enable takes effect at once, or under the withdrawal lock after the lock's delay (the owner, a guardian or the withdrawal address can drop it meanwhile). Refused before the vault runs version 4. A stock vault that holds the stock but was never created (it was sent to its address) is created first for an enable, its fee paid like the vault's other transactions.",
     { venue: venueName, enabled: z.boolean() },
     (a) => agent.venues.setVenue(a.venue, a.enabled),
   );
@@ -1110,9 +1122,9 @@ export function registerTools(server: McpServer, agent: Agent): void {
     { token: address, amount: units, slippageBps: slippage, referrer: address.optional() },
     (a) => lp().sell({ token: a.token, amount: a.amount, ...(a.slippageBps === undefined ? {} : { slippageBps: a.slippageBps }), ...(a.referrer === undefined ? {} : { referrer: a.referrer }) }),
   );
-  tool("token_vault", "The agent's vault for a token (one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token): address, balance, and for a launched token the dividends to claim.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
-  tool("transfer_token", "Sends a token other than USDG (any token a vault of the agent holds: one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token) from the agent's vault of it to an address; USDG goes with withdraw.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
-  tool("claim_dividends", "Claims the dividends the agent's token vault earned, into the agent's vault of the dividend token.", { token: address }, (a) => lp().claimDividends(a.token));
+  tool("token_vault", "The agent's vault for a token (one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token): address, whether it exists, balance, and for a launched token the dividends to claim. Tokens reach a vault's address before the vault exists (an Ostra Swap buy, an unshield, a transfer): the first tool that spends from it creates it.", { token: address }, (a) => lp().tokenVaultInfo(a.token));
+  tool("transfer_token", "Sends a token other than USDG (any token a vault of the agent holds: one Ostra Swap bought, a launched token, WETH, OSTRA or a stock token) from the agent's vault of it to an address; USDG goes with withdraw. A vault that holds the tokens but was never created (they were sent to its address) is created first, its fee paid like the vault's other transactions.", { token: address, destination: address, amount: units }, (a) => lp().transferToken(a));
+  tool("claim_dividends", "Claims the dividends the agent's token vault earned, into the agent's vault of the dividend token. A token vault that earned them but was never created is created first, its fee paid like the vault's other transactions.", { token: address }, (a) => lp().claimDividends(a.token));
 
   // --- the creator vault (it owns the agent's identity) ----------------------------------------------------------
   tool(
