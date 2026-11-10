@@ -330,11 +330,13 @@ test("the remote gateway's OAuth: connect proved by the owner's key, sessions, a
   assert.equal((await appApi("/approve/done", { id: aid, outcome: "signed" })).status, 409);
   assert.equal((await readV5(fork.client, vault))?.policy.perTx, parseUnits("5", 6), "nothing changed on chain");
 
-  // Refresh: a new pair; its session replaces the first.
+  // Refresh: a new pair; its session shares the home's server with the first.
   const r2 = (await (await refresh(g2.tokens)).json()) as Tokens;
   assert.ok(r2.access_token !== g2.tokens.access_token && r2.refresh_token !== g2.tokens.refresh_token);
   const b = await mcp(r2.access_token);
   assert.equal(text(await b.callTool({ name: "v5_status", arguments: {} })).role, "agent");
+  assert.equal(text(await a.callTool({ name: "v5_status", arguments: {} })).role, "agent", "the first session goes on");
+  assert.deepEqual(homeServers(join(root, homeDir, "home")), servers, "one server for both");
 
   // Connecting again, kept, while b's session lives: its server hands the key out and b goes on, with the new key.
   wait = 21_000 - (Date.now() - issued2);

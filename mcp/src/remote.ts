@@ -7,8 +7,12 @@
 // (tools.ts).
 //
 // One child per home at a time: the agent key is a chain of one-time keys kept in OSTRA_HOME, so two processes on one
-// home could sign with the same key. A new session of a home ends the session before it; a session idle for
-// OSTRA_REMOTE_IDLE_SECONDS ends, and its child with it.
+// home could sign with the same key. The sessions of a home share its child (a Claude account opens several at once:
+// its chats, its apps, the connector's settings page): the gateway initializes the child once, answers each session's
+// initialize itself, and passes each session's requests to the child under ids of its own, so every answer goes back
+// to the session that asked (multiplexing, 10 Nov 2026; before, a new session ended the one before it, and Claude's
+// calls on that one failed). A session idle for OSTRA_REMOTE_IDLE_SECONDS ends; the child ends with its home's last
+// session. A home keeps at most MAX_SESSIONS_PER_HOME sessions: one more ends the one idle longest.
 //
 // A user is authenticated by OAuth (remote-auth.ts, with OSTRA_REMOTE_PUBLIC_URL): a grant is for one vault and the
 // agent key its owner installed, its home <root>/v<HMAC of the vault> (the key in <root>/home-id.key); or by a fixed
@@ -31,7 +35,7 @@
 //   OSTRA_REMOTE_IDLE_SECONDS  a session's idle time before it ends (default 900)
 //   OSTRA_REMOTE_ALLOWED_HOSTS the Host headers accepted (comma separated; default the listen address), against DNS
 //                              rebinding
-//   OSTRA_REMOTE_MAX_SESSIONS  the most sessions (children) at once (default 50); a new user past it is answered 503
+//   OSTRA_REMOTE_MAX_SESSIONS  the most children (homes served) at once (default 50); a new home past it is answered 503
 //   OSTRA_REMOTE_SANDBOX       bwrap (the default with OAuth) or off (the default without): each child in its own
 //                              bubblewrap sandbox, which sees only the system's programs and libraries, the code and
 //                              the files the environment names that it runs on (read only), and its home's home/ and
@@ -62,7 +66,7 @@ import { createPublicClient, getAddress, http, isAddress, type Address, type Hex
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, isInitializeRequest, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { robinhoodChain } from "@ostraagent/sdk";
 import { loadConfig } from "./config.ts";
 import { OWNER_TOOLS, REMOTE_REFUSED_TOOLS, RemoteAuth } from "./remote-auth.ts";
@@ -71,8 +75,12 @@ const SERVER = join(dirname(fileURLToPath(import.meta.url)), "server.ts");
 /** The largest request body taken (MCP requests are small; tool arguments are JSON). */
 const MAX_BODY = 1 << 20;
 const USER_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
-/** A user may start at most one session per this many ms (each start spawns a server and reads the chain). */
+/** A home's child may be started at most once per this many ms (each start spawns a server and reads the chain). */
 const OPEN_INTERVAL_MS = 2_000;
+/** The sessions one home keeps at once (they share its child); one more ends the one idle longest. */
+const MAX_SESSIONS_PER_HOME = 16;
+/** The child's notifications every session of its home gets (the others are dropped). */
+const LIST_CHANGED = new Set(["notifications/tools/list_changed", "notifications/resources/list_changed", "notifications/prompts/list_changed"]);
 /** How long the gateway's own request to a child (agent_key_request) may take. */
 const CHILD_CALL_MS = 60_000;
 /** The variables of the gateway's environment a child gets besides OSTRA_* (OSTRA_REMOTE_* never). */
@@ -89,10 +97,33 @@ const FLOCK_BUSY = 75;
 
 /** `fixed`: a user of the users file (its token fixed); otherwise one of an OAuth grant (`grant`), its home from its vault. */
 type User = { id: string; tokenSha256: Buffer; vault: Address; fixed: boolean; grant: string | null };
+/** A request the gateway sends a child for itself (never a client's), waiting for its answer. */
+type Waiter = { done: (m: JSONRPCMessage) => void; fail: (err: Error) => void };
+
 /**
- * A home's session and its child. `exited` settles when the child's process has exited; `ending` is set by the first
- * end() and every later end() waits for the same one; `inflight` counts the session's POSTs being answered; `mine`
- * the gateway's own requests to the child, by id; `lists` the ids of the client's tools/list requests (how many of each).
+ * A home's child, shared by the home's sessions. `init` is its initialize result once the gateway has initialized it
+ * (null until then); `exited` settles when its process has exited; `ending` is set by the first endHome(). `mine` holds the
+ * gateway's own requests to it; `routes` the sessions' requests passed to it, by the id the child sees; `inflight` the
+ * gateway's own calls being answered (the child stays while one is).
+ */
+type Home = {
+  user: string;
+  vault: Address;
+  child: StdioClientTransport;
+  pid: number | null;
+  exited: Promise<void>;
+  init: Record<string, unknown> | null;
+  ending: Promise<void> | null;
+  sessions: Set<Session>;
+  mine: Map<string, Waiter>;
+  routes: Map<string, { s: Session; id: string | number; list: boolean; progress: string | number | null }>;
+  seq: number;
+  inflight: number;
+};
+
+/**
+ * A client's session of a home. `ending` is set by the first end(); `inflight` counts its POSTs being answered;
+ * `active` is when it was last used (the one idle longest goes first when its home is full).
  */
 type Session = {
   id: string;
@@ -102,14 +133,11 @@ type Session = {
   fixed: boolean;
   grant: string | null;
   transport: StreamableHTTPServerTransport;
-  child: StdioClientTransport;
-  pid: number | null;
-  exited: Promise<void>;
+  home: Home;
   idle: NodeJS.Timeout | null;
   inflight: number;
+  active: number;
   ending: Promise<void> | null;
-  mine: Map<string, { done: (m: JSONRPCMessage) => void; fail: (err: Error) => void }>;
-  lists: Map<string, number>;
 };
 
 function log(event: string, fields: Record<string, unknown> = {}): void {
@@ -264,9 +292,9 @@ async function main(): Promise<void> {
 
   /** Initialized sessions by session id. */
   const sessions = new Map<string, Session>();
-  /** Each home's one live session, from the moment its child is spawned until that child is gone. */
-  const byUser = new Map<string, Session>();
-  /** When each user last started a session (ms): at most one start per OPEN_INTERVAL_MS. */
+  /** Each home's one child, from the moment it is spawned until it is gone. */
+  const homes = new Map<string, Home>();
+  /** When each home's child was last started (ms): at most one start per OPEN_INTERVAL_MS. */
   const lastOpen = new Map<string, number>();
   /** The prefix of the ids of the gateway's own requests to children (never one a client sends). */
   const mineId = `ostra-gateway-${randomUUID()}-`;
@@ -290,42 +318,70 @@ async function main(): Promise<void> {
   };
 
   /**
-   * Ends a session: its transport, then its child, waiting for the child's process to exit. Every later call waits
-   * for the same end. Its home's slot is freed only once the child is gone; a child that does not exit keeps its
-   * home blocked (logged), never a second child on that home.
+   * Ends a home's child: its sessions first, then the child, waiting for its process to exit. Every later call waits
+   * for the same end. The home's slot is freed only once the child is gone; a child that does not exit keeps its home
+   * blocked (logged), never a second child on that home.
    */
-  const end = (s: Session, why: string): Promise<void> => {
-    if (s.ending !== null) return s.ending;
+  const endHome = (h: Home, why: string): Promise<void> => {
+    if (h.ending !== null) return h.ending;
     let done!: () => void;
     let failed!: (err: unknown) => void;
-    s.ending = new Promise<void>((res, rej) => {
+    h.ending = new Promise<void>((res, rej) => {
       done = res;
       failed = rej;
     });
     void (async () => {
-      if (s.idle !== null) clearTimeout(s.idle);
-      sessions.delete(s.id);
-      for (const w of s.mine.values()) w.fail(new Error(`the session ended (${why})`));
-      s.mine.clear();
-      log("session_end", { session: s.id, user: s.user, why });
-      await s.transport.close().catch(() => {});
-      await s.child.close().catch(() => {});
-      const warn = setTimeout(() => log("child_stuck", { user: s.user, pid: s.pid, why: "still running 15 s after its end: its home stays blocked until it exits" }), 15_000);
+      for (const s of [...h.sessions]) endLater(s, why);
+      for (const w of h.mine.values()) w.fail(new Error(`the session's server ended (${why})`));
+      h.mine.clear();
+      h.routes.clear();
+      log("child_end", { user: h.user, pid: h.pid, why });
+      await h.child.close().catch(() => {});
+      const warn = setTimeout(() => log("child_stuck", { user: h.user, pid: h.pid, why: "still running 15 s after its end: its home stays blocked until it exits" }), 15_000);
       warn.unref();
-      await s.exited;
+      await h.exited;
       clearTimeout(warn);
-      if (byUser.get(s.user) === s) byUser.delete(s.user);
+      if (homes.get(h.user) === h) homes.delete(h.user);
     })().then(done, (err: unknown) => {
-      log("child_stuck", { user: s.user, pid: s.pid, error: String(err) });
+      log("child_stuck", { user: h.user, pid: h.pid, error: String(err) });
       failed(err);
     });
+    return h.ending;
+  };
+  /** Ends the home's child once it serves no session and no call of the gateway's own (never while it starts). */
+  const endHomeIfUnused = (h: Home, why: string): void => {
+    if (h.init !== null && h.sessions.size === 0 && h.inflight === 0) void endHome(h, why).catch(() => {});
+  };
+
+  /**
+   * Ends a session: its transport, and its requests still with the child are forgotten (their answers dropped). The
+   * home's child ends with its last session; the promise settles once that child, if it ended, is gone.
+   */
+  const end = (s: Session, why: string): Promise<void> => {
+    if (s.ending !== null) return s.ending;
+    // Set before anything runs: closing the transport calls its onclose, and so end() again, synchronously.
+    let started!: () => void;
+    const gate = new Promise<void>((r) => (started = r));
+    s.ending = (async () => {
+      await gate;
+      if (s.idle !== null) clearTimeout(s.idle);
+      if (s.id !== "") sessions.delete(s.id);
+      const h = s.home;
+      h.sessions.delete(s);
+      for (const [k, r] of h.routes) if (r.s === s) h.routes.delete(k);
+      log("session_end", { session: s.id, user: s.user, why });
+      await s.transport.close().catch(() => {});
+      if (h.sessions.size === 0 && h.inflight === 0) await endHome(h, why).catch(() => {});
+    })();
+    started();
     return s.ending;
   };
   /** end() from a callback: a failure is logged there, never an unhandled rejection. */
   const endLater = (s: Session, why: string): void => void end(s, why).catch(() => {});
 
-  /** Arms the idle timer, unless a POST of the session (or the gateway's own request) is still being answered. */
+  /** Arms the idle timer, unless a POST of the session is still being answered. */
   const touch = (s: Session): void => {
+    s.active = Date.now();
     if (s.idle !== null) clearTimeout(s.idle);
     s.idle = null;
     if (s.inflight > 0 || s.ending !== null) return;
@@ -342,7 +398,7 @@ async function main(): Promise<void> {
       checkPrivatePath(usersPath, 0o600);
       const next = parseUsers(readFileSync(usersPath, "utf8"));
       // A user removed, or given a new token or vault: its live session ends.
-      for (const s of byUser.values()) {
+      for (const s of sessions.values()) {
         if (!s.fixed) continue;
         const u = next.find((x) => x.id === s.user);
         if (u === undefined || !u.tokenSha256.equals(s.tokenSha256) || u.vault !== s.vault) endLater(s, "user_changed");
@@ -378,9 +434,9 @@ async function main(): Promise<void> {
     return { id: vaultUserId(g.vault), tokenSha256: hash, vault: g.vault, fixed: false, grant: g.grant };
   };
 
-  /** Ends the session of grant `grant`, if one is live. */
+  /** Ends the sessions of grant `grant` (its home's child goes on for the other sessions, if any). */
   const endGrantSessions = (grant: string, why: string): void => {
-    for (const s of byUser.values()) if (s.grant === grant) endLater(s, why);
+    for (const s of sessions.values()) if (s.grant === grant) endLater(s, why);
   };
 
   /** The child's environment: only what it needs from the gateway's, and this home's own folders. */
@@ -413,87 +469,156 @@ async function main(): Promise<void> {
   };
   /** A home's log, opened for the child's stderr: never through a link (the home's folders are the child's to change). */
   const openLog = (u: User): number => openSync(join(root, u.id, "mcp.log"), fsc.O_WRONLY | fsc.O_APPEND | fsc.O_CREAT | fsc.O_NOFOLLOW, 0o600);
-  /** Connect children running now (short-lived, outside byUser): counted with the sessions against maxSessions. */
+  /** Connect children running now (short-lived, outside homes): counted with the homes against maxSessions. */
   let connecting = 0;
 
-  /** A new session of `u`, its child started; ends the home's session before it first. Called under the home's lock only. */
-  const open = async (u: User): Promise<Session> => {
-    const before = byUser.get(u.id);
-    if (before !== undefined) await end(before, "replaced");
-    if (byUser.size + connecting >= maxSessions) throw Object.assign(new Error("the gateway is full: try again later"), { status: 503 });
+  /** The gateway's own request to a home's child (never a client's): its answer, or an error after CHILD_CALL_MS. */
+  const askChild = (h: Home, method: string, params: Record<string, unknown>): Promise<JSONRPCMessage> =>
+    new Promise<JSONRPCMessage>((resolve, reject) => {
+      const id = `${mineId}${++mineSeq}`;
+      h.inflight++;
+      const timer = setTimeout(() => {
+        h.mine.delete(id);
+        finish();
+        reject(new Error(`${method}: no answer from the home's server within ${CHILD_CALL_MS / 1000} s`));
+      }, CHILD_CALL_MS);
+      const finish = () => {
+        clearTimeout(timer);
+        h.inflight--;
+        endHomeIfUnused(h, "unused");
+      };
+      h.mine.set(id, {
+        done: (m) => {
+          finish();
+          resolve(m);
+        },
+        fail: (err) => {
+          finish();
+          reject(err);
+        },
+      });
+      h.child.send({ jsonrpc: "2.0", id, method, params } as JSONRPCMessage).catch((err: unknown) => {
+        h.mine.delete(id);
+        finish();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
+    });
+
+  /** A child's message: an answer to the gateway, or to the session that asked, or a notification for its sessions. */
+  const fromChild = (h: Home, m: JSONRPCMessage): void => {
+    if (!("method" in m) && "id" in m) {
+      const key = String(m.id);
+      if (key.startsWith(mineId)) {
+        const w = h.mine.get(key);
+        h.mine.delete(key);
+        w?.done(m);
+        return;
+      }
+      const r = h.routes.get(key);
+      if (r === undefined) return; // its session ended: the answer has no one to go to
+      h.routes.delete(key);
+      let out = { ...m, id: r.id } as JSONRPCMessage;
+      if (r.list && "result" in m) {
+        const res = m.result as { tools?: { name?: string }[] };
+        if (Array.isArray(res.tools)) out = { ...out, result: { ...res, tools: res.tools.filter((t) => !REMOTE_REFUSED_TOOLS.has(t.name ?? "")) } } as JSONRPCMessage;
+      }
+      touch(r.s);
+      void r.s.transport.send(out).catch((err: unknown) => log("client_send_failed", { user: h.user, error: String(err) }));
+      return;
+    }
+    if ("method" in m && "id" in m) {
+      // The server asks nothing of clients (no sampling, roots or elicitation): refused, never passed on.
+      void h.child.send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "the remote gateway passes no requests to clients" } } as JSONRPCMessage).catch(() => {});
+      return;
+    }
+    if ("method" in m && m.method === "notifications/progress") {
+      const params = (m.params ?? {}) as { progressToken?: unknown };
+      const r = h.routes.get(String(params.progressToken));
+      if (r !== undefined && r.progress !== null) void r.s.transport.send({ ...m, params: { ...params, progressToken: r.progress } } as JSONRPCMessage).catch(() => {});
+      return;
+    }
+    // A list changed is every session's; any other notification (a log message, say) is no session's: the sessions of
+    // a home may be different grants', and none sees what is not its own.
+    if ("method" in m && LIST_CHANGED.has(m.method)) for (const s of h.sessions) void s.transport.send(m).catch(() => {});
+  };
+
+  /** A session's message: answered here (initialize, an owner's or a refused tool) or passed to its home's child. */
+  const fromSession = (s: Session, u: User, m: JSONRPCMessage): void => {
+    const h = s.home;
+    if ("method" in m && m.method === "initialize" && "id" in m) {
+      // The child was initialized once, by the gateway: the session gets its answer, at the version it asked when the
+      // server supports it (as the server itself answers, SDK server/index.js _oninitialize).
+      const asked = ((m.params ?? {}) as { protocolVersion?: unknown }).protocolVersion;
+      const init = h.init ?? {};
+      const protocolVersion = typeof asked === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(asked) ? asked : LATEST_PROTOCOL_VERSION;
+      void s.transport.send({ jsonrpc: "2.0", id: m.id, result: { ...init, protocolVersion } } as JSONRPCMessage).catch((err: unknown) => log("client_send_failed", { user: u.id, error: String(err) }));
+      return;
+    }
+    if ("method" in m && m.method === "notifications/initialized") return;
+    const answer = remoteToolAnswer(u, m);
+    if (answer !== null) {
+      void s.transport.send(answer).catch((err: unknown) => log("client_send_failed", { user: u.id, error: String(err) }));
+      return;
+    }
+    if ("method" in m && "id" in m) {
+      const key = `c${++h.seq}`;
+      const params = (m.params ?? undefined) as { _meta?: { progressToken?: string | number } } | undefined;
+      const progress = params?._meta?.progressToken ?? null;
+      h.routes.set(key, { s, id: m.id, list: !u.fixed && m.method === "tools/list", progress });
+      const out = progress === null ? { ...m, id: key } : { ...m, id: key, params: { ...params, _meta: { ...params?._meta, progressToken: key } } };
+      void h.child.send(out as JSONRPCMessage).catch((err: unknown) => log("child_send_failed", { user: u.id, error: String(err) }));
+      return;
+    }
+    if ("method" in m && m.method === "notifications/cancelled") {
+      const params = (m.params ?? {}) as { requestId?: unknown; reason?: unknown };
+      for (const [key, r] of h.routes) {
+        if (r.s !== s || r.id !== params.requestId) continue;
+        h.routes.delete(key);
+        void h.child.send({ ...m, params: { ...params, requestId: key } } as JSONRPCMessage).catch(() => {});
+      }
+    }
+    // Other notifications and answers from a client are not the server's to see.
+  };
+
+  /**
+   * A home's child, spawned and initialized by the gateway (its initialize answered and acknowledged), under the
+   * home's lock only.
+   */
+  const spawnHome = async (u: User): Promise<Home> => {
+    if (homes.size + connecting >= maxSessions) throw Object.assign(new Error("the gateway is full: try again later"), { status: 503 });
+    const last = lastOpen.get(u.id) ?? 0;
+    if (Date.now() - last < OPEN_INTERVAL_MS) throw Object.assign(new Error("too many sessions started: try again shortly"), { status: 429 });
+    lastOpen.set(u.id, Date.now());
     const env = childEnv(u);
     const stderr = openLog(u);
     const child = new StdioClientTransport({ ...childCommand(u), env, stderr });
     let exited!: () => void;
-    const s: Session = {
-      id: "",
+    const h: Home = {
       user: u.id,
-      tokenSha256: u.tokenSha256,
-      fixed: u.fixed,
-      grant: u.grant,
       vault: u.vault,
-      transport: null as unknown as StreamableHTTPServerTransport,
       child,
       pid: null,
       exited: new Promise<void>((r) => (exited = r)),
-      idle: null,
-      inflight: 0,
+      init: null,
       ending: null,
+      sessions: new Set(),
       mine: new Map(),
-      lists: new Map(),
+      routes: new Map(),
+      seq: 0,
+      inflight: 0,
     };
-    byUser.set(u.id, s);
-    s.transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id) => {
-        s.id = id;
-        sessions.set(id, s);
-        log("session_start", { session: id, user: u.id, pid: s.pid });
-      },
-      enableDnsRebindingProtection: true,
-      allowedHosts,
-    });
-    s.transport.onmessage = (m) => {
-      const answer = remoteToolAnswer(u, m);
-      if (answer !== null) {
-        void s.transport.send(answer).catch((err: unknown) => log("client_send_failed", { user: u.id, error: String(err) }));
-        return;
-      }
-      if (!u.fixed && "method" in m && m.method === "tools/list" && "id" in m) s.lists.set(JSON.stringify(m.id), (s.lists.get(JSON.stringify(m.id)) ?? 0) + 1);
-      void child.send(m).catch((err: unknown) => log("child_send_failed", { user: u.id, error: String(err) }));
-    };
-    child.onmessage = (m) => {
-      if (!("method" in m) && "id" in m && typeof m.id === "string" && m.id.startsWith(mineId)) {
-        const w = s.mine.get(m.id);
-        s.mine.delete(m.id);
-        w?.done(m);
-        return;
-      }
-      touch(s);
-      let out = m;
-      const listId = !("method" in m) && "id" in m ? JSON.stringify(m.id) : null;
-      const listed = listId !== null ? (s.lists.get(listId) ?? 0) : 0;
-      if (listId !== null && listed > 0) {
-        if (listed === 1) s.lists.delete(listId);
-        else s.lists.set(listId, listed - 1);
-      }
-      if (listed > 0 && "result" in m) {
-        const r = m.result as { tools?: { name?: string }[] };
-        if (Array.isArray(r.tools)) out = { ...m, result: { ...r, tools: r.tools.filter((t) => !REMOTE_REFUSED_TOOLS.has(t.name ?? "")) } } as JSONRPCMessage;
-      }
-      void s.transport.send(out).catch((err: unknown) => log("client_send_failed", { user: u.id, error: String(err) }));
-    };
-    s.transport.onclose = () => endLater(s, "closed");
-    child.onclose = () => endLater(s, "child_exit");
+    homes.set(u.id, h);
+    child.onmessage = (m) => fromChild(h, m);
+    child.onclose = () => void endHome(h, "child_exit").catch(() => {});
     child.onerror = (err) => log("child_error", { user: u.id, error: String(err) });
     // start() spawns the child synchronously, keeping it in _process (SDK 1.32.1, pinned), before its first await: its
-    // real exit is watched from that moment, so an end() racing the start still waits for it (StdioClientTransport.close
+    // real exit is watched from that moment, so an end racing the start still waits for it (StdioClientTransport.close
     // sends SIGKILL last without waiting for the exit).
     const starting = child.start();
     const proc = (child as unknown as { _process?: ChildProcess })._process;
     if (proc === undefined) exited();
     else {
-      s.pid = proc.pid ?? null;
+      h.pid = proc.pid ?? null;
       if (proc.exitCode !== null || proc.signalCode !== null) exited();
       else
         proc.once("exit", (code) => {
@@ -504,48 +629,73 @@ async function main(): Promise<void> {
     try {
       await starting;
       if (proc === undefined) throw new Error("the MCP SDK's StdioClientTransport kept no child process: the gateway cannot see it exit");
-      if (s.ending !== null) throw new Error("the session ended while its server started");
+      const m = await askChild(h, "initialize", { protocolVersion: LATEST_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "ostra-remote-gateway", version: "1.0.0" } });
+      if (!("result" in m)) throw new Error(`the home's server refused initialize: ${JSON.stringify((m as { error?: unknown }).error)}`);
+      h.init = m.result as Record<string, unknown>;
+      await child.send({ jsonrpc: "2.0", method: "notifications/initialized" } as JSONRPCMessage);
+      if (h.ending !== null) throw new Error("the home's server ended while it started");
+      log("child_start", { user: u.id, pid: h.pid });
     } catch (err) {
-      await end(s, "child_failed").catch(() => {});
+      await endHome(h, "child_failed").catch(() => {});
       throw err;
     } finally {
       closeSync(stderr);
     }
+    return h;
+  };
+
+  /**
+   * A new session of `u` on its home's child (started first when the home has none); the session idle longest goes
+   * first when the home is full. Called under the home's lock only.
+   */
+  const open = async (u: User): Promise<Session> => {
+    let h = homes.get(u.id);
+    // A fixed user given another vault: the child of the vault before ends, never shared with the new one.
+    if (h !== undefined && h.ending === null && h.vault !== u.vault) await endHome(h, "vault_changed").catch(() => {});
+    if (h !== undefined && h.ending !== null) {
+      await h.ending.catch(() => {});
+      h = undefined;
+    }
+    if (h === undefined) h = await spawnHome(u);
+    if (h.sessions.size >= MAX_SESSIONS_PER_HOME) {
+      // The one idle longest goes: one with no call being answered first, of the same grant before another's.
+      const rank = (x: Session) => (x.inflight > 0 ? 2 : 0) + (x.grant === u.grant ? 0 : 1);
+      const out = [...h.sessions].sort((a, b) => rank(a) - rank(b) || a.active - b.active)[0] as Session;
+      void end(out, "home_full").catch(() => {});
+    }
+    const home = h;
+    const s: Session = {
+      id: "",
+      user: u.id,
+      tokenSha256: u.tokenSha256,
+      fixed: u.fixed,
+      grant: u.grant,
+      vault: u.vault,
+      transport: null as unknown as StreamableHTTPServerTransport,
+      home,
+      idle: null,
+      inflight: 0,
+      active: Date.now(),
+      ending: null,
+    };
+    home.sessions.add(s);
+    s.transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => {
+        s.id = id;
+        sessions.set(id, s);
+        log("session_start", { session: id, user: u.id, pid: home.pid, sessions: home.sessions.size });
+      },
+      enableDnsRebindingProtection: true,
+      allowedHosts,
+    });
+    s.transport.onmessage = (m) => fromSession(s, u, m);
+    s.transport.onclose = () => endLater(s, "closed");
     return s;
   };
 
-  /** The gateway's own tools/call to a live, initialized session's child; its answer is never passed to the client. */
-  const callChild = (s: Session, name: string, args: Record<string, unknown>): Promise<JSONRPCMessage> =>
-    new Promise<JSONRPCMessage>((resolve, reject) => {
-      const id = `${mineId}${++mineSeq}`;
-      s.inflight++;
-      touch(s);
-      const timer = setTimeout(() => {
-        s.mine.delete(id);
-        finish();
-        reject(new Error(`${name}: no answer from the session's server within ${CHILD_CALL_MS / 1000} s`));
-      }, CHILD_CALL_MS);
-      const finish = () => {
-        clearTimeout(timer);
-        s.inflight--;
-        touch(s);
-      };
-      s.mine.set(id, {
-        done: (m) => {
-          finish();
-          resolve(m);
-        },
-        fail: (err) => {
-          finish();
-          reject(err);
-        },
-      });
-      s.child.send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } } as JSONRPCMessage).catch((err: unknown) => {
-        s.mine.delete(id);
-        finish();
-        reject(err instanceof Error ? err : new Error(String(err)));
-      });
-    });
+  /** The gateway's own tools/call to a home's live child; its answer is never passed to a client. */
+  const callChild = (h: Home, name: string, args: Record<string, unknown>): Promise<JSONRPCMessage> => askChild(h, "tools/call", { name, arguments: args });
 
   /** Waits until process `pid` is gone (polled; for the short-lived connect child, whose process is not watched). */
   const gone = async (pid: number | null | undefined): Promise<void> => {
@@ -574,22 +724,22 @@ async function main(): Promise<void> {
 
   /**
    * A new agent key root from vault `vault`'s home, for a connect (remote-auth.ts), under the home's lock: asked of
-   * the home's live session's child when there is one (the session goes on), else of a short-lived child, gone before
-   * the lock is let go.
+   * the home's live child when there is one (its sessions go on), else of a short-lived child, gone before the lock is
+   * let go.
    */
   const issueAgentKey = (vault: Address) =>
     withUserLock(vaultUserId(vault), async () => {
       const u: User = { id: vaultUserId(vault), tokenSha256: Buffer.alloc(32), vault, fixed: false, grant: null };
-      const live = byUser.get(u.id);
-      if (live !== undefined && live.id !== "" && live.ending === null) {
+      const live = homes.get(u.id);
+      if (live !== undefined && live.init !== null && live.ending === null) {
         const m = await callChild(live, "agent_key_request", {});
         if ("error" in m) throw new Error(`agent_key_request: ${JSON.stringify(m.error)}`);
         const key = rootOf((m as { result?: unknown }).result);
         log("connect_agent_key", { user: u.id, index: key.index, from: "session" });
         return key;
       }
-      if (live !== undefined) await end(live, "connect");
-      if (byUser.size + connecting >= maxSessions) throw Object.assign(new Error("the gateway is full: try again later"), { status: 503 });
+      if (live !== undefined) await endHome(live, "connect");
+      if (homes.size + connecting >= maxSessions) throw Object.assign(new Error("the gateway is full: try again later"), { status: 503 });
       connecting++;
       const env = childEnv(u);
       const stderr = openLog(u);
@@ -698,11 +848,12 @@ async function main(): Promise<void> {
 
   const server = createServer(async (req, res) => {
     let counted: Session | null = null;
+    let opened: Session | null = null;
     try {
       const path = (req.url ?? "/").split("?")[0] ?? "/";
       if (path === "/health" && req.method === "GET") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, sessions: sessions.size, children: byUser.size }));
+        res.end(JSON.stringify({ ok: true, sessions: sessions.size, children: homes.size }));
         return;
       }
       if (auth !== null && path !== "/mcp" && (await auth.handle(req, res, path, new URL(req.url ?? "/", "http://gateway")))) return;
@@ -719,11 +870,14 @@ async function main(): Promise<void> {
       } else if (req.method === "POST" && isInitializeRequest(body)) {
         const refused = initializeRefusal(req);
         if (refused !== null) return reply(res, refused[0], refused[1]);
-        const last = lastOpen.get(u.id) ?? 0;
-        if (Date.now() - last < OPEN_INTERVAL_MS) return reply(res, 429, "too many sessions started: try again shortly", { "retry-after": "2" });
-        lastOpen.set(u.id, Date.now());
         s = await withUserLock(u.id, () => open(u));
-      } else return reply(res, 400, "no session: start with initialize");
+        opened = s;
+      } else {
+        // What a client sent without a session (its methods only, never their arguments), to see why.
+        const methods = (Array.isArray(body) ? body : [body]).map((x) => (x !== null && typeof x === "object" && "method" in x ? String((x as { method: unknown }).method) : "-"));
+        log("request_refused", { status: 400, httpMethod: req.method, methods: methods.slice(0, 5) });
+        return reply(res, 400, "no session: start with initialize");
+      }
       if (req.method === "POST") {
         s.inflight++;
         counted = s;
@@ -733,9 +887,14 @@ async function main(): Promise<void> {
       // An initialize the transport refused leaves no session: its child goes.
       if (s.id === "") await withUserLock(s.user, () => end(s as Session, "initialize_refused"));
     } catch (err) {
+      // An initialize that failed after its session was made: that session ends (its id never given out).
+      if (opened !== null && opened.id === "") {
+        const o = opened;
+        await withUserLock(o.user, () => end(o, "initialize_failed")).catch(() => {});
+      }
       const status = (err as { status?: number }).status ?? (err instanceof SyntaxError ? 400 : 500);
       log("request_failed", { status, error: err instanceof Error ? err.message : String(err) });
-      if (!res.headersSent) reply(res, status, status === 500 ? "internal error" : (err as Error).message);
+      if (!res.headersSent) reply(res, status, status === 500 ? "internal error" : (err as Error).message, status === 429 ? { "retry-after": "2" } : {});
     } finally {
       if (counted !== null) {
         counted.inflight--;
@@ -743,13 +902,14 @@ async function main(): Promise<void> {
       }
     }
   });
-  server.maxConnections = 4 * maxSessions + 16;
+  // Each session holds its GET stream and a POST or two: three connections per session a home may keep.
+  server.maxConnections = 3 * maxSessions * MAX_SESSIONS_PER_HOME + 16;
   server.headersTimeout = 20_000;
   server.listen(port, host, () => log("listening", { listen, users: users.length, idleSeconds, maxSessions, oauth: auth !== null, sandbox: sandboxMode }));
   const stop = () => {
-    log("stopping", { children: byUser.size });
+    log("stopping", { children: homes.size });
     server.close();
-    void Promise.allSettled([...byUser.values()].map((s) => end(s, "stopping"))).then(() => process.exit(0));
+    void Promise.allSettled([...homes.values()].map((h) => endHome(h, "stopping"))).then(() => process.exit(0));
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);

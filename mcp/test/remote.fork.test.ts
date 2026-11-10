@@ -3,8 +3,9 @@
 // runs in this process; its agent is reached only over Streamable HTTP, through the gateway, as a Claude connector
 // would: a user added with scripts/remote-user.ts, a bearer token, an MCP client. The agent asks for a key over HTTP,
 // the owner installs it, and the agent withdraws within the policy over HTTP; an owner's tool is refused in the
-// agent's session; a wrong token is refused; a second session of the same user ends the first (one child per home);
-// a session ended by DELETE takes its child with it.
+// agent's session; a wrong token is refused; the sessions of one user share one child (one server per home), each
+// answered on its own even when they ask at once with the same request ids; a burst of initializes starts one server;
+// a home past its sessions ends the one idle longest; a home's last session ended by DELETE takes its child with it.
 // Needs anvil on PATH.
 
 import assert from "node:assert/strict";
@@ -78,7 +79,7 @@ function result(r: Awaited<ReturnType<Client["callTool"]>>): Record<string, unkn
   return JSON.parse(text) as Record<string, unknown>;
 }
 
-test("the remote gateway: an agent reached over Streamable HTTP, held to the owner's policy, one session per user", { timeout: 1_800_000 }, async () => {
+test("the remote gateway: an agent reached over Streamable HTTP, held to the owner's policy, the sessions of a user on one server", { timeout: 1_800_000 }, async () => {
   const d = await liveAtV5(fork, LIVE_DEPLOYMENT);
   const record = join(dir, "robinhood-v5.json");
   writeFileSync(record, `${JSON.stringify(d, null, 2)}\n`);
@@ -192,20 +193,41 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
   symlinkSync(usersFile, join(root, "alice", "pad-files", "link.png"));
   await assert.rejects(async () => result(await a.callTool({ name: "upload_image", arguments: { path: join(root, "alice", "pad-files", "link.png") } })), /only files under/);
 
-  // A second session of the same user ends the first: one child per home, the first's process gone.
+  // A second session of the same user shares the first's server: both answered, each its own answers, even asked at
+  // once (the two clients number their requests alike: the gateway gives the child ids of its own).
   const aliceHome = join(root, "alice", "home");
   assert.equal(homeProcs(aliceHome).length, 1);
   const firstPid = homeProcs(aliceHome)[0];
-  await new Promise((r) => setTimeout(r, 2_100));
   const b = await connect();
-  await assert.rejects(a.callTool({ name: "v5_status", arguments: {} }), /Session not found|404/);
-  assert.equal(result(await b.callTool({ name: "v5_status", arguments: {} })).role, "agent");
-  assert.match(readFileSync(logs.gateway, "utf8"), /"why":"replaced"/);
-  assert.deepEqual(await health(), { ok: true, sessions: 1, children: 1 });
-  assert.equal(homeProcs(aliceHome).length, 1);
-  assert.notEqual(homeProcs(aliceHome)[0], firstPid, "the first session's server is gone");
+  for (let i = 0; i < 3; i++) {
+    const [ra, rb, la, lb] = await Promise.all([
+      a.callTool({ name: "v5_status", arguments: {} }),
+      b.callTool({ name: "balance", arguments: {} }),
+      a.listTools(),
+      b.listTools(),
+    ]);
+    assert.equal(result(ra).role, "agent");
+    assert.equal(rb.isError, undefined, JSON.stringify(rb).slice(0, 300));
+    assert.equal(la.tools.length, lb.tools.length);
+  }
+  // Two fresh clients number their requests alike (initialize 0, then 1, 2...): asked at once with the same ids, each
+  // gets its own answer (v5_status names the role; balance does not).
+  const c1 = await connect();
+  const c2 = await connect();
+  for (let i = 0; i < 3; i++) {
+    const [r1, r2] = await Promise.all([c1.callTool({ name: "v5_status", arguments: {} }), c2.callTool({ name: "balance", arguments: {} })]);
+    assert.equal(result(r1).role, "agent");
+    assert.equal(result(r2).role, undefined, JSON.stringify(r2).slice(0, 300));
+  }
+  await (c1.transport as StreamableHTTPClientTransport).terminateSession();
+  await (c2.transport as StreamableHTTPClientTransport).terminateSession();
+  await c1.close();
+  await c2.close();
+  assert.deepEqual(await health(), { ok: true, sessions: 2, children: 1 });
+  assert.deepEqual(homeProcs(aliceHome), [firstPid], "one server for both sessions");
+  assert.doesNotMatch(readFileSync(logs.gateway, "utf8"), /"why":"replaced"/);
 
-  // Initializes in a burst: started at most once per 2 s, never two servers on the home at any moment.
+  // Initializes in a burst join the live server: all answered, never a second server on the home.
   let most = 0;
   let sampling = true;
   const sampler = (async () => {
@@ -214,23 +236,25 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
       await new Promise((r) => setTimeout(r, 15));
     }
   })();
-  const beforeBurst = homeProcs(aliceHome)[0];
-  await new Promise((r) => setTimeout(r, 2_100));
   const burst = await Promise.all(Array.from({ length: 5 }, () => rawInitialize(token)));
-  await new Promise((r) => setTimeout(r, 3_000));
+  await new Promise((r) => setTimeout(r, 1_000));
   sampling = false;
   await sampler;
-  assert.deepEqual([...burst].sort(), [200, 429, 429, 429, 429], `burst answered ${burst.join(",")}`);
+  assert.deepEqual(burst, [200, 200, 200, 200, 200], `burst answered ${burst.join(",")}`);
   assert.equal(most, 1, `at most one server on the home at once (saw ${most})`);
-  assert.equal((await health()).children, 1);
-  assert.equal(homeProcs(aliceHome).length, 1);
-  assert.notEqual(homeProcs(aliceHome)[0], beforeBurst, "the burst's one session replaced the one before");
+  assert.deepEqual(await health(), { ok: true, sessions: 7, children: 1 });
+  assert.deepEqual(homeProcs(aliceHome), [firstPid]);
+
+  // A home keeps at most 16 sessions: one more ends the one idle longest, and the server goes on.
+  for (let i = 0; i < 10; i++) assert.equal(await rawInitialize(token), 200);
+  assert.deepEqual(await health(), { ok: true, sessions: 16, children: 1 });
+  assert.match(readFileSync(logs.gateway, "utf8"), /"why":"home_full"/);
+  assert.deepEqual(homeProcs(aliceHome), [firstPid]);
 
   // A refused initialize (a Host not allowed) ends nothing and starts nothing.
-  const before = homeProcs(aliceHome)[0];
-  await new Promise((r) => setTimeout(r, 2_100));
   assert.equal(await rawInitialize(token, "evil.example:443"), 403);
-  assert.deepEqual(homeProcs(aliceHome), [before]);
+  assert.deepEqual(homeProcs(aliceHome), [firstPid]);
+  assert.equal((await health()).sessions, 16);
 
   // Another user's token never reaches alice's session.
   const bobToken = execFileSync(process.execPath, [ADD_USER, usersFile, "add", "bob", vault], { encoding: "utf8" }).trim();
@@ -239,13 +263,36 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
   const asBob = await postRaw(bobToken, { jsonrpc: "2.0", id: 9, method: "tools/list", params: {} }, { "mcp-session-id": sessionId });
   assert.equal(asBob, 404);
 
-  // A new token for alice: the old one is refused and her live session ends.
-  execFileSync(process.execPath, [ADD_USER, usersFile, "add", "alice", vault], { encoding: "utf8" });
+  // A new token for alice: the old one is refused and her live sessions end, her server with them.
+  const token2 = execFileSync(process.execPath, [ADD_USER, usersFile, "add", "alice", vault], { encoding: "utf8" }).trim();
   assert.equal(await rawInitialize(token), 401);
-  await until(async () => (await health()).children === 0, "alice's session ends with her old token");
+  await until(async () => (await health()).children === 0, "alice's sessions end with her old token");
   assert.equal(homeProcs(aliceHome).length, 0);
   assert.match(readFileSync(logs.gateway, "utf8"), /"why":"user_changed"/);
   await live.close().catch(() => {});
+  await a.close().catch(() => {});
+  await b.close().catch(() => {});
+
+  // With no server on the home, a burst of initializes starts exactly one (the home's lock): all answered.
+  let most2 = 0;
+  let sampling2 = true;
+  const sampler2 = (async () => {
+    while (sampling2) {
+      most2 = Math.max(most2, homeProcs(aliceHome).length);
+      await new Promise((r) => setTimeout(r, 15));
+    }
+  })();
+  const burst2 = await Promise.all(Array.from({ length: 4 }, () => rawInitialize(token2)));
+  await new Promise((r) => setTimeout(r, 1_000));
+  sampling2 = false;
+  await sampler2;
+  assert.deepEqual(burst2, [200, 200, 200, 200], `burst answered ${burst2.join(",")}`);
+  assert.equal(most2, 1, `one server started for the burst (saw ${most2})`);
+  assert.deepEqual(await health(), { ok: true, sessions: 4, children: 1 });
+  // Their user removed again (a new token, unused): its sessions and server end.
+  execFileSync(process.execPath, [ADD_USER, usersFile, "add", "alice", vault], { encoding: "utf8" });
+  assert.equal(await rawInitialize(token2), 401);
+  await until(async () => (await health()).children === 0, "alice's sessions end again");
 
   // DELETE ends a session and its child (bob's).
   const bobClient = new Client({ name: "remote-test", version: "0.0.0" });
