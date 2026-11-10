@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ROBINHOOD_PUBLIC_RPC } from "@ostraagent/sdk";
-import { DEFAULT_LOGS, DEFAULT_SWAP_DEPLOYMENT, loadProxyConfig, parseListen, privatePoolOf } from "../src/config.ts";
+import { DEFAULT_DEPLOYMENT, DEFAULT_LOGS, DEFAULT_SWAP_DEPLOYMENT, loadProxyConfig, parseListen, privatePoolOf, vaultBeaconOf } from "../src/config.ts";
 
 const base = {
   OSTRA_RPC_URL: "https://rpc.mainnet.chain.robinhood.com",
@@ -21,7 +21,7 @@ test("both rates and the socket's address", () => {
     perIp: 3,
     total: 7,
     clientIp: "socket",
-    logs: { rpcUrl: ROBINHOOD_PUBLIC_RPC, perIp: DEFAULT_LOGS.perIp, total: DEFAULT_LOGS.total, swapDeployment: DEFAULT_SWAP_DEPLOYMENT },
+    logs: { rpcUrl: ROBINHOOD_PUBLIC_RPC, perIp: DEFAULT_LOGS.perIp, total: DEFAULT_LOGS.total, swapDeployment: DEFAULT_SWAP_DEPLOYMENT, deployment: DEFAULT_DEPLOYMENT },
   });
   assert.equal(loadProxyConfig({ ...base, OSTRA_RPC_PROXY_CLIENT_IP: "cf-connecting-ip" }).clientIp, "cf-connecting-ip");
   assert.equal(loadProxyConfig({ ...base, OSTRA_RPC_PROXY_CLIENT_IP: "" }).clientIp, "socket");
@@ -56,14 +56,17 @@ test("the logs route: defaults, its own variables checked, and the pool from the
     OSTRA_RPC_PROXY_LOGS_PER_IP: "4",
     OSTRA_RPC_PROXY_LOGS_TOTAL: "9",
     OSTRA_SWAP_DEPLOYMENT: "/x/record.json",
+    OSTRA_DEPLOYMENT: "/x/ostra.json",
   });
-  assert.deepEqual(c.logs, { rpcUrl: "http://127.0.0.1:8545", perIp: 4, total: 9, swapDeployment: "/x/record.json" });
+  assert.deepEqual(c.logs, { rpcUrl: "http://127.0.0.1:8545", perIp: 4, total: 9, swapDeployment: "/x/record.json", deployment: "/x/ostra.json" });
   assert.equal(loadProxyConfig({ ...base, OSTRA_RPC_PROXY_LOGS_URL: "" }).logs.rpcUrl, ROBINHOOD_PUBLIC_RPC);
   assert.throws(() => loadProxyConfig({ ...base, OSTRA_RPC_PROXY_LOGS_URL: "ws://x" }), /OSTRA_RPC_PROXY_LOGS_URL must be an http or https URL/);
   assert.throws(() => loadProxyConfig({ ...base, OSTRA_RPC_PROXY_LOGS_PER_IP: "0" }), /OSTRA_RPC_PROXY_LOGS_PER_IP must be a positive/);
   assert.throws(() => loadProxyConfig({ ...base, OSTRA_RPC_PROXY_LOGS_PER_IP: "61" }), /OSTRA_RPC_PROXY_LOGS_PER_IP must not exceed/);
   // The record of the ostra-swap checkout next to this one.
   assert.deepEqual(privatePoolOf(DEFAULT_SWAP_DEPLOYMENT), { privatePool: "0xe4250895Da2499602Cee4e178Fb46A0cF39F5b76", fromBlock: 94_940_585n });
+  // The vault beacon of this checkout's mainnet record.
+  assert.equal(vaultBeaconOf(DEFAULT_DEPLOYMENT), "0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0");
   const dir = mkdtempSync(join(tmpdir(), "rpc-proxy-"));
   try {
     const file = join(dir, "r.json");
@@ -73,6 +76,9 @@ test("the logs route: defaults, its own variables checked, and the pool from the
     assert.throws(() => privatePoolOf(file), /names no privatePool/);
     writeFileSync(file, JSON.stringify({ chainId: 4663, privatePool: "0xe4250895Da2499602Cee4e178Fb46A0cF39F5b76" }));
     assert.throws(() => privatePoolOf(file), /has no fromBlock/);
+    assert.throws(() => vaultBeaconOf(file), /names no vaultBeacon/);
+    writeFileSync(file, JSON.stringify({ chainId: 1, vaultBeacon: "0xE9F525B9EaeE48d13AEd28fE146F48f2832a18a0" }));
+    assert.throws(() => vaultBeaconOf(file), /not Robinhood Chain's/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -7,7 +7,10 @@
 // Only the requests the web app's logsClient makes (core/src/private-balance.ts, ostra-swap sdk/src/private.ts and
 // pools.ts, read 23 Oct 2026), all against one node so the logs and the state they are checked against agree:
 //   eth_getLogs      of OstraPrivatePool: Shielded, Unshielded, PrivateSwapped, NoteAdded (one event a request);
-//                    of Uniswap v4's PoolManager: Initialize (one pair's pools)
+//                    of Uniswap v4's PoolManager: Initialize (one pair's pools);
+//                    of the vault beacon: Upgraded (core v5.ts fromBlock: where version 5's events start);
+//                    of any address: a version 5 vault's AgentKeySet, AgentSpent, AllowSet, PriorsBorrowed (core
+//                    v5.ts, the vault page's Agent tab and /connect; any address, since every vault is one)
 //   eth_call         to OstraPrivatePool: currentTree(), treeSize(uint256), currentRoot() (PoolTrees.sync)
 //   eth_blockNumber, eth_chainId
 // One event per request (topic0 one value, never a list), other topics one value or null, at most LOG_WINDOW_BLOCKS
@@ -16,6 +19,7 @@
 
 import { getAbiItem, isAddress, parseAbiItem, toEventSelector, toFunctionSelector, type AbiEvent, type AbiFunction, type Address, type Hex } from "viem";
 import { ostraPrivatePoolAbi } from "../../../ostra-swap/sdk/src/abi.ts";
+import { ostraVaultModuleV5Abi, upgradeableBeaconAbi } from "../../sdk/src/abi.ts";
 import { LOG_WINDOW_BLOCKS } from "../../core/src/channels.ts";
 import { BYTES32, QUANTITY, checkEnvelope, refuse, type Checked } from "./policy.ts";
 
@@ -29,6 +33,15 @@ export const POOL_EVENTS = (["Shielded", "Unshielded", "PrivateSwapped", "NoteAd
 export const INITIALIZE_EVENT = parseAbiItem(
   "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)",
 );
+
+/** The beacon's Upgraded, from the ABI core reads it with (sdk/src/abi.ts). */
+export const UPGRADED_EVENT = getAbiItem({ abi: upgradeableBeaconAbi, name: "Upgraded" }) as AbiEvent;
+
+/** A version 5 vault's events core v5.ts searches (V5Service #logs), from the ABI it reads them with (OstraVaultModuleV5, sdk/src/abi.ts). */
+export const VAULT_V5_EVENTS = (["AgentKeySet", "AgentSpent", "AllowSet", "PriorsBorrowed"] as const).map((name) => getAbiItem({ abi: ostraVaultModuleV5Abi, name }) as AbiEvent);
+
+/** topic0 served at any address (a vault's version 5 events). */
+export const ANY_ADDRESS_TOPICS: ReadonlySet<string> = new Set(VAULT_V5_EVENTS.map((e) => toEventSelector(e)));
 
 /** The pool's functions served by eth_call (PoolTrees.sync), by selector, with the length of their calldata. */
 export const POOL_READS: ReadonlyMap<Hex, { name: string; bytes: number }> = new Map(
@@ -45,6 +58,8 @@ export type LogsPolicy = {
   privatePool: Address;
   /** The first block of its searches (the same record's fromBlock). */
   fromBlock: bigint;
+  /** The vault beacon (Ostra's deployment record vaultBeacon). */
+  vaultBeacon: Address;
 };
 
 /** topic0 served per contract (lower-case addresses and topics). */
@@ -52,6 +67,7 @@ export function servedTopics(p: LogsPolicy): ReadonlyMap<string, ReadonlySet<str
   return new Map([
     [p.privatePool.toLowerCase(), new Set(POOL_EVENTS.map((e) => toEventSelector(e)))],
     [UNISWAP_V4_POOL_MANAGER.toLowerCase(), new Set([toEventSelector(INITIALIZE_EVENT)])],
+    [p.vaultBeacon.toLowerCase(), new Set([toEventSelector(UPGRADED_EVENT)])],
   ]);
 }
 
@@ -63,8 +79,7 @@ function logsQuery(params: unknown[] | undefined, topics: ReadonlyMap<string, Re
   const f = params[0];
   if (Object.keys(f).some((k) => k !== "address" && k !== "topics" && k !== "fromBlock" && k !== "toBlock")) return "a filter of address, topics, fromBlock and toBlock only";
   if (typeof f.address !== "string" || !isAddress(f.address, { strict: false })) return "one contract address";
-  const served = topics.get(f.address.toLowerCase());
-  if (served === undefined) return "the logs of OstraPrivatePool or Uniswap v4's PoolManager";
+  const served = topics.get(f.address.toLowerCase()) ?? ANY_ADDRESS_TOPICS;
   if (!Array.isArray(f.topics) || f.topics.length < 1 || f.topics.length > 4) return "a list of one to four topics";
   const [topic0, ...rest] = f.topics as unknown[];
   if (typeof topic0 !== "string" || !served.has(topic0.toLowerCase())) return "one of the events the web app reads";

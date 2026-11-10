@@ -10,13 +10,16 @@ import { createPublicClient, encodeFunctionData, getAbiItem, http, numberToHex, 
 import { ROBINHOOD_PUBLIC_RPC, USDG, robinhoodChain } from "@ostraagent/sdk";
 import * as swap from "../../../ostra-swap/sdk/src/index.ts";
 import { LOG_WINDOW_BLOCKS } from "../../core/src/channels.ts";
-import { DEFAULT_SWAP_DEPLOYMENT, privatePoolOf } from "../src/config.ts";
+import { DEFAULT_DEPLOYMENT, DEFAULT_SWAP_DEPLOYMENT, privatePoolOf, vaultBeaconOf } from "../src/config.ts";
 import { LOGS_UPSTREAM_IN_FLIGHT, Slots, createRpcProxyServer } from "../src/http.ts";
-import { INITIALIZE_EVENT, POOL_EVENTS, POOL_READS, UNISWAP_V4_POOL_MANAGER, checkLogsRequest } from "../src/logs-policy.ts";
+import { INITIALIZE_EVENT, POOL_EVENTS, POOL_READS, UNISWAP_V4_POOL_MANAGER, UPGRADED_EVENT, VAULT_V5_EVENTS, checkLogsRequest } from "../src/logs-policy.ts";
+import { getLogsChunked } from "../../sdk/src/morpho.ts";
+import { ostraVaultFactoryAbi } from "../../sdk/src/abi.ts";
 import { RateLimiter } from "../src/policy.ts";
 
 const { privatePool: pool, fromBlock } = privatePoolOf(DEFAULT_SWAP_DEPLOYMENT);
-const policy = { privatePool: pool, fromBlock };
+const vaultBeacon = vaultBeaconOf(DEFAULT_DEPLOYMENT);
+const policy = { privatePool: pool, fromBlock, vaultBeacon };
 const topic = (e: AbiEvent) => toEventSelector(e);
 const [shielded, unshielded, swapped, noteAdded] = POOL_EVENTS as [AbiEvent, AbiEvent, AbiEvent, AbiEvent];
 const word: Hex = `0x${"cd".repeat(32)}`;
@@ -252,5 +255,58 @@ test("over HTTP: an upstream that does not answer is answered 504 in time, and i
   } finally {
     p.server.close();
     up.close();
+  }
+});
+
+test("version 5: the vault beacon's Upgraded and a vault's agent key and allowlist events, as core v5.ts asks them", () => {
+  const v5 = readFileSync(new URL("../../core/src/v5.ts", import.meta.url), "utf8");
+  const asked = [...v5.matchAll(/#logs\(vault, "([A-Za-z]+)"\)/g)].map((m) => m[1]).sort();
+  assert.deepEqual(VAULT_V5_EVENTS.map((e) => e.name).sort(), asked, "the events served are the ones V5Service searches");
+  const vault: Address = "0x5912000000000000000000000000000000000001";
+  const window = { fromBlock: numberToHex(1_000n), toBlock: numberToHex(1_000n + LOG_WINDOW_BLOCKS - 1n) };
+  assert.ok(served("eth_getLogs", [{ address: vaultBeacon, topics: [topic(UPGRADED_EVENT)], ...window }]));
+  for (const e of VAULT_V5_EVENTS) assert.ok(served("eth_getLogs", [{ address: vault, topics: [topic(e)], ...window }]), e.name);
+  assert.ok(served("eth_getLogs", [{ address: vault, topics: [topic(VAULT_V5_EVENTS[0] as AbiEvent), word], ...window }]));
+  // Upgraded only at the vault beacon; at any address only the version 5 vault events; never "latest" or a wider window.
+  const transfer = topic(parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)") as AbiEvent);
+  for (const f of [
+    { address: vault, topics: [topic(UPGRADED_EVENT)], ...window },
+    { address: USDG, topics: [transfer], ...window },
+    { address: vaultBeacon, topics: [topic(VAULT_V5_EVENTS[0] as AbiEvent)], ...window },
+    { address: vault, topics: [topic(VAULT_V5_EVENTS[0] as AbiEvent)], fromBlock: window.fromBlock, toBlock: "latest" },
+    { address: vault, topics: [topic(VAULT_V5_EVENTS[0] as AbiEvent)], fromBlock: "0x0", toBlock: numberToHex(LOG_WINDOW_BLOCKS) },
+    { address: vault, topics: [[topic(VAULT_V5_EVENTS[0] as AbiEvent), topic(VAULT_V5_EVENTS[1] as AbiEvent)]], ...window },
+    { address: vault, topics: [], ...window },
+  ]) {
+    assert.equal(served("eth_getLogs", [f]), false, JSON.stringify(f));
+  }
+});
+
+test("over HTTP, mainnet: version 5's searches through /logs, the same as the public RPC answers them", { timeout: 300_000 }, async () => {
+  const p = await logsProxy(ROBINHOOD_PUBLIC_RPC);
+  const direct = createPublicClient({ chain: robinhoodChain, transport: http(ROBINHOOD_PUBLIC_RPC, { retryCount: 2 }) }) as PublicClient;
+  const record = JSON.parse(readFileSync(DEFAULT_DEPLOYMENT, "utf8")) as { fromBlock: string };
+  try {
+    const head = await p.client.getBlockNumber();
+    // core v5.ts fromBlock: the beacon's upgrades from the record's first block, in windows.
+    const ups = await getLogsChunked(p.client, { address: vaultBeacon, event: UPGRADED_EVENT, fromBlock: BigInt(record.fromBlock), toBlock: head });
+    const upsDirect = await getLogsChunked(direct, { address: vaultBeacon, event: UPGRADED_EVENT, fromBlock: BigInt(record.fromBlock), toBlock: head });
+    assert.ok(ups.length >= 4, "the beacon was upgraded to versions 2 to 5");
+    assert.deepEqual(ups.map((l) => l.transactionHash), upsDirect.map((l) => l.transactionHash));
+    const v5From = (ups[ups.length - 1] as { blockNumber: bigint }).blockNumber;
+    // A vault of the factory (its first VaultCreated, read directly), then V5Service #logs: each event of that vault
+    // from version 5's first block, as the Agent tab and /connect read them, the same through /logs as directly.
+    const created = getAbiItem({ abi: ostraVaultFactoryAbi, name: "VaultCreated" }) as AbiEvent;
+    const d = JSON.parse(readFileSync(DEFAULT_DEPLOYMENT, "utf8")) as { vaultFactory: Address };
+    const first = await getLogsChunked(direct, { address: d.vaultFactory, event: created, fromBlock: BigInt(record.fromBlock), toBlock: head });
+    const vault = (first[0] as unknown as { args: { vault: Address } }).args.vault;
+    for (const e of VAULT_V5_EVENTS) {
+      const via = await getLogsChunked(p.client, { address: vault, event: e, fromBlock: v5From, toBlock: head }).catch((err: unknown) => assert.fail(`${e.name}: ${String(err)}`));
+      const plain = await getLogsChunked(direct, { address: vault, event: e, fromBlock: v5From, toBlock: head });
+      assert.deepEqual(via.map((l) => l.transactionHash), plain.map((l) => l.transactionHash), e.name);
+    }
+    await assert.rejects(p.client.getLogs({ address: vault, event: VAULT_V5_EVENTS[0] as AbiEvent, fromBlock: v5From, toBlock: "latest" }));
+  } finally {
+    p.server.close();
   }
 });

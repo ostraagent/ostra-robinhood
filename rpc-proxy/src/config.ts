@@ -18,6 +18,8 @@
 //                                Chain's public RPC)
 //   OSTRA_RPC_PROXY_LOGS_PER_IP  requests a second per client IP address (default 20)
 //   OSTRA_RPC_PROXY_LOGS_TOTAL   requests a second in all (default 60)
+//   OSTRA_DEPLOYMENT             Ostra's deployment record (default deployments/robinhood-mainnet.json of this
+//                                repository): its vault beacon, whose upgrades /logs serves (logs-policy.ts)
 //   OSTRA_SWAP_DEPLOYMENT        the ostra-swap deployment record naming
 //                                OstraPrivatePool (default the ostra-swap checkout
 //                                next to this one, deployments/robinhood-mainnet.json)
@@ -37,7 +39,7 @@ export type ProxyConfig = {
   perIp: number;
   total: number;
   clientIp: "socket" | "cf-connecting-ip";
-  logs: { rpcUrl: string; perIp: number; total: number; swapDeployment: string };
+  logs: { rpcUrl: string; perIp: number; total: number; swapDeployment: string; deployment: string };
 };
 
 /**
@@ -46,6 +48,7 @@ export type ProxyConfig = {
  */
 export const DEFAULT_LOGS = { perIp: 20, total: 60 } as const;
 export const DEFAULT_SWAP_DEPLOYMENT = fileURLToPath(new URL("../../../ostra-swap/deployments/robinhood-mainnet.json", import.meta.url));
+export const DEFAULT_DEPLOYMENT = fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url));
 
 const orDefault = (env: NodeJS.ProcessEnv, name: string, fallback: string): string => (env[name] === undefined || env[name] === "" ? fallback : (env[name] as string));
 
@@ -103,6 +106,7 @@ export function loadProxyConfig(env: NodeJS.ProcessEnv = process.env): ProxyConf
       perIp: logsPerIp,
       total: logsTotal,
       swapDeployment: orDefault(env, "OSTRA_SWAP_DEPLOYMENT", DEFAULT_SWAP_DEPLOYMENT),
+      deployment: orDefault(env, "OSTRA_DEPLOYMENT", DEFAULT_DEPLOYMENT),
     },
   };
 }
@@ -114,4 +118,12 @@ export function privatePoolOf(recordPath: string): { privatePool: Address; fromB
   if (typeof record.privatePool !== "string" || !isAddress(record.privatePool, { strict: false })) throw new Error(`the ostra-swap deployment record ${recordPath} names no privatePool`);
   if (typeof record.fromBlock !== "string" || !/^[0-9]+$/.test(record.fromBlock)) throw new Error(`the ostra-swap deployment record ${recordPath} has no fromBlock`);
   return { privatePool: getAddress(record.privatePool), fromBlock: BigInt(record.fromBlock) };
+}
+
+/** The vault beacon of Ostra's deployment record (Robinhood Chain's): every vault's implementation, upgraded by it. */
+export function vaultBeaconOf(recordPath: string): Address {
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as { chainId?: unknown; vaultBeacon?: unknown };
+  if (record.chainId !== ROBINHOOD_CHAIN_ID) throw new Error(`the deployment record ${recordPath} is not Robinhood Chain's`);
+  if (typeof record.vaultBeacon !== "string" || !isAddress(record.vaultBeacon, { strict: false })) throw new Error(`the deployment record ${recordPath} names no vaultBeacon`);
+  return getAddress(record.vaultBeacon);
 }

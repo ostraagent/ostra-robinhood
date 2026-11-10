@@ -58,7 +58,7 @@ async function proxy(perIp: number, total: number, upstream: string = fork.url) 
     limiter: new RateLimiter(perIp, total),
     clientIp: "socket",
     log: (event, fields = {}) => events.push({ event, fields }),
-    logs: { rpcUrl: upstream, limiter: new RateLimiter(perIp, total), policy: { privatePool: someone, fromBlock: 0n } },
+    logs: { rpcUrl: upstream, limiter: new RateLimiter(perIp, total), policy: { privatePool: someone, fromBlock: 0n, vaultBeacon: someone } },
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const at = server.address();

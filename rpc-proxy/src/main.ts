@@ -5,10 +5,10 @@
 // client IP address and OSTRA_RPC_PROXY_TOTAL in all (http.ts). The /logs route
 // serves the web app's log scans from an RPC that serves them (logs-policy.ts);
 // it needs OstraPrivatePool's address, read from the ostra-swap deployment
-// record at start. Configuration: config.ts. Stops cleanly on SIGINT and SIGTERM.
+// record at start, and the vault beacon's, from Ostra's. Configuration: config.ts. Stops cleanly on SIGINT and SIGTERM.
 
 import { ROBINHOOD_CHAIN_ID } from "@ostraagent/sdk";
-import { loadProxyConfig, privatePoolOf } from "./config.ts";
+import { loadProxyConfig, privatePoolOf, vaultBeaconOf } from "./config.ts";
 import { createRpcProxyServer } from "./http.ts";
 import { RateLimiter } from "./policy.ts";
 
@@ -35,6 +35,7 @@ async function main(): Promise<void> {
   const id = await chainId(config.rpcUrl);
   if (id !== ROBINHOOD_CHAIN_ID) throw new Error(`the RPC is chain ${id}, not Robinhood Chain (${ROBINHOOD_CHAIN_ID})`);
   const { privatePool, fromBlock } = privatePoolOf(config.logs.swapDeployment);
+  const vaultBeacon = vaultBeaconOf(config.logs.deployment);
   // The logs upstream is checked too, but one that cannot be reached now does not stop the proxy: / does not need it.
   let logsChain: number | null = null;
   try {
@@ -49,7 +50,7 @@ async function main(): Promise<void> {
     limiter: new RateLimiter(config.perIp, config.total),
     clientIp: config.clientIp,
     log,
-    logs: { rpcUrl: config.logs.rpcUrl, limiter: new RateLimiter(config.logs.perIp, config.logs.total), policy: { privatePool, fromBlock } },
+    logs: { rpcUrl: config.logs.rpcUrl, limiter: new RateLimiter(config.logs.perIp, config.logs.total), policy: { privatePool, fromBlock, vaultBeacon } },
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -61,7 +62,7 @@ async function main(): Promise<void> {
     perIp: config.perIp,
     total: config.total,
     clientIp: config.clientIp,
-    logs: { perIp: config.logs.perIp, total: config.logs.total, privatePool, upstreamChecked: logsChain !== null },
+    logs: { perIp: config.logs.perIp, total: config.logs.total, privatePool, vaultBeacon, upstreamChecked: logsChain !== null },
   });
 
   let stopping = false;
