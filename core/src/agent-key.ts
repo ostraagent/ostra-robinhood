@@ -70,8 +70,11 @@ export const AGENT_KEY_DIR = "agent-key";
 const SEARCH_WINDOW = 256n;
 /** The indexes skipped past the highest known when the mark is rebuilt (roots handed out but never seen on chain). */
 const RESTORE_SKIP = 64n;
+/** The roots agent_key_request handed out last, kept with their index: an installed one is found without a search. */
+const ISSUED_KEPT = 64;
 
 type MarkRecord = { version: 1; chainId: number; vault: Address; next: string };
+type IssuedRecord = { version: 1; roots: [root: Hex, index: string][] };
 
 export type AgentKeyParts = {
   client: PublicClient;
@@ -144,6 +147,22 @@ export class AgentKey {
     return `${this.#p.config.chainId}-${this.vault.toLowerCase()}.json`;
   }
 
+  #issuedName(): string {
+    return `${this.#p.config.chainId}-${this.vault.toLowerCase()}.issued.json`;
+  }
+
+  /** The roots handed out last and their indexes (a hint only: each is checked against the keychain before use). */
+  async #issued(): Promise<[Hex, bigint][]> {
+    const text = await this.#p.folder.read(this.#issuedName());
+    if (text === undefined) return [];
+    try {
+      const r = JSON.parse(text) as IssuedRecord;
+      return r.version === 1 && Array.isArray(r.roots) ? r.roots.map(([root, i]) => [root.toLowerCase() as Hex, BigInt(i)]) : [];
+    } catch {
+      return [];
+    }
+  }
+
   /** The vault, running version 5 (else nothing is signed). */
   async state(): Promise<V5State> {
     if ((await readVault(this.#p.client, this.#p.config.deployment, this.vault)) === null) throw new Error(`${this.vault} is not an Ostra vault of this deployment`);
@@ -213,11 +232,17 @@ export class AgentKey {
     return i;
   }
 
-  /** The index of this keychain's key whose root is `root`, or null when it is none of this seed's. */
+  /**
+   * The index of this keychain's key whose root is `root`, or null when it is none of this seed's: searched down from
+   * the newest index handed out (the key in force is almost always one of the last), then SEARCH_WINDOW past it; a root
+   * agent_key_request handed out lately is found at once (the issued record), however many were handed out after it.
+   */
   async indexOf(root: Hex): Promise<bigint | null> {
     const r = root.toLowerCase();
+    for (const [h, i] of await this.#issued()) if (h === r && this.#root(i) === r) return i;
     const next = await this.#next();
-    for (let i = 0n; i < next + SEARCH_WINDOW; i++) if (this.#root(i) === r) return i;
+    for (let i = next - 1n; i >= 0n; i--) if (this.#root(i) === r) return i;
+    for (let i = next; i < next + SEARCH_WINDOW; i++) if (this.#root(i) === r) return i;
     return null;
   }
 
@@ -230,7 +255,11 @@ export class AgentKey {
     return this.#serial(async () => {
       await this.state();
       const i = await this.#take();
-      return { vault: this.vault, root: this.#root(i), index: i.toString() };
+      const root = this.#root(i);
+      const kept = (await this.#issued()).slice(-(ISSUED_KEPT - 1));
+      const rec: IssuedRecord = { version: 1, roots: [...kept.map(([h, x]) => [h, x.toString()] as [Hex, string]), [root, i.toString()]] };
+      await this.#p.folder.write(this.#issuedName(), `${JSON.stringify(rec)}\n`);
+      return { vault: this.vault, root, index: i.toString() };
     });
   }
 

@@ -6,7 +6,8 @@
 //
 // With OSTRA_HOME_EXCLUSIVE=yes (the remote gateway's children, remote.ts) it holds OSTRA_HOME for itself: it refuses
 // to start while another live server holds it (its one-time keys must never be signed with twice), and it exits when
-// its stdin closes, so that no server outlives the gateway that started it.
+// its stdin closes, so that no server outlives the gateway that started it. With OSTRA_HOME_EXCLUSIVE=flock (a
+// sandboxed child) the gateway holds the home for it with flock(1); it still exits when its stdin closes.
 
 import { linkSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -85,11 +86,14 @@ function holdHome(home: string): void {
 }
 
 async function main(): Promise<void> {
-  const exclusive = process.env.OSTRA_HOME_EXCLUSIVE === "yes";
-  if (exclusive) {
+  const exclusive = process.env.OSTRA_HOME_EXCLUSIVE;
+  if (exclusive !== undefined && exclusive !== "") {
+    if (exclusive !== "yes" && exclusive !== "flock") throw new Error("OSTRA_HOME_EXCLUSIVE is yes or flock");
     const home = process.env.OSTRA_HOME;
     if (home === undefined || home === "") throw new Error("OSTRA_HOME_EXCLUSIVE needs OSTRA_HOME");
-    holdHome(home);
+    // flock: the gateway started this server under flock(1) on the home, in a sandbox of its own (process ids there
+    // are not the host's, so the pid lock could not tell a live holder).
+    if (exclusive === "yes") holdHome(home);
     process.stdin.on("end", () => process.exit(0));
     process.stdin.on("close", () => process.exit(0));
   }

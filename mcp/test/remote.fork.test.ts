@@ -296,7 +296,9 @@ function homeProcs(home: string): string[] {
   for (const d of readdirSync("/proc")) {
     if (!/^\d+$/.test(d)) continue;
     try {
-      if (!readFileSync(`/proc/${d}/cmdline`, "latin1").includes("server.ts")) continue;
+      const cmd = readFileSync(`/proc/${d}/cmdline`, "latin1");
+      // The server itself, not the flock(1) that holds its home for it.
+      if (!cmd.includes("server.ts") || cmd.startsWith("/usr/bin/flock")) continue;
       if (readFileSync(`/proc/${d}/environ`, "latin1").split("\0").includes(`OSTRA_HOME=${home}`)) out.push(d);
     } catch {
       // gone, or not ours
