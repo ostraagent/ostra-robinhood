@@ -47,8 +47,8 @@
 //
 // The other OSTRA_* variables of its environment (OSTRA_RPC_URL_FILE, OSTRA_DEPLOYMENT, the service URLs...) and a
 // few system ones (PASSED_ENV) are passed to the children; nothing else is. Per home it sets OSTRA_HOME,
-// OSTRA_AGENT_OF, OSTRA_PAD_FILES, OSTRA_FILES_ONLY_IN (tools read local files only from the home's own pad-files)
-// and OSTRA_HOME_EXCLUSIVE (server.ts then refuses to share the home, or with "flock" leaves that to flock(1), and
+// OSTRA_AGENT_OF, OSTRA_PAD_FILES, OSTRA_FILES_ONLY_IN (tools read local files only from the home's own pad-files),
+// OSTRA_HOSTED (no answer tells the user to export a seed kept here) and OSTRA_HOME_EXCLUSIVE (server.ts then refuses to share the home, or with "flock" leaves that to flock(1), and
 // exits when its stdin closes). Logs are JSON lines on stderr, naming homes by their id, never a vault; a child's
 // stderr goes to <root>/<id>/mcp.log.
 //
@@ -86,7 +86,7 @@ const CHILD_CALL_MS = 60_000;
 /** The variables of the gateway's environment a child gets besides OSTRA_* (OSTRA_REMOTE_* never). */
 const PASSED_ENV = new Set(["PATH", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
 /** The variables set per home, never bound into a sandbox from the gateway's environment. */
-const PER_HOME_ENV = new Set(["OSTRA_HOME", "OSTRA_AGENT_OF", "OSTRA_PAD_FILES", "OSTRA_FILES_ONLY_IN", "OSTRA_HOME_EXCLUSIVE"]);
+const PER_HOME_ENV = new Set(["OSTRA_HOME", "OSTRA_AGENT_OF", "OSTRA_PAD_FILES", "OSTRA_FILES_ONLY_IN", "OSTRA_HOME_EXCLUSIVE", "OSTRA_HOSTED"]);
 /** What a sandbox sees of the system, read only, when it is there. */
 const SYSTEM_RO = ["/usr", "/etc/ssl", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf", "/etc/localtime"];
 const FLOCK = "/usr/bin/flock";
@@ -454,6 +454,7 @@ async function main(): Promise<void> {
       OSTRA_PAD_FILES: join(dir, "pad-files"),
       OSTRA_FILES_ONLY_IN: join(dir, "pad-files"),
       OSTRA_HOME_EXCLUSIVE: sandbox ? "flock" : "yes",
+      OSTRA_HOSTED: "yes",
     };
   };
 

@@ -269,11 +269,23 @@ export function registerTools(server: McpServer, agent: Agent): void {
 
   // --- the vault ---------------------------------------------------------------------------------
   tool("open_vault", "Creates the agent's vault (USDG on Robinhood Chain, post-quantum WOTS keys) or finds it. With the Ostra relayer, its creation is paid later from the vault.", {}, () => agent.buyer.open());
+  /**
+   * A status without the reminder to export the seed when this server is hosted (the remote gateway): the user cannot
+   * reach this host, and the owner's own seed and backup are the owner's (the Ostra web app).
+   */
+  const unhosted = <T extends { backupExported?: boolean; backupReminder?: string }>(status: T): T | Omit<T, "backupExported" | "backupReminder"> => {
+    if (!agent.config.hosted) return status;
+    const { backupExported: _exported, backupReminder: _reminder, ...rest } = status;
+    return rest;
+  };
+  const HOSTED_KEYS =
+    "this server runs on Ostra's remote MCP gateway: its seed is kept there and never exported (it holds this agent's key, and the vaults and wallet made from it, such as the creator vault below, funded from the owner's vault only as the owner's policy and allowlist permit); the owner's own seed and its backup stay with the owner (the Ostra web app or the owner's MCP server)";
   tool("balance", "The vault's balance, nonce, any operation signed and not landed, the relayer channels, and the creator vault.", {}, async () => ({
-    vault: await agent.buyer.status(),
+    vault: unhosted(await agent.buyer.status()),
     relayerChannels: agent.relayer === null ? null : await agent.relayer.channels(),
     creatorVault: await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
     relayer: agent.config.relayerUrl !== null,
+    ...(agent.config.hosted ? { keys: HOSTED_KEYS } : {}),
   }));
   // The payment wallet holds at most 5 USDG, which only its own top-ups keep to: withdraw and pay orders refuse this
   // server's own wallet (an agent key's wallet, on the owner's server, is the owner's to fund as it decides).
@@ -388,7 +400,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
   tool("accept_payments", "Sets up the seller side: the seller vault with the Ostra keeper's crank (it claims vouchers), and the merchant key for the seller server (merchant/).", {}, () => agent.acceptPayments());
   tool("seller_balance", "The seller vault: balance, nonce, crank.", {}, async () => {
     if (!(await agent.sellerReady())) throw new Error("this agent has no seller vault yet; call accept_payments first");
-    return agent.seller.status();
+    return unhosted(await agent.seller.status());
   });
   tool("seller_withdraw", "Sends USDG from the seller vault (default: to the agent's vault).", { amount: usdg, destination: address.optional() }, async (a) => {
     if (!(await agent.sellerReady())) throw new Error("this agent has no seller vault yet; call accept_payments first");

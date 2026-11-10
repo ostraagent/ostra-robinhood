@@ -211,13 +211,20 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
     assert.equal(la.tools.length, lb.tools.length);
   }
   // Two fresh clients number their requests alike (initialize 0, then 1, 2...): asked at once with the same ids, each
-  // gets its own answer (v5_status names the role; balance does not).
+  // gets its own answer (v5_status has the policy; balance has the relayer channels). Hosted by the gateway, balance
+  // never tells the user to export the seed (kept on the gateway's host) and says so.
   const c1 = await connect();
   const c2 = await connect();
   for (let i = 0; i < 3; i++) {
     const [r1, r2] = await Promise.all([c1.callTool({ name: "v5_status", arguments: {} }), c2.callTool({ name: "balance", arguments: {} })]);
     assert.equal(result(r1).role, "agent");
-    assert.equal(result(r2).role, undefined, JSON.stringify(r2).slice(0, 300));
+    assert.ok("policy" in result(r1) && !("relayerChannels" in result(r1)));
+    const bal = result(r2);
+    assert.ok("relayerChannels" in bal && !("policy" in bal), JSON.stringify(r2).slice(0, 300));
+    assert.ok(typeof bal.creatorVault === "object" && bal.creatorVault !== null);
+    assert.match(String(bal.keys), /remote MCP gateway/);
+    assert.ok(!("backupReminder" in (bal.vault as Record<string, unknown>)) && !("backupExported" in (bal.vault as Record<string, unknown>)));
+    assert.ok(!JSON.stringify(r2).includes("backup export"));
   }
   await (c1.transport as StreamableHTTPClientTransport).terminateSession();
   await (c2.transport as StreamableHTTPClientTransport).terminateSession();
