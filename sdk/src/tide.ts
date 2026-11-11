@@ -145,15 +145,59 @@ export const TIDE_MAX_LINKED_VAULTS = 96;
 // -------------------------------------------------------------------------------------------------------------------
 
 /**
- * Week 1's rules (decided by Edu on 26 Oct 2026; on 31 Oct the X account and post condition was dropped, and five
- * details below set): points per US dollar (E6 points per E6 dollar), the fee cap, the combined balance cap, the
- * activity threshold of a day, the multipliers (basis points) and the cap of one agent's share of the pot.
+ * One week's rules: points per US dollar (E6 points per E6 dollar), the fee caps, the combined balance cap, the
+ * activity threshold of a day, the multipliers (basis points) and the cap of one agent's share of the pot. A rate of
+ * 0 leaves its source out entirely (week 1 had no Ostrapad fees and no Raeto vault deposits).
  */
-export const TIDE_RULES = {
+export type TideRules = {
+  week: number;
+  feePointsPerUsd: bigint;
+  feeCapE6: bigint;
+  raetoPointsPerUsd: bigint;
+  /**
+   * Ostrapad, on jobs judged by the evaluator pool (from week 2): the platform fee of a job completed, for its provider;
+   * the platform fee and the evaluator fee of a job completed, for its client; the evaluator fee of a decision that
+   * stood (not overturned on appeal), for its evaluator. The three together count up to padFeeCapE6, the provider's
+   * row first.
+   */
+  padCompletePointsPerUsd: bigint;
+  padHirePointsPerUsd: bigint;
+  padJudgePointsPerUsd: bigint;
+  padFeeCapE6: bigint;
+  /** Whether an Ostrapad fee counts toward an active day, with the swap fees and the Raeto credits. */
+  padCountsActive: boolean;
+  /** Deposits in Raeto's vaults through vault v4 venues, a balance row above cash, filled first under the cap (from week 2). */
+  raetoVaultPointsPerUsd: bigint;
+  /** Whether Spark Savings USDG held through vault v4 counts as cash (from week 2). */
+  sparkInCash: boolean;
+  cashPointsPerUsd: bigint;
+  borroPointsPerUsd: bigint;
+  idlePointsPerUsd: bigint;
+  balanceCapE6: bigint;
+  activeDayMinE6: bigint;
+  earlyBefore: number;
+  earlyBps: bigint;
+  active3Bps: bigint;
+  active7Bps: bigint;
+  shareCapBps: bigint;
+};
+
+/**
+ * Week 1's rules (decided by Edu on 26 Oct 2026; on 31 Oct the X account and post condition was dropped, and five
+ * details below set).
+ */
+export const TIDE_RULES_WEEK_1: TideRules = {
   week: 1,
   feePointsPerUsd: 100n,
   feeCapE6: 20_000_000n,
   raetoPointsPerUsd: 10n,
+  padCompletePointsPerUsd: 0n,
+  padHirePointsPerUsd: 0n,
+  padJudgePointsPerUsd: 0n,
+  padFeeCapE6: 0n,
+  padCountsActive: false,
+  raetoVaultPointsPerUsd: 0n,
+  sparkInCash: false,
   cashPointsPerUsd: 2n,
   borroPointsPerUsd: 2n,
   idlePointsPerUsd: 1n,
@@ -164,7 +208,41 @@ export const TIDE_RULES = {
   active3Bps: 12_000n,
   active7Bps: 13_000n,
   shareCapBps: 2_000n,
-} as const;
+};
+
+/**
+ * Week 2's rules (the table Edu decided on 2 Nov 2026 and announced that day; the two details it left open decided on
+ * 11 Nov): week 1's, plus Ostrapad on pool-judged jobs (completing 300, hiring 100, judging 100 points per $1 of fee,
+ * $20 of Ostrapad fees a week; a hire counts a completed job's platform and evaluator fees; Ostrapad fees count toward
+ * an active day), USDG and stocks in Raeto's vaults through vault v4 (3 per $1, the balance cap filled with them
+ * first), Spark Savings USDG through vault v4 as cash, and x1.5 for every agent registered through Ostra before week 2
+ * started (4 Nov 2026 00:00 UTC).
+ */
+export const TIDE_RULES_WEEK_2: TideRules = {
+  ...TIDE_RULES_WEEK_1,
+  week: 2,
+  padCompletePointsPerUsd: 300n,
+  padHirePointsPerUsd: 100n,
+  padJudgePointsPerUsd: 100n,
+  padFeeCapE6: 20_000_000n,
+  padCountsActive: true,
+  raetoVaultPointsPerUsd: 3n,
+  sparkInCash: true,
+  earlyBefore: TIDE_START + TIDE_WEEK,
+};
+
+/** Every week with rules, by number. */
+export const TIDE_WEEK_RULES: ReadonlyMap<number, TideRules> = new Map([TIDE_RULES_WEEK_1, TIDE_RULES_WEEK_2].map((r) => [r.week, r]));
+
+/** The latest week with rules: what the scoring script scores up to. */
+export const TIDE_RULES: TideRules = TIDE_RULES_WEEK_2;
+
+/** Week `week`'s rules; refused for a week with none. */
+export function tideRulesFor(week: number): TideRules {
+  const r = TIDE_WEEK_RULES.get(week);
+  if (r === undefined) throw new RangeError(`week ${week} has no Tide rules`);
+  return r;
+}
 
 /**
  * One swap that paid Ostra's fee, as the score sees it: its time, the fee in dollars, and its trade for the netting:
@@ -186,8 +264,17 @@ export function tideFeePair(tokenIn: Address, tokenOut: Address): { pair: string
 }
 /** USDG the agent sent Raeto for AI credits. */
 export type TideRaeto = { time: number; usdE6: bigint };
-/** The agent's balances at the end of one UTC day of the week, in dollars: in cash vaults, in Borro, and idle. */
-export type TideDay = { cashE6: bigint; borroE6: bigint; idleE6: bigint };
+/**
+ * An Ostrapad fee that counts for the agent (USDG, E6 dollars), on a job judged by the evaluator pool, at the time the
+ * job ended: "complete" the platform fee of its job as provider; "hire" the platform and evaluator fees of its
+ * completed job as client; "judge" the evaluator fee of its decision that stood.
+ */
+export type TidePad = { time: number; kind: "complete" | "hire" | "judge"; feeE6: bigint; jobId?: string };
+/**
+ * The agent's balances at the end of one UTC day of the week, in dollars: in Raeto's vaults (through vault v4; from
+ * week 2), in cash vaults, in Borro, and idle.
+ */
+export type TideDay = { raetoE6?: bigint; cashE6: bigint; borroE6: bigint; idleE6: bigint };
 
 export type TideAgentInput = {
   agentId: string;
@@ -195,6 +282,8 @@ export type TideAgentInput = {
   registeredAt: number;
   fees: readonly TideFee[];
   raeto: readonly TideRaeto[];
+  /** Ostrapad fees (from week 2). */
+  pad?: readonly TidePad[];
   /** Seven days, the week's first to its last. */
   days: readonly TideDay[];
 };
@@ -203,7 +292,19 @@ export type TideBreakdown = {
   agentId: string;
   fee: { paidE6: string; countedE6: string; nettedOutE6: string; cappedE6: string; points: string };
   raeto: { paidE6: string; points: string };
-  balances: { cashAvgE6: string; borroAvgE6: string; idleAvgE6: string; countedCashE6: string; countedBorroE6: string; countedIdleE6: string; points: string };
+  /** Ostrapad fees on pool-judged jobs (from week 2; zeros before), by row, and what counted under the cap. */
+  pad: { completeE6: string; hireE6: string; judgeE6: string; countedCompleteE6: string; countedHireE6: string; countedJudgeE6: string; points: string };
+  balances: {
+    raetoVaultAvgE6: string;
+    cashAvgE6: string;
+    borroAvgE6: string;
+    idleAvgE6: string;
+    countedRaetoVaultE6: string;
+    countedCashE6: string;
+    countedBorroE6: string;
+    countedIdleE6: string;
+    points: string;
+  };
   basePoints: string;
   activeDays: number[];
   early: boolean;
@@ -219,11 +320,14 @@ function abs(x: bigint): bigint {
  * One agent's points for the week, with where they came from (every count E6). `start` replaces the week's own start
  * (OstraTide's), for a test on a fork whose blocks all come after it.
  */
-export function tideScore(a: TideAgentInput, week: number, rules = TIDE_RULES, start = tideWeekSpan(week).start): TideBreakdown {
+export function tideScore(a: TideAgentInput, week: number, rules: TideRules = tideRulesFor(week), start = tideWeekSpan(week).start): TideBreakdown {
+  if (rules.week !== week) throw new RangeError(`week ${week} scored with week ${rules.week}'s rules`);
   if (a.days.length !== 7) throw new RangeError(`agent ${a.agentId}: seven days of balances, not ${a.days.length}`);
   const inWeek = (t: number) => t >= start && t < start + TIDE_WEEK;
   const fees = a.fees.filter((f) => inWeek(f.time));
   const raeto = a.raeto.filter((r) => inWeek(r.time));
+  const padOn = rules.padCompletePointsPerUsd + rules.padHirePointsPerUsd + rules.padJudgePointsPerUsd > 0n;
+  const pad = padOn ? (a.pad ?? []).filter((p) => inWeek(p.time)) : [];
 
   // Fees, round trips netted per pair: a pair traded both ways in the week counts the fees of its trades in the share
   // of its volume that is not undone (|bought - sold| over bought + sold).
@@ -246,8 +350,25 @@ export function tideScore(a: TideAgentInput, week: number, rules = TIDE_RULES, s
   const raetoPaid = raeto.reduce((s, r) => s + r.usdE6, 0n);
   const raetoPoints = raetoPaid * rules.raetoPointsPerUsd;
 
-  // Daily average balances; the combined cap filled by the 2-point balances first.
+  // Ostrapad fees: the three rows share one cap, filled by the provider's row first.
+  const padSum = (kind: TidePad["kind"]) => pad.filter((p) => p.kind === kind).reduce((s, p) => s + p.feeE6, 0n);
+  const padComplete = padSum("complete");
+  const padHire = padSum("hire");
+  const padJudge = padSum("judge");
+  let padRoom = rules.padFeeCapE6;
+  const padTake = (v: bigint) => {
+    const t = v < padRoom ? v : padRoom;
+    padRoom -= t;
+    return t;
+  };
+  const cComplete = padTake(padComplete);
+  const cHire = padTake(padHire);
+  const cJudge = padTake(padJudge);
+  const padPoints = cComplete * rules.padCompletePointsPerUsd + cHire * rules.padHirePointsPerUsd + cJudge * rules.padJudgePointsPerUsd;
+
+  // Daily average balances; the combined cap filled by the highest rows first: Raeto vaults, then cash and Borro, then idle.
   const avg = (pick: (d: TideDay) => bigint) => a.days.reduce((s, d) => s + pick(d), 0n) / 7n;
+  const raetoVaultAvg = rules.raetoVaultPointsPerUsd === 0n ? 0n : avg((d) => d.raetoE6 ?? 0n);
   const cashAvg = avg((d) => d.cashE6);
   const borroAvg = avg((d) => d.borroE6);
   const idleAvg = avg((d) => d.idleE6);
@@ -257,15 +378,27 @@ export function tideScore(a: TideAgentInput, week: number, rules = TIDE_RULES, s
     room -= t;
     return t;
   };
+  const cRaetoVault = take(raetoVaultAvg);
   const cCash = take(cashAvg);
   const cBorro = take(borroAvg);
   const cIdle = take(idleAvg);
-  const balancePoints = cCash * rules.cashPointsPerUsd + cBorro * rules.borroPointsPerUsd + cIdle * rules.idlePointsPerUsd;
+  const balancePoints = cRaetoVault * rules.raetoVaultPointsPerUsd + cCash * rules.cashPointsPerUsd + cBorro * rules.borroPointsPerUsd + cIdle * rules.idlePointsPerUsd;
 
-  // Active days: at least $0.10 of fees to Ostra or Raeto credits in the UTC day.
+  // Active days: at least $0.10 of fees to Ostra or Raeto credits in the UTC day (and Ostrapad fees, when the week says so).
   const spent = new Array<bigint>(7).fill(0n);
   for (const f of fees) spent[Math.floor((f.time - start) / TIDE_DAY)]! += f.feeE6;
   for (const r of raeto) spent[Math.floor((r.time - start) / TIDE_DAY)]! += r.usdE6;
+  if (rules.padCountsActive) {
+    // One job's fees count once toward a day: an agent on two sides of a job (its own vaults hiring and providing)
+    // paid its platform fee once, so the job counts its largest credit, not their sum.
+    const perJob = new Map<string, TidePad>();
+    pad.forEach((p, i) => {
+      const k = p.jobId ?? `#${i}`;
+      const prev = perJob.get(k);
+      if (prev === undefined || p.feeE6 > prev.feeE6) perJob.set(k, p);
+    });
+    for (const p of perJob.values()) spent[Math.floor((p.time - start) / TIDE_DAY)]! += p.feeE6;
+  }
   const activeDays = spent.flatMap((v, i) => (v >= rules.activeDayMinE6 ? [i + 1] : []));
   const early = a.registeredAt < rules.earlyBefore;
   let mult = 10_000n;
@@ -273,16 +406,27 @@ export function tideScore(a: TideAgentInput, week: number, rules = TIDE_RULES, s
   if (activeDays.length === 7) mult = (mult * rules.active7Bps) / 10_000n;
   else if (activeDays.length >= 3) mult = (mult * rules.active3Bps) / 10_000n;
 
-  const base = feePoints + raetoPoints + balancePoints;
+  const base = feePoints + raetoPoints + padPoints + balancePoints;
   const points = (base * mult) / 10_000n;
   return {
     agentId: a.agentId,
     fee: { paidE6: paid.toString(), countedE6: counted.toString(), nettedOutE6: (paid - counted).toString(), cappedE6: capped.toString(), points: feePoints.toString() },
     raeto: { paidE6: raetoPaid.toString(), points: raetoPoints.toString() },
+    pad: {
+      completeE6: padComplete.toString(),
+      hireE6: padHire.toString(),
+      judgeE6: padJudge.toString(),
+      countedCompleteE6: cComplete.toString(),
+      countedHireE6: cHire.toString(),
+      countedJudgeE6: cJudge.toString(),
+      points: padPoints.toString(),
+    },
     balances: {
+      raetoVaultAvgE6: raetoVaultAvg.toString(),
       cashAvgE6: cashAvg.toString(),
       borroAvgE6: borroAvg.toString(),
       idleAvgE6: idleAvg.toString(),
+      countedRaetoVaultE6: cRaetoVault.toString(),
       countedCashE6: cCash.toString(),
       countedBorroE6: cBorro.toString(),
       countedIdleE6: cIdle.toString(),
@@ -301,7 +445,7 @@ export function tideScore(a: TideAgentInput, week: number, rules = TIDE_RULES, s
  * rest is shared again among the others by their points, until none is over; what no one can take stays in the pot.
  * Amounts round down (in the token's base units). Ties keep the input order; agents with no points get nothing.
  */
-export function tideShares(points: readonly { agentId: string; points: bigint }[], pot: bigint, rules = TIDE_RULES): Map<string, bigint> {
+export function tideShares(points: readonly { agentId: string; points: bigint }[], pot: bigint, rules: TideRules = TIDE_RULES): Map<string, bigint> {
   const cap = (pot * rules.shareCapBps) / 10_000n;
   const out = new Map<string, bigint>();
   let open = points.filter((p) => p.points > 0n);

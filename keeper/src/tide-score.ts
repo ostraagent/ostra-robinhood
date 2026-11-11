@@ -25,12 +25,21 @@
 //              paid out to it; the fee is the hub's, USDG or WETH, WETH at Chainlink ETH/USD at the swap's block); the
 //              volume, for the netting, is the fee over its rate. Private swaps name no vault and are not counted.
 //   Raeto      USDG sent from one of the agent's vaults to Raeto's payTo in the week.
+//   Ostrapad   (from week 2) jobs the evaluator pool judged (created with no evaluator: JobCreated's evaluator is the
+//              zero address) that ended in the week (JobCompleted, JobRejected), for the agent's vaults: as provider
+//              of a completed job, its platform fee (FeePaid: burn plus treasury); as client of a completed job, its
+//              platform fee and its evaluator fee (EvaluatorFeePaid); as the evaluator whose decision stood (no
+//              AppealResolved overturning it), its evaluator fee. USDG, so E6 dollars.
 //   Balances   at the last block of each UTC day of the week, in each of the agent's vaults: USDG, WETH (Chainlink
 //              ETH/USD) and the stock tokens with a Chainlink feed (at that block), idle; Steakhouse USDG shares
 //              (Ostra's cash vault, previewRedeem), in cash; Borro's USDG vault shares, and per Borro stock market the
 //              stock vault shares held and posted as Morpho collateral, at the market's own oracle, less the debt in
-//              it (never below 0), in Borro: what is borrowed and held again is not counted twice. OSTRA and other
-//              tokens are not counted. A day not over yet is read at the latest block (an estimate, said so).
+//              it (never below 0), in Borro: what is borrowed and held again is not counted twice. From week 2, the
+//              deposits in Raeto's vaults (vault v4 venues): principalOf in Raeto's USDG vault, and stockOf in each
+//              Raeto stock vault at the stock's Chainlink feed (a stock without one is not counted), in their own row;
+//              and Spark Savings USDG (convertToAssets of the shares held) as cash.
+//              OSTRA and other tokens are not counted. A day not over yet is read at the latest block (an estimate,
+//              said so).
 //   State      who owns an identity, the link approvals, the payee's token and the pot are read at one block: the
 //              last before the link deadline once it has passed (the latest before), so a score read again after
 //              the deadline gives the same result whatever happens later.
@@ -46,10 +55,18 @@ import {
   LAUNCH_PAIRS,
   MORPHO_BLUE,
   OSTRA,
+  OSTRAPAD,
+  OSTRAPAD_FROM_BLOCK,
   OSTRA_TIDE,
+  RAETO_AAPL_VAULT,
+  RAETO_GOOGL_VAULT,
+  RAETO_NVDA_VAULT,
+  RAETO_SPCX_VAULT,
+  RAETO_TSLA_VAULT,
+  RAETO_USDG_VAULT,
+  SPARK_SAVINGS_USDG,
   STEAKHOUSE_USDG,
   TIDE_DAY,
-  TIDE_RULES,
   USDG,
   WETH,
   borroStocks,
@@ -61,6 +78,7 @@ import {
   tideMemberDigest,
   tidePayeeCreation,
   tidePayeeVault,
+  tideRulesFor,
   tideScore,
   tideSetDigest,
   tideShares,
@@ -74,8 +92,10 @@ import {
   type TideBreakdown,
   type TideDay,
   type TideFee,
+  type TidePad,
   type TidePayeeCreation,
   type TideRaeto,
+  type TideRules,
 } from "@ostraagent/sdk";
 
 /** Where Raeto takes USDG for credits (core/src/raeto.ts RAETO_PAY_TO, read 25 Oct 2026). */
@@ -140,12 +160,20 @@ const EV = {
   agentRegistered: parseAbiItem("event AgentRegistered(uint256 indexed agentId)"),
   swapped: parseAbiItem("event Swapped(address indexed account, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, address hub, uint256 fee, uint16 feeBps, address recipient)"),
   transfer: parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)"),
+  jobCreated: parseAbiItem("event JobCreated(bytes32 indexed jobId, address indexed client, address indexed provider, address evaluator, uint256 expiredAt)"),
+  jobCompleted: parseAbiItem("event JobCompleted(bytes32 indexed jobId, address indexed evaluator, bytes32 reason)"),
+  jobRejected: parseAbiItem("event JobRejected(bytes32 indexed jobId, address indexed rejector, bytes32 reason)"),
+  feePaid: parseAbiItem("event FeePaid(bytes32 indexed jobId, uint256 burn, uint256 treasury)"),
+  evaluatorFeePaid: parseAbiItem("event EvaluatorFeePaid(bytes32 indexed jobId, address indexed evaluator, uint256 amount)"),
+  appealResolved: parseAbiItem("event AppealResolved(bytes32 indexed jobId, bool overturned)"),
 } as const;
 
 const tideAbi = parseAbi(["function potBalance(uint256 week) view returns (uint256)"]);
 const identityAbi = parseAbi(["function ownerOf(uint256 tokenId) view returns (address)"]);
 const approvalAbi = parseAbi(["function hashValidFrom(bytes32 hash) view returns (uint64)"]);
 const tokenAbi = parseAbi(["function token() view returns (address)"]);
+const raetoAbi = parseAbi(["function principalOf(address) view returns (uint256)", "function stockOf(address) view returns (uint256)"]);
+const erc4626Abi = parseAbi(["function balanceOf(address) view returns (uint256)", "function convertToAssets(uint256) view returns (uint256)"]);
 
 type Log = { address: Address; blockNumber: bigint; logIndex: number; transactionHash: Hex; args: Record<string, unknown> };
 
@@ -210,6 +238,30 @@ function usdE6(amount: bigint, decimals: number, answerE8: bigint): bigint {
 
 const STOCKS = LAUNCH_PAIRS.filter((p) => p.kind === "stock" && p.feed !== null).map((p) => ({ token: p.address, feed: p.feed as Address, decimals: p.decimals, symbol: p.symbol }));
 
+/** Raeto's stock vaults (core venues' catalog) priced by their stock's Chainlink feed: those whose stock has one. */
+const RAETO_STOCK_VAULTS = (
+  [
+    ["NVDA", RAETO_NVDA_VAULT],
+    ["TSLA", RAETO_TSLA_VAULT],
+    ["GOOGL", RAETO_GOOGL_VAULT],
+    ["AAPL", RAETO_AAPL_VAULT],
+    ["SPCX", RAETO_SPCX_VAULT],
+  ] as const
+).flatMap(([symbol, vault]) => {
+  const s = STOCKS.find((x) => x.symbol === symbol);
+  return s === undefined ? [] : [{ vault, feed: s.feed, decimals: s.decimals }];
+});
+
+/** A read of a contract that has no code at that block (deployed later) answers nothing: 0. Anything else throws. */
+async function readOrZero(read: () => Promise<unknown>): Promise<bigint> {
+  try {
+    return (await read()) as bigint;
+  } catch (err) {
+    if (err instanceof BaseError && err.walk((e) => e instanceof ContractFunctionZeroDataError) !== null) return 0n;
+    throw err;
+  }
+}
+
 /** What one block's balances are priced with: Chainlink's answers, and each Borro stock market's oracle and totals. */
 type Prices = { feeds: Map<Address, bigint>; borro: { price: bigint; borrowAssets: bigint; borrowShares: bigint }[] };
 
@@ -245,11 +297,22 @@ async function pricesAt(client: PublicClient, blockNumber: bigint, timestamp: nu
  * market's oracle less the debt, never below 0). The debt is Morpho's toAssetsUp of the borrow shares at the market's
  * borrows accrued to the block's time (pricesAt).
  */
-async function balancesAt(client: PublicClient, vaults: readonly Address[], blockNumber: bigint, prices: Prices): Promise<TideDay> {
+async function balancesAt(client: PublicClient, vaults: readonly Address[], blockNumber: bigint, prices: Prices, rules: TideRules): Promise<TideDay> {
   const borro = borroStocks();
   const ethPrice = prices.feeds.get(CHAINLINK_ETH_USD)!;
-  const day: TideDay = { cashE6: 0n, borroE6: 0n, idleE6: 0n };
+  const day: TideDay = rules.raetoVaultPointsPerUsd === 0n ? { cashE6: 0n, borroE6: 0n, idleE6: 0n } : { raetoE6: 0n, cashE6: 0n, borroE6: 0n, idleE6: 0n };
   for (const v of vaults) {
+    if (day.raetoE6 !== undefined) {
+      day.raetoE6 += await readOrZero(() => client.readContract({ address: RAETO_USDG_VAULT, abi: raetoAbi, functionName: "principalOf", args: [v], blockNumber }));
+      for (const r of RAETO_STOCK_VAULTS) {
+        const stock = await readOrZero(() => client.readContract({ address: r.vault, abi: raetoAbi, functionName: "stockOf", args: [v], blockNumber }));
+        if (stock > 0n) day.raetoE6 += usdE6(stock, r.decimals, prices.feeds.get(r.feed)!);
+      }
+    }
+    if (rules.sparkInCash) {
+      const shares = await readOrZero(() => client.readContract({ address: SPARK_SAVINGS_USDG, abi: erc4626Abi, functionName: "balanceOf", args: [v], blockNumber }));
+      if (shares > 0n) day.cashE6 += (await client.readContract({ address: SPARK_SAVINGS_USDG, abi: erc4626Abi, functionName: "convertToAssets", args: [shares], blockNumber })) as bigint;
+    }
     const tokens = [USDG, WETH, ...STOCKS.map((s) => s.token)];
     const bal = (await client.multicall({
       contracts: [
@@ -313,6 +376,7 @@ export type TideReadOptions = {
 /** The week's score: every agent's vaults, points and share, and the tree of the shares (null before the week ends). */
 export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> {
   const log = o.log ?? (() => {});
+  const rules = tideRulesFor(o.week);
   const start = o.testStart ?? tideWeekSpan(o.week).start;
   const end = start + (tideWeekSpan(o.week).end - tideWeekSpan(o.week).start);
   const head = await o.client.getBlock();
@@ -523,18 +587,63 @@ export async function readTideWeek(o: TideReadOptions): Promise<TideWeekResult> 
     raeto.set(id, [...(raeto.get(id) ?? []), { time: await timeOf(l.blockNumber), usdE6: l.args.value as bigint }]);
   }
 
+  // Ostrapad: the pool-judged jobs that ended in the week, credited to the counted vaults that provided, hired or judged them.
+  const pad = new Map<string, TidePad[]>();
+  const padCredit = (vault: Address, p: TidePad) => {
+    const id = owner.get(getAddress(vault));
+    if (id !== undefined && p.feeE6 > 0n) pad.set(id, [...(pad.get(id) ?? []), p]);
+  };
+  if (rules.padCompletePointsPerUsd + rules.padHirePointsPerUsd + rules.padJudgePointsPerUsd > 0n) {
+    const jobKey = (l: Log) => (l.args.jobId as Hex).toLowerCase();
+    const completed = await ev(EV.jobCompleted, OSTRAPAD, weekStartBlock, weekEndBlock);
+    const rejected = await ev(EV.jobRejected, OSTRAPAD, weekStartBlock, weekEndBlock);
+    if (completed.length + rejected.length > 0) {
+      const pool = new Map<string, { client: Address; provider: Address }>();
+      for (const l of await ev(EV.jobCreated, OSTRAPAD, OSTRAPAD_FROM_BLOCK, weekEndBlock)) {
+        if (BigInt(l.args.evaluator as Address) === 0n) pool.set(jobKey(l), { client: getAddress(l.args.client as Address), provider: getAddress(l.args.provider as Address) });
+      }
+      const evalFee = new Map<string, { evaluator: Address; amount: bigint }>();
+      for (const l of await ev(EV.evaluatorFeePaid, OSTRAPAD, OSTRAPAD_FROM_BLOCK, weekEndBlock)) {
+        const k = jobKey(l);
+        if (evalFee.has(k)) throw new Error(`job ${k}: two evaluator fees paid`);
+        evalFee.set(k, { evaluator: getAddress(l.args.evaluator as Address), amount: l.args.amount as bigint });
+      }
+      const overturned = new Set((await ev(EV.appealResolved, OSTRAPAD, OSTRAPAD_FROM_BLOCK, weekEndBlock)).filter((l) => l.args.overturned === true).map(jobKey));
+      const platform = new Map((await ev(EV.feePaid, OSTRAPAD, weekStartBlock, weekEndBlock)).map((l) => [`${l.transactionHash}:${jobKey(l)}`, (l.args.burn as bigint) + (l.args.treasury as bigint)]));
+      for (const [ended, done] of [
+        [completed, true],
+        [rejected, false],
+      ] as const) {
+        for (const l of ended) {
+          const k = jobKey(l);
+          const job = pool.get(k);
+          if (job === undefined) continue;
+          const time = await timeOf(l.blockNumber);
+          const judged = evalFee.get(k);
+          if (done) {
+            const fee = platform.get(`${l.transactionHash}:${k}`);
+            if (fee === undefined) throw new Error(`job ${k}: completed in ${l.transactionHash} without its FeePaid`);
+            padCredit(job.provider, { time, kind: "complete", feeE6: fee, jobId: k });
+            padCredit(job.client, { time, kind: "hire", feeE6: fee + (judged?.amount ?? 0n), jobId: k });
+          }
+          if (judged !== undefined && !overturned.has(k)) padCredit(judged.evaluator, { time, kind: "judge", feeE6: judged.amount, jobId: k });
+        }
+      }
+    }
+  }
+
   // Balances at each day's last block, priced once per block.
   const prices = await mapLimit(dayEnds, 2, async (d) => pricesAt(o.client, d.block, await timeOf(d.block)));
   const inputs: TideAgentInput[] = [];
   for (const a of agents) {
     const { vaults: vs } = vaultsOf.get(a.agentId)!;
-    const days = await mapLimit(dayEnds.map((d, k) => ({ d, k })), 2, ({ d, k }) => balancesAt(o.client, vs, d.block, prices[k]!));
-    inputs.push({ agentId: a.agentId, registeredAt: a.at, fees: fees.get(a.agentId) ?? [], raeto: raeto.get(a.agentId) ?? [], days });
+    const days = await mapLimit(dayEnds.map((d, k) => ({ d, k })), 2, ({ d, k }) => balancesAt(o.client, vs, d.block, prices[k]!, rules));
+    inputs.push({ agentId: a.agentId, registeredAt: a.at, fees: fees.get(a.agentId) ?? [], raeto: raeto.get(a.agentId) ?? [], pad: pad.get(a.agentId) ?? [], days });
     log("tide_agent", { agentId: a.agentId, vaults: vs.length });
   }
-  const scores = inputs.map((x) => tideScore(x, o.week, TIDE_RULES, start));
+  const scores = inputs.map((x) => tideScore(x, o.week, rules, start));
   const pot = (await o.client.readContract({ address: OSTRA_TIDE, abi: tideAbi, functionName: "potBalance", args: [BigInt(o.week)], blockNumber: stateBlock })) as bigint;
-  const shares = tideShares(scores.map((s) => ({ agentId: s.agentId, points: BigInt(s.points) })), pot);
+  const shares = tideShares(scores.map((s) => ({ agentId: s.agentId, points: BigInt(s.points) })), pot, rules);
   const results: TideAgentResult[] = agents.map((a, i) => {
     const x = vaultsOf.get(a.agentId)!;
     const v = verified.get(a.agentId);

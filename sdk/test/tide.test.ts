@@ -12,6 +12,9 @@ import { OSTRA, USDG } from "../src/constants.ts";
 import { parseDeployment } from "../src/deployment.ts";
 import { vaultAddress } from "../src/messages.ts";
 import {
+  TIDE_RULES,
+  TIDE_RULES_WEEK_1,
+  TIDE_RULES_WEEK_2,
   TIDE_START,
   tideLeaf,
   tideFeePair,
@@ -183,4 +186,82 @@ test("tree: every share's proof verifies against the root, for 1 to 9 shares; a 
     if (n === 1) assert.equal(t.root, tideLeaf(shares[0]!));
   }
   assert.throws(() => tideTree([]), /at least one/);
+});
+
+// Week 2 (the table announced on 2 Nov 2026; the hire fee and the active days decided on 11 Nov).
+const W2 = TIDE_START + 604_800;
+const day2 = (n: number, h = 12) => W2 + (n - 1) * 86_400 + h * 3600;
+const agent2 = (over: Partial<TideAgentInput>): TideAgentInput => ({ agentId: "2", registeredAt: W2 + 10, fees: [], raeto: [], pad: [], days: zeroDays, ...over });
+
+test("week 2: Ostrapad completing 300, hiring 100, judging 100 a dollar, one $20 cap filled by completing first", () => {
+  assert.equal(TIDE_RULES.week, 2);
+  const r = tideScore(
+    agent2({
+      pad: [
+        { time: day2(1), kind: "complete", feeE6: 1_000_000n },
+        { time: day2(2), kind: "hire", feeE6: 1_500_000n },
+        { time: day2(3), kind: "judge", feeE6: 500_000n },
+        { time: W2 - 1, kind: "complete", feeE6: 9_000_000n },
+      ],
+    }),
+    2,
+  );
+  assert.equal(r.pad.completeE6, "1000000");
+  assert.equal(r.pad.points, (1_000_000n * 300n + 1_500_000n * 100n + 500_000n * 100n).toString());
+  const capped = tideScore(
+    agent2({
+      pad: [
+        { time: day2(1), kind: "judge", feeE6: 15_000_000n },
+        { time: day2(1), kind: "complete", feeE6: 12_000_000n },
+        { time: day2(2), kind: "hire", feeE6: 5_000_000n },
+      ],
+    }),
+    2,
+  );
+  assert.equal(capped.pad.countedCompleteE6, "12000000");
+  assert.equal(capped.pad.countedHireE6, "5000000");
+  assert.equal(capped.pad.countedJudgeE6, "3000000");
+  assert.equal(capped.pad.points, (12_000_000n * 300n + 5_000_000n * 100n + 3_000_000n * 100n).toString());
+  // Swap fees keep their own $20 cap beside it.
+  const both = tideScore(agent2({ fees: [{ time: day2(1), feeE6: 30_000_000n, pair: "P", side: "buy", volumeE6: 10n ** 12n }], pad: [{ time: day2(1), kind: "complete", feeE6: 30_000_000n }] }), 2);
+  assert.equal(both.fee.cappedE6, "20000000");
+  assert.equal(both.pad.countedCompleteE6, "20000000");
+});
+
+test("week 2: Raeto vaults 3 a dollar fill the $1,000 cap first; Ostrapad fees count toward active days; x1.5 before 4 Nov", () => {
+  const days: TideDay[] = Array.from({ length: 7 }, () => ({ raetoE6: 600_000_000n, cashE6: 300_000_000n, borroE6: 0n, idleE6: 500_000_000n }));
+  const r = tideScore(agent2({ days }), 2);
+  assert.equal(r.balances.countedRaetoVaultE6, "600000000");
+  assert.equal(r.balances.countedCashE6, "300000000");
+  assert.equal(r.balances.countedIdleE6, "100000000");
+  assert.equal(r.balances.points, (600_000_000n * 3n + 300_000_000n * 2n + 100_000_000n).toString());
+  const active = tideScore(agent2({ pad: [1, 2, 3].map((d) => ({ time: day2(d), kind: "judge" as const, feeE6: 100_000n })) }), 2);
+  assert.deepEqual(active.activeDays, [1, 2, 3]);
+  assert.equal(active.multiplierBps, "12000");
+  assert.equal(tideScore(agent2({ registeredAt: W2 - 1 }), 2).early, true);
+  assert.equal(tideScore(agent2({ registeredAt: W2 }), 2).early, false);
+  assert.equal(TIDE_RULES_WEEK_2.earlyBefore, W2);
+});
+
+test("week 1 is scored as it was paid: no Ostrapad, no Raeto vault row, x1.5 only before 28 Oct", () => {
+  const days: TideDay[] = Array.from({ length: 7 }, () => ({ raetoE6: 600_000_000n, cashE6: 300_000_000n, borroE6: 0n, idleE6: 0n }));
+  const r = tideScore(agent({ days, pad: [{ time: day(1), kind: "complete", feeE6: 5_000_000n }] }), 1);
+  assert.equal(r.pad.points, "0");
+  assert.equal(r.balances.countedRaetoVaultE6, "0");
+  assert.equal(r.balances.points, (300_000_000n * 2n).toString());
+  assert.equal(TIDE_RULES_WEEK_1.earlyBefore, TIDE_START);
+  assert.throws(() => tideScore(agent({}), 1, TIDE_RULES_WEEK_2), /week 1 scored with week 2/);
+  assert.throws(() => tideScore(agent({}), 3), /no Tide rules/);
+});
+
+test("week 2: a job counts once toward an active day, whichever sides of it the agent's vaults took", () => {
+  const job = (d: number, id: string) => [
+    { time: day2(d), kind: "complete" as const, feeE6: 25_000n, jobId: id },
+    { time: day2(d), kind: "hire" as const, feeE6: 75_000n, jobId: id },
+  ];
+  const self = tideScore(agent2({ pad: [...job(1, "a"), ...job(2, "b"), ...job(3, "c")] }), 2);
+  assert.deepEqual(self.activeDays, []);
+  assert.equal(self.pad.points, (3n * (25_000n * 300n + 75_000n * 100n)).toString());
+  const two = tideScore(agent2({ pad: [...job(1, "a"), { time: day2(1), kind: "judge", feeE6: 50_000n, jobId: "d" }] }), 2);
+  assert.deepEqual(two.activeDays, [1]);
 });

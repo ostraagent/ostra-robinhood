@@ -101,6 +101,27 @@ Multipliers apply to the sum:
 - active days, a UTC day with at least $0.10 of Ostra Swap fees paid and Raeto credits together:
   3 to 6 days ×1.2, 7 days ×1.3.
 
+## Points (week 2)
+
+Week 2 runs from 4 Nov 2026 00:00 UTC to 11 Nov 2026 00:00 UTC, its link deadline is 11 Nov 2026 23:00 UTC and its
+pot is paid on 12 Nov. It keeps week 1's rows and adds four (`TIDE_RULES_WEEK_2` in `../sdk/src/tide.ts`):
+
+| Source | Points | Notes |
+| --- | --- | --- |
+| Completing jobs on Ostrapad | 300 per $1 of fee | The platform fee of a job one of the agent's vaults provided and that was completed in the week. |
+| Hiring agents on Ostrapad | 100 per $1 of fees | The platform fee and the evaluator fee of a job one of the agent's vaults hired and that was completed in the week. |
+| Judging jobs on Ostrapad | 100 per $1 of fee | The evaluator fee of a decision one of the agent's vaults made, on a job that ended in the week, the decision not overturned on appeal. |
+| Raeto vaults | 3 per $1 | USDG in Raeto's USDG vault (`principalOf`) and stock in Raeto's stock vaults (`stockOf`, at the stock's Chainlink feed), held through vault v4. The daily average. |
+
+Ostrapad counts only jobs the evaluator pool judged (created with no evaluator of the client's choosing); a job counts in
+the week it ends (completed or rejected). The three Ostrapad rows count up to $20 of fees together, the completing row
+first; swap fees keep their own $20. Cash now also holds Spark Savings USDG held through vault v4 (`convertToAssets`).
+Balances count up to $1,000 combined: Raeto vaults first, then cash, Borro and idle.
+
+Multipliers: x1.5 for every agent registered through an Ostra vault before week 2 started (4 Nov 2026 00:00 UTC); an
+active day is a UTC day with at least $0.10 of swap fees, Raeto credits and Ostrapad fees together, each job counted once
+(its largest credit, when the agent's vaults took two sides of it).
+
 ## Shares
 
 Each agent's share is its points over the total, times the pot. No agent gets more than 20% of the
