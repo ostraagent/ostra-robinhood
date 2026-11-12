@@ -6,12 +6,12 @@
     "url": "https://github.com/ostraagent/ostra-robinhood",
     "source": "github"
   },
-  "version": "0.1.22",
+  "version": "0.1.23",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@ostraagent/mcp",
-      "version": "0.1.22",
+      "version": "0.1.23",
       "transport": {
         "type": "stdio"
       }
