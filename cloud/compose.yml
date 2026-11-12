@@ -1,5 +1,10 @@
 # Ostra Cloud (design 12 Nov 2026): the enclave's services, one dstack app on Phala Cloud (Intel TDX, KMS on Base).
-# @IMAGE@ is the image built by cloud/build.sh, by digest (cloud/build.sh deploy-compose writes this file with it).
+# The deployed file is this one with each quoted @IMAGE@ and @HOST@ below, quotes included, replaced by a value and
+# nothing else changed: @IMAGE@ by the image built from cloud/Dockerfile, by digest
+# (ghcr.io/ostraagent/ostra-cloud@sha256:...), @HOST@ by the app's public host name, <app id>-8080.<the dstack
+# gateway's domain>. The app id is the DstackApp contract the first deploy makes, so the first deploy has @HOST@
+# pending.invalid (every MCP request refused, /health answered) and an update right after it sets the real name; the
+# DstackApp approves both compose hashes.
 #
 #   signer   the only holder of the agents' seeds: no network at all, the dstack socket for its seal key, its sockets
 #            in a volume the gateway shares; it makes the admin key in the enclave, in a volume only the gateway shares
@@ -9,8 +14,8 @@
 #   front    the one published port (8080, behind the dstack gateway's TLS), its bytes passed to the gateway
 #
 # The values from the deployment's encrypted environment (dstack's, never in this file): OSTRA_RPC_URL (the chain's
-# RPC, with its key), OSTRA_REMOTE_ALLOWED_HOSTS (the app's public host name) and OSTRA_REMOTE_USERS_JSON (the
-# operators' fixed tokens, by their SHA-256: {"users":[...]}, mcp/scripts/remote-user.ts).
+# RPC, with its key) and OSTRA_REMOTE_USERS_JSON (the operators' fixed tokens, by their SHA-256: {"users":[...]},
+# mcp/scripts/remote-user.ts). dstack gives them to compose as its process environment (exactly, from JSON).
 
 services:
   signer:
@@ -51,7 +56,7 @@ services:
       OSTRA_REMOTE_ROOT: /var/lib/ostra-remote
       OSTRA_REMOTE_USERS: /run/ostra-users/users.json
       OSTRA_REMOTE_USERS_JSON: ${OSTRA_REMOTE_USERS_JSON:?set the operators users}
-      OSTRA_REMOTE_ALLOWED_HOSTS: ${OSTRA_REMOTE_ALLOWED_HOSTS:?set the public host name}
+      OSTRA_REMOTE_ALLOWED_HOSTS: "@HOST@"
       OSTRA_REMOTE_SANDBOX: bwrap
       OSTRA_REMOTE_SIGNER_SOCKETS: /run/ostra-signer
       OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE: /var/lib/ostra-signer-admin/admin.key
