@@ -797,8 +797,8 @@ export class RelayerClient implements Sender {
   }
 
   /** The x402 HTTP client of relayer channel `c`: the stock batch-settlement client, the vault as payer, the channel's voucher key signing, never depositing. */
-  #x402(c: RelayerChannel): x402HTTPClient {
-    const voucherKey = this.#keys.channelVoucherSigner(this.#config.chainId, this.#config.deployment.token, c.config.salt);
+  async #x402(c: RelayerChannel): Promise<x402HTTPClient> {
+    const voucherKey = await this.#keys.channelVoucherSigner(this.#config.chainId, this.#config.deployment.token, c.config.salt);
     if (voucherKey.address !== getAddress(c.config.payerAuthorizer)) throw new Error(`the voucher key of relayer channel ${c.channel} is not derived from this machine's master seed`);
     const client = this.#client;
     // The vault is the payer and signs nothing but WOTS spends; it only reads the chain here.
@@ -851,7 +851,7 @@ export class RelayerClient implements Sender {
   async #payFrom(c: RelayerChannel, calls: readonly RelayCall[], answer: Answer, maxAmount: bigint, prepay: boolean, allowFailedSwaps = false): Promise<Answer> {
     let current = answer;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const http = this.#x402(c);
+      const http = await this.#x402(c);
       const required = this.#required(http, current);
       const offer = required.accepts.find((r) => r.scheme === "batch-settlement");
       if (offer === undefined) throw new RelayerError(402, "no_offer", "the relayer's 402 has no batch-settlement offer");
@@ -903,7 +903,7 @@ export class RelayerClient implements Sender {
     if (getAddress(config.receiver) !== facts.split || getAddress(config.receiverAuthorizer) !== facts.vault || config.withdrawDelay !== facts.gracePeriodSeconds) {
       throw new Error(`channel ${channel} is not on the relayer's terms`);
     }
-    const voucherKey = this.#keys.channelVoucherSigner(this.#config.chainId, d.token, config.salt);
+    const voucherKey = await this.#keys.channelVoucherSigner(this.#config.chainId, d.token, config.salt);
     if (voucherKey.address !== getAddress(config.payerAuthorizer)) throw new Error(`the voucher key of relayer channel ${channel} is not derived from this machine's master seed`);
     const ch = await this.#openedChannel(id, openTx);
     if (ch.balance !== found.amount || ch.pendingWithdrawal !== null) throw new Error(`relayer channel ${channel} does not hold its deposit of ${found.amount}`);

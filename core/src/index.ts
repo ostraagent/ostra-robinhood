@@ -29,6 +29,7 @@ export * from "./random.ts";
 export * from "./relay.ts";
 export * from "./reputation.ts";
 export * from "./seed-backup.ts";
+export * from "./seed-accounts.ts";
 export * from "./sessions.ts";
 export * from "./shield.ts";
 export * from "./storage.ts";

@@ -42,7 +42,7 @@ import { OSTRAPAD } from "./pad.ts";
 import { QuoteError } from "./quote.ts";
 import { readVault } from "./reads.ts";
 import { failedModuleSpends, moduleFailureText, RelaySimulationError, simulateRelay } from "./relayer.ts";
-import { WOTS_SIGNATURE_LEN, WotsKeychain, randomBytes32, type WotsStore } from "./wots.ts";
+import { WOTS_SIGNATURE_LEN, WotsKeychain, randomBytes32, type WotsSigner, type WotsStore } from "./wots.ts";
 
 const AGENT_DOMAIN = stringToHex(VAULT_AGENT_DOMAIN); // bytes24
 const U16_MAX = (1n << 16n) - 1n;
@@ -558,7 +558,7 @@ export type SignedAgentSpend = { action: VaultAction; nextKeyRoot: Hex; params: 
  * after this one. Each of these would hold the agent key once the signature is out.
  */
 export async function signAgentSpend(
-  keychain: WotsKeychain,
+  keychain: WotsSigner,
   k: { vault: Address; agentNonce: bigint; keyRoot: Hex; vaultKeyRoot: Hex; index: bigint; nextIndex: bigint },
   a: { chainId: number; action: VaultAction; params: Hex },
 ): Promise<SignedAgentSpend> {

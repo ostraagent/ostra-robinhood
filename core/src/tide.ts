@@ -103,7 +103,7 @@ export class TideService {
   }
 
   /** The agent's link secret: from the seed, for this chain and OstraTide. */
-  #secret(): Hex {
+  #secret(): Promise<Hex> {
     return this.#p.keys.tideSecret(this.#p.config.chainId, OSTRA_TIDE);
   }
 
@@ -216,7 +216,7 @@ export class TideService {
       if (m !== undefined) return { payee: m.vault, creation: null };
       return own === null ? null : { payee: own.payee, creation: own.creation };
     };
-    const secret = this.#secret();
+    const secret = await this.#secret();
     const keep = async (vaults: Address[], p: Payee | null, when: string) => {
       const r = await this.#post("/api/v1/tide/link", { agentId: agentId.toString(), secret, vaults, payee: p?.payee ?? null, ...(p === null || p.creation === null ? {} : { payeeCreation: p.creation }) });
       if (r.status !== 200) throw new Error(`Ostra's index did not keep the link ${when} (${r.status} ${String(r.json.error ?? "")} ${String(r.json.message ?? "")})`);
@@ -299,7 +299,7 @@ export class TideService {
   /** The agent's own figures for the latest week scored (or `week`). */
   async points(week?: number): Promise<Record<string, unknown>> {
     const { agentId } = await this.#agent();
-    const r = await this.#post("/api/v1/tide/points", { agentId: agentId.toString(), viewKey: tideViewKey(this.#secret()), ...(week === undefined ? {} : { week }) });
+    const r = await this.#post("/api/v1/tide/points", { agentId: agentId.toString(), viewKey: tideViewKey(await this.#secret()), ...(week === undefined ? {} : { week }) });
     if (r.status === 404) return { agentId: agentId.toString(), linked: false, note: "Ostra's index has no link of this agent: call tide with action link first" };
     if (r.status === 202 && r.json.error === "not_verified") return { agentId: agentId.toString(), linked: false, missing: r.json.missing, note: "the score did not count this link: call tide with action link again" };
     if (r.status === 202) return { agentId: agentId.toString(), note: "the link is kept; the points appear after the next score (every 30 minutes)" };
@@ -310,6 +310,6 @@ export class TideService {
   /** The web app's page of the agent's points: the view key in the URL's fragment. */
   async dashboard(): Promise<{ url: string; note: string }> {
     const { agentId } = await this.#agent();
-    return { url: `${TIDE_APP_URL}#agent=${agentId.toString()}&key=${tideViewKey(this.#secret())}`, note: "anyone holding this link sees this agent's points and linked vaults: share it only with people who should see them" };
+    return { url: `${TIDE_APP_URL}#agent=${agentId.toString()}&key=${tideViewKey(await this.#secret())}`, note: "anyone holding this link sees this agent's points and linked vaults: share it only with people who should see them" };
   }
 }

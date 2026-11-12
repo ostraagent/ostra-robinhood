@@ -14,7 +14,7 @@ import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFun
 import { ostraDevBuyAbi } from "./abi.ts";
 import { CIRCUIT_BREAKER, DEV_BUY, LAUNCHPAD, VAULT_ACTION } from "./constants.ts";
 import { signVaultSpend, type SignedSpend, type VaultKeyState } from "./messages.ts";
-import type { WotsKeychain } from "./wots.ts";
+import type { WotsSigner } from "./wots.ts";
 
 type LaunchHashArgs = ContractFunctionArgs<typeof ostraDevBuyAbi, "pure", "launchHash">;
 /** OstraLaunchpad.LaunchParams, as the contract's ABI types it. */
@@ -77,7 +77,7 @@ export function decodeDevBuyParams(params: Hex): { devBuy: Address; launchHash: 
 
 /** The creator vault's DevBuy spend for the launch `p` with the dev buy `d` (the vault is p.creatorVault). */
 export async function signVaultDevBuy(
-  keychain: WotsKeychain,
+  keychain: WotsSigner,
   state: VaultKeyState,
   a: { chainId: number; devBuy: Address; launch: LaunchParams; dev: DevBuyTerms },
 ): Promise<SignedSpend> {

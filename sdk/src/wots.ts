@@ -239,12 +239,24 @@ export class WotsKeyMismatchError extends Error {
 }
 
 /**
+ * What the signing helpers use of a keychain (WotsKeychain implements it). keyRoot is synchronous, so a keychain whose
+ * master secret another process holds cannot implement it: a seedless agent (Ostra Cloud) signs through core's
+ * AgentSeed operations instead, and its owner keychains, which it never uses, refuse every call.
+ */
+export interface WotsSigner {
+  readonly keychainId: Uint8Array;
+  keyRoot(index: bigint): Uint8Array;
+  signed(index: bigint): Promise<WotsSignatureRecord | undefined>;
+  sign(index: bigint, message: Uint8Array, expectedKeyRoot?: Uint8Array): Promise<Uint8Array>;
+}
+
+/**
  * A chain of one-time keys derived from a client master secret. Use one
  * keychain id per on-chain object (a vault, a deposit's approval keys, a set
  * of leaves) and the object's own counter as the index (a vault's nonce).
  * The master secret never leaves the client; Ostra only ever sees key roots.
  */
-export class WotsKeychain {
+export class WotsKeychain implements WotsSigner {
   readonly keychainId: Uint8Array;
   readonly #master: Uint8Array;
   readonly #store: WotsStore;

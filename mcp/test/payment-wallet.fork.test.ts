@@ -127,7 +127,8 @@ test("the payment wallet: set up, an exact payment, the agent key's top-up and p
   const d = await liveAtV5(fork, LIVE_DEPLOYMENT);
   const record = join(dir, "robinhood-v5.json");
   writeFileSync(record, `${JSON.stringify(d, null, 2)}\n`);
-  assert.equal(await vaultBeaconAtRecord(fork, d), "upgraded on the fork as scheduled");
+  // Mainnet runs version 5 since the scheduled upgrade executed; before it, the fork runs the upgrade as scheduled.
+  assert.ok(["upgraded on the fork as scheduled", "on mainnet already"].includes(await vaultBeaconAtRecord(fork, d)));
   await checkDeployment(fork.client, d);
   const base = join(dir, "robinhood");
   const port = 30_000 + Math.floor(Math.random() * 20_000);

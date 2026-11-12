@@ -22,7 +22,7 @@
 // perTx and what the budget has left, the allowlists of the action) and then run with a throwaway key (sdk
 // simulateAgentSpend): a signature that could not land would hold the key.
 
-import { bytesToHex, decodeFunctionData, getAddress, hexToBytes, type Abi, type AbiEvent, type Address, type Hex, type PublicClient } from "viem";
+import { decodeFunctionData, getAddress, hexToBytes, type Abi, type AbiEvent, type Address, type Hex, type PublicClient } from "viem";
 import {
   ALLOW_KIND,
   QuoteError,
@@ -48,7 +48,6 @@ import {
   readVault,
   readVaultGuard,
   RelaySimulationError,
-  signAgentSpend,
   simulateAgentSpend,
   simulateRelay,
   spendAsAgentCall,
@@ -57,11 +56,10 @@ import {
   type RelayCall,
   type V5State,
   type VaultAction,
-  type WotsKeychain,
 } from "@ostraagent/sdk";
 import { formatUnitsAmount, TOKEN_DECIMALS } from "./amount.ts";
 import type { Config } from "./config.ts";
-import type { Keys } from "./keys.ts";
+import type { AgentSeed } from "./keys.ts";
 import type { Folder } from "./storage.ts";
 
 /** Where this seed keeps the next agent key index of the vault (one file per vault). */
@@ -81,8 +79,8 @@ export type AgentKeyParts = {
   /** Serves eth_getLogs over long windows (the vault's AgentKeySet and AgentSpent, to rebuild the mark). */
   logsClient: PublicClient;
   config: Config;
-  /** This agent's own keys (never the owner's seed). */
-  keys: Keys;
+  /** This agent's own seed, for its agent keys (never the owner's seed): in memory, or a hosted agent's signer. */
+  keys: AgentSeed;
   /** The vault the agent key signs for (OSTRA_AGENT_OF). */
   vault: Address;
   folder: Folder;
@@ -116,7 +114,6 @@ function v5Event(name: string): AbiEvent {
 export class AgentKey {
   readonly vault: Address;
   readonly #p: AgentKeyParts;
-  readonly #keychain: WotsKeychain;
   readonly #roots = new Map<bigint, Hex>();
   #from: bigint | null = null;
   #lock: Promise<unknown> = Promise.resolve();
@@ -124,7 +121,6 @@ export class AgentKey {
   constructor(p: AgentKeyParts) {
     this.#p = p;
     this.vault = getAddress(p.vault);
-    this.#keychain = p.keys.agentKeychain(p.config.chainId, this.vault);
   }
 
   /** One at a time: the mark and the keys move together. */
@@ -134,13 +130,19 @@ export class AgentKey {
     return run;
   }
 
-  #root(index: bigint): Hex {
+  /** The root of key `index`, lower case (kept: a root never changes). */
+  async #root(index: bigint): Promise<Hex> {
     let r = this.#roots.get(index);
     if (r === undefined) {
-      r = bytesToHex(this.#keychain.keyRoot(index));
+      r = (await this.#p.keys.agentKeyRoot(this.#p.config.chainId, this.vault, index)).toLowerCase() as Hex;
       this.#roots.set(index, r);
     }
     return r;
+  }
+
+  /** What key `index` signed: this device's record, else the escrow's. */
+  #signed(index: bigint) {
+    return this.#p.keys.agentSigned(this.#p.config.chainId, this.vault, index);
   }
 
   #name(): string {
@@ -212,7 +214,7 @@ export class AgentKey {
     const onChain = await this.#rootsOnChain();
     let found = -1n;
     for (let i = 0n; i < found + 1n + SEARCH_WINDOW; i++) {
-      if (onChain.has(this.#root(i)) || (await this.#keychain.signed(i)) !== undefined) found = i;
+      if (onChain.has(await this.#root(i)) || (await this.#signed(i)) !== undefined) found = i;
     }
     const next = found + 1n + RESTORE_SKIP;
     await this.#setNext(next);
@@ -239,10 +241,10 @@ export class AgentKey {
    */
   async indexOf(root: Hex): Promise<bigint | null> {
     const r = root.toLowerCase();
-    for (const [h, i] of await this.#issued()) if (h === r && this.#root(i) === r) return i;
+    for (const [h, i] of await this.#issued()) if (h === r && (await this.#root(i)) === r) return i;
     const next = await this.#next();
-    for (let i = next - 1n; i >= 0n; i--) if (this.#root(i) === r) return i;
-    for (let i = next; i < next + SEARCH_WINDOW; i++) if (this.#root(i) === r) return i;
+    for (let i = next - 1n; i >= 0n; i--) if ((await this.#root(i)) === r) return i;
+    for (let i = next; i < next + SEARCH_WINDOW; i++) if ((await this.#root(i)) === r) return i;
     return null;
   }
 
@@ -255,7 +257,7 @@ export class AgentKey {
     return this.#serial(async () => {
       await this.state();
       const i = await this.#take();
-      const root = this.#root(i);
+      const root = await this.#root(i);
       const kept = (await this.#issued()).slice(-(ISSUED_KEPT - 1));
       const rec: IssuedRecord = { version: 1, roots: [...kept.map(([h, x]) => [h, x.toString()] as [Hex, string]), [root, i.toString()]] };
       await this.#p.folder.write(this.#issuedName(), `${JSON.stringify(rec)}\n`);
@@ -285,7 +287,7 @@ export class AgentKey {
     if (BigInt(s.agentKey.root) === 0n) return null;
     const index = await this.indexOf(s.agentKey.root);
     if (index === null) return null;
-    const rec = await this.#keychain.signed(index);
+    const rec = await this.#signed(index);
     if (rec === undefined) return null;
     const m = decodeAgentSpendMessage(hexToBytes(`0x${rec.message}`));
     if (m.vault !== this.vault || m.chainId !== this.#p.config.chainId) throw new Error(`agent key ${index} signed for another vault or chain`);
@@ -329,11 +331,11 @@ export class AgentKey {
     };
     // This device's records first, newest first (no request); the escrow's only when none of them is it (a restore).
     for (let i = mark - 1n; i >= 0n; i--) {
-      const found = match(await this.#p.keys.store.load(this.#keychain.keychainId, i));
+      const found = match(await this.#p.keys.agentRecorded(this.#p.config.chainId, this.vault, i));
       if (found !== null) return found;
     }
     for (let i = mark - 1n; i >= 0n; i--) {
-      const found = match(await this.#keychain.signed(i));
+      const found = match(await this.#signed(i));
       if (found !== null) return found;
     }
     return null;
@@ -476,7 +478,7 @@ export class AgentKey {
       if (v === null) throw new Error(`${this.vault} is not an Ostra vault`);
       // The next key is taken (and the mark moved past it) before signing: a crash after this never hands it out again.
       const next = await this.#take();
-      const signed = await signAgentSpend(this.#keychain, { vault: this.vault, agentNonce: s.agentKey.agentNonce, keyRoot: s.agentKey.root, vaultKeyRoot: v.keyRoot, index, nextIndex: next }, { chainId: this.#p.config.chainId, action: action as VaultAction, params });
+      const signed = await this.#p.keys.signAgentSpend({ vault: this.vault, agentNonce: s.agentKey.agentNonce, keyRoot: s.agentKey.root, vaultKeyRoot: v.keyRoot, index, nextIndex: next }, { chainId: this.#p.config.chainId, action: action as VaultAction, params });
       return spendAsAgentCall(this.vault, signed);
     });
   }

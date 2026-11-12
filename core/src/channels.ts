@@ -34,7 +34,7 @@
 // channel address depended on the open slot; an x402 channel id is fixed by
 // its config.
 
-import { bytesToHex, decodeFunctionData, encodeFunctionData, getAddress, isAddress, parseAbiItem, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, decodeFunctionData, encodeFunctionData, getAddress, isAddress, parseAbiItem, type Address, type Hash, type Hex, type PublicClient } from "viem";
 import type { BatchSettlementClientContext } from "@x402/evm/batch-settlement/client";
 import {
   MULTICALL3,
@@ -43,7 +43,6 @@ import {
   X402_MAX_WITHDRAW_DELAY,
   X402_MIN_WITHDRAW_DELAY,
   channelId as computeChannelId,
-  closeDigest,
   decodeOpenChannelParams,
   multicall3Abi,
   ostraSplitFactoryAbi,
@@ -60,6 +59,7 @@ import { formatTokenAmount, parseTokenAmount } from "./amount.ts";
 import { chainTime } from "./chain.ts";
 import type { Config } from "./config.ts";
 import type { Keys } from "./keys.ts";
+import type { VoucherAccount } from "./seed-accounts.ts";
 import { randomBytes } from "./random.ts";
 import { VAULT_SPEND_GAS, type Sender } from "./relay.ts";
 import type { SessionPayment } from "./sessions.ts";
@@ -485,7 +485,7 @@ export class ChannelService {
       if (receiver === getAddress("0x0000000000000000000000000000000000000000")) throw new RangeError("the receiver must not be the zero address");
 
       const salt = randomSalt();
-      const voucher: PrivateKeyAccount = this.#keys.channelVoucherSigner(this.#config.chainId, this.#token(), salt);
+      const voucher = await this.#keys.channelVoucherSigner(this.#config.chainId, this.#token(), salt);
       const open: OpenChannelParams = { payerAuthorizer: voucher.address, receiver, receiverAuthorizer: payee, withdrawDelay: gracePeriod, salt, amount: deposit };
       const vault = await this.#vault.vaultAddress();
       const opened = { status: "open" as const, payee, receiver, deposit: formatTokenAmount(deposit), gracePeriod, recipients, voucherKey: voucher.address };
@@ -572,7 +572,7 @@ export class ChannelService {
         if (computeChannelId(cfg, this.#config.chainId, d.batchSettlement).toLowerCase() !== channel || getAddress(cfg.payer) !== vault || getAddress(cfg.token) !== d.token) {
           throw new Error(`channel ${channel} was not opened by this agent's vault`);
         }
-        const voucher = this.#keys.channelVoucherSigner(this.#config.chainId, d.token, cfg.salt);
+        const voucher = await this.#keys.channelVoucherSigner(this.#config.chainId, d.token, cfg.salt);
         if (voucher.address !== getAddress(cfg.payerAuthorizer)) throw new Error(`channel ${channel} uses a voucher key this machine cannot derive`);
         const ch = await this.#read(channel);
         const open: OpenChannelParams = {
@@ -617,7 +617,7 @@ export class ChannelService {
   }
 
   /** The voucher key of a channel, derived again from the master seed and the channel salt. */
-  voucherSigner(record: ChannelRecord): PrivateKeyAccount {
+  voucherSigner(record: ChannelRecord): Promise<VoucherAccount> {
     return this.#keys.channelVoucherSigner(record.chainId, record.token, record.salt);
   }
 
@@ -671,12 +671,12 @@ export class ChannelService {
       }
       try {
         if (status === "open") {
-          const voucher = this.voucherSigner(record);
+          const voucher = await this.voucherSigner(record);
           if (voucher.address !== getAddress(record.config.payerAuthorizer)) throw new Error(`the voucher key of channel ${channel} could not be derived`);
           const amount = ch.balance - ch.totalClaimed;
           const closeNonce = await this.#client.readContract({ address: record.vault, abi: ostraVaultAbi, functionName: "closeNonce", args: [channel] });
           const deadline = (await chainTime(this.#client)) + CLOSE_REQUEST_TTL_SECONDS;
-          const signature = await voucher.sign({ hash: closeDigest({ chainId: this.#config.chainId, vault: record.vault, channelId: channel, amount, nonce: closeNonce, deadline }) });
+          const signature = await voucher.signClose({ vault: record.vault, channelId: channel, amount, nonce: closeNonce, deadline });
           const data = encodeFunctionData({ abi: ostraVaultAbi, functionName: "requestClose", args: [record.config, amount, deadline, signature] });
           await this.#send(record, sent, "request_close", { to: record.vault, data });
           continue;

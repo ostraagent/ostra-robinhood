@@ -259,7 +259,7 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   const again = await a.tide.link();
   assert.ok((again.approvals as { status: string }[]).every((s) => s.status === "approved before"), JSON.stringify(again.approvals));
   // D linked with MCP 0.1.15: its buyer vault's member approval and the set approval naming no payee, kept verified.
-  const secretD = dd.keys.tideSecret(d.chainId, OSTRA_TIDE);
+  const secretD = await dd.keys.tideSecret(d.chainId, OSTRA_TIDE);
   await spend(dd.buyer, dd.sender, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideMemberDigest({ chainId: d.chainId, agentId: idD, vault: buyerD, secret: secretD }), approved: true }));
   const oldVaults = tideSortVaults([dd.creatorVault, buyerD]);
   await spend(dd.creator, dd.sender, VAULT_ACTION.APPROVE_HASH, approveHashParams({ hash: tideSetDigest({ chainId: d.chainId, agentId: idD, vaults: oldVaults, payee: null, secret: secretD }), approved: true }));
@@ -361,7 +361,7 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   const partial = await fetch(`${indexerUrl}/api/v1/tide/link`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ agentId: idA.toString(), secret: a.keys.tideSecret(d.chainId, OSTRA_TIDE), vaults: [a.creatorVault, buyerA], payee: null }),
+    body: JSON.stringify({ agentId: idA.toString(), secret: await a.keys.tideSecret(d.chainId, OSTRA_TIDE), vaults: [a.creatorVault, buyerA], payee: null }),
   });
   assert.equal(((await partial.json()) as { verified: boolean }).verified, false);
   const both = (JSON.parse(await readFile(join(root, "tide-links.json"), "utf8")) as (TideLinkRecord & { verified?: boolean })[]).filter((x) => x.agentId === idA.toString());
@@ -450,7 +450,7 @@ test("a week of Ostra Tide: the link checked on chain, the points by source, the
   assert.equal(rc.link.status, "unproven");
   assert.ok(rc.link.status === "unproven" && rc.link.missing.length === 1 && rc.link.missing[0]!.includes("set digest"), JSON.stringify(rc.link));
   assert.equal(rc.viewKey, null);
-  assert.equal(ra.viewKey, tideViewKey(a.keys.tideSecret(d.chainId, OSTRA_TIDE)));
+  assert.equal(ra.viewKey, tideViewKey(await a.keys.tideSecret(d.chainId, OSTRA_TIDE)));
   assert.equal(ra.pending.length, 8, "the 8 others kept for A, each lacking the set approval");
   assert.deepEqual(rc.vaults, [c.creatorVault]);
   assert.equal(rc.breakdown.points, "0");

@@ -149,8 +149,8 @@ export class PayService {
   }
 
   /** The stock x402 client paying from channel record `r` (the vault as payer, the channel's voucher key signing, never depositing). */
-  #x402(r: ChannelRecord & { pay: PayChannelState }): x402HTTPClient {
-    const voucherKey = this.#channels.voucherSigner(r);
+  async #x402(r: ChannelRecord & { pay: PayChannelState }): Promise<x402HTTPClient> {
+    const voucherKey = await this.#channels.voucherSigner(r);
     if (voucherKey.address !== getAddress(r.config.payerAuthorizer)) throw new Error(`the voucher key of channel ${r.channel} is not derived from this machine's master seed`);
     const client = this.#client;
     const payer = {
@@ -261,7 +261,7 @@ export class PayService {
       /** What the vouchers sent for this request add to the channel's charge. */
       let paid = 0n;
       for (let attempt = 0; attempt < 2; attempt++) {
-        const http = this.#x402(r);
+        const http = await this.#x402(r);
         const current = required2.accepts.find((x) => offerProblem(x, this.#config.x402Network, token) === null) ?? offer;
         // A corrective 402 is a new offer: it is held to maxPrice as the first one was.
         if (!/^[1-9][0-9]*$/.test(current.amount) || BigInt(current.amount) > maxPrice) {

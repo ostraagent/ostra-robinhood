@@ -105,7 +105,7 @@ const ZERO32: Hex = `0x${"00".repeat(32)}`;
  */
 export interface PadPrivateSide {
   /** The listing's fields for private orders: the KEM public key (base64) and the posting address. */
-  listingFields(): { kem: string; post: Address };
+  listingFields(): Promise<{ kem: string; post: Address }>;
   /** True when a job's description names an encrypted order, false when a public one; throws when it cannot tell. */
   isPrivate(description: Hex): Promise<boolean>;
   sealOrder(o: { client: Address; provider: Address; agentId: string; offer: string; input: string; attachments: string[]; listing: PadListing; budget: bigint; pool: boolean }): Promise<{ digest: Hex; uri: string }>;
@@ -477,7 +477,7 @@ export class PadService {
       if (reputation !== undefined && offers === null) throw new RangeError("a reputation proof goes with a listing's offers; nothing was signed");
       if (reputation !== undefined && this.#p.listingProof === undefined) throw new Error("reputation proofs are not available here (OstraReputation is not deployed on this chain, or no prover); nothing was signed");
       if (offers !== null) {
-        const entry = padServiceEntry({ provider: vault, offers: offers as PadOffer[], ...(this.#p.private === undefined ? {} : this.#p.private.listingFields()) }, this.#pad, this.#p.config.chainId);
+        const entry = padServiceEntry({ provider: vault, offers: offers as PadOffer[], ...(this.#p.private === undefined ? {} : await this.#p.private.listingFields()) }, this.#pad, this.#p.config.chainId);
         // Proven before any approval: a statement that cannot be proven signs nothing.
         if (reputation !== undefined && this.#p.listingProof !== undefined) {
           proven = await this.#p.listingProof({ agentId, file: { ...current, services: [...services, entry] }, thresholds: reputation });

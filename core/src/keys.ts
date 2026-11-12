@@ -28,11 +28,42 @@
 // disk in OSTRA_HOME (mcp/src/keys.ts); the web app keeps them in the
 // browser. Nothing here is ever sent anywhere or printed.
 
-import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type PrivateKeyAccount } from "viem";
+import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type LocalAccount, type PrivateKeyAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { PAD_KEM_DOMAIN, WotsKeychain, padKemKeys, padKemSeed, padPostingAccount, sha256, utf8, type PadKemKeys, type WotsStore } from "@ostraagent/sdk";
+import {
+  PAD_KEM_DOMAIN,
+  WotsKeychain,
+  closeRequestTypedData,
+  padKemKeys,
+  padKemSeed,
+  padPostingAccount,
+  padUnwrapKey,
+  sha256,
+  signAgentSpend,
+  utf8,
+  voucherTypedData,
+  type PadKemKeys,
+  type PadWrap,
+  type SignedAgentSpend,
+  type VaultAction,
+  type WotsSignatureRecord,
+  type WotsStore,
+} from "@ostraagent/sdk";
 import type { SignatureEscrowClient } from "./escrow.ts";
 import { backupSignerOf, sealSeed } from "./passkey.ts";
+import {
+  TRANSFER_WITH_AUTHORIZATION_TYPE,
+  padPostHash,
+  padPoster,
+  paymentWalletAccount,
+  voucherAccount,
+  type CloseRequestFields,
+  type PadPostMessage,
+  type PadPoster,
+  type PaymentTransfer,
+  type VoucherAccount,
+  type VoucherFields,
+} from "./seed-accounts.ts";
 import type { Folder } from "./storage.ts";
 
 /** The folder of the private vaults' records: one folder per private vault in it (keys.forPrivateVault). */
@@ -149,6 +180,47 @@ export function agentKeychainId(chainId: number, vault: Address): Uint8Array {
   return sha256([AGENT_KEYCHAIN_DOMAIN, chainBytes(chainId), tokenBytes(vault)]);
 }
 
+/** Where an agent spend is signed: the vault, its agent nonce and key in force, the key's index and the next key's. */
+export type AgentSpendKey = { vault: Address; agentNonce: bigint; keyRoot: Hex; vaultKeyRoot: Hex; index: bigint; nextIndex: bigint };
+
+/**
+ * What an agent uses its master seed for, every call async and typed: the whole surface a hosted agent (Ostra Cloud)
+ * asks its signer for, so that the seed stays in a process of its own. Every signature is of a message built from its
+ * fields here, never of a hash or message handed in. Keys answers it from the seed in memory; the owner's keys (the
+ * vault keychains, the shield, the private pool, the seller) are not part of it. seed-accounts.ts builds the accounts
+ * the services sign with on top of it.
+ */
+export interface AgentSeed {
+  /** The root of key `index` of this seed's agent key of `vault` (version 5). */
+  agentKeyRoot(chainId: number, vault: Address, index: bigint): Promise<Hex>;
+  /** What agent key `index` of `vault` signed: this device's record, else the signature escrow's. */
+  agentSigned(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined>;
+  /** What agent key `index` of `vault` signed by this device's record only (no request to the escrow). */
+  agentRecorded(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined>;
+  /** Signs an agent spend with key `k.index` of `k.vault`, naming key `k.nextIndex` as the next (sdk signAgentSpend). */
+  signAgentSpend(k: AgentSpendKey, a: { chainId: number; action: VaultAction; params: Hex }): Promise<SignedAgentSpend>;
+  /** The address of the voucher key of the channel opened with `salt` on (chain, token). */
+  voucherAddress(chainId: number, token: Address, salt: Hex): Promise<Address>;
+  /** That voucher key's signature of an x402 batch-settlement Voucher (sdk voucherTypedData on chain `chainId`). */
+  signVoucher(chainId: number, token: Address, salt: Hex, v: VoucherFields): Promise<Hex>;
+  /** That voucher key's signature of an OstraVault CloseRequest on chain `chainId` (sdk closeRequestTypedData). */
+  signCloseRequest(chainId: number, token: Address, salt: Hex, c: CloseRequestFields): Promise<Hex>;
+  /** The address of the payment wallet of `vault` on (chain, token). */
+  paymentWalletAddress(chainId: number, token: Address, vault: Address): Promise<Address>;
+  /** That wallet's EIP-3009 TransferWithAuthorization from itself, on `token`'s EIP-712 domain of chain `chainId`. */
+  signPaymentTransfer(chainId: number, token: Address, vault: Address, t: PaymentTransfer): Promise<Hex>;
+  /** The Ostra Tide link secret for OstraTide `tide`. */
+  tideSecret(chainId: number, tide: Address): Promise<Hex>;
+  /** The address of the posting key of Ostrapad's private jobs on (chain, OstraPad). */
+  padPostingAddress(chainId: number, pad: Address): Promise<Address>;
+  /** That posting key's signature (EIP-191, raw) of an Ostrapad message (seed-accounts.ts padPostHash). */
+  signPadPost(chainId: number, pad: Address, m: PadPostMessage): Promise<Hex>;
+  /** The ML-KEM-768 public key of Ostrapad's private jobs on (chain, OstraPad). */
+  padKemPublicKey(chainId: number, pad: Address): Promise<Uint8Array>;
+  /** A private job's content key from a wrap to `recipient` under this seed's KEM key (sdk padUnwrapKey), or null when the wrap is not one. */
+  padUnwrap(chainId: number, pad: Address, wrap: PadWrap, recipient: Address, keyCommit: Uint8Array): Promise<Uint8Array | null>;
+}
+
 /** What a Keys holds: the master seed and fee payer key, the WOTS store, and where records are kept. */
 export type KeysParts<S extends WotsStore = WotsStore> = {
   master: Uint8Array;
@@ -166,7 +238,7 @@ export type KeysParts<S extends WotsStore = WotsStore> = {
   escrow?: SignatureEscrowClient | null;
 };
 
-export class Keys<S extends WotsStore = WotsStore> {
+export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
   /** Where records are kept: the agent's folder, or a private vault's own folder in it (forPrivateVault). */
   readonly folder: Folder;
   readonly feePayer: PrivateKeyAccount;
@@ -178,6 +250,8 @@ export class Keys<S extends WotsStore = WotsStore> {
   readonly #master: Uint8Array;
   readonly #root: Folder;
   readonly #backupExported: () => Promise<boolean>;
+  /** The agent keychains made so far, one per (chain, vault): one copy of the seed each, not one per call. */
+  readonly #agentKeychains = new Map<string, WotsKeychain>();
 
   constructor(parts: KeysParts<S>) {
     if (parts.master.length !== 32) throw new RangeError("the master seed must be 32 bytes");
@@ -249,8 +323,30 @@ export class Keys<S extends WotsStore = WotsStore> {
   }
 
   /** Keychain of this seed's agent key of `vault` (version 5; agent-key.ts keeps which index is next). */
-  agentKeychain(chainId: number, vault: Address): WotsKeychain {
-    return this.#keychain(agentKeychainId(chainId, vault));
+  #agentKeychain(chainId: number, vault: Address): WotsKeychain {
+    const key = `${chainId}-${getAddress(vault)}`;
+    let k = this.#agentKeychains.get(key);
+    if (k === undefined) {
+      k = this.#keychain(agentKeychainId(chainId, vault));
+      this.#agentKeychains.set(key, k);
+    }
+    return k;
+  }
+
+  async agentKeyRoot(chainId: number, vault: Address, index: bigint): Promise<Hex> {
+    return bytesToHex(this.#agentKeychain(chainId, vault).keyRoot(index));
+  }
+
+  agentSigned(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined> {
+    return this.#agentKeychain(chainId, vault).signed(index);
+  }
+
+  agentRecorded(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined> {
+    return this.store.load(agentKeychainId(chainId, vault), index);
+  }
+
+  signAgentSpend(k: AgentSpendKey, a: { chainId: number; action: VaultAction; params: Hex }): Promise<SignedAgentSpend> {
+    return signAgentSpend(this.#agentKeychain(a.chainId, k.vault), k, a);
   }
 
   /** Keychain of private vault `index` (key index = the vault's on-chain nonce). */
@@ -279,8 +375,26 @@ export class Keys<S extends WotsStore = WotsStore> {
    * opens with `salt`. The salt is part of the channel config, so the master
    * seed and the config recover the key.
    */
-  channelVoucherSigner(chainId: number, token: Address, salt: Hex): PrivateKeyAccount {
+  #voucherKey(chainId: number, token: Address, salt: Hex): PrivateKeyAccount {
     return accountFromSecret(sha256([VOUCHER_KEY_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), saltBytes(salt)]));
+  }
+
+  async voucherAddress(chainId: number, token: Address, salt: Hex): Promise<Address> {
+    return this.#voucherKey(chainId, token, salt).address;
+  }
+
+  signVoucher(chainId: number, token: Address, salt: Hex, v: VoucherFields): Promise<Hex> {
+    // Field by field: the settlement contract and the chain are never the caller's (sdk voucherTypedData takes a settlement).
+    return this.#voucherKey(chainId, token, salt).signTypedData(voucherTypedData({ channelId: v.channelId, maxClaimableAmount: v.maxClaimableAmount, chainId }));
+  }
+
+  signCloseRequest(chainId: number, token: Address, salt: Hex, c: CloseRequestFields): Promise<Hex> {
+    return this.#voucherKey(chainId, token, salt).signTypedData(closeRequestTypedData({ chainId, vault: c.vault, channelId: c.channelId, amount: c.amount, nonce: c.nonce, deadline: c.deadline }));
+  }
+
+  /** The voucher key as an account: x402 Vouchers (signTypedData) and close requests (signClose) only (seed-accounts.ts). */
+  channelVoucherSigner(chainId: number, token: Address, salt: Hex): Promise<VoucherAccount> {
+    return voucherAccount(this, chainId, token, salt);
   }
 
   /**
@@ -288,8 +402,27 @@ export class Keys<S extends WotsStore = WotsStore> {
    * holding a small balance from the vault to pay APIs whose offer is a transfer signed by the payer's own key (x402
    * exact, EIP-3009). The seed and the vault's address recover it.
    */
-  paymentWalletSigner(chainId: number, token: Address, vault: Address): PrivateKeyAccount {
+  #paymentWallet(chainId: number, token: Address, vault: Address): PrivateKeyAccount {
     return accountFromSecret(sha256([PAYMENT_WALLET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), tokenBytes(vault)]));
+  }
+
+  async paymentWalletAddress(chainId: number, token: Address, vault: Address): Promise<Address> {
+    return this.#paymentWallet(chainId, token, vault).address;
+  }
+
+  signPaymentTransfer(chainId: number, token: Address, vault: Address, t: PaymentTransfer): Promise<Hex> {
+    const wallet = this.#paymentWallet(chainId, token, vault);
+    return wallet.signTypedData({
+      domain: { name: t.name, version: t.version, chainId, verifyingContract: getAddress(token) },
+      types: { TransferWithAuthorization: TRANSFER_WITH_AUTHORIZATION_TYPE },
+      primaryType: "TransferWithAuthorization",
+      message: { from: wallet.address, to: t.to, value: t.value, validAfter: t.validAfter, validBefore: t.validBefore, nonce: t.nonce },
+    });
+  }
+
+  /** The payment wallet as an account: EIP-3009 transfers from itself on its token only (seed-accounts.ts). */
+  paymentWalletSigner(chainId: number, token: Address, vault: Address): Promise<LocalAccount> {
+    return paymentWalletAccount(this, chainId, token, vault);
   }
 
   /**
@@ -334,7 +467,7 @@ export class Keys<S extends WotsStore = WotsStore> {
    * The agent's Ostra Tide link secret for OstraTide `tide` on `chainId` (core tide.ts): what makes its vault link's
    * approvals hashes nobody else can match to the agent; its hash is the agent's view key of its own points.
    */
-  tideSecret(chainId: number, tide: Address): Hex {
+  async tideSecret(chainId: number, tide: Address): Promise<Hex> {
     return bytesToHex(sha256([TIDE_LINK_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(tide)]));
   }
 
@@ -342,13 +475,39 @@ export class Keys<S extends WotsStore = WotsStore> {
    * The agent's ML-KEM-768 key pair for Ostrapad's private jobs on (chain, OstraPad) (sdk pad-private.ts padKemSeed with
    * the MCP's domain): its public key goes in the agent's listing and KEM registration; the seed recovers it.
    */
-  padKem(chainId: number, pad: Address): PadKemKeys {
+  #padKem(chainId: number, pad: Address): PadKemKeys {
     return padKemKeys(padKemSeed(this.#master, PAD_KEM_DOMAIN.mcp, chainId, pad));
   }
 
+  async padKemPublicKey(chainId: number, pad: Address): Promise<Uint8Array> {
+    const keys = this.#padKem(chainId, pad);
+    keys.secretKey.fill(0);
+    return keys.publicKey;
+  }
+
+  async padUnwrap(chainId: number, pad: Address, wrap: PadWrap, recipient: Address, keyCommit: Uint8Array): Promise<Uint8Array | null> {
+    // A wrap to another recipient opens with no key (padUnwrapKey's first check): no KEM key is made for it.
+    if (getAddress(wrap.recipient) !== getAddress(recipient)) return null;
+    const keys = this.#padKem(chainId, pad);
+    try {
+      return padUnwrapKey(wrap, recipient, keys, keyCommit);
+    } finally {
+      keys.secretKey.fill(0);
+    }
+  }
+
   /** The agent's posting key for Ostrapad's private jobs on (chain, OstraPad): it signs wraps, uploads and reservations. */
-  padPosting(chainId: number, pad: Address): PrivateKeyAccount {
-    return padPostingAccount(this.#master, chainId, pad);
+  async padPostingAddress(chainId: number, pad: Address): Promise<Address> {
+    return padPostingAccount(this.#master, chainId, pad).address;
+  }
+
+  signPadPost(chainId: number, pad: Address, m: PadPostMessage): Promise<Hex> {
+    return padPostingAccount(this.#master, chainId, pad).signMessage({ message: { raw: padPostHash(chainId, pad, m) } });
+  }
+
+  /** The posting key as Ostrapad's poster: its address and its signatures of Ostrapad's messages (seed-accounts.ts). */
+  padPosting(chainId: number, pad: Address): Promise<PadPoster> {
+    return padPoster(this, chainId, pad);
   }
 
   /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */

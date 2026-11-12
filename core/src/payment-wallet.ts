@@ -22,7 +22,7 @@
 // Entries, in the agent's `payment-wallet` folder: <vault>.json, the wallet's record (its address, its payments, its
 // top-ups and withdrawals; no secret).
 
-import { bytesToHex, domainSeparator, encodeFunctionData, getAddress, isAddress, parseSignature, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, domainSeparator, encodeFunctionData, getAddress, isAddress, parseSignature, zeroAddress, type Address, type Hash, type Hex, type LocalAccount, type PublicClient } from "viem";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
 import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { toClientEvmSigner } from "@x402/evm";
@@ -188,13 +188,13 @@ export class PaymentWallet {
     return vault;
   }
 
-  #signer(vault: Address): PrivateKeyAccount {
+  #signer(vault: Address): Promise<LocalAccount> {
     return this.#p.keys.paymentWalletSigner(this.#p.config.chainId, this.#token, vault);
   }
 
   /** The wallet's address for the buyer vault (nothing is created). */
   async address(): Promise<Address> {
-    return this.#signer(await this.#vault()).address;
+    return (await this.#signer(await this.#vault())).address;
   }
 
   async #load(vault: Address, address: Address): Promise<PaymentWalletRecord | null> {
@@ -316,7 +316,7 @@ export class PaymentWallet {
 
   async status(): Promise<PaymentWalletStatus> {
     const vault = await this.#vault();
-    const address = this.#signer(vault).address;
+    const address = (await this.#signer(vault)).address;
     return this.#statusOf(vault, address, await this.#load(vault, address));
   }
 
@@ -331,7 +331,7 @@ export class PaymentWallet {
   setup(amountText?: string, agentWalletText?: string): Promise<PaymentWalletStatus & { created: boolean; allowlist?: V5Change | { status: "listed"; inForce: boolean; effectiveAt: string }; toppedUp?: { txHash: Hash; amount: string }; note?: string }> {
     return this.#serial(async () => {
       const vault = await this.#vault();
-      const address = this.#signer(vault).address;
+      const address = (await this.#signer(vault)).address;
       const agent = this.#p.buyer.agentKey !== null;
       // The agent's wallet, checked before anything is created or signed.
       let agentWallet: Address | null = null;
@@ -407,7 +407,7 @@ export class PaymentWallet {
     return this.#serial(async () => {
       const { offer } = a;
       const vault = await this.#vault();
-      const signer = this.#signer(vault);
+      const signer = await this.#signer(vault);
       const r = await this.#load(vault, signer.address);
       if (r === null) throw new Error(`${a.url} is paid by a USDG transfer signed by the payer's own key (x402 exact), which this agent pays from its payment wallet: none is set up yet (payment_wallet_setup); nothing was paid`);
       if (!/^[1-9][0-9]*$/.test(offer.amount)) throw new Error(`the offer's amount ${offer.amount} is not a positive integer; nothing was paid`);
@@ -503,7 +503,7 @@ export class PaymentWallet {
   withdraw(amountText?: string): Promise<{ status: "sent"; txHash: Hash; destination: Address; amount: string; left: string }> {
     return this.#serial(async () => {
       const vault = await this.#vault();
-      const signer = this.#signer(vault);
+      const signer = await this.#signer(vault);
       const { r } = await this.#record(vault, signer.address);
       const balance = await this.#balance(signer.address);
       const reserved = await this.#reserved(r);

@@ -20,7 +20,7 @@ import { mkdir, open, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { bytesToHex, getAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient } from "viem";
+import { bytesToHex, getAddress, type Address, type Hash, type Hex, type PublicClient } from "viem";
 import {
   PAD_ENC_KIND,
   PAD_ENC_MAX_FILE,
@@ -46,25 +46,20 @@ import {
   padParseManifest,
   padPlaintextPrefix,
   padRecoverSigner,
-  padReserveMessage,
   padSafeAttachmentName,
   padSealFile,
-  padUnwrapKey,
-  padUploadMessage,
   padWrapBytes,
   padWrapFromBytes,
   padWrapKey,
-  padWrapMessage,
   sha256 as sha256Parts,
   type PadByteSource,
   type PadEncHeader,
   type PadEncKind,
   type PadJob,
-  type PadKemKeys,
   type PadListing,
   type PadWrap,
 } from "@ostraagent/sdk";
-import type { Folder } from "@ostraagent/core";
+import type { Folder, PadPoster } from "@ostraagent/core";
 
 /** The panel's late point: an evaluator without K waits until evalStart + EVAL_WINDOW - this before rejecting for no K (revision 7). */
 export const NO_KEY_WAIT_S = 42n * 3_600n;
@@ -82,9 +77,12 @@ export type PadPrivateParts = {
   history?: PublicClient;
   chainId: number;
   pad: Address;
-  /** The agent's ML-KEM-768 keys and posting key for this chain and OstraPad (from the seed). */
-  kem: () => PadKemKeys;
-  posting: () => PrivateKeyAccount;
+  /** The agent's ML-KEM-768 public key for this chain and OstraPad (from the seed). */
+  kemPublicKey: () => Promise<Uint8Array>;
+  /** A job key from a wrap to `recipient` under the agent's KEM key (sdk padUnwrapKey; the secret key stays with the seed), or null. */
+  unwrap: (wrap: PadWrap, recipient: Address, keyCommit: Uint8Array) => Promise<Uint8Array | null>;
+  /** The agent's posting key for this chain and OstraPad (from the seed). */
+  posting: () => Promise<PadPoster>;
   /** The Ostra uploader's base (the relayer's URL; /v1/enc/ and /v1/ipfs/ under it). */
   uploaderUrl: string;
   /** Ostra's index (its /api/v1/pad/private/ routes). */
@@ -161,10 +159,10 @@ export class PadPrivate {
   }
 
   /** What the listing publishes for private orders: the KEM public key (base64) and the posting address. */
-  listingFields(): { kem: string; post: Address } {
+  async listingFields(): Promise<{ kem: string; post: Address }> {
     let bin = "";
-    for (const b of this.#p.kem().publicKey) bin += String.fromCharCode(b);
-    return { kem: btoa(bin), post: this.#p.posting().address };
+    for (const b of await this.#p.kemPublicKey()) bin += String.fromCharCode(b);
+    return { kem: btoa(bin), post: (await this.#p.posting()).address };
   }
 
   // ------------------------------------------------------------------------------------------------------------- keys
@@ -334,14 +332,15 @@ export class PadPrivate {
   async sealOrder(o: { client: Address; provider: Address; agentId: string; offer: string; input: string; attachments: string[]; listing: PadListing; budget: bigint; pool: boolean }): Promise<{ digest: Hex; uri: string }> {
     if (o.listing.kem === undefined || o.listing.post === undefined) throw new Error("the provider's listing publishes no key for private orders (kem and post): order it as a public job; nothing was signed");
     const providerPk = padListingKem(o.listing.kem);
-    const me = this.#p.kem();
+    const mePk = await this.#p.kemPublicKey();
+    const clientPosting = (await this.#p.posting()).address;
     const k = padNewJobKey();
     const ctx = { chainId: this.#p.chainId, pad: this.#p.pad, jobId: `0x${"00".repeat(32)}` as Hex, round: 0 };
     const header: PadEncHeader = {
       kind: PAD_ENC_KIND.order,
       salt: padNewSalt(),
       plaintextLength: 0,
-      order: { keyCommit: padKeyCommit(k), clientPosting: this.#p.posting().address, providerPosting: getAddress(o.listing.post), wraps: [padWrapKey(k, ctx, o.client, me.publicKey), padWrapKey(k, ctx, o.provider, providerPk)] },
+      order: { keyCommit: padKeyCommit(k), clientPosting, providerPosting: getAddress(o.listing.post), wraps: [padWrapKey(k, ctx, o.client, mePk), padWrapKey(k, ctx, o.provider, providerPk)] },
     };
     const manifest = { type: "ostrapad-order-v1", agent: `eip155:${this.#p.chainId}:${o.agentId}`, offer: o.offer, client: caip(this.#p.chainId, o.client), provider: caip(this.#p.chainId, o.provider), input: o.input };
     const plain = await this.#plaintext(manifest, o.attachments, o.pool);
@@ -403,9 +402,8 @@ export class PadPrivate {
     if (order === null) return null;
     const kept = await this.#key(description);
     if (kept !== null && padKeyCommit(kept).every((b, i) => b === order.keyCommit[i])) return { k: kept, keyCommit: order.keyCommit, header };
-    const keys = this.#p.kem();
     for (const w of order.wraps) {
-      const k = padUnwrapKey(w, me, keys, order.keyCommit);
+      const k = await this.#p.unwrap(w, me, order.keyCommit);
       if (k !== null) {
         await this.#saveKey(description, k);
         return { k, keyCommit: order.keyCommit, header };
@@ -414,7 +412,7 @@ export class PadPrivate {
     const got = await this.#json(`${this.#p.indexerUrl}/api/v1/pad/private/wraps/${jobId}`);
     for (const s of (got.body.wraps as { recipient: string; wrap: string }[] | undefined) ?? []) {
       if (getAddress(s.recipient) !== getAddress(me)) continue;
-      const k = padUnwrapKey(padWrapFromBytes(new Uint8Array(Buffer.from(s.wrap, "base64"))), me, keys, order.keyCommit);
+      const k = await this.#p.unwrap(padWrapFromBytes(new Uint8Array(Buffer.from(s.wrap, "base64"))), me, order.keyCommit);
       if (k !== null) {
         await this.#saveKey(description, k);
         return { k, keyCommit: order.keyCommit, header };
@@ -525,7 +523,7 @@ export class PadPrivate {
     if (!job.pool && getAddress(job.evaluator) !== getAddress(job.client)) throw new Error("a private job is judged by the evaluator pool or by its client; this one names a third-party evaluator, who could not read it: not accepted; nothing was signed");
     const key = await this.#jobKey(job.id, description, me);
     if (key === null) throw new Error("the private order does not open with this agent's key (or cannot be read): not accepted; nothing was signed");
-    if (key.header.order?.providerPosting !== this.#p.posting().address) throw new Error("the private order names another posting address for the provider: not accepted; nothing was signed");
+    if (key.header.order?.providerPosting !== (await this.#p.posting()).address) throw new Error("the private order names another posting address for the provider: not accepted; nothing was signed");
     // Wraps for the evaluators and the panel go through Ostra's index, which takes them only once it holds the job's
     // order header with this posting address (review round 9, R9-B2).
     if (job.pool) {
@@ -536,7 +534,7 @@ export class PadPrivate {
       } catch {
         indexed = null;
       }
-      if (indexed !== this.#p.posting().address) throw new Error("Ostra's index does not hold this private job's order yet (it reads new orders every minute), so no evaluator could be given its key: not accepted now; try again in a few minutes; nothing was signed");
+      if (indexed !== (await this.#p.posting()).address) throw new Error("Ostra's index does not hold this private job's order yet (it reads new orders every minute), so no evaluator could be given its key: not accepted now; try again in a few minutes; nothing was signed");
     }
     const opened = await this.#open(job, description, PAD_ENC_KIND.order, key);
     if (opened === null) throw new Error("the private order cannot be read: not accepted; nothing was signed");
@@ -559,7 +557,7 @@ export class PadPrivate {
   /** The provider's reservation of `bytes` for the job's delivery, signed by its posting key. */
   async reserve(jobId: Hex, bytes: number): Promise<void> {
     const seq = BigInt(Date.now());
-    const signature = await this.#p.posting().signMessage({ message: { raw: padReserveMessage({ chainId: this.#p.chainId, pad: this.#p.pad, jobId, bytes: BigInt(bytes), seq }) } });
+    const signature = await (await this.#p.posting()).signPost({ kind: "reserve", jobId, bytes: BigInt(bytes), seq });
     const r = await this.#json(`${this.#p.uploaderUrl}/v1/enc/reserve`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jobId, bytes, seq: seq.toString(), signature }) });
     if (r.status !== 200) throw new Error(`the uploader has no room for this job's delivery now (${String(r.body.message ?? r.body.error ?? r.status)}): not accepted; nothing was signed`);
   }
@@ -572,7 +570,7 @@ export class PadPrivate {
     try {
       const sealed = await this.#seal(key.k, { kind: PAD_ENC_KIND.delivery, salt: padNewSalt(), plaintextLength: plain.source.size, order: null }, plain.source);
       try {
-        const signature = await this.#p.posting().signMessage({ message: { raw: padUploadMessage({ chainId: this.#p.chainId, pad: this.#p.pad, jobId: job.id, kind: PAD_ENC_KIND.delivery, sha256: sealed.digest, size: BigInt(sealed.size) }) } });
+        const signature = await (await this.#p.posting()).signPost({ kind: "upload", jobId: job.id, encKind: PAD_ENC_KIND.delivery, sha256: sealed.digest, size: BigInt(sealed.size) });
         const uri = await this.#upload(sealed.path, PAD_ENC_KIND.delivery, sealed.digest, sealed.size, { jobId: job.id, signature });
         return { digest: sealed.digest, uri };
       } finally {
@@ -602,7 +600,7 @@ export class PadPrivate {
     const prefix = padPlaintextPrefix(manifest);
     const sealed = await this.#seal(key.k, { kind: PAD_ENC_KIND.reason, salt: padNewSalt(), plaintextLength: prefix.length, order: null }, { size: prefix.length, read: async (o, n) => prefix.subarray(o, o + n) });
     try {
-      const signature = await this.#p.posting().signMessage({ message: { raw: padUploadMessage({ chainId: this.#p.chainId, pad: this.#p.pad, jobId: job.id, kind: PAD_ENC_KIND.reason, sha256: sealed.digest, size: BigInt(sealed.size) }) } });
+      const signature = await (await this.#p.posting()).signPost({ kind: "upload", jobId: job.id, encKind: PAD_ENC_KIND.reason, sha256: sealed.digest, size: BigInt(sealed.size) });
       const uri = await this.#upload(sealed.path, PAD_ENC_KIND.reason, sealed.digest, sealed.size, { jobId: job.id, signature });
       return { digest: sealed.digest, uri };
     } finally {
@@ -616,9 +614,9 @@ export class PadPrivate {
    * re-registration of the same key would not change its arrival anyway).
    */
   async register(vault: Address, approve: (digest: Hex) => Promise<Hash>): Promise<Record<string, unknown>> {
-    const pk = this.#p.kem().publicKey;
+    const pk = await this.#p.kemPublicKey();
     const pkHash = bytesToHex(sha256Parts([pk]));
-    const posting = this.#p.posting().address;
+    const posting = (await this.#p.posting()).address;
     const current = await this.#json(`${this.#p.indexerUrl}/api/v1/pad/private/kem/${vault}`);
     const last = ((current.body.registrations as { pkHash: string; posting: string }[] | undefined) ?? []).at(-1);
     if (last !== undefined && last.pkHash === pkHash && getAddress(last.posting) === posting) {
@@ -720,7 +718,7 @@ export class PadPrivate {
     if (key === null) return "no_key";
     const wrap: PadWrap = padWrapKey(key.k, { chainId: this.#p.chainId, pad: this.#p.pad, jobId, round }, recipient, reg.pk);
     const seq = BigInt(Date.now());
-    const signature = await this.#p.posting().signMessage({ message: { raw: padWrapMessage({ chainId: this.#p.chainId, pad: this.#p.pad, jobId, round, wrap, seq }) } });
+    const signature = await (await this.#p.posting()).signPost({ kind: "wrap", jobId, round, wrap, seq });
     const entry: KeptWrap = { jobId, round, wrap: Buffer.from(padWrapBytes(wrap)).toString("base64"), seq: seq.toString(), signature, posted: false };
     // One unposted wrap per job, round and recipient: a new one replaces the one the index has not taken yet.
     const others = kept.filter((w) => w.posted || w.jobId !== jobId || w.round !== round || padWrapFromBytes(new Uint8Array(Buffer.from(w.wrap, "base64"))).recipient !== getAddress(recipient));

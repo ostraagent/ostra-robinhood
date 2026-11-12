@@ -4,19 +4,33 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bytesToHex, encodeFunctionData, getAddress, keccak256, stringToHex, zeroAddress, type Hex } from "viem";
+import { bytesToHex, encodeFunctionData, getAddress, keccak256, recoverAddress, recoverMessageAddress, recoverTypedDataAddress, stringToHex, zeroAddress, type Hex } from "viem";
 import {
   CHAINLINK_ETH_USD,
   MAX_RELAY_CALLS,
+  OSTRAPAD,
+  PAD_KEM_DOMAIN,
   ROBINHOOD_CHAIN_ID,
   USDG,
+  VAULT_ACTION,
   WotsKeychain,
   approvalMessage,
+  closeDigest,
   ostraVaultAbi,
+  padKemKeys,
+  padKemSeed,
+  padKeyCommit,
+  padNewJobKey,
+  padPostingAccount,
+  padReserveMessage,
+  padWrapKey,
+  signAgentSpend,
   signVaultOpenChannel,
   signVaultSetCrankKey,
   signVaultTransfer,
+  transferParams,
   vaultChannelConfig,
+  voucherTypedData,
   type WotsSignatureRecord,
   type WotsStore,
 } from "@ostraagent/sdk";
@@ -24,6 +38,8 @@ import {
   ChannelStore,
   Keys,
   RELAYER_CHANNEL_DEPOSIT,
+  TRANSFER_WITH_AUTHORIZATION_TYPE,
+  agentKeychainId,
   SessionStore,
   UNSHIELD_MAX_WINDOW_HOURS,
   accountFromSecret,
@@ -78,6 +94,79 @@ const keys = (folder = new MemoryFolder()) =>
   new Keys({ master: MASTER, feePayer: accountFromSecret(new Uint8Array(32).fill(9)), store: new MemoryWotsStore(), folder, backupExported: async () => false });
 const A = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
 
+test("the agent's seed operations (AgentSeed) answer as the seed's own keychains and keys do", async () => {
+  const k = keys();
+  const vault = A(0xb5);
+  const chain = new WotsKeychain(MASTER, agentKeychainId(ROBINHOOD_CHAIN_ID, vault), new MemoryWotsStore());
+  // The agent key roots: this seed's agent keychain of the vault, per vault and chain.
+  assert.equal(await k.agentKeyRoot(ROBINHOOD_CHAIN_ID, vault, 3n), bytesToHex(chain.keyRoot(3n)));
+  assert.notEqual(await k.agentKeyRoot(ROBINHOOD_CHAIN_ID, vault, 3n), await k.agentKeyRoot(ROBINHOOD_CHAIN_ID, A(0xb6), 3n));
+  assert.notEqual(await k.agentKeyRoot(ROBINHOOD_CHAIN_ID, vault, 3n), await k.agentKeyRoot(ROBINHOOD_CHAIN_ID + 1, vault, 3n));
+  // An agent spend: the same signature as the keychain's (WOTS signs deterministically), recorded, and one key signs once.
+  const spendKey = { vault, agentNonce: 4n, keyRoot: bytesToHex(chain.keyRoot(0n)), vaultKeyRoot: keccak256(stringToHex("vault key")), index: 0n, nextIndex: 1n };
+  const a = { chainId: ROBINHOOD_CHAIN_ID, action: VAULT_ACTION.TRANSFER, params: transferParams({ to: A(0xc1), amount: 5n }) } as const;
+  assert.equal(await k.agentSigned(ROBINHOOD_CHAIN_ID, vault, 0n), undefined);
+  const signed = await k.signAgentSpend(spendKey, a);
+  assert.deepEqual(signed, await signAgentSpend(chain, spendKey, a));
+  assert.equal((await k.agentRecorded(ROBINHOOD_CHAIN_ID, vault, 0n))?.signature, signed.signature.slice(2));
+  assert.equal((await k.agentSigned(ROBINHOOD_CHAIN_ID, vault, 0n))?.message, bytesToHex(signed.message).slice(2));
+  assert.equal(await k.agentRecorded(ROBINHOOD_CHAIN_ID, A(0xb6), 0n), undefined);
+  await assert.rejects(k.signAgentSpend({ ...spendKey, nextIndex: 2n }, a));
+  // Ostrapad's private jobs: the posting key signs Ostrapad's messages built from their fields.
+  const poster = await k.padPosting(ROBINHOOD_CHAIN_ID, OSTRAPAD);
+  assert.equal(poster.address, padPostingAccount(MASTER, ROBINHOOD_CHAIN_ID, OSTRAPAD).address);
+  const reserve = { jobId: keccak256(stringToHex("job")), bytes: 1000n, seq: 2n };
+  const posted = await poster.signPost({ kind: "reserve", ...reserve });
+  assert.equal(await recoverMessageAddress({ message: { raw: padReserveMessage({ chainId: ROBINHOOD_CHAIN_ID, pad: OSTRAPAD, ...reserve }) }, signature: posted }), poster.address);
+  const pk = await k.padKemPublicKey(ROBINHOOD_CHAIN_ID, OSTRAPAD);
+  assert.deepEqual(pk, padKemKeys(padKemSeed(MASTER, PAD_KEM_DOMAIN.mcp, ROBINHOOD_CHAIN_ID, OSTRAPAD)).publicKey);
+  const jobKey = padNewJobKey();
+  const ctx = { chainId: ROBINHOOD_CHAIN_ID, pad: OSTRAPAD, jobId: keccak256(stringToHex("job")), round: 0 };
+  const wrap = padWrapKey(jobKey, ctx, A(0xd1), pk);
+  assert.deepEqual(await k.padUnwrap(ROBINHOOD_CHAIN_ID, OSTRAPAD, wrap, A(0xd1), padKeyCommit(jobKey)), jobKey);
+  assert.equal(await k.padUnwrap(ROBINHOOD_CHAIN_ID, OSTRAPAD, wrap, A(0xd2), padKeyCommit(jobKey)), null);
+  assert.equal(await keys().padUnwrap(ROBINHOOD_CHAIN_ID + 1, OSTRAPAD, wrap, A(0xd1), padKeyCommit(jobKey)), null);
+  // A channel's voucher key: x402 Vouchers and close requests, nothing else.
+  const salt = keccak256(stringToHex("salt"));
+  const voucher = await k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt);
+  assert.equal(voucher.address, await k.voucherAddress(ROBINHOOD_CHAIN_ID, USDG, salt));
+  const v = voucherTypedData({ channelId: keccak256(stringToHex("channel")), maxClaimableAmount: 7n, chainId: ROBINHOOD_CHAIN_ID });
+  const vSig = await voucher.signTypedData(v);
+  assert.equal(await recoverTypedDataAddress({ ...v, signature: vSig }), voucher.address);
+  assert.equal(vSig, await k.signVoucher(ROBINHOOD_CHAIN_ID, USDG, salt, v.message));
+  // A field the operation does not take (another settlement contract) changes nothing.
+  assert.equal(await k.signVoucher(ROBINHOOD_CHAIN_ID, USDG, salt, { ...v.message, settlement: A(0xaa) } as never), vSig);
+  // As the x402 client hands it over: the amount as a decimal string.
+  assert.equal(await voucher.signTypedData({ ...v, message: { ...v.message, maxClaimableAmount: "7" } } as never), vSig);
+  const close = { vault: A(0xb5), channelId: keccak256(stringToHex("channel")), amount: 5n, nonce: 1n, deadline: 1_800_000_000n };
+  const cSig = await voucher.signClose(close);
+  assert.equal(await recoverAddress({ hash: closeDigest({ chainId: ROBINHOOD_CHAIN_ID, ...close }), signature: cSig }), voucher.address);
+  await assert.rejects(voucher.signMessage({ message: "hello" }), /signs only/);
+  await assert.rejects(voucher.signTypedData({ ...v, domain: { ...v.domain, verifyingContract: A(0x99) } }), /signs only/);
+  await assert.rejects(voucher.signTypedData({ ...v, domain: { ...v.domain, chainId: ROBINHOOD_CHAIN_ID + 1 } }), /signs only/);
+  await assert.rejects(voucher.signTypedData({ ...v, primaryType: "Other", types: { Other: v.types.Voucher } } as never), /signs only/);
+  await assert.rejects(voucher.signTypedData({ ...v, message: { ...v.message, extra: 1n } } as never), /signs only/);
+  // The payment wallet: EIP-3009 transfers from itself on its own token, nothing else.
+  const wallet = await k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, vault);
+  assert.equal(wallet.address, await k.paymentWalletAddress(ROBINHOOD_CHAIN_ID, USDG, vault));
+  const transfer = {
+    domain: { name: "Global Dollar", version: "1", chainId: ROBINHOOD_CHAIN_ID, verifyingContract: USDG },
+    types: { TransferWithAuthorization: TRANSFER_WITH_AUTHORIZATION_TYPE },
+    primaryType: "TransferWithAuthorization",
+    message: { from: wallet.address, to: A(0xc2), value: 3n, validAfter: 0n, validBefore: 1_800_000_000n, nonce: keccak256(stringToHex("n")) },
+  } as const;
+  const tSig = await wallet.signTypedData(transfer);
+  assert.equal(await recoverTypedDataAddress({ ...transfer, signature: tSig }), wallet.address);
+  await assert.rejects(wallet.signTypedData({ ...transfer, message: { ...transfer.message, from: A(0xc3) } }), /signs only/);
+  await assert.rejects(wallet.signTypedData({ ...transfer, domain: { ...transfer.domain, verifyingContract: A(0xc4) } }), /signs only/);
+  await assert.rejects(wallet.signTypedData(v as never), /signs only/);
+  await assert.rejects(wallet.signMessage({ message: "hello" }), /signs only/);
+  // The Tide link secret: per chain and OstraTide, the same from the same seed.
+  assert.match(await k.tideSecret(ROBINHOOD_CHAIN_ID, A(0xe1)), /^0x[0-9a-f]{64}$/);
+  assert.equal(await k.tideSecret(ROBINHOOD_CHAIN_ID, A(0xe1)), await keys().tideSecret(ROBINHOOD_CHAIN_ID, A(0xe1)));
+  assert.notEqual(await k.tideSecret(ROBINHOOD_CHAIN_ID, A(0xe1)), await k.tideSecret(ROBINHOOD_CHAIN_ID, A(0xe2)));
+});
+
 test("token amounts and ETH format as before", () => {
   assert.equal(parseTokenAmount("1.25"), 1_250_000n);
   assert.equal(parseTokenAmount("0.000001"), 1n);
@@ -95,7 +184,7 @@ test("base64url decodes without Buffer", () => {
   assert.throws(() => fromBase64Url("a+b"));
 });
 
-test("key derivations: separate per vault kind, chain, token and index; secp256k1 accounts", () => {
+test("key derivations: separate per vault kind, chain, token and index; secp256k1 accounts", async () => {
   const k = keys();
   const v = vaultKeychainId(ROBINHOOD_CHAIN_ID, USDG);
   assert.notEqual(bytesToHex(v), bytesToHex(sellerKeychainId(ROBINHOOD_CHAIN_ID, USDG)));
@@ -105,18 +194,18 @@ test("key derivations: separate per vault kind, chain, token and index; secp256k
   assert.notEqual(bytesToHex(privateVaultKeychainId(ROBINHOOD_CHAIN_ID, USDG, 0n)), bytesToHex(privateVaultKeychainId(ROBINHOOD_CHAIN_ID, USDG, 1n)));
   const salt1 = keccak256(stringToHex("a"));
   const salt2 = keccak256(stringToHex("b"));
-  assert.equal(k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1).address, keys().channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1).address);
-  assert.notEqual(k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1).address, k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt2).address);
+  assert.equal((await k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1)).address, (await keys().channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1)).address);
+  assert.notEqual((await k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt1)).address, (await k.channelVoucherSigner(ROBINHOOD_CHAIN_ID, USDG, salt2)).address);
   assert.notEqual(k.shieldSigner(ROBINHOOD_CHAIN_ID, USDG, 0n).address, k.shieldSigner(ROBINHOOD_CHAIN_ID, USDG, 1n).address);
   assert.notEqual(k.shieldDepositId(ROBINHOOD_CHAIN_ID, USDG, 0n), k.shieldDepositId(ROBINHOOD_CHAIN_ID, USDG, 1n));
   assert.match(k.merchantKey(ROBINHOOD_CHAIN_ID, USDG), /^0x[0-9a-f]{64}$/);
   assert.notEqual(k.selfCrankSigner(ROBINHOOD_CHAIN_ID, USDG).address, accountFromSecret(new Uint8Array(32).fill(9)).address);
   // The payment wallet: one per vault, chain and token, the same from the same seed.
-  const wallet = k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1)).address;
-  assert.equal(wallet, keys().paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1)).address);
-  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa2)).address);
-  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID + 1, USDG, A(0xa1)).address);
-  assert.notEqual(wallet, k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, A(1), A(0xa1)).address);
+  const wallet = (await k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1))).address;
+  assert.equal(wallet, (await keys().paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa1))).address);
+  assert.notEqual(wallet, (await k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, USDG, A(0xa2))).address);
+  assert.notEqual(wallet, (await k.paymentWalletSigner(ROBINHOOD_CHAIN_ID + 1, USDG, A(0xa1))).address);
+  assert.notEqual(wallet, (await k.paymentWalletSigner(ROBINHOOD_CHAIN_ID, A(1), A(0xa1))).address);
   assert.notEqual(wallet, k.selfCrankSigner(ROBINHOOD_CHAIN_ID, USDG).address);
   assert.equal(isPrivateKey(new Uint8Array(32)), false);
   assert.equal(isPrivateKey(new Uint8Array(32).fill(0xff)), false);

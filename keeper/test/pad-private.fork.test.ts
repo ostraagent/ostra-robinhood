@@ -57,7 +57,6 @@ import {
   padProviderPay,
   padWrapBytes,
   padWrapKey,
-  padWrapMessage,
   readPadAppeal,
   readPadJob,
   registerAgentParams,
@@ -156,7 +155,7 @@ async function agent(name: string, seed: number, uploaderUrl: string, indexerUrl
   const creatorVault = getAddress(await creator.vaultAddress());
   let agentId: bigint | null = null;
   let file: Record<string, unknown> | null = { ...profileFile({ vault: creatorVault }), name, description: `${name}, a test agent` };
-  const priv = new AgentPrivate({ client, chainId: d.chainId, pad: OSTRAPAD, kem: () => keys.padKem(d.chainId, OSTRAPAD), posting: () => keys.padPosting(d.chainId, OSTRAPAD), uploaderUrl, indexerUrl, folder: folder.folder("pad"), filesDir: join(root, `${name}-files`), fetch: f, history: client });
+  const priv = new AgentPrivate({ client, chainId: d.chainId, pad: OSTRAPAD, kemPublicKey: () => keys.padKemPublicKey(d.chainId, OSTRAPAD), unwrap: (w, r, c) => keys.padUnwrap(d.chainId, OSTRAPAD, w, r, c), posting: () => keys.padPosting(d.chainId, OSTRAPAD), uploaderUrl, indexerUrl, folder: folder.folder("pad"), filesDir: join(root, `${name}-files`), fetch: f, history: client });
   const pad = new PadService({
     client,
     config,
@@ -260,7 +259,7 @@ test("private jobs: read, judged and reasoned under K; a rejection for no K uphe
   }
   await warp(Number(PAD.STAKE_DELAY) + 60);
   await sync();
-  assert.deepEqual(index.listingPosts(provider.vault), [provider.keys.padPosting(d.chainId, OSTRAPAD).address], "the listing publishes the provider's posting address");
+  assert.deepEqual(index.listingPosts(provider.vault), [(await provider.keys.padPosting(d.chainId, OSTRAPAD)).address], "the listing publishes the provider's posting address");
 
   const cases: Case[] = [];
   const judge = async (k: Case): Promise<Verdict | null> => {
@@ -390,8 +389,8 @@ test("private jobs: read, judged and reasoned under K; a rejection for no K uphe
   const evaluatorPk = kem.get(getAddress(p2.job.evaluator))!.publicKey;
   const junk = padWrapKey(padNewJobKey(), { chainId: d.chainId, pad: OSTRAPAD, jobId: p2.id, round: p2.job.round }, getAddress(p2.job.evaluator), evaluatorPk);
   const seq = BigInt(simMs);
-  const posting = provider.keys.padPosting(d.chainId, OSTRAPAD);
-  const signature = await posting.signMessage({ message: { raw: padWrapMessage({ chainId: d.chainId, pad: OSTRAPAD, jobId: p2.id, round: p2.job.round, wrap: junk, seq }) } });
+  const posting = await provider.keys.padPosting(d.chainId, OSTRAPAD);
+  const signature = await posting.signPost({ kind: "wrap", jobId: p2.id, round: p2.job.round, wrap: junk, seq });
   const posted = await fetch(`${indexerUrl}/api/v1/pad/private/wraps/${p2.id}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ round: p2.job.round, wrap: Buffer.from(padWrapBytes(junk)).toString("base64"), seq: seq.toString(), signature }) });
   assert.equal(posted.status, 200, await posted.text());
   await provider.pad.deliver({ jobId: p2.id, output: "A private report on topic two.", attachments: [findings] });
@@ -495,7 +494,7 @@ test("private jobs: read, judged and reasoned under K; a rejection for no K uphe
   // An encrypted order uploaded but never made a job (as when a client's create fails after its upload).
   const loneK = padNewJobKey();
   const lonePlain = padPlaintextPrefix({ type: "ostrapad-order-v1", agent: `eip155:${d.chainId}:${agentId}`, offer: "private-file", client: `eip155:${d.chainId}:${client.vault}`, provider: `eip155:${d.chainId}:${provider.vault}`, input: "Never made a job." });
-  const loneFile = padEncryptFile(loneK, { kind: 1, salt: padNewSalt(), plaintextLength: lonePlain.length, order: { keyCommit: padKeyCommit(loneK), clientPosting: client.keys.padPosting(d.chainId, OSTRAPAD).address, providerPosting: provider.keys.padPosting(d.chainId, OSTRAPAD).address, wraps: [padWrapKey(loneK, { chainId: d.chainId, pad: OSTRAPAD, jobId: ZERO32, round: 0 }, client.vault, client.keys.padKem(d.chainId, OSTRAPAD).publicKey)] } }, lonePlain);
+  const loneFile = padEncryptFile(loneK, { kind: 1, salt: padNewSalt(), plaintextLength: lonePlain.length, order: { keyCommit: padKeyCommit(loneK), clientPosting: (await client.keys.padPosting(d.chainId, OSTRAPAD)).address, providerPosting: (await provider.keys.padPosting(d.chainId, OSTRAPAD)).address, wraps: [padWrapKey(loneK, { chainId: d.chainId, pad: OSTRAPAD, jobId: ZERO32, round: 0 }, client.vault, await client.keys.padKemPublicKey(d.chainId, OSTRAPAD))] } }, lonePlain);
   const loneDigest = sha256(loneFile);
   const begun = (await (await fetch(`${uploaderUrl}/v1/enc/uploads`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ size: loneFile.length, sha256: loneDigest, kind: 1 }) })).json()) as { id: string };
   assert.equal((await fetch(`${uploaderUrl}/v1/enc/uploads/${begun.id}/0`, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: loneFile })).status, 200);

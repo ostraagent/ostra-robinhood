@@ -550,7 +550,7 @@ async function main(): Promise<void> {
     check(record?.status === "open" && record.deposit === "0.1", "the channel is listed open", record);
     let x402State: BatchSettlementClientContext | undefined;
     // The vault channel's voucher key, derived from the master seed and the channel's salt.
-    const voucherKey = keys.channelVoucherSigner(d.chainId, token, ch.config.salt);
+    const voucherKey = await keys.channelVoucherSigner(d.chainId, token, ch.config.salt);
     const scheme = new BatchSettlementEvmScheme({ address: buyerVault, signTypedData: () => Promise.reject(new Error("a vault never signs")), readContract: (a: never) => client.readContract(a) } as never, {
       voucherSigner: toClientEvmSigner(voucherKey, client as never),
       payerAuthorizer: voucherKey.address,

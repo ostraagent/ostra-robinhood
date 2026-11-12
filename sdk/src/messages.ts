@@ -62,7 +62,7 @@ import {
   X402_MAX_WITHDRAW_DELAY,
   X402_MIN_WITHDRAW_DELAY,
 } from "./constants.ts";
-import { WOTS_SIGNATURE_LEN, type WotsKeychain } from "./wots.ts";
+import { WOTS_SIGNATURE_LEN, type WotsSigner } from "./wots.ts";
 
 const SPEND_DOMAIN = stringToHex("OSTRA/VAULT/EVM/v1"); // bytes18
 const APPROVE_DOMAIN = stringToHex("OSTRA/APPROVE/EVM/v1"); // bytes20
@@ -887,7 +887,7 @@ export function decodeForwardParams(params: Hex): { token: Address; amount: bigi
 }
 
 /** The key root a recovery moves a vault to: key `nonce` (the vault's current nonce) of the new seed's keychain. */
-export function recoveryKeyRoot(newKeychain: WotsKeychain, vaultNonce: bigint): Hex {
+export function recoveryKeyRoot(newKeychain: WotsSigner, vaultNonce: bigint): Hex {
   return bytesToHex(newKeychain.keyRoot(uint(vaultNonce, U64_MAX, "vaultNonce")));
 }
 
@@ -948,7 +948,7 @@ export type VaultKeyState = { vault: Address; nonce: bigint; keyRoot: Hex; keyIn
 
 /** Signs a spend with key `nonce` and rotates to key `nonce + 1` of the same keychain. */
 export async function signVaultSpend(
-  keychain: WotsKeychain,
+  keychain: WotsSigner,
   state: VaultKeyState,
   a: { chainId: number; action: VaultAction; params: Hex },
 ): Promise<SignedSpend> {
@@ -960,26 +960,26 @@ export async function signVaultSpend(
   return { action: a.action, nextKeyRoot, params: a.params, signature: wotsSignature(signature), message };
 }
 
-export function signVaultTransfer(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; to: Address; amount: bigint }): Promise<SignedSpend> {
+export function signVaultTransfer(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; to: Address; amount: bigint }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.TRANSFER, params: transferParams(a) });
 }
 
-export function signVaultOpenChannel(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; open: OpenChannelParams }): Promise<SignedSpend> {
+export function signVaultOpenChannel(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; open: OpenChannelParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.OPEN_CHANNEL, params: openChannelParams(a.open) });
 }
 
-export function signVaultSetCrankKey(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; crank: Address }): Promise<SignedSpend> {
+export function signVaultSetCrankKey(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; crank: Address }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_CRANK_KEY, params: setCrankParams(a.crank) });
 }
 
 /** Signs a Swap; `token` is the vault's token, which must be the swap's input (the vault refuses anything else). */
-export async function signVaultSwap(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; token: Address; swap: SwapParams }): Promise<SignedSpend> {
+export async function signVaultSwap(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; token: Address; swap: SwapParams }): Promise<SignedSpend> {
   const params = swapParams(a.swap);
   if (swapInput(a.swap) !== addr(a.token, "token")) throw new RangeError("the swap's input currency is not the vault's token");
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SWAP, params });
 }
 
-export function signVaultConfigurePool(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; configure: ConfigurePoolParams }): Promise<SignedSpend> {
+export function signVaultConfigurePool(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; configure: ConfigurePoolParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: configurePoolParams(a.configure) });
 }
 
@@ -998,7 +998,7 @@ export function airdropRoundAmountParams(p: AirdropRoundAmountParams): Hex {
   return encodeAbiParameters(CONFIGURE_POOL_TYPES, [nonZeroAddr(p.airdrop, "airdrop"), bytes32(p.poolId, "poolId"), AIRDROP.FIELD_ROUND_AMOUNT, positive(p.amount, U256_MAX, "amount")]);
 }
 
-export function signVaultSetAirdropAmount(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; round: AirdropRoundAmountParams }): Promise<SignedSpend> {
+export function signVaultSetAirdropAmount(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; round: AirdropRoundAmountParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: airdropRoundAmountParams(a.round) });
 }
 
@@ -1016,44 +1016,44 @@ export function decodeStartAirdropParams(params: Hex): StartAirdropParams {
   return { airdrop, poolId, root: numberToHex(value, { size: 32 }) };
 }
 
-export function signVaultStartAirdrop(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; start: StartAirdropParams }): Promise<SignedSpend> {
+export function signVaultStartAirdrop(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; start: StartAirdropParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: startAirdropParams(a.start) });
 }
 
-export function signVaultSetCreatorShare(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; share: CreatorShareParams }): Promise<SignedSpend> {
+export function signVaultSetCreatorShare(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; share: CreatorShareParams }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CONFIGURE_POOL, params: creatorShareParams(a.share) });
 }
 
-export function signVaultClaimDividend(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; recipient: Address }): Promise<SignedSpend> {
+export function signVaultClaimDividend(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; recipient: Address }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.CLAIM_DIVIDEND, params: claimDividendParams(a.recipient) });
 }
 
-export function signVaultSetGuardian(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; guardian: Address; enabled: boolean }): Promise<SignedSpend> {
+export function signVaultSetGuardian(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; guardian: Address; enabled: boolean }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_GUARDIAN, params: setGuardianParams(a) });
 }
 
-export function signVaultSetRecoveryPolicy(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; threshold: number; delay: number }): Promise<SignedSpend> {
+export function signVaultSetRecoveryPolicy(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; threshold: number; delay: number }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_RECOVERY_POLICY, params: setRecoveryPolicyParams(a) });
 }
 
-export function signVaultSetProfile(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
+export function signVaultSetProfile(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_PROFILE, params: setProfileParams(a.uri) });
 }
 
-export function signVaultSetTokenMetadata(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; token: Address; poolId: Hex; uri: string }): Promise<SignedSpend> {
+export function signVaultSetTokenMetadata(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; token: Address; poolId: Hex; uri: string }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_TOKEN_METADATA, params: setTokenMetadataParams(a) });
 }
 
-export function signVaultRegisterAgent(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
+export function signVaultRegisterAgent(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; uri: string }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.REGISTER_AGENT, params: registerAgentParams(a.uri) });
 }
 
-export function signVaultSetAgentUri(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; agentId: bigint; uri: string }): Promise<SignedSpend> {
+export function signVaultSetAgentUri(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; agentId: bigint; uri: string }): Promise<SignedSpend> {
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SET_AGENT_URI, params: setAgentUriParams(a) });
 }
 
 /** Signed by the guardian's own vault key: supports moving `vault` to `newKeyRoot`. */
-export async function signVaultSupportRecovery(keychain: WotsKeychain, state: VaultKeyState, a: { chainId: number; vault: Address; newKeyRoot: Hex }): Promise<SignedSpend> {
+export async function signVaultSupportRecovery(keychain: WotsSigner, state: VaultKeyState, a: { chainId: number; vault: Address; newKeyRoot: Hex }): Promise<SignedSpend> {
   if (addr(a.vault, "vault") === addr(state.vault, "guardian vault")) throw new RangeError("a vault cannot support its own recovery");
   return signVaultSpend(keychain, state, { chainId: a.chainId, action: VAULT_ACTION.SUPPORT_RECOVERY, params: supportRecoveryParams(a) });
 }
@@ -1261,7 +1261,7 @@ export type SignedApproval = { key: Hex; batchId: bigint; state: Hex; nextKeyRoo
  * checking that every one of your leaves is in the batch.
  */
 export async function signApproveBatch(
-  keychain: WotsKeychain,
+  keychain: WotsSigner,
   key: { index: bigint; currentKeyRoot: Hex },
   a: { chainId: number; pool: Address; key: Hex; batchId: bigint; state: Hex },
 ): Promise<SignedApproval> {
@@ -1327,7 +1327,7 @@ export type SignedLeafSpend = { batchId: bigint; leafIndex: number; destination:
 
 /** Signs a leaf spend with leaf key `index`; `leafKeyRoot` is the key root stored in the batch leaf. */
 export async function signSpendLeaf(
-  keychain: WotsKeychain,
+  keychain: WotsSigner,
   key: { index: bigint; leafKeyRoot: Hex },
   a: { chainId: number; pool: Address; batchId: bigint; leafIndex: number; destination: Address; leafAmount: bigint },
 ): Promise<SignedLeafSpend> {

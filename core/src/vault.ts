@@ -35,7 +35,7 @@
 // new seed's first spend finishes the recovery on-chain, and the vault is
 // this seed's from then on. Any spend by the current key cancels a recovery.
 
-import { bytesToHex, encodeAbiParameters, encodeFunctionData, getAddress, isAddress, keccak256, zeroAddress, type Address, type Hash, type Hex, type PrivateKeyAccount, type PublicClient, type Transport } from "viem";
+import { bytesToHex, encodeAbiParameters, encodeFunctionData, getAddress, isAddress, keccak256, zeroAddress, type Address, type Hash, type Hex, type PublicClient, type Transport } from "viem";
 import {
   LAUNCHPAD,
   VAULT_ACTION,
@@ -1277,7 +1277,7 @@ export class VaultService {
     const balance = await this.#balance(vault);
     if (balance < terms.amount) throw this.#short(balance, `the relayer channel deposit of ${formatTokenAmount(terms.amount)}`);
     const salt = bytesToHex(randomBytes(32));
-    const voucher: PrivateKeyAccount = this.#keys.channelVoucherSigner(this.#config.chainId, this.#config.deployment.token, salt);
+    const voucher = await this.#keys.channelVoucherSigner(this.#config.chainId, this.#config.deployment.token, salt);
     const open: OpenChannelParams = { payerAuthorizer: voucher.address, receiver: terms.receiver, receiverAuthorizer: terms.receiverAuthorizer, withdrawDelay: terms.withdrawDelay, salt, amount: terms.amount };
     const config = vaultChannelConfig(vault, this.#config.deployment.token, open);
     const channel = computeChannelId(config, this.#config.chainId, this.#config.deployment.batchSettlement).toLowerCase() as Hex;
