@@ -10,6 +10,10 @@
 //                     it is used (sdk FileWotsStore).
 //   backup-exported   present once an encrypted backup of the seed was exported.
 // Nothing here is ever printed or sent anywhere.
+//
+// On Ostra Cloud (OSTRA_SIGNER_*, config.ts) the home holds no seed: the signer holds it (signer.ts), and the Keys is
+// seedless (core keys.ts), its agent key's operations asked of the signer. The fee payer key stays in the home. A home
+// that holds a seed is refused then: two seeds for one agent would hand out keys of either.
 
 import { randomBytes } from "node:crypto";
 import { stat } from "node:fs/promises";
@@ -19,6 +23,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { FileWotsStore } from "@ostraagent/sdk";
 import { Keys, isPrivateKey, type SignatureEscrowClient } from "@ostraagent/core";
 import { DiskFolder, ensurePrivateDir } from "./disk.ts";
+import { SignerSeed, type SignerConfig } from "./signer-client.ts";
 
 export const MASTER_FILE = "master.key";
 export const FEE_PAYER_FILE = "fee-payer.key";
@@ -56,15 +61,32 @@ function newPrivateKey(): Uint8Array {
   }
 }
 
-/** Opens (or creates) the agent's keys in `home`. */
-export async function openKeys(home: string, escrow: SignatureEscrowClient | null): Promise<Keys<FileWotsStore>> {
+/** Opens (or creates) the agent's keys in `home`; with `signer`, seedless (Ostra Cloud): the seed is the signer's. */
+export async function openKeys(home: string, escrow: SignatureEscrowClient | null, signer: SignerConfig | null = null): Promise<Keys<FileWotsStore>> {
   await ensurePrivateDir(home);
   const folder = new DiskFolder(home);
   await folder.ensure();
-  const master = await secret(folder, MASTER_FILE, () => new Uint8Array(randomBytes(32)));
+  if (signer !== null && (await exists(join(home, MASTER_FILE)))) {
+    throw new Error(`${join(home, MASTER_FILE)} holds a seed, and this agent's seed is its signer's (OSTRA_SIGNER_*): a home served through the signer holds none`);
+  }
+  // The signer's token is read before any key is made in the home: none is made for an agent whose token cannot be read.
+  const remote = signer === null ? null : await SignerSeed.open(signer);
+  const master = remote !== null ? null : await secret(folder, MASTER_FILE, () => new Uint8Array(randomBytes(32)));
   const fee = await secret(folder, FEE_PAYER_FILE, newPrivateKey);
   if (!isPrivateKey(fee.value)) throw new Error(`${join(home, FEE_PAYER_FILE)} is not a valid secp256k1 private key`);
   await ensurePrivateDir(join(home, WOTS_DIR));
+  if (remote !== null) {
+    return new Keys({
+      remote,
+      feePayer: privateKeyToAccount(bytesToHex(fee.value)),
+      store: new FileWotsStore(join(home, WOTS_DIR)),
+      folder,
+      // No seed here to back up: the signer seals it in the enclave and never hands it out.
+      backupExported: async () => true,
+      escrow,
+    });
+  }
+  if (master === null) throw new Error("unreachable: a home with no signer holds its seed");
   return new Keys({
     master: master.value,
     feePayer: privateKeyToAccount(bytesToHex(fee.value)),

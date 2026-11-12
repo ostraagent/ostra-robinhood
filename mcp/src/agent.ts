@@ -17,6 +17,11 @@
 // aggregator's batches) left the tools, as no batch ever formed on mainnet;
 // its services stay so that records kept from before still finish, and an
 // auto-shield set on it moves to the private notes (#moveAutoShield).
+//
+// On Ostra Cloud (OSTRA_SIGNER_*) the keys are seedless (keys.ts): the agent's
+// own vaults are not used, so the creator vault has no relayer client, the
+// private notes are off (decided 12 Nov 2026) and the sweep leaves out what
+// only the agent's own seed could do.
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -195,7 +200,8 @@ export class Agent {
     this.payments = new PayService(client, config, this.buyer, this.channels, this.paymentWallet);
     this.ai = config.aiUrl === null ? null : new AiService(config, this.payments, this.buyer);
     this.seller = new VaultService(client, transport, config, keys, this.sender, "seller");
-    this.creatorRelayer = config.relayerUrl === null ? null : new RelayerClient(client, config, p.creatorKeys, config.relayerUrl);
+    // Seedless: no creator vault (its key is the agent's own seed's), so no relayer channels of its own either.
+    this.creatorRelayer = config.relayerUrl === null || keys.seedless ? null : new RelayerClient(client, config, p.creatorKeys, config.relayerUrl);
     const creatorSender = this.creatorRelayer ?? this.local;
     this.creator = new VaultService(client, transport, config, p.creatorKeys, creatorSender, "creator");
     this.creatorRelayer?.attachBuyerVault(this.creator);
@@ -226,7 +232,8 @@ export class Agent {
       const logsClient = createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 6, retryDelay: 2_000 }) }) as PublicClient;
       const vaultFor = (token: Address) => this.vaultFor(token);
       this.swap = new SwapService({ client, logsClient, config, swap: config.swap, vaultFor, sender: this.sender, folder: keys.folder.folder(SWAP_DIR) });
-      this.privateBalance = new PrivateBalanceService({
+      // Seedless (Ostra Cloud): the private notes are off (decided 12 Nov 2026): their secrets are the agent's own seed's.
+      this.privateBalance = keys.seedless ? null : new PrivateBalanceService({
         client,
         logsClient,
         config,
@@ -433,7 +440,7 @@ export class Agent {
     const client = createPublicClient({ chain: robinhoodChain, transport }) as PublicClient;
     await assertRobinhoodChain(client);
     const escrow = config.relayerUrl === null ? null : new SignatureEscrowClient(config.relayerUrl);
-    const keys = await openKeys(config.home, escrow);
+    const keys = await openKeys(config.home, escrow, config.signer);
     const creatorKeys = await keys.forCreatorVault(config.chainId, config.deployment.token);
     const agent = new Agent({ config, client, transport, keys, creatorKeys, escrow, log });
     await agent.#loadSeller();
@@ -447,6 +454,8 @@ export class Agent {
    * start that has them. It never stops the server from starting.
    */
   async #moveAutoShield(): Promise<void> {
+    // Seedless (Ostra Cloud): no creator vault, so no auto-shield of one.
+    if (this.keys.seedless) return;
     try {
       const old = await this.creatorShield.autoShield();
       if (!old.enabled) return;
@@ -569,11 +578,12 @@ export class Agent {
         }
         await step("creator channel closes", () => this.creatorChannels.continueClosing());
       }
-      if (this.config.aggregatorUrl !== null) {
+      // Seedless (Ostra Cloud): the shielded pool's deposits and private vaults are the agent's own seed's; none is made.
+      if (this.config.aggregatorUrl !== null && !this.keys.seedless) {
         await step("shield", () => this.shield.sweep());
         await step("creator shield", () => this.creatorShield.sweep());
       }
-      await step("unshield", () => this.unshield.sweep());
+      if (!this.keys.seedless) await step("unshield", () => this.unshield.sweep());
       if (this.swap !== null) {
         await step("ostra swap orders", () => this.swap!.finishPending());
         await step("ostra swap splits", () => this.swap!.runSplits());

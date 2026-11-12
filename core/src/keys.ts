@@ -27,21 +27,32 @@
 // The MCP package keeps the seed, the fee payer key and the WOTS store on
 // disk in OSTRA_HOME (mcp/src/keys.ts); the web app keeps them in the
 // browser. Nothing here is ever sent anywhere or printed.
+//
+// A seedless Keys (Ostra Cloud, design 12 Nov 2026) holds no seed at all: its
+// agent's seed is in the signer, a process of its own, and every AgentSeed
+// operation is asked of it (KeysParts.remote). Everything else the seed is for
+// (the agent's own vaults, the shield, the private pool, the seller, backups)
+// is refused with HostedRefusedError, the keychains only when they are used,
+// so that the services holding them are still made.
 
 import { bytesToHex, getAddress, hexToBytes, type Address, type Hex, type LocalAccount, type PrivateKeyAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   PAD_KEM_DOMAIN,
+  WotsKeyReuseError,
   WotsKeychain,
+  agentSpendMessage,
   closeRequestTypedData,
   padKemKeys,
   padKemSeed,
   padPostingAccount,
   padUnwrapKey,
+  randomBytes32,
   sha256,
   signAgentSpend,
   utf8,
   voucherTypedData,
+  wotsVerify,
   type PadKemKeys,
   type PadWrap,
   type SignedAgentSpend,
@@ -221,9 +232,58 @@ export interface AgentSeed {
   padUnwrap(chainId: number, pad: Address, wrap: PadWrap, recipient: Address, keyCommit: Uint8Array): Promise<Uint8Array | null>;
 }
 
-/** What a Keys holds: the master seed and fee payer key, the WOTS store, and where records are kept. */
+/**
+ * What a seedless agent (Ostra Cloud) refuses: an operation that needs its own seed beyond the AgentSeed operations its
+ * signer answers. Nothing was signed when it is thrown.
+ */
+export class HostedRefusedError extends Error {
+  constructor(what: string) {
+    super(`${what} needs this agent's own seed, which Ostra Cloud keeps in its signer: here the agent spends only from its owner's vault, with the agent key the owner installed, within the owner's policy; nothing was signed`);
+    this.name = "HostedRefusedError";
+  }
+}
+
+/** The store of a HostedKeychain: never reached (its keychain refuses first). */
+const NO_STORE: WotsStore = {
+  load: async () => {
+    throw new HostedRefusedError("a one-time key");
+  },
+  saveIfAbsent: async () => {
+    throw new HostedRefusedError("a one-time key");
+  },
+};
+
+/**
+ * A keychain of a seedless Keys: made like any other (the services hold their keychains from the start), refusing
+ * every use. Its master is random and never used: every method that could reach it is refused here.
+ */
+class HostedKeychain extends WotsKeychain {
+  readonly #what: string;
+
+  constructor(id: Uint8Array, what: string) {
+    super(randomBytes32(), id, NO_STORE);
+    this.#what = what;
+  }
+
+  override keyRoot(_index: bigint): Uint8Array {
+    throw new HostedRefusedError(this.#what);
+  }
+
+  override async signed(_index: bigint): Promise<WotsSignatureRecord | undefined> {
+    throw new HostedRefusedError(this.#what);
+  }
+
+  override async sign(_index: bigint, _message: Uint8Array, _expectedKeyRoot?: Uint8Array): Promise<Uint8Array> {
+    throw new HostedRefusedError(this.#what);
+  }
+}
+
+/** What a Keys holds: the master seed (or, seedless, the signer that holds it) and fee payer key, the WOTS store, and where records are kept. */
 export type KeysParts<S extends WotsStore = WotsStore> = {
-  master: Uint8Array;
+  /** The master seed; leave it out for a seedless Keys, with `remote`. */
+  master?: Uint8Array;
+  /** Seedless (Ostra Cloud): the signer that holds this agent's seed and answers its AgentSeed operations. */
+  remote?: AgentSeed;
   feePayer: PrivateKeyAccount;
   store: S;
   /** Where the services of this vault keep their records. */
@@ -247,22 +307,42 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
   readonly masterCreated: boolean;
   /** The relayer's signature escrow every keychain asks before it signs; null: records on this device only. */
   readonly escrow: SignatureEscrowClient | null;
-  readonly #master: Uint8Array;
+  /** The master seed, or null for a seedless Keys (#remote then answers the AgentSeed operations). */
+  readonly #master: Uint8Array | null;
+  readonly #remote: AgentSeed | null;
   readonly #root: Folder;
   readonly #backupExported: () => Promise<boolean>;
   /** The agent keychains made so far, one per (chain, vault): one copy of the seed each, not one per call. */
   readonly #agentKeychains = new Map<string, WotsKeychain>();
 
   constructor(parts: KeysParts<S>) {
-    if (parts.master.length !== 32) throw new RangeError("the master seed must be 32 bytes");
+    if ((parts.master === undefined) === (parts.remote === undefined)) throw new Error("a Keys holds a master seed or a signer (remote), one of the two");
+    if (parts.master !== undefined && parts.master.length !== 32) throw new RangeError("the master seed must be 32 bytes");
     this.folder = parts.folder;
     this.feePayer = parts.feePayer;
     this.store = parts.store;
-    this.masterCreated = parts.masterCreated ?? false;
+    this.masterCreated = parts.master === undefined ? false : (parts.masterCreated ?? false);
     this.escrow = parts.escrow ?? null;
-    this.#master = parts.master.slice();
+    this.#master = parts.master === undefined ? null : parts.master.slice();
+    this.#remote = parts.remote ?? null;
     this.#root = parts.root ?? parts.folder;
     this.#backupExported = parts.backupExported;
+  }
+
+  /** True for a seedless Keys (Ostra Cloud): its seed is in the signer, and only the AgentSeed operations are answered. */
+  get seedless(): boolean {
+    return this.#master === null;
+  }
+
+  /** The master seed, or HostedRefusedError naming `what` for a seedless Keys. */
+  #seed(what: string): Uint8Array {
+    if (this.#master === null) throw new HostedRefusedError(what);
+    return this.#master;
+  }
+
+  /** The same seed (or signer) for a Keys of another folder. */
+  #same(): { master: Uint8Array } | { remote: AgentSeed } {
+    return this.#master !== null ? { master: this.#master } : { remote: this.#remote as AgentSeed };
   }
 
   /**
@@ -274,7 +354,7 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
   async forPrivateVault(chainId: number, token: Address, index: bigint): Promise<Keys<S>> {
     const folder = this.#root.folder(PRIVATE_DIR).folder(`${chainId}-${getAddress(token)}-${index}`);
     await folder.ensure();
-    return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
+    return new Keys({ ...this.#same(), feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
   }
 
   /**
@@ -286,7 +366,7 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
   async forCreatorVault(chainId: number, token: Address): Promise<Keys<S>> {
     const folder = this.#root.folder(CREATOR_DIR).folder(`${chainId}-${getAddress(token)}`);
     await folder.ensure();
-    return new Keys({ master: this.#master, feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
+    return new Keys({ ...this.#same(), feePayer: this.feePayer, store: this.store, folder, root: this.#root, backupExported: this.#backupExported, escrow: this.escrow });
   }
 
   /** True once an encrypted backup of the master seed has been exported. */
@@ -296,30 +376,34 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
 
   /** The seed's backup key (passkey.ts): it signs this seed's writes to the relayer's passkey backups. */
   backupSigner(): PrivateKeyAccount {
-    return backupSignerOf(this.#master);
+    return backupSignerOf(this.#seed("the seed's backup"));
   }
 
   /** The master seed encrypted under a passkey's PRF output, for the backup of passkey `credentialId` (passkey.ts sealSeed). */
   passkeyBackup(prf: Uint8Array, credentialId: Uint8Array): Promise<string> {
-    return sealSeed(this.#master, prf, credentialId);
+    return sealSeed(this.#seed("the seed's passkey backup"), prf, credentialId);
   }
 
-  /** A keychain of this seed that asks the signature escrow (when there is one) before it signs. */
-  #keychain(id: Uint8Array): WotsKeychain {
+  /**
+   * A keychain of this seed that asks the signature escrow (when there is one) before it signs; seedless, one that
+   * refuses every use as `what`.
+   */
+  #keychain(id: Uint8Array, what: string): WotsKeychain {
+    if (this.#master === null) return new HostedKeychain(id, what);
     return new WotsKeychain(this.#master, id, this.store, this.escrow?.lookup);
   }
 
   vaultKeychain(chainId: number, token: Address): WotsKeychain {
-    return this.#keychain(vaultKeychainId(chainId, token));
+    return this.#keychain(vaultKeychainId(chainId, token), "this agent's own vault");
   }
 
   sellerKeychain(chainId: number, token: Address): WotsKeychain {
-    return this.#keychain(sellerKeychainId(chainId, token));
+    return this.#keychain(sellerKeychainId(chainId, token), "the seller vault");
   }
 
   /** Keychain of the creator vault for (chain, token) (key index = the vault's on-chain nonce). */
   creatorKeychain(chainId: number, token: Address): WotsKeychain {
-    return this.#keychain(creatorKeychainId(chainId, token));
+    return this.#keychain(creatorKeychainId(chainId, token), "the creator vault");
   }
 
   /** Keychain of this seed's agent key of `vault` (version 5; agent-key.ts keeps which index is next). */
@@ -327,31 +411,69 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
     const key = `${chainId}-${getAddress(vault)}`;
     let k = this.#agentKeychains.get(key);
     if (k === undefined) {
-      k = this.#keychain(agentKeychainId(chainId, vault));
+      k = this.#keychain(agentKeychainId(chainId, vault), "the agent key");
       this.#agentKeychains.set(key, k);
     }
     return k;
   }
 
   async agentKeyRoot(chainId: number, vault: Address, index: bigint): Promise<Hex> {
+    if (this.#remote !== null) return this.#remote.agentKeyRoot(chainId, vault, index);
     return bytesToHex(this.#agentKeychain(chainId, vault).keyRoot(index));
   }
 
-  agentSigned(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined> {
-    return this.#agentKeychain(chainId, vault).signed(index);
+  /**
+   * Seedless: the signer's record, else the signature escrow's for the signer's key root, checked against that key
+   * (as WotsKeychain.signed does). The escrow's is not written to the signer (it takes no records): asked again, it
+   * is looked up again.
+   */
+  async agentSigned(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined> {
+    if (this.#remote === null) return this.#agentKeychain(chainId, vault).signed(index);
+    const local = await this.#remote.agentRecorded(chainId, vault, index);
+    if (local !== undefined || this.escrow === null) return local;
+    const root = await this.#remote.agentKeyRoot(chainId, vault, index);
+    const held = await this.escrow.lookup(root);
+    if (held === null) return undefined;
+    const bare = (h: string) => (h.startsWith("0x") || h.startsWith("0X") ? h.slice(2) : h).toLowerCase();
+    const message = hexToBytes(`0x${bare(held.message)}`);
+    const signature = hexToBytes(`0x${bare(held.signature)}`);
+    const keyRoot = hexToBytes(root);
+    if (!wotsVerify(signature, message, keyRoot)) throw new Error(`the escrowed signature for agent key ${index} does not verify against that key`);
+    return {
+      version: 1,
+      keychain: bytesToHex(agentKeychainId(chainId, vault)).slice(2),
+      index: index.toString(),
+      keyRoot: bare(root),
+      messageSha256: bytesToHex(sha256([message])).slice(2),
+      message: bare(held.message),
+      signature: bare(held.signature),
+      createdAt: new Date().toISOString(),
+    };
   }
 
   agentRecorded(chainId: number, vault: Address, index: bigint): Promise<WotsSignatureRecord | undefined> {
+    if (this.#remote !== null) return this.#remote.agentRecorded(chainId, vault, index);
     return this.store.load(agentKeychainId(chainId, vault), index);
   }
 
-  signAgentSpend(k: AgentSpendKey, a: { chainId: number; action: VaultAction; params: Hex }): Promise<SignedAgentSpend> {
-    return signAgentSpend(this.#agentKeychain(a.chainId, k.vault), k, a);
+  async signAgentSpend(k: AgentSpendKey, a: { chainId: number; action: VaultAction; params: Hex }): Promise<SignedAgentSpend> {
+    if (this.#remote === null) return signAgentSpend(this.#agentKeychain(a.chainId, k.vault), k, a);
+    // Seedless: the escrow's checks the seed's keychain makes here (sdk signAgentSpend, WotsKeychain.sign), made before
+    // the signer is asked (it has no network, so it sees its own records only): the next key never signed, and the key
+    // signing signed nothing else.
+    if ((await this.agentSigned(a.chainId, k.vault, k.nextIndex)) !== undefined) throw new RangeError(`agent key ${k.nextIndex} signed already: the next agent key is one that never signed`);
+    const held = await this.agentSigned(a.chainId, k.vault, k.index);
+    if (held !== undefined) {
+      const nextKeyRoot = await this.#remote.agentKeyRoot(a.chainId, k.vault, k.nextIndex);
+      const message = agentSpendMessage({ chainId: a.chainId, vault: k.vault, agentNonce: k.agentNonce, nextKeyRoot, action: a.action, params: a.params });
+      if (held.message !== bytesToHex(message).slice(2)) throw new WotsKeyReuseError(k.index);
+    }
+    return this.#remote.signAgentSpend(k, a);
   }
 
   /** Keychain of private vault `index` (key index = the vault's on-chain nonce). */
   privateVaultKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return this.#keychain(privateVaultKeychainId(chainId, token, index));
+    return this.#keychain(privateVaultKeychainId(chainId, token, index), "a private vault");
   }
 
   /**
@@ -360,14 +482,14 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * its close requests with it.
    */
   merchantKey(chainId: number, token: Address): Hex {
-    const secret = sha256([MERCHANT_KEY_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token)]);
+    const secret = sha256([MERCHANT_KEY_DOMAIN, this.#seed("the seller's merchant key"), chainBytes(chainId), tokenBytes(token)]);
     accountFromSecret(secret);
     return bytesToHex(secret);
   }
 
   /** The seller's own crank key for (chain, token), installed by settle_self when the keeper cannot act. */
   selfCrankSigner(chainId: number, token: Address): PrivateKeyAccount {
-    return accountFromSecret(sha256([SELF_CRANK_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token)]));
+    return accountFromSecret(sha256([SELF_CRANK_DOMAIN, this.#seed("the seller's own crank"), chainBytes(chainId), tokenBytes(token)]));
   }
 
   /**
@@ -376,19 +498,22 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * seed and the config recover the key.
    */
   #voucherKey(chainId: number, token: Address, salt: Hex): PrivateKeyAccount {
-    return accountFromSecret(sha256([VOUCHER_KEY_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), saltBytes(salt)]));
+    return accountFromSecret(sha256([VOUCHER_KEY_DOMAIN, this.#seed("a channel's voucher key"), chainBytes(chainId), tokenBytes(token), saltBytes(salt)]));
   }
 
   async voucherAddress(chainId: number, token: Address, salt: Hex): Promise<Address> {
+    if (this.#remote !== null) return this.#remote.voucherAddress(chainId, token, salt);
     return this.#voucherKey(chainId, token, salt).address;
   }
 
   signVoucher(chainId: number, token: Address, salt: Hex, v: VoucherFields): Promise<Hex> {
+    if (this.#remote !== null) return this.#remote.signVoucher(chainId, token, salt, v);
     // Field by field: the settlement contract and the chain are never the caller's (sdk voucherTypedData takes a settlement).
     return this.#voucherKey(chainId, token, salt).signTypedData(voucherTypedData({ channelId: v.channelId, maxClaimableAmount: v.maxClaimableAmount, chainId }));
   }
 
   signCloseRequest(chainId: number, token: Address, salt: Hex, c: CloseRequestFields): Promise<Hex> {
+    if (this.#remote !== null) return this.#remote.signCloseRequest(chainId, token, salt, c);
     return this.#voucherKey(chainId, token, salt).signTypedData(closeRequestTypedData({ chainId, vault: c.vault, channelId: c.channelId, amount: c.amount, nonce: c.nonce, deadline: c.deadline }));
   }
 
@@ -403,14 +528,16 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * exact, EIP-3009). The seed and the vault's address recover it.
    */
   #paymentWallet(chainId: number, token: Address, vault: Address): PrivateKeyAccount {
-    return accountFromSecret(sha256([PAYMENT_WALLET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(token), tokenBytes(vault)]));
+    return accountFromSecret(sha256([PAYMENT_WALLET_DOMAIN, this.#seed("the payment wallet"), chainBytes(chainId), tokenBytes(token), tokenBytes(vault)]));
   }
 
   async paymentWalletAddress(chainId: number, token: Address, vault: Address): Promise<Address> {
+    if (this.#remote !== null) return this.#remote.paymentWalletAddress(chainId, token, vault);
     return this.#paymentWallet(chainId, token, vault).address;
   }
 
   signPaymentTransfer(chainId: number, token: Address, vault: Address, t: PaymentTransfer): Promise<Hex> {
+    if (this.#remote !== null) return this.#remote.signPaymentTransfer(chainId, token, vault, t);
     const wallet = this.#paymentWallet(chainId, token, vault);
     return wallet.signTypedData({
       domain: { name: t.name, version: t.version, chainId, verifyingContract: getAddress(token) },
@@ -431,17 +558,17 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * deposit's EIP-3009 authorization and the aggregator polls.
    */
   shieldSigner(chainId: number, token: Address, index: bigint): PrivateKeyAccount {
-    return accountFromSecret(sha256([SHIELD_KEY_DOMAIN, this.#master, ...shieldParts(chainId, token, index)]));
+    return accountFromSecret(sha256([SHIELD_KEY_DOMAIN, this.#seed("the shielded pool"), ...shieldParts(chainId, token, index)]));
   }
 
   /** depositId of shield deposit `index`; with the depositor key it fixes the deposit key (OstraPool.depositKey). */
   shieldDepositId(chainId: number, token: Address, index: bigint): Hex {
-    return bytesToHex(sha256([SHIELD_DEPOSIT_ID_DOMAIN, this.#master, ...shieldParts(chainId, token, index)]));
+    return bytesToHex(sha256([SHIELD_DEPOSIT_ID_DOMAIN, this.#seed("the shielded pool"), ...shieldParts(chainId, token, index)]));
   }
 
   /** Approval keys of shield deposit `index` (one per approveBatch; the key rotates every time). */
   shieldApprovalKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return this.#keychain(shieldApprovalKeychainId(chainId, token, index));
+    return this.#keychain(shieldApprovalKeychainId(chainId, token, index), "the shielded pool");
   }
 
   /**
@@ -450,7 +577,7 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * secret when a field element must be drawn again (private-balance.ts #digest).
    */
   noteSecret(chainId: number, pool: Address, purpose: "sk" | "rho", index: bigint, block = 0n): Uint8Array {
-    return sha256([NOTE_SECRET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(pool), utf8(purpose), u64Be(index), u64Be(block)]);
+    return sha256([NOTE_SECRET_DOMAIN, this.#seed("Ostra Swap's private notes"), chainBytes(chainId), tokenBytes(pool), utf8(purpose), u64Be(index), u64Be(block)]);
   }
 
   /**
@@ -460,7 +587,7 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    */
   spendNoteSecret(chainId: number, pool: Address, purpose: "change" | "out", spent: Hex, block = 0n): Uint8Array {
     if (!/^0x[0-9a-fA-F]{64}$/.test(spent)) throw new RangeError("the note spent is a 32-byte commitment");
-    return sha256([NOTE_SECRET_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(pool), utf8(purpose), hexToBytes(spent), u64Be(block)]);
+    return sha256([NOTE_SECRET_DOMAIN, this.#seed("Ostra Swap's private notes"), chainBytes(chainId), tokenBytes(pool), utf8(purpose), hexToBytes(spent), u64Be(block)]);
   }
 
   /**
@@ -468,7 +595,8 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * approvals hashes nobody else can match to the agent; its hash is the agent's view key of its own points.
    */
   async tideSecret(chainId: number, tide: Address): Promise<Hex> {
-    return bytesToHex(sha256([TIDE_LINK_DOMAIN, this.#master, chainBytes(chainId), tokenBytes(tide)]));
+    if (this.#remote !== null) return this.#remote.tideSecret(chainId, tide);
+    return bytesToHex(sha256([TIDE_LINK_DOMAIN, this.#seed("Ostra Tide's link"), chainBytes(chainId), tokenBytes(tide)]));
   }
 
   /**
@@ -476,16 +604,18 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
    * the MCP's domain): its public key goes in the agent's listing and KEM registration; the seed recovers it.
    */
   #padKem(chainId: number, pad: Address): PadKemKeys {
-    return padKemKeys(padKemSeed(this.#master, PAD_KEM_DOMAIN.mcp, chainId, pad));
+    return padKemKeys(padKemSeed(this.#seed("Ostrapad's private jobs"), PAD_KEM_DOMAIN.mcp, chainId, pad));
   }
 
   async padKemPublicKey(chainId: number, pad: Address): Promise<Uint8Array> {
+    if (this.#remote !== null) return this.#remote.padKemPublicKey(chainId, pad);
     const keys = this.#padKem(chainId, pad);
     keys.secretKey.fill(0);
     return keys.publicKey;
   }
 
   async padUnwrap(chainId: number, pad: Address, wrap: PadWrap, recipient: Address, keyCommit: Uint8Array): Promise<Uint8Array | null> {
+    if (this.#remote !== null) return this.#remote.padUnwrap(chainId, pad, wrap, recipient, keyCommit);
     // A wrap to another recipient opens with no key (padUnwrapKey's first check): no KEM key is made for it.
     if (getAddress(wrap.recipient) !== getAddress(recipient)) return null;
     const keys = this.#padKem(chainId, pad);
@@ -498,11 +628,13 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
 
   /** The agent's posting key for Ostrapad's private jobs on (chain, OstraPad): it signs wraps, uploads and reservations. */
   async padPostingAddress(chainId: number, pad: Address): Promise<Address> {
-    return padPostingAccount(this.#master, chainId, pad).address;
+    if (this.#remote !== null) return this.#remote.padPostingAddress(chainId, pad);
+    return padPostingAccount(this.#seed("Ostrapad's private jobs"), chainId, pad).address;
   }
 
   signPadPost(chainId: number, pad: Address, m: PadPostMessage): Promise<Hex> {
-    return padPostingAccount(this.#master, chainId, pad).signMessage({ message: { raw: padPostHash(chainId, pad, m) } });
+    if (this.#remote !== null) return this.#remote.signPadPost(chainId, pad, m);
+    return padPostingAccount(this.#seed("Ostrapad's private jobs"), chainId, pad).signMessage({ message: { raw: padPostHash(chainId, pad, m) } });
   }
 
   /** The posting key as Ostrapad's poster: its address and its signatures of Ostrapad's messages (seed-accounts.ts). */
@@ -512,6 +644,6 @@ export class Keys<S extends WotsStore = WotsStore> implements AgentSeed {
 
   /** Leaf keys of shield deposit `index`: leaf j of leaf set a is key a * 256 + j (shield.ts leafKeyIndex), which spends it once. */
   shieldLeafKeychain(chainId: number, token: Address, index: bigint): WotsKeychain {
-    return this.#keychain(shieldLeafKeychainId(chainId, token, index));
+    return this.#keychain(shieldLeafKeychainId(chainId, token, index), "the shielded pool");
   }
 }

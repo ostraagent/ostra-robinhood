@@ -12,7 +12,7 @@ import { join, sep } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AGENT_ACTION_NAMES, AI_TASK_KINDS, ALLOW_KIND_NAMES, MAX_UPLOAD_IMAGE_BYTES, RELAYER_CHANNEL_DEPOSIT, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, readAutonomoGateways, uploadImage, venueByName } from "@ostraagent/core";
+import { AGENT_ACTION_NAMES, AI_TASK_KINDS, ALLOW_KIND_NAMES, HostedRefusedError, MAX_UPLOAD_IMAGE_BYTES, RELAYER_CHANNEL_DEPOSIT, RaetoError, RelayerError, RelayerUnavailableError, VENUES, formatTokenAmount, raetoImages, readAutonomoGateways, uploadImage, venueByName } from "@ostraagent/core";
 import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall } from "@ostraagent/sdk";
 import type { Agent } from "./agent.ts";
 import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
@@ -149,6 +149,7 @@ async function run(fn: () => Promise<unknown>, rpcUrls: readonly string[]): Prom
     else if (err instanceof RelayerError) kind = `relayer_refused ${err.status} ${err.code}`;
     else if (err instanceof QuoteError) kind = `refused_before_signing ${err.code}`;
     else if (err instanceof RaetoError) kind = `raeto_refused ${err.status}`;
+    else if (err instanceof HostedRefusedError) kind = "not_on_ostra_cloud";
     else if (err instanceof RangeError) kind = "invalid_input";
     // The RPC URLs may carry an API key (viem's errors print them): never passed on.
     const message = rpcUrls.reduce((text, url) => redact(text, url), err instanceof Error ? err.message : String(err));
@@ -166,6 +167,7 @@ export function registerTools(server: McpServer, agent: Agent): void {
     return agent.swap;
   };
   const notes = () => {
+    if (agent.keys.seedless) throw new HostedRefusedError("Ostra Swap's private notes");
     if (agent.privateBalance === null) throw new Error("Ostra Swap is not configured here (OSTRA_SWAP_DEPLOYMENT)");
     return agent.privateBalance;
   };
@@ -311,22 +313,26 @@ export function registerTools(server: McpServer, agent: Agent): void {
   };
   const HOSTED_KEYS =
     "this server runs on Ostra's remote MCP gateway: its seed is kept there and never exported (it holds this agent's key, and the vaults and wallet made from it, such as the creator vault below, funded from the owner's vault only as the owner's policy and allowlist permit); the owner's own seed and its backup stay with the owner (the Ostra web app or the owner's MCP server)";
+  const SIGNER_KEYS =
+    "this server runs on Ostra Cloud: this agent's seed is sealed in Ostra Cloud's signer, never in this server and never exported, and it signs only with the agent key the vault's owner installed (spends from the owner's vault within the owner's policy, its channels, its payment wallet, Ostrapad's private jobs); the agent has no vaults of its own here (no creator vault, no token vaults, no private notes); the owner's own seed and its backup stay with the owner (the Ostra web app or the owner's MCP server)";
   tool(
     "balance",
     "The vault's balance, nonce, any operation signed and not landed, the relayer channels, the creator vault, and the agent's vaults of other tokens that hold some (WETH, OSTRA, stock tokens, tokens bought through Ostra Swap).",
     {},
     async () => {
-      const tokenVaults = await agent.tokenVaultHoldings().catch((e: Error) => `could not be read now: ${e.message.split("\n")[0]}`);
+      // Seedless (Ostra Cloud): the agent has no vaults of its own (their keys are its own seed's, kept in the signer).
+      const seedless = agent.keys.seedless;
+      const tokenVaults = seedless ? [] : await agent.tokenVaultHoldings().catch((e: Error) => `could not be read now: ${e.message.split("\n")[0]}`);
       return {
         vault: unhosted(await agent.buyer.status()),
         relayerChannels: agent.relayer === null ? null : await agent.relayer.channels(),
-        creatorVault: await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
+        creatorVault: seedless ? null : await agent.creator.state().then((s) => ({ vault: s.vault, exists: s.exists, balance: formatTokenAmount(s.balance), pendingOperation: s.pendingAction })),
         tokenVaults,
         ...(Array.isArray(tokenVaults) && tokenVaults.some((v) => !v.exists)
           ? { tokenVaultsNote: "a vault with exists false holds tokens sent to its address but is not created yet: the first tool that spends from it (transfer_token, ostra_swap, sell, claim_dividends, borro_lend, venue_set, private_shield, tide with link) creates it first, its fee paid like the vault's other transactions" }
           : {}),
         relayer: agent.config.relayerUrl !== null,
-        ...(agent.config.hosted ? { keys: HOSTED_KEYS } : {}),
+        ...(agent.config.hosted ? { keys: agent.keys.seedless ? SIGNER_KEYS : HOSTED_KEYS } : {}),
       };
     },
   );

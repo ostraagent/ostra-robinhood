@@ -419,9 +419,11 @@ export class VaultService {
    * The keychain index of `root` when it is this seed's key for a vault at `nonce`: `nonce` itself, or an earlier
    * index a recovery asked the guardians to support (requestRecovery keeps them): under the withdrawal lock the
    * vault's old key may spend while a recovery waits, so the recovery finishes to a key at an earlier index than the
-   * nonce. Null: not this seed's key.
+   * nonce. Null: not this seed's key; always in agent mode, where the vault and its key are the owner's (and a seedless
+   * agent's own keychain refuses to derive anything).
    */
   async #ownIndex(root: Hex, nonce: bigint): Promise<bigint | null> {
+    if (this.#agent !== null) return null;
     const r = root.toLowerCase();
     if (this.#keyRoot(nonce).toLowerCase() === r) return nonce;
     const adopted = await this.#adoptedRecord();

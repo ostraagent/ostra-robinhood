@@ -44,6 +44,18 @@
 //   OSTRA_REMOTE_SANDBOX_RO    more paths (directories too) a sandbox sees read only (comma separated)
 //   OSTRA_REMOTE_REFRESH_GRACE_SECONDS  a rotated refresh token taken again within this is a retry (default 30)
 //   OSTRA_REMOTE_KEY_STATE_SECONDS      how long a vault's agent key state read from the chain is used (default 15)
+//   OSTRA_REMOTE_SIGNER_SOCKETS         Ostra Cloud (design 12 Nov 2026): the signer's sockets directory (signer.ts
+//                                       OSTRA_SIGNER_SOCKETS). Each home's seed is then the signer's, never in the home:
+//   OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE  the signer's admin key (32 bytes, hex, 0600). Before each child of a home
+//                                       starts, the gateway has the signer make the home's seed if it has none
+//                                       (agent.create) and revokes every token handed out for it before (agent.rotate),
+//                                       then writes the new token to <root>/<id>/signer.token (0600): each child holds
+//                                       a token no child before it held. The child gets its socket, its id and its
+//                                       token file (OSTRA_SIGNER_*; in its sandbox, its socket's directory and its
+//                                       token, read only, and no other's). Both or neither, and only with
+//                                       OSTRA_REMOTE_SANDBOX=bwrap: outside a sandbox a child, running as the gateway,
+//                                       could read the admin key and every token. No other OSTRA_SIGNER_* variable of
+//                                       the gateway's environment reaches a child
 //
 // The other OSTRA_* variables of its environment (OSTRA_RPC_URL_FILE, OSTRA_DEPLOYMENT, the service URLs...) and a
 // few system ones (PASSED_ENV) are passed to the children; nothing else is. Per home it sets OSTRA_HOME,
@@ -58,7 +70,7 @@
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync, type ChildProcess } from "node:child_process";
-import { closeSync, constants as fsc, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsc, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +82,9 @@ import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, isInitializeReque
 import { robinhoodChain } from "@ostraagent/sdk";
 import { loadConfig } from "./config.ts";
 import { OWNER_TOOLS, REMOTE_REFUSED_TOOLS, RemoteAuth } from "./remote-auth.ts";
+import { ADMIN, MAX_SOCKETS_DIR, socketPath } from "./signer.ts";
+import { SignerAdmin } from "./signer-client.ts";
+import { agentToken } from "./signer-protocol.ts";
 
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), "server.ts");
 /** The largest request body taken (MCP requests are small; tool arguments are JSON). */
@@ -86,7 +101,9 @@ const CHILD_CALL_MS = 60_000;
 /** The variables of the gateway's environment a child gets besides OSTRA_* (OSTRA_REMOTE_* never). */
 const PASSED_ENV = new Set(["PATH", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
 /** The variables set per home, never bound into a sandbox from the gateway's environment. */
-const PER_HOME_ENV = new Set(["OSTRA_HOME", "OSTRA_AGENT_OF", "OSTRA_PAD_FILES", "OSTRA_FILES_ONLY_IN", "OSTRA_HOME_EXCLUSIVE", "OSTRA_HOSTED"]);
+const PER_HOME_ENV = new Set(["OSTRA_HOME", "OSTRA_AGENT_OF", "OSTRA_PAD_FILES", "OSTRA_FILES_ONLY_IN", "OSTRA_HOME_EXCLUSIVE", "OSTRA_HOSTED", "OSTRA_SIGNER_SOCKET", "OSTRA_SIGNER_AGENT", "OSTRA_SIGNER_TOKEN_FILE"]);
+/** A home's signer token, beside its home (never in it: the home is the child's to write). */
+const SIGNER_TOKEN = "signer.token";
 /** What a sandbox sees of the system, read only, when it is there. */
 const SYSTEM_RO = ["/usr", "/etc/ssl", "/etc/ca-certificates", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf", "/etc/localtime"];
 const FLOCK = "/usr/bin/flock";
@@ -204,6 +221,27 @@ function codeDirs(): string[] {
   return [...out];
 }
 
+/**
+ * The signer of OSTRA_REMOTE_SIGNER_SOCKETS and OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE (both or neither), or null. Its
+ * sockets are never under the homes' root, nor the root under them.
+ */
+function signerOf(root: string): { sockets: string; keyFile: string; adminKey: Buffer; admin: SignerAdmin } | null {
+  const sockets = process.env.OSTRA_REMOTE_SIGNER_SOCKETS ?? "";
+  const keyFile = process.env.OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE ?? "";
+  if (sockets === "" && keyFile === "") return null;
+  if (sockets === "" || keyFile === "") throw new Error("set OSTRA_REMOTE_SIGNER_SOCKETS and OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE together, or neither");
+  if (!isAbsolute(sockets) || Buffer.byteLength(sockets) > MAX_SOCKETS_DIR) throw new Error(`OSTRA_REMOTE_SIGNER_SOCKETS is an absolute path of at most ${MAX_SOCKETS_DIR} bytes (signer.ts)`);
+  if (!statSync(sockets).isDirectory()) throw new Error(`${sockets} is not a directory`);
+  const r = realpathSync(root);
+  const s = realpathSync(sockets);
+  if (s === r || s.startsWith(`${r}/`) || r.startsWith(`${s}/`)) throw new Error("the signer's sockets and the homes' root are apart: neither is in the other");
+  checkPrivatePath(keyFile, 0o600);
+  const t = readFileSync(keyFile, "utf8").trim().replace(/^0x/, "");
+  if (!/^[0-9a-fA-F]{64}$/.test(t)) throw new Error(`${keyFile} must hold 32 bytes as hex`);
+  const adminKey = Buffer.from(t, "hex");
+  return { sockets, keyFile, adminKey, admin: new SignerAdmin(socketPath(sockets, ADMIN), adminKey) };
+}
+
 async function main(): Promise<void> {
   const usersPath = process.env.OSTRA_REMOTE_USERS !== undefined && process.env.OSTRA_REMOTE_USERS !== "" ? process.env.OSTRA_REMOTE_USERS : null;
   const publicUrl = process.env.OSTRA_REMOTE_PUBLIC_URL !== undefined && process.env.OSTRA_REMOTE_PUBLIC_URL !== "" ? process.env.OSTRA_REMOTE_PUBLIC_URL.replace(/\/+$/, "") : null;
@@ -226,6 +264,9 @@ async function main(): Promise<void> {
   const sandbox = sandboxMode === "bwrap";
   if (!existsSync(FLOCK)) throw new Error(`the gateway holds each home with flock(1): ${FLOCK} is missing`);
   const hidKey = homeIdKey(root);
+  /** Ostra Cloud: the signer that holds every home's seed (OSTRA_REMOTE_SIGNER_*), or null: each home holds its own. */
+  const signer = signerOf(root);
+  if (signer !== null && !sandbox) throw new Error("OSTRA_REMOTE_SIGNER_* needs OSTRA_REMOTE_SANDBOX=bwrap: outside a sandbox every child could read the signer's admin key and every home's token");
   /** The home id of an OAuth grant's vault. */
   const vaultUserId = (vault: Address) => `v${createHmac("sha256", hidKey).update(getAddress(vault)).digest("hex").slice(0, 40)}`;
 
@@ -253,15 +294,22 @@ async function main(): Promise<void> {
     // is seen only when OSTRA_REMOTE_SANDBOX_RO names it.
     for (const [k, v] of Object.entries(process.env)) {
       if (v === undefined || !isAbsolute(v) || PER_HOME_ENV.has(k)) continue;
-      if (((k.startsWith("OSTRA_") && !k.startsWith("OSTRA_REMOTE_")) || k === "NODE_EXTRA_CA_CERTS") && existsSync(v) && statSync(v).isFile()) add(v);
+      if (((k.startsWith("OSTRA_") && !k.startsWith("OSTRA_REMOTE_") && !k.startsWith("OSTRA_SIGNER_")) || k === "NODE_EXTRA_CA_CERTS") && existsSync(v) && statSync(v).isFile()) add(v);
     }
     for (const p of (process.env.OSTRA_REMOTE_SANDBOX_RO ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "")) add(p);
-    // Never the homes: no path read only may be, hold, or lie in the root.
+    // Never the homes: no path read only may be, hold, or lie in the root; nor the signer's sockets but each home's own.
     const r = realpathSync(root);
-    for (const p of [...sandboxRo, ...sandboxLinks]) if (p === r || p.startsWith(`${r}/`) || r.startsWith(p === "/" ? "/" : `${p}/`)) throw new Error(`the sandbox would see ${p}, which is, holds or lies in ${root} (the homes): move it, or the homes`);
+    const sockets = signer === null ? [] : [realpathSync(signer.sockets), realpathSync(signer.keyFile)];
+    for (const p of [...sandboxRo, ...sandboxLinks]) {
+      for (const x of [r, ...sockets]) if (p === x || p.startsWith(`${x}/`) || x.startsWith(p === "/" ? "/" : `${p}/`)) throw new Error(`the sandbox would see ${p}, which is, holds or lies in ${x} (the homes, the signer's sockets or its admin key): move it`);
+    }
   }
-  /** A sandbox's arguments: the home's home/ and pad-files/ read and write, nothing else of <root> (its log stays outside). */
-  const sandboxArgs = (dir: string): string[] => {
+  /**
+   * A sandbox's arguments: the home's home/ and pad-files/ read and write, nothing else of <root> (its log stays
+   * outside); with the signer, its own socket's directory and its token, read only.
+   */
+  const sandboxArgs = (id: string): string[] => {
+    const dir = join(root, id);
     // No capabilities inside, whoever runs the gateway (bwrap started by root otherwise keeps all of root's).
     const a: string[] = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
     // /bin, /lib, /lib64 and /sbin as the system has them: links into /usr, or directories.
@@ -284,6 +332,11 @@ async function main(): Promise<void> {
       a.push("--ro-bind", p, p);
     }
     a.push("--bind", join(dir, "home"), join(dir, "home"), "--bind", join(dir, "pad-files"), join(dir, "pad-files"), "--chdir", join(dir, "home"), "--setenv", "HOME", join(dir, "home"));
+    if (signer !== null) {
+      // The directory, not the socket: a socket the signer makes again on a restart is the one the sandbox sees.
+      const sockDir = dirname(socketPath(signer.sockets, id));
+      a.push("--ro-bind", sockDir, sockDir, "--ro-bind", join(dir, SIGNER_TOKEN), join(dir, SIGNER_TOKEN));
+    }
     return a;
   };
 
@@ -439,15 +492,47 @@ async function main(): Promise<void> {
     for (const s of sessions.values()) if (s.grant === grant) endLater(s, why);
   };
 
+  /**
+   * Ostra Cloud: before a child of the home starts, its seed is made in the signer if it has none, every token of the
+   * home before is revoked, and the new one written beside the home (0600). A signer that cannot be reached starts no
+   * child (503).
+   */
+  const prepareSigner = async (u: User): Promise<void> => {
+    if (signer === null) return;
+    const dir = join(root, u.id);
+    // A home from before the signer holds its own seed: its agent key is that seed's, and its server refuses to start
+    // on the signer (keys.ts). No seed is made for it.
+    if (existsSync(join(dir, "home", "master.key"))) {
+      log("home_holds_seed", { user: u.id });
+      throw Object.assign(new Error("this agent's home holds its own seed, from before Ostra Cloud's signer: it is not served here"), { status: 409 });
+    }
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    let epoch: number;
+    let created: boolean;
+    try {
+      created = (await signer.admin.create(u.id)).created;
+      epoch = await signer.admin.rotate(u.id);
+    } catch (err) {
+      log("signer_failed", { user: u.id, error: err instanceof Error ? err.message : String(err) });
+      throw Object.assign(new Error("Ostra Cloud's signer cannot be reached now: try again shortly"), { status: 503 });
+    }
+    const path = join(dir, SIGNER_TOKEN);
+    const tmp = `${path}.${randomBytes(6).toString("hex")}`;
+    writeFileSync(tmp, `${agentToken(signer.adminKey, u.id, epoch)}\n`, { mode: 0o600, flag: "wx" });
+    renameSync(tmp, path);
+    log("signer_agent", { user: u.id, created, epoch });
+  };
+
   /** The child's environment: only what it needs from the gateway's, and this home's own folders. */
   const childEnv = (u: User): Record<string, string> => {
     const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined && ((k.startsWith("OSTRA_") && !k.startsWith("OSTRA_REMOTE_")) || PASSED_ENV.has(k))) env[k] = v;
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !PER_HOME_ENV.has(k) && ((k.startsWith("OSTRA_") && !k.startsWith("OSTRA_REMOTE_") && !k.startsWith("OSTRA_SIGNER_")) || PASSED_ENV.has(k))) env[k] = v;
     const dir = join(root, u.id);
     mkdirSync(join(dir, "home"), { recursive: true, mode: 0o700 });
     mkdirSync(join(dir, "pad-files"), { recursive: true, mode: 0o700 });
     return {
       ...env,
+      ...(signer === null ? {} : { OSTRA_SIGNER_SOCKET: socketPath(signer.sockets, u.id), OSTRA_SIGNER_AGENT: u.id, OSTRA_SIGNER_TOKEN_FILE: join(dir, SIGNER_TOKEN) }),
       HOME: join(dir, "home"),
       OSTRA_HOME: join(dir, "home"),
       OSTRA_AGENT_OF: u.vault,
@@ -466,7 +551,7 @@ async function main(): Promise<void> {
     const dir = join(root, u.id);
     const locked = [FLOCK, "--wait", String(FLOCK_WAIT_SECONDS), "--conflict-exit-code", String(FLOCK_BUSY), join(dir, "home", ".server.flock"), process.execPath, SERVER];
     if (!sandbox) return { command: FLOCK, args: locked.slice(1), cwd: join(dir, "home") };
-    return { command: "bwrap", args: [...sandboxArgs(dir), "--", ...locked], cwd: join(dir, "home") };
+    return { command: "bwrap", args: [...sandboxArgs(u.id), "--", ...locked], cwd: join(dir, "home") };
   };
   /** A home's log, opened for the child's stderr: never through a link (the home's folders are the child's to change). */
   const openLog = (u: User): number => openSync(join(root, u.id, "mcp.log"), fsc.O_WRONLY | fsc.O_APPEND | fsc.O_CREAT | fsc.O_NOFOLLOW, 0o600);
@@ -590,6 +675,16 @@ async function main(): Promise<void> {
     const last = lastOpen.get(u.id) ?? 0;
     if (Date.now() - last < OPEN_INTERVAL_MS) throw Object.assign(new Error("too many sessions started: try again shortly"), { status: 429 });
     lastOpen.set(u.id, Date.now());
+    if (signer !== null) {
+      // Its place among maxSessions is kept while the signer answers (the home is in `homes` only once spawned).
+      connecting++;
+      try {
+        // A failure counts as a start: a home's requests to the signer stay at most one per OPEN_INTERVAL_MS.
+        await prepareSigner(u);
+      } finally {
+        connecting--;
+      }
+    }
     const env = childEnv(u);
     const stderr = openLog(u);
     const child = new StdioClientTransport({ ...childCommand(u), env, stderr });
@@ -742,6 +837,12 @@ async function main(): Promise<void> {
       if (live !== undefined) await endHome(live, "connect");
       if (homes.size + connecting >= maxSessions) throw Object.assign(new Error("the gateway is full: try again later"), { status: 503 });
       connecting++;
+      try {
+        await prepareSigner(u);
+      } catch (err) {
+        connecting--;
+        throw err;
+      }
       const env = childEnv(u);
       const stderr = openLog(u);
       const transport = new StdioClientTransport({ ...childCommand(u), env, stderr });
@@ -906,7 +1007,7 @@ async function main(): Promise<void> {
   // Each session holds its GET stream and a POST or two: three connections per session a home may keep.
   server.maxConnections = 3 * maxSessions * MAX_SESSIONS_PER_HOME + 16;
   server.headersTimeout = 20_000;
-  server.listen(port, host, () => log("listening", { listen, users: users.length, idleSeconds, maxSessions, oauth: auth !== null, sandbox: sandboxMode }));
+  server.listen(port, host, () => log("listening", { listen, users: users.length, idleSeconds, maxSessions, oauth: auth !== null, sandbox: sandboxMode, signer: signer !== null }));
   const stop = () => {
     log("stopping", { children: homes.size });
     server.close();

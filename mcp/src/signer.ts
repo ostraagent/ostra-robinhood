@@ -318,7 +318,8 @@ export type SignerOptions = {
  */
 type Conn = { principal: string; authorized: boolean; closed: boolean; last: number };
 
-const ADMIN = "#admin";
+/** The admin's principal (the gateway): not an agent id (AGENT_ID has no "#"). */
+export const ADMIN = "#admin";
 
 /** The socket of an agent, or of the admin, in the sockets directory: each in a directory of its own. */
 export function socketPath(dir: string, principal: string): string {

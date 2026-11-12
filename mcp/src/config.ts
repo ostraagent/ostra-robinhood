@@ -61,6 +61,11 @@
 //                         Unset: any path, as before
 //   OSTRA_HOSTED          "yes": this server runs on a host its user never reaches (the remote MCP gateway sets it
 //                         for each home): its seed is kept there, and no answer tells the user to export it
+//   OSTRA_SIGNER_SOCKET   Ostra Cloud (design 12 Nov 2026): the Unix socket of this agent's signer, which holds its
+//   OSTRA_SIGNER_AGENT    seed (signer.ts), the agent id the signer knows it by, and the file (0600) of its token; all
+//   OSTRA_SIGNER_TOKEN_FILE  three or none, with OSTRA_AGENT_OF and OSTRA_HOSTED=yes only (the remote gateway sets them
+//                         for each home). OSTRA_HOME then holds no seed: the agent signs only with its agent key, through
+//                         the signer, and what needs its own seed is refused (core keys.ts HostedRefusedError)
 //   OSTRA_PAY_PRIVATE_HOSTS  "yes": the pay tool may reach hosts that are not public (loopback, private and
 //                         link-local addresses: a seller on the user's own network, local tests); ignored when
 //                         OSTRA_HOSTED is "yes". Unset: pay reaches public hosts only
@@ -93,6 +98,8 @@ import { parseSwapDeployment, type SwapDeployment } from "@ostraagent/swap";
 import { RAETO_API, X402_NETWORK, type Config } from "@ostraagent/core";
 import { checkPrivate } from "./disk.ts";
 import { packaged, type ProverHashes } from "./packaged.ts";
+import { AGENT_ID } from "./signer-protocol.ts";
+import type { SignerConfig } from "./signer-client.ts";
 
 /** ostra-prove as a native binary, or its WebAssembly build: a directory with ostra_prove.js and ostra_prove_bg.wasm. */
 export type ProverConfig = { kind: "native"; path: string } | { kind: "wasm"; dir: string; sha256: ProverHashes | null };
@@ -162,6 +169,8 @@ export type McpConfig = Config & {
   hosted: boolean;
   /** OSTRA_PAY_PRIVATE_HOSTS=yes, not hosted: the pay tool may reach hosts that are not public. */
   payPrivateHosts: boolean;
+  /** Ostra Cloud: this agent's signer (OSTRA_SIGNER_*), which holds its seed; null: the seed is in OSTRA_HOME. */
+  signer: SignerConfig | null;
 };
 
 /** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
@@ -179,6 +188,18 @@ function agentOf(env: NodeJS.ProcessEnv): Address | null {
   if (v === undefined || v === "") return null;
   if (!isAddress(v, { strict: false })) throw new Error("OSTRA_AGENT_OF is the address of the version 5 vault this server is the agent of");
   return getAddress(v);
+}
+
+function signerConfig(env: NodeJS.ProcessEnv): SignerConfig | null {
+  const v = (name: string) => (env[name] !== undefined && env[name] !== "" ? (env[name] as string) : null);
+  const socket = v("OSTRA_SIGNER_SOCKET");
+  const agent = v("OSTRA_SIGNER_AGENT");
+  const tokenFile = v("OSTRA_SIGNER_TOKEN_FILE");
+  if (socket === null && agent === null && tokenFile === null) return null;
+  if (socket === null || agent === null || tokenFile === null) throw new Error("set OSTRA_SIGNER_SOCKET, OSTRA_SIGNER_AGENT and OSTRA_SIGNER_TOKEN_FILE together, or none of them");
+  if (!AGENT_ID.test(agent)) throw new Error("OSTRA_SIGNER_AGENT is an agent id: lower case letters, digits and dashes (at most 63)");
+  if (env.OSTRA_AGENT_OF === undefined || env.OSTRA_AGENT_OF === "" || env.OSTRA_HOSTED !== "yes") throw new Error("OSTRA_SIGNER_* is for a hosted agent: set it with OSTRA_AGENT_OF and OSTRA_HOSTED=yes");
+  return { socket, agent, tokenFile };
 }
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
@@ -239,6 +260,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     filesOnlyIn: env.OSTRA_FILES_ONLY_IN !== undefined && env.OSTRA_FILES_ONLY_IN !== "" ? env.OSTRA_FILES_ONLY_IN : null,
     hosted: env.OSTRA_HOSTED === "yes",
     payPrivateHosts: env.OSTRA_PAY_PRIVATE_HOSTS === "yes" && env.OSTRA_HOSTED !== "yes",
+    signer: signerConfig(env),
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,
