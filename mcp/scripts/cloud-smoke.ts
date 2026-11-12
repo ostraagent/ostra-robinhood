@@ -8,7 +8,7 @@
 // The session's server holds no seed: its agent key's roots come from the signer (agent_key_request: a new root is
 // handed out and kept as issued, never installed), the chain and Ostra's services through the egress (v5_status,
 // balance). pay reaches a public host through the egress (https://example.com/, no payment asked: TLS checked end
-// to end with the image's certificate authorities); the egress refuses a name that resolves to 127.0.0.1; the
+// to end with the image's certificate authorities); the egress refuses a name that resolves to loopback only; the
 // server itself refuses the cloud metadata address and plain HTTP. Prints CLOUD_SMOKE_OK at the end; any failure exits
 // 1 with what failed.
 
@@ -18,6 +18,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createPublicClient, getAddress, http, isAddress, type PublicClient } from "viem";
 import { listOstraVaults, parseDeployment, robinhoodChain } from "@ostraagent/sdk";
+import { isPublicAddress } from "../src/public-fetch.ts";
 
 if (process.argv[2] === "latest-vault") {
   const d = parseDeployment(JSON.parse(await readFile(process.env.OSTRA_DEPLOYMENT ?? "", "utf8")));
@@ -85,10 +86,10 @@ try {
   if (typeof okStatus !== "number" || okStatus >= 500) fail(`pay https://example.com/ answered ${String(okStatus)}`);
   console.log(`  pay https://example.com/: status ${okStatus} through the egress, nothing paid`);
 
-  // pay: refused before anything is paid. localtest.me resolves to 127.0.0.1 in public DNS (checked here first): the
-  // egress refuses it.
+  // pay: refused before anything is paid. localtest.me resolves to loopback in public DNS (127.0.0.1, and ::1 where AAAA
+  // is answered): checked here first to be a name with no public address, which the egress refuses.
   const local = await lookup("localtest.me", { all: true }).catch(() => []);
-  if (local.length === 0 || !local.every((a) => a.address === "127.0.0.1")) fail(`localtest.me does not resolve to 127.0.0.1 only here (${JSON.stringify(local)}): the egress check needs another such name`);
+  if (local.length === 0 || local.some((a) => isPublicAddress(a.address))) fail(`localtest.me resolves to ${JSON.stringify(local)} here, not only to addresses that are not public: the egress check needs another such name`);
   for (const [target, why] of [
     ["https://localtest.me/", /not a public address/],
     ["https://169.254.169.254/latest/meta-data/", /not a public address/],
