@@ -66,6 +66,9 @@
 //   OSTRA_SIGNER_TOKEN_FILE  three or none, with OSTRA_AGENT_OF and OSTRA_HOSTED=yes only (the remote gateway sets them
 //                         for each home). OSTRA_HOME then holds no seed: the agent signs only with its agent key, through
 //                         the signer, and what needs its own seed is refused (core keys.ts HostedRefusedError)
+//   OSTRA_PAY_PROXY       Ostra Cloud: the enclave's egress (http://host:port, egress.ts), which the pay tool's
+//                         requests go through (HTTPS on port 443 only; the egress refuses hosts that are not public).
+//                         With OSTRA_HOSTED=yes only
 //   OSTRA_PAY_PRIVATE_HOSTS  "yes": the pay tool may reach hosts that are not public (loopback, private and
 //                         link-local addresses: a seller on the user's own network, local tests); ignored when
 //                         OSTRA_HOSTED is "yes". Unset: pay reaches public hosts only
@@ -171,6 +174,8 @@ export type McpConfig = Config & {
   payPrivateHosts: boolean;
   /** Ostra Cloud: this agent's signer (OSTRA_SIGNER_*), which holds its seed; null: the seed is in OSTRA_HOME. */
   signer: SignerConfig | null;
+  /** Ostra Cloud: the egress the pay tool's requests go through (OSTRA_PAY_PROXY), or null: straight to the host. */
+  payProxy: string | null;
 };
 
 /** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
@@ -200,6 +205,20 @@ function signerConfig(env: NodeJS.ProcessEnv): SignerConfig | null {
   if (!AGENT_ID.test(agent)) throw new Error("OSTRA_SIGNER_AGENT is an agent id: lower case letters, digits and dashes (at most 63)");
   if (env.OSTRA_AGENT_OF === undefined || env.OSTRA_AGENT_OF === "" || env.OSTRA_HOSTED !== "yes") throw new Error("OSTRA_SIGNER_* is for a hosted agent: set it with OSTRA_AGENT_OF and OSTRA_HOSTED=yes");
   return { socket, agent, tokenFile };
+}
+
+function payProxy(env: NodeJS.ProcessEnv): string | null {
+  const v = env.OSTRA_PAY_PROXY;
+  if (v === undefined || v === "") return null;
+  if (env.OSTRA_HOSTED !== "yes") throw new Error("OSTRA_PAY_PROXY is for a hosted agent (Ostra Cloud's egress): set it with OSTRA_HOSTED=yes");
+  let url: URL;
+  try {
+    url = new URL(v);
+  } catch {
+    throw new Error("OSTRA_PAY_PROXY is http://host:port");
+  }
+  if (url.protocol !== "http:" || url.port === "" || url.username !== "" || url.password !== "" || (url.pathname !== "/" && url.pathname !== "") || url.search !== "") throw new Error("OSTRA_PAY_PROXY is http://host:port");
+  return `http://${url.host}`;
 }
 
 function serviceUrl(env: NodeJS.ProcessEnv, name: string, fallback: string | null): string | null {
@@ -261,6 +280,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     hosted: env.OSTRA_HOSTED === "yes",
     payPrivateHosts: env.OSTRA_PAY_PRIVATE_HOSTS === "yes" && env.OSTRA_HOSTED !== "yes",
     signer: signerConfig(env),
+    payProxy: payProxy(env),
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,

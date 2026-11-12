@@ -1,0 +1,110 @@
+# Ostra Cloud (design 12 Nov 2026): the enclave's services, one dstack app on Phala Cloud (Intel TDX, KMS on Base).
+# @IMAGE@ is the image built by cloud/build.sh, by digest (cloud/build.sh deploy-compose writes this file with it).
+#
+#   signer   the only holder of the agents' seeds: no network at all, the dstack socket for its seal key, its sockets
+#            in a volume the gateway shares; it makes the admin key in the enclave, in a volume only the gateway shares
+#   gateway  the remote MCP gateway (remote.ts): one agent server per home, each in its bubblewrap sandbox (the
+#            container under sysbox-runc, whose user namespace lets bwrap make its own), on the inner network only
+#   egress   the only way out of the inner network: CONNECT to port 443 of public hosts only (egress.ts)
+#   front    the one published port (8080, behind the dstack gateway's TLS), its bytes passed to the gateway
+#
+# The values from the deployment's encrypted environment (dstack's, never in this file): OSTRA_RPC_URL (the chain's
+# RPC, with its key), OSTRA_REMOTE_ALLOWED_HOSTS (the app's public host name) and OSTRA_REMOTE_USERS_JSON (the
+# operators' fixed tokens, by their SHA-256: {"users":[...]}, mcp/scripts/remote-user.ts).
+
+services:
+  signer:
+    image: "@IMAGE@"
+    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/signer.ts"]
+    network_mode: none
+    environment:
+      OSTRA_SIGNER_SOCKETS: /run/ostra-signer
+      OSTRA_SIGNER_ROOT: /var/lib/ostra-signer
+      OSTRA_SIGNER_ADMIN_KEY_FILE: /var/lib/ostra-signer-admin/admin.key
+      OSTRA_SIGNER_ADMIN_KEY_CREATE: "yes"
+      OSTRA_SIGNER_SEAL: dstack
+      DSTACK_SOCK: /var/run/dstack.sock
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - signer-data:/var/lib/ostra-signer
+      - signer-admin:/var/lib/ostra-signer-admin
+      - signer-sockets:/run/ostra-signer
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/ostra-signer/admin/sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    restart: always
+
+  gateway:
+    image: "@IMAGE@"
+    runtime: sysbox-runc
+    # The users file is written from the encrypted environment at each start (0600, outside the homes).
+    command: ["sh", "-c", "umask 077 && printf '%s' \"$$OSTRA_REMOTE_USERS_JSON\" > /run/ostra-users/users.json && unset OSTRA_REMOTE_USERS_JSON && exec node /opt/ostra/ostra-robinhood/mcp/src/remote.ts"]
+    depends_on:
+      signer:
+        condition: service_healthy
+      egress:
+        condition: service_started
+    environment:
+      OSTRA_REMOTE_LISTEN: 0.0.0.0:4920
+      OSTRA_REMOTE_ROOT: /var/lib/ostra-remote
+      OSTRA_REMOTE_USERS: /run/ostra-users/users.json
+      OSTRA_REMOTE_USERS_JSON: ${OSTRA_REMOTE_USERS_JSON:?set the operators users}
+      OSTRA_REMOTE_ALLOWED_HOSTS: ${OSTRA_REMOTE_ALLOWED_HOSTS:?set the public host name}
+      OSTRA_REMOTE_SANDBOX: bwrap
+      OSTRA_REMOTE_SIGNER_SOCKETS: /run/ostra-signer
+      OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE: /var/lib/ostra-signer-admin/admin.key
+      # Passed to every agent's server (config.ts).
+      OSTRA_DEPLOYMENT: /opt/ostra/ostra-robinhood/deployments/robinhood-mainnet.json
+      OSTRA_SWAP_DEPLOYMENT: /opt/ostra/ostra-swap/deployments/robinhood-mainnet.json
+      OSTRA_RPC_URL: ${OSTRA_RPC_URL:?set the chain RPC}
+      OSTRA_RELAYER_URL: https://relayer.ostraagent.xyz
+      OSTRA_KEEPER_URL: https://keeper.ostraagent.xyz
+      OSTRA_AGGREGATOR_URL: "off"
+      OSTRA_AI_URL: https://ai.ostraagent.xyz
+      OSTRA_PAD_INDEXER_URL: https://app.ostraagent.xyz
+      OSTRA_HISTORY_RPC_URL: https://rpc.ostraagent.xyz
+      OSTRA_PROVER: "off"
+      OSTRA_PAY_PROXY: http://egress:3128
+      # Everything else the servers send goes through the egress too (Node's built-in proxy support).
+      NODE_USE_ENV_PROXY: "1"
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+    volumes:
+      - remote-data:/var/lib/ostra-remote
+      - signer-sockets:/run/ostra-signer
+      - signer-admin:/var/lib/ostra-signer-admin:ro
+    networks: [inner]
+    restart: always
+
+  egress:
+    image: "@IMAGE@"
+    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/egress.ts"]
+    environment:
+      OSTRA_EGRESS_LISTEN: 0.0.0.0:3128
+    networks: [inner, outer]
+    restart: always
+
+  front:
+    image: "@IMAGE@"
+    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/front.ts"]
+    environment:
+      OSTRA_FRONT_LISTEN: 0.0.0.0:8080
+      OSTRA_FRONT_TARGET: gateway:4920
+    ports:
+      - "8080:8080"
+    depends_on: [gateway]
+    networks: [inner, outer]
+    restart: always
+
+networks:
+  inner:
+    internal: true
+  outer: {}
+
+volumes:
+  signer-data: {}
+  signer-admin: {}
+  signer-sockets: {}
+  remote-data: {}

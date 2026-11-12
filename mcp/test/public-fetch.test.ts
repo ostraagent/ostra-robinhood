@@ -182,3 +182,13 @@ test("OSTRA_PAY_PRIVATE_HOSTS=yes lets pay reach hosts that are not public, neve
   assert.equal((await loadConfig({ ...base, OSTRA_PAY_PRIVATE_HOSTS: "1" })).payPrivateHosts, false);
   assert.equal((await loadConfig({ ...base, OSTRA_PAY_PRIVATE_HOSTS: "yes", OSTRA_HOSTED: "yes" })).payPrivateHosts, false);
 });
+
+test("OSTRA_PAY_PROXY (Ostra Cloud's egress) is taken only on a hosted server, as http://host:port", async () => {
+  const base = { OSTRA_HOME: "/nonexistent/ostra-config-test", OSTRA_DEPLOYMENT: fileURLToPath(new URL("../../deployments/robinhood-mainnet.json", import.meta.url)) };
+  assert.equal((await loadConfig(base)).payProxy, null);
+  assert.equal((await loadConfig({ ...base, OSTRA_HOSTED: "yes", OSTRA_PAY_PROXY: "http://egress:3128" })).payProxy, "http://egress:3128");
+  await assert.rejects(loadConfig({ ...base, OSTRA_PAY_PROXY: "http://egress:3128" }), /OSTRA_HOSTED=yes/);
+  for (const bad of ["https://egress:3128", "http://egress", "http://u:p@egress:3128", "http://egress:3128/x", "egress:3128"]) {
+    await assert.rejects(loadConfig({ ...base, OSTRA_HOSTED: "yes", OSTRA_PAY_PROXY: bad }), /http:\/\/host:port/, bad);
+  }
+});

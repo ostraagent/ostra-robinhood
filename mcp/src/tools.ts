@@ -17,7 +17,7 @@ import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall 
 import type { Agent } from "./agent.ts";
 import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
 import { ensurePrivateDir } from "./disk.ts";
-import { publicFetch } from "./public-fetch.ts";
+import { proxiedFetch, publicFetch } from "./public-fetch.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
 
@@ -185,7 +185,8 @@ export function registerTools(server: McpServer, agent: Agent): void {
   };
   const localFiles = async (paths: string[] | undefined): Promise<string[] | undefined> => (paths === undefined ? undefined : Promise.all(paths.map(localFile)));
   const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
-  const paySend = agent.config.payPrivateHosts ? undefined : publicFetch();
+  // Ostra Cloud: through the enclave's egress, which checks the host (OSTRA_PAY_PROXY); else to public hosts only.
+  const paySend = agent.config.payProxy !== null ? proxiedFetch(agent.config.payProxy) : agent.config.payPrivateHosts ? undefined : publicFetch();
   const rpcUrls = [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])];
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
     server.registerTool(name, { description, inputSchema: shape, ...(READ_ONLY_TOOLS.has(name) ? { annotations: { readOnlyHint: true } } : {}) }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), rpcUrls)) as never);

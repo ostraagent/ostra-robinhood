@@ -13,6 +13,8 @@
 //                                socket serves only its own principal, so no process can take another's connections
 //   OSTRA_SIGNER_ROOT            the signer's data (0700): agents/<agent id>/{seed.sealed,epoch,wots/}
 //   OSTRA_SIGNER_ADMIN_KEY_FILE  32 bytes, hex (0600): the admin key the agent and admin tokens derive from
+//   OSTRA_SIGNER_ADMIN_KEY_CREATE  "yes": the signer makes that file (32 random bytes) when it is missing, so that the
+//                                key is born in the enclave (Ostra Cloud's compose shares it with the gateway only)
 //   OSTRA_SIGNER_SEAL            "dstack" (the seal key from the dstack guest agent's GetKey, bound to the app) or
 //                                "file:<path>" (32 bytes, hex, 0600: outside a TEE, for the operator's tests)
 //   OSTRA_SIGNER_RATE            the signing operations one agent may make per minute (default 120)
@@ -31,7 +33,7 @@ import { chmod, link, lstat, mkdir, open, readdir, readFile, rename, stat, unlin
 import { chmodSync, constants, existsSync, realpathSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { connect, createServer, type Server, type Socket } from "node:net";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -1073,6 +1075,15 @@ async function main(): Promise<void> {
   };
   const rate = perMinute("OSTRA_SIGNER_RATE", "120");
   const workRate = perMinute("OSTRA_SIGNER_WORK_RATE", "1024");
+  if (env.OSTRA_SIGNER_ADMIN_KEY_CREATE === "yes" && !existsSync(adminFile)) {
+    const key = randomBytes(32);
+    try {
+      // Made whole and exclusively: another start that made it first keeps its key.
+      if (await createWhole(dirname(adminFile), basename(adminFile), `${key.toString("hex")}\n`)) log("admin_key_created", {});
+    } finally {
+      key.fill(0);
+    }
+  }
   const adminKey = await hexFile(adminFile, "the admin key");
   let sealKey: Uint8Array;
   if (sealMode === "dstack") sealKey = await dstackKey(env.DSTACK_SOCK ?? "/var/run/dstack.sock");

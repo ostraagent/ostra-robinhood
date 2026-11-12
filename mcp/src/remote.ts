@@ -99,7 +99,7 @@ const LIST_CHANGED = new Set(["notifications/tools/list_changed", "notifications
 /** How long the gateway's own request to a child (agent_key_request) may take. */
 const CHILD_CALL_MS = 60_000;
 /** The variables of the gateway's environment a child gets besides OSTRA_* (OSTRA_REMOTE_* never). */
-const PASSED_ENV = new Set(["PATH", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
+const PASSED_ENV = new Set(["PATH", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
 /** The variables set per home, never bound into a sandbox from the gateway's environment. */
 const PER_HOME_ENV = new Set(["OSTRA_HOME", "OSTRA_AGENT_OF", "OSTRA_PAD_FILES", "OSTRA_FILES_ONLY_IN", "OSTRA_HOME_EXCLUSIVE", "OSTRA_HOSTED", "OSTRA_SIGNER_SOCKET", "OSTRA_SIGNER_AGENT", "OSTRA_SIGNER_TOKEN_FILE"]);
 /** A home's signer token, beside its home (never in it: the home is the child's to write). */
@@ -899,8 +899,9 @@ async function main(): Promise<void> {
   };
 
   if (publicUrl !== null) {
-    // The chain as the children read it: the deployment and the RPCs of their environment (config.ts).
-    const config = await loadConfig(process.env);
+    // The chain as the children read it: the deployment and the RPCs of their environment (config.ts). OSTRA_PAY_PROXY
+    // is the children's (hosted ones only), never the gateway's.
+    const config = await loadConfig({ ...process.env, OSTRA_PAY_PROXY: "" });
     const keyStateSeconds = seconds("OSTRA_REMOTE_KEY_STATE_SECONDS", 1, 300);
     const redirects = (process.env.OSTRA_REMOTE_REDIRECTS ?? "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback").split(",").map((r) => r.trim()).filter((r) => r !== "");
     auth = new RemoteAuth({
