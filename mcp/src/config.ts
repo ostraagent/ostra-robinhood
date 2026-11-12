@@ -61,6 +61,9 @@
 //                         Unset: any path, as before
 //   OSTRA_HOSTED          "yes": this server runs on a host its user never reaches (the remote MCP gateway sets it
 //                         for each home): its seed is kept there, and no answer tells the user to export it
+//   OSTRA_PAY_PRIVATE_HOSTS  "yes": the pay tool may reach hosts that are not public (loopback, private and
+//                         link-local addresses: a seller on the user's own network, local tests); ignored when
+//                         OSTRA_HOSTED is "yes". Unset: pay reaches public hosts only
 //   OSTRA_SWAP_ANSWER_MS  how long ostra_swap and trading buy and sell wait
 //                         for their swap before answering "pending" while it
 //                         goes on (milliseconds, 1 to 600000; default 40000,
@@ -157,6 +160,8 @@ export type McpConfig = Config & {
   filesOnlyIn: string | null;
   /** OSTRA_HOSTED=yes: run by the remote gateway, on a host the user never reaches (its seed is not exported from here). */
   hosted: boolean;
+  /** OSTRA_PAY_PRIVATE_HOSTS=yes, not hosted: the pay tool may reach hosts that are not public. */
+  payPrivateHosts: boolean;
 };
 
 /** OSTRA_SWAP_ANSWER_MS's default: within the 60 s many MCP clients wait for a call. */
@@ -233,6 +238,7 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     agentOf: agentOf(env),
     filesOnlyIn: env.OSTRA_FILES_ONLY_IN !== undefined && env.OSTRA_FILES_ONLY_IN !== "" ? env.OSTRA_FILES_ONLY_IN : null,
     hosted: env.OSTRA_HOSTED === "yes",
+    payPrivateHosts: env.OSTRA_PAY_PRIVATE_HOSTS === "yes" && env.OSTRA_HOSTED !== "yes",
     prover,
     chainId: deployment.chainId,
     rpcUrl: rpcUrl ?? ROBINHOOD_PUBLIC_RPC,

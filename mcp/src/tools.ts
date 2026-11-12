@@ -17,6 +17,7 @@ import { GUARD_OP, LAUNCH_PAIRS, QuoteError, USDG, WETH, redact, type GuardCall 
 import type { Agent } from "./agent.ts";
 import { BUILDER_AFTER_MS, BUILDER_RULES, UNAVAILABLE, builderOf, builderToken } from "./builder.ts";
 import { ensurePrivateDir } from "./disk.ts";
+import { publicFetch } from "./public-fetch.ts";
 
 const toJson = (value: unknown) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2);
 
@@ -59,6 +60,35 @@ function videoExt(b: Buffer): string {
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
 /** A finished video job's status (the gateway's). */
 const FINAL_JOB = ["completed", "failed", "cancelled", "expired"];
+
+/**
+ * Tools that only read: no transaction is sent or signed, no record changes but this machine's bookkeeping of what
+ * the chain already shows (list_channels marks a closed channel finished). They carry readOnlyHint: true, so a client
+ * that asks before each tool of this server (Hermes with trust untrusted) runs them without asking. A tool that also
+ * acts (an action argument, finishing pending work as private_balance does) is not here.
+ */
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  "balance",
+  "list_channels",
+  "payment_wallet_status",
+  "autonomo_catalog",
+  "ostra_ai_credit",
+  "seller_balance",
+  "ostra_swap_quote",
+  "ostra_swap_orders",
+  "recovery_status",
+  "borro_markets",
+  "borro_position",
+  "v5_status",
+  "venues",
+  "strategy_report",
+  "pad_search",
+  "pad_earnings",
+  "reputation_verify",
+  "token_vault",
+  "profile",
+  "vesting_info",
+]);
 
 /**
  * The launchpad's tools that were closed (decided by Edu on 26 Oct 2026: the launchpad is closed for new launches and
@@ -153,9 +183,10 @@ export function registerTools(server: McpServer, agent: Agent): void {
   };
   const localFiles = async (paths: string[] | undefined): Promise<string[] | undefined> => (paths === undefined ? undefined : Promise.all(paths.map(localFile)));
   const opt = <K extends string, V>(key: K, value: V | undefined) => (value === undefined ? {} : ({ [key]: value } as { [P in K]: V }));
+  const paySend = agent.config.payPrivateHosts ? undefined : publicFetch();
   const rpcUrls = [agent.config.rpcUrl, agent.config.logsRpcUrl, ...(agent.config.ethRpcUrl === null ? [] : [agent.config.ethRpcUrl])];
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, fn: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) =>
-    server.registerTool(name, { description, inputSchema: shape }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), rpcUrls)) as never);
+    server.registerTool(name, { description, inputSchema: shape, ...(READ_ONLY_TOOLS.has(name) ? { annotations: { readOnlyHint: true } } : {}) }, ((args: z.infer<z.ZodObject<S>>) => run(() => fn(args), rpcUrls)) as never);
 
   // ostra_swap and trading buy and sell wait this long for their swap before answering "pending" (config
   // OSTRA_SWAP_ANSWER_MS): MCP clients commonly give up on a call at 60 s, a client that gave up does not stop the swap,
@@ -328,7 +359,8 @@ export function registerTools(server: McpServer, agent: Agent): void {
     "pay",
     "Sends an HTTP request; when the route answers 402 with an x402 batch-settlement offer in USDG from an Ostra seller, pays it from a channel of the vault (opening one when needed) and returns the answer. A route whose offer is x402 exact in USDG on Robinhood Chain (a transfer signed by the payer's own key, such as Autonomo's gateways: autonomo_catalog) is paid from the vault's payment wallet (payment_wallet_setup), topped up from the vault when it holds too little. Refused before anything is signed when the price is above maxPrice.",
     { url: z.string().url(), method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"), headers: z.record(z.string(), z.string()).optional(), body: z.string().max(1_000_000).optional(), maxPrice: usdg, deposit: usdg.optional() },
-    (a) => agent.payments.pay({ url: a.url, method: a.method, maxPrice: a.maxPrice, ...(a.headers === undefined ? {} : { headers: a.headers }), ...(a.body === undefined ? {} : { body: a.body }), ...(a.deposit === undefined ? {} : { deposit: a.deposit }) }),
+    // The URL is the model's: its requests reach public hosts only (public-fetch.ts), unless OSTRA_PAY_PRIVATE_HOSTS.
+    (a) => agent.payments.pay({ url: a.url, method: a.method, maxPrice: a.maxPrice, ...(a.headers === undefined ? {} : { headers: a.headers }), ...(a.body === undefined ? {} : { body: a.body }), ...(a.deposit === undefined ? {} : { deposit: a.deposit }) }, paySend),
   );
 
   tool(

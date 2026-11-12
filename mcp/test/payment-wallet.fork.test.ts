@@ -24,6 +24,7 @@ import { liveAtV5, startFork, vaultBeaconAtRecord, type Fork } from "@ostraagent
 import { setupMainnet } from "../../relayer/scripts/setup-mainnet.ts";
 import { Agent } from "../src/agent.ts";
 import { loadConfig } from "../src/config.ts";
+import { publicFetch } from "../src/public-fetch.ts";
 
 const here = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 const LIVE_DEPLOYMENT = here("../../deployments/robinhood-mainnet.json");
@@ -200,8 +201,10 @@ test("the payment wallet: set up, an exact payment, the agent key's top-up and p
   await assert.rejects(owner.payments.pay({ url: shop.url, maxPrice: "0.005" }), /more than maxPrice/);
   assert.equal(shop.settled.length, 0);
 
-  // Paid from the wallet.
-  const paid = await owner.payments.pay({ url: shop.url, maxPrice: "0.02" });
+  // Paid from the wallet, through the pay tool's client (public-fetch.ts; the shop is on this machine, so loopback
+  // counts as public for this test): the 402, the payment and the answer all go through it.
+  const viaTool = publicFetch(undefined, (a) => a === "127.0.0.1");
+  const paid = await owner.payments.pay({ url: shop.url, maxPrice: "0.02" }, viaTool);
   assert.equal(paid.status, 200, JSON.stringify(paid));
   assert.equal(paid.paid, "0.01");
   assert.deepEqual(paid.wallet, { address: wallet, left: "0.99" });
@@ -239,7 +242,7 @@ test("the payment wallet: set up, an exact payment, the agent key's top-up and p
   assert.equal((await owner.v5.status()).allowlist.some((e) => e.kind === "recipient" && getAddress(`0x${e.value.slice(-40)}`) === wallet), false, "the owner's own wallet is never allowlisted");
   assert.equal((await owner.paymentWallet.setup("0", agentWallet)).allowlist?.status, "listed", "nothing more is signed for an entry already there");
   assert.equal((await agent.paymentWallet.status()).agentTopUp?.allowlisted, true);
-  const agentPaid = await agent.payments.pay({ url: shop.url, maxPrice: "0.02" });
+  const agentPaid = await agent.payments.pay({ url: shop.url, maxPrice: "0.02" }, viaTool);
   assert.equal(agentPaid.status, 200, `${JSON.stringify(agentPaid)}\n${tails()}`);
   assert.equal(agentPaid.paid, "0.01");
   assert.match(agentPaid.note ?? "", /topped up with 1 USDG from the vault/);

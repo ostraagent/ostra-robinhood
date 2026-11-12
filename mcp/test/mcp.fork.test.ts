@@ -30,6 +30,7 @@ import { STEAKHOUSE_USDG, USDG, deployBreaker, usdgAbi, type Deployment } from "
 import { OUT_DIR, deployLaunchpadOnFork, deployOnFork, startFork, type Fork } from "@ostraagent/sdk/test/fork";
 import { createSafe } from "@ostraagent/sdk/test/safe";
 import { splitLogsClient } from "../../core/test/split-logs.ts";
+import { READ_ONLY_TOOLS } from "../src/tools.ts";
 
 let fork: Fork;
 let d: Deployment;
@@ -142,7 +143,11 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
   const home = join(root, "home");
   const client = await connect(home);
   try {
-    const tools = (await client.listTools()).tools.map((t) => t.name);
+    const listed = (await client.listTools()).tools;
+    const tools = listed.map((t) => t.name);
+    // readOnlyHint on the read-only tools, and on no other.
+    const readOnly = listed.filter((t) => t.annotations?.readOnlyHint === true).map((t) => t.name).sort();
+    assert.deepEqual(readOnly, [...READ_ONLY_TOOLS].sort());
     for (const name of ["open_vault", "balance", "withdraw", "pay", "open_channel", "close_channel", "private_shield", "private_unshield", "private_withdraw", "auto_shield", "set_guardian", "sell", "token_vault", "transfer_token", "claim_dividends", "vesting_release", "airdrop_claim", "release_creator_payout", "profile", "upload_image", "publish_profile", "fund_creator_vault", "creator_withdraw", "pad_publish", "pad_search", "pad_order", "pad_jobs", "pad_deliver", "pad_evaluate", "pad_earnings", "tide", "reputation_snapshot", "reputation_prove", "reputation_verify"]) {
       assert.ok(tools.includes(name), `tool ${name}`);
     }
@@ -170,6 +175,17 @@ test("the MCP server's tools over stdio: vault, withdrawal, the agent's identity
     assert.ok(!tooMuch.ok && /less than 1000/.test(tooMuch.text), tooMuch.text);
     const w = await call(client, "withdraw", { destination: fork.accounts[3]!.address, amount: "1.5" });
     assert.ok(w.ok && w.json.status === "sent", w.text);
+
+    // pay reaches public hosts only: this machine, a private address and the cloud metadata address are refused
+    // before any request or signature (the vault's balance and nonce stay).
+    const held = await call(client, "balance");
+    for (const url of [`${logsUrl}/`, "http://localhost:8545/", "http://10.0.0.1/", "http://169.254.169.254/latest/meta-data/", "http://[::1]:8545/"]) {
+      const refused = await call(client, "pay", { url, maxPrice: "1" });
+      assert.ok(!refused.ok && /pay reaches public hosts only; nothing was sent/.test(refused.text), refused.text);
+    }
+    const still = await call(client, "balance");
+    const of = (x: Answer) => { const v = x.json.vault as { balance: string; nonce: string }; return [v.balance, v.nonce]; };
+    assert.deepEqual(of(still), of(held));
 
     // Ostrapad before the agent has an identity: listing refused, nothing signed.
     const early = await call(client, "pad_publish", { action: "publish", offers: [{ id: "report", title: "Report", description: "A report.", input: "A topic.", price: "1", hours: 24, evaluator: "pool" }] });

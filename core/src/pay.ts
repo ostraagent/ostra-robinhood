@@ -23,6 +23,10 @@
 // Chain (EIP-3009, as Autonomo's gateways do; decided 8 Nov 2026) is paid from
 // the vault's payment wallet (payment-wallet.ts), when this agent has one: a
 // small balance behind an ordinary key, topped up from the vault.
+//
+// Every request goes through `send` (default: fetch). The MCP server's `pay` tool, whose URL the model chooses, passes
+// one that reaches public hosts only (mcp/src/public-fetch.ts); Ostra AI's calls, to the URL its operator configured,
+// take the default.
 
 import { getAddress, isAddress, type Address, type Hex, type PublicClient } from "viem";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
@@ -43,6 +47,19 @@ export const PAY_MAX_BODY_CHARS = 65_536;
 const REQUEST_TIMEOUT_MS = 120_000;
 /** A channel is used for a payment only while it has at least this long to live. */
 const MIN_LIFE_LEFT_SECONDS = 300;
+
+/** What sends one of `pay`'s requests: fetch(url, init), or one held to stricter rules. */
+export type PaySend = (url: string, init: RequestInit) => Promise<Response>;
+
+/** A PaySend's refusal of the request itself (a host that is not public): told to the caller as it is. */
+export class PayRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PayRefusedError";
+  }
+}
+
+const plainSend: PaySend = (url, init) => fetch(url, init);
 
 export type PayInput = {
   url: string;
@@ -106,9 +123,9 @@ export class PayService {
     return run;
   }
 
-  async #fetch(input: PayInput, headers: Record<string, string> = {}): Promise<Response> {
+  async #fetch(send: PaySend, input: PayInput, headers: Record<string, string> = {}): Promise<Response> {
     try {
-      return await fetch(input.url, {
+      return await send(input.url, {
         method: input.method ?? "GET",
         headers: { ...(input.headers ?? {}), ...headers },
         ...(input.body === undefined ? {} : { body: input.body }),
@@ -116,6 +133,8 @@ export class PayService {
         redirect: "manual",
       });
     } catch (err) {
+      // A refusal of the request itself (a host that is not public) is told as it is.
+      if (err instanceof PayRefusedError) throw err;
       throw new Error(`${input.url} cannot be reached: ${(err as Error).message}`);
     }
   }
@@ -188,8 +207,11 @@ export class PayService {
     return new x402HTTPClient(x);
   }
 
-  /** Sends the request; when the route asks for payment, pays it from a channel of this vault to the seller. */
-  pay(input: PayInput): Promise<PayResult> {
+  /**
+   * Sends the request; when the route asks for payment, pays it from a channel of this vault to the seller. Each of
+   * its requests goes through `send` (default fetch).
+   */
+  pay(input: PayInput, send: PaySend = plainSend): Promise<PayResult> {
     return this.#serial(async () => {
       let url: URL;
       try {
@@ -199,7 +221,7 @@ export class PayService {
       }
       if (url.protocol !== "https:" && url.protocol !== "http:") throw new RangeError("pay sends http(s) requests only");
       const maxPrice = parseTokenAmount(input.maxPrice);
-      const first = await this.#fetch(input);
+      const first = await this.#fetch(send, input);
       if (first.status !== 402) return this.#answer(first, null, null, undefined, input.maxBodyChars);
 
       let firstBody: unknown = null;
@@ -220,7 +242,7 @@ export class PayService {
         const exact = required.accepts.find((r) => exactOfferProblem(r, this.#config.x402Network, token) === null);
         if (exact !== undefined) {
           if (this.#wallet === null) throw new Error(`${input.url} is paid by a USDG transfer signed by the payer's own key (x402 exact), which this agent pays from a payment wallet: there is none here; nothing was paid`);
-          const w = await this.#wallet.payExact({ url: input.url, required, offer: exact, maxPrice, send: (headers) => this.#fetch(input, headers) });
+          const w = await this.#wallet.payExact({ url: input.url, required, offer: exact, maxPrice, send: (headers) => this.#fetch(send, input, headers) });
           const out = await this.#answer(w.answer, w.paid, null, w.note, input.maxBodyChars);
           return { ...out, wallet: { address: w.address, left: formatTokenAmount(w.left) } };
         }
@@ -284,7 +306,7 @@ export class PayService {
           }
         });
         r.pay = saved.pay;
-        answer = await this.#fetch(input, http.encodePaymentSignatureHeader(payload));
+        answer = await this.#fetch(send, input, http.encodePaymentSignatureHeader(payload));
         const result = await http.processPaymentResult(payload, (name) => answer.headers.get(name), answer.status);
         if (answer.status === 402 && result.recovered && attempt === 0) {
           // The seller had charged this channel more than recorded here: resynced, paid once more.
