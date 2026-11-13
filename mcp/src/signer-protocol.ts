@@ -5,19 +5,26 @@
 //
 //   request   {"id": n, "agent": "<agent id>", "token": "<hex>", "op": "<op>", "args": {...}}
 //   admin     {"id": n, "admin": "<hex>", "op": "agent.create" | "agent.rotate", "args": {"agent": "<agent id>"}}
+//             {"id": n, "admin": "<hex>", "op": "attest", "args": {"nonce": "<64 hex>"}}
 //   answer    {"id": n, "ok": true, "result": ...} or {"id": n, "ok": false, "error": "<message>"}
 //
 // The agent token is HMAC-SHA256(admin key, TOKEN_DOMAIN || agent id || "/" || epoch) and the admin token
 // HMAC-SHA256(admin key, ADMIN_DOMAIN): whoever holds the admin key (the gateway) hands each agent process its own
 // token, and a token opens that agent's seed only. agent.create and agent.rotate answer the agent's epoch; agent.rotate
 // raises it, so every token handed out before stops working (a leaked token is revoked without touching the others).
+// attest answers the enclave's attestation (the dstack guest agent's) over report data the signer derives from the
+// nonce (attestReportData), so whoever chose the nonce knows the quote is fresh and made for this request.
 
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { getAddress, isAddress, type Address, type Hex } from "viem";
 import { VAULT_AGENT_ACTIONS, type VaultAction } from "@ostraagent/sdk";
 
 export const TOKEN_DOMAIN = "OSTRA/CLOUD/SIGNER/TOKEN/v1";
 export const ADMIN_DOMAIN = "OSTRA/CLOUD/SIGNER/ADMIN/v1";
+/** What an attestation's report data commits to, before the nonce (attestReportData). */
+export const ATTEST_DOMAIN = "OSTRA/CLOUD/ATTEST/v1";
+/** An attestation nonce: 32 bytes, lower case hex. */
+export const ATTEST_NONCE = /^[0-9a-f]{64}$/;
 /** An agent id: what the gateway names a home by (remote.ts USER_ID). */
 export const AGENT_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 /** The largest request line taken. */
@@ -43,13 +50,19 @@ export const AGENT_OPS = [
   "tide.secret",
 ] as const;
 export type AgentOp = (typeof AGENT_OPS)[number];
-export const ADMIN_OPS = ["agent.create", "agent.rotate"] as const;
+export const ADMIN_OPS = ["agent.create", "agent.rotate", "attest"] as const;
 /** The operations that sign or open something (counted against the rate limit). */
 export const SIGNING_OPS: ReadonlySet<string> = new Set(["agent.signSpend", "voucher.sign", "voucher.signClose", "payment.signTransfer", "pad.signPost", "pad.unwrap"]);
 
 export function agentToken(adminKey: Uint8Array, agent: string, epoch: number): string {
   if (!Number.isSafeInteger(epoch) || epoch < 0) throw new RangeError("epoch must be a non-negative integer");
   return createHmac("sha256", adminKey).update(`${TOKEN_DOMAIN}${agent}/${epoch}`).digest("hex");
+}
+
+/** The report data of an attestation for `nonce` (ATTEST_NONCE): SHA-256(ATTEST_DOMAIN || the nonce's 32 bytes), hex. */
+export function attestReportData(nonce: string): string {
+  if (!ATTEST_NONCE.test(nonce)) throw new BadRequest("nonce must be 32 bytes, lower case hex");
+  return createHash("sha256").update(ATTEST_DOMAIN).update(Buffer.from(nonce, "hex")).digest("hex");
 }
 
 export function adminToken(adminKey: Uint8Array): string {

@@ -199,6 +199,16 @@ test("Ostra Cloud's signer: a hosted agent with no seed in its home, held to the
   const url = `http://${gatewayListen}`;
   await waitFor(`${url}/health`).catch((err: unknown) => assert.fail(`${String(err)}\n${tails()}`));
   assert.match(readFileSync(logs.gateway, "utf8"), /"sandbox":"bwrap","signer":true/);
+  // GET /attestation: anyone may ask (no token, CORS open); the nonce is checked; this signer seals from a file, so it
+  // has no TEE to attest and the gateway answers 503 (the enclave's own is checked on Ostra Cloud, by dstack-verifier).
+  const att = async (q: string) => {
+    const r = await fetch(`${url}/attestation${q}`);
+    return { status: r.status, cors: r.headers.get("access-control-allow-origin"), body: (await r.json()) as { error?: string } };
+  };
+  assert.deepEqual(await att("?nonce=xyz"), { status: 400, cors: "*", body: { error: "nonce must be 32 bytes, lower case hex (64 characters)" } });
+  assert.deepEqual(await att(`?nonce=${"AB".repeat(32)}`), { status: 400, cors: "*", body: { error: "nonce must be 32 bytes, lower case hex (64 characters)" } });
+  assert.deepEqual(await att(`?nonce=${"ab".repeat(32)}`), { status: 503, cors: "*", body: { error: "the attestation could not be made: ask again" } });
+  assert.match(readFileSync(logs.gateway, "utf8"), /"event":"attest_failed","message":"the signer refused: no attestation here: the signer runs outside a TEE/);
 
   const connect = async (bearer = token) => {
     const client = new Client({ name: "cloud-signer-test", version: "0.0.0" });

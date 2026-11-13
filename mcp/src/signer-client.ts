@@ -14,7 +14,7 @@ import { connect, type Socket } from "node:net";
 import { getAddress, isAddress, isHex, type Address, type Hex } from "viem";
 import { decodeAgentSpendMessage, wotsVerify, type PadWrap, type SignedAgentSpend, type VaultAction, type WotsSignatureRecord } from "@ostraagent/sdk";
 import type { AgentSeed, AgentSpendKey, CloseRequestFields, PadPostMessage, PaymentTransfer, VoucherFields } from "@ostraagent/core";
-import { AGENT_ID, MAX_LINE, MAX_OPEN, adminToken, encode, type AgentOp } from "./signer-protocol.ts";
+import { AGENT_ID, ATTEST_NONCE, MAX_LINE, MAX_OPEN, adminToken, attestReportData, encode, type AgentOp } from "./signer-protocol.ts";
 
 /** How long one request may wait for its answer. */
 const REQUEST_MS = 30_000;
@@ -412,5 +412,18 @@ export class SignerAdmin {
     const r = await this.#ask("agent.rotate", agent);
     if (!Number.isSafeInteger(r.epoch) || (r.epoch as number) < 1) throw new Error("the signer answered agent.rotate with no epoch");
     return r.epoch as number;
+  }
+
+  /**
+   * The enclave's attestation for `nonce` (ATTEST_NONCE): its report data (checked to be attestReportData(nonce)) and
+   * the attestation as the dstack guest agent encoded it.
+   */
+  async attest(nonce: string): Promise<{ reportData: string; attestation: string }> {
+    if (!ATTEST_NONCE.test(nonce)) throw new RangeError("a nonce is 32 bytes, lower case hex");
+    const r = await this.#line.request({ admin: this.#token, op: "attest", args: { nonce } });
+    if (r === null || typeof r !== "object") throw new Error("the signer answered attest with nothing");
+    const { reportData, attestation } = r as Record<string, unknown>;
+    if (reportData !== attestReportData(nonce) || typeof attestation !== "string" || attestation === "") throw new Error("the signer answered attest with no attestation for this nonce");
+    return { reportData, attestation };
   }
 }

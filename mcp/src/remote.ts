@@ -57,6 +57,11 @@
 //                                       could read the admin key and every token. No other OSTRA_SIGNER_* variable of
 //                                       the gateway's environment reaches a child
 //
+// With the signer, GET /attestation?nonce=<64 hex> answers anyone (no token; CORS open, so the Mini App can ask) the
+// enclave's attestation from the signer (signer-protocol.ts attest): {nonce, reportDataDomain, reportData,
+// attestation}, report data SHA-256(ATTEST_DOMAIN || nonce), so whoever chose the nonce knows the quote is fresh. At most
+// ATTESTS_PER_MINUTE a minute, for everyone together (each is a TDX quote); past it, 429.
+//
 // The other OSTRA_* variables of its environment (OSTRA_RPC_URL_FILE, OSTRA_DEPLOYMENT, the service URLs...) and a
 // few system ones (PASSED_ENV) are passed to the children; nothing else is. Per home it sets OSTRA_HOME,
 // OSTRA_AGENT_OF, OSTRA_PAD_FILES, OSTRA_FILES_ONLY_IN (tools read local files only from the home's own pad-files),
@@ -85,7 +90,7 @@ import { bundled, isEntry } from "./entry.ts";
 import { OWNER_TOOLS, REMOTE_REFUSED_TOOLS, RemoteAuth } from "./remote-auth.ts";
 import { ADMIN, MAX_SOCKETS_DIR, socketPath } from "./signer.ts";
 import { SignerAdmin } from "./signer-client.ts";
-import { agentToken } from "./signer-protocol.ts";
+import { ATTEST_DOMAIN, ATTEST_NONCE, agentToken } from "./signer-protocol.ts";
 
 /** The agent server each child runs: server.ts beside this file, or in the image the server bundle beside this one. */
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), bundled === null ? "server.ts" : "server.mjs");
@@ -94,6 +99,8 @@ const MAX_BODY = 1 << 20;
 const USER_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 /** A home's child may be started at most once per this many ms (each start spawns a server and reads the chain). */
 const OPEN_INTERVAL_MS = 2_000;
+/** The attestations the gateway asks the signer for per minute, for all callers together (the signer's own limit). */
+const ATTESTS_PER_MINUTE = 30;
 /** The sessions one home keeps at once (they share its child); one more ends the one idle longest. */
 const MAX_SESSIONS_PER_HOME = 16;
 /** The child's notifications every session of its home gets (the others are dropped). */
@@ -229,7 +236,7 @@ function codeDirs(): string[] {
  * The signer of OSTRA_REMOTE_SIGNER_SOCKETS and OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE (both or neither), or null. Its
  * sockets are never under the homes' root, nor the root under them.
  */
-function signerOf(root: string): { sockets: string; keyFile: string; adminKey: Buffer; admin: SignerAdmin } | null {
+function signerOf(root: string): { sockets: string; keyFile: string; adminKey: Buffer; admin: SignerAdmin; attestAdmin: SignerAdmin } | null {
   const sockets = process.env.OSTRA_REMOTE_SIGNER_SOCKETS ?? "";
   const keyFile = process.env.OSTRA_REMOTE_SIGNER_ADMIN_KEY_FILE ?? "";
   if (sockets === "" && keyFile === "") return null;
@@ -243,7 +250,8 @@ function signerOf(root: string): { sockets: string; keyFile: string; adminKey: B
   const t = readFileSync(keyFile, "utf8").trim().replace(/^0x/, "");
   if (!/^[0-9a-fA-F]{64}$/.test(t)) throw new Error(`${keyFile} must hold 32 bytes as hex`);
   const adminKey = Buffer.from(t, "hex");
-  return { sockets, keyFile, adminKey, admin: new SignerAdmin(socketPath(sockets, ADMIN), adminKey) };
+  // Attestations on a connection of their own: one that times out ends its connection, never a home's agent.create.
+  return { sockets, keyFile, adminKey, admin: new SignerAdmin(socketPath(sockets, ADMIN), adminKey), attestAdmin: new SignerAdmin(socketPath(sockets, ADMIN), adminKey) };
 }
 
 async function main(): Promise<void> {
@@ -956,6 +964,29 @@ async function main(): Promise<void> {
     return null;
   };
 
+  /** When the attestations of the last minute were asked for (ATTESTS_PER_MINUTE at most). */
+  const attested: number[] = [];
+  const attestation = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify(body));
+    };
+    if (signer === null) return json(404, { error: "no attestation here: the gateway runs without a signer" });
+    const nonce = new URL(req.url ?? "/", "http://gateway").searchParams.get("nonce") ?? "";
+    if (!ATTEST_NONCE.test(nonce)) return json(400, { error: "nonce must be 32 bytes, lower case hex (64 characters)" });
+    const now = Date.now();
+    while (attested.length > 0 && now - (attested[0] as number) >= 60_000) attested.shift();
+    if (attested.length >= ATTESTS_PER_MINUTE) return json(429, { error: "too many attestations this minute: ask again in a minute" });
+    attested.push(now);
+    try {
+      const a = await signer.attestAdmin.attest(nonce);
+      json(200, { nonce, reportDataDomain: ATTEST_DOMAIN, reportData: a.reportData, attestation: a.attestation });
+    } catch (err) {
+      log("attest_failed", { message: (err as Error).message.slice(0, 200) });
+      json(503, { error: "the attestation could not be made: ask again" });
+    }
+  };
+
   const server = createServer(async (req, res) => {
     let counted: Session | null = null;
     let opened: Session | null = null;
@@ -966,6 +997,7 @@ async function main(): Promise<void> {
         res.end(JSON.stringify({ ok: true, sessions: sessions.size, children: homes.size }));
         return;
       }
+      if (path === "/attestation" && req.method === "GET") return await attestation(req, res);
       if (auth !== null && path !== "/mcp" && (await auth.handle(req, res, path, new URL(req.url ?? "/", "http://gateway")))) return;
       if (path !== "/mcp") return reply(res, 404, "not found");
       const u = await authenticate(req);

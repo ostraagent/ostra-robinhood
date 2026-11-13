@@ -5,7 +5,7 @@
 // framing and the rate limits are enforced.
 
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { connect } from "node:net";
@@ -29,7 +29,7 @@ import {
 } from "@ostraagent/sdk";
 import { TRANSFER_WITH_AUTHORIZATION_TYPE } from "@ostraagent/core";
 import { Signer, socketPath, type SignerOptions } from "../src/signer.ts";
-import { MAX_LINE, adminToken, agentToken } from "../src/signer-protocol.ts";
+import { MAX_LINE, adminToken, agentToken, attestReportData } from "../src/signer-protocol.ts";
 
 const A = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`) as Address;
 const adminKey = randomBytes(32);
@@ -166,6 +166,20 @@ test("tokens: agent.rotate revokes an agent's tokens only; admin and agent token
   // The admin's socket serves the admin only, and an agent's socket never runs an admin op.
   assert.equal((await call(ADMIN, { agent: "alice", token: agentToken(adminKey, "alice", 0), op: "tide.secret", args: { chainId: ROBINHOOD_CHAIN_ID, tide: A(1) } })).error, "this socket serves another principal");
   assert.equal((await call("alice", { admin: adminToken(adminKey), op: "agent.rotate", args: { agent: "alice" } })).error, "this socket serves another principal");
+});
+
+test("attest: the admin's only, its nonce 32 bytes of lower case hex, refused outside a TEE (a seal from a file)", async () => {
+  const nonce = "ab".repeat(32);
+  // The report data: SHA-256 of the domain and the nonce's 32 bytes (the enclave's quote commits to it).
+  assert.equal(attestReportData(nonce), createHash("sha256").update(Buffer.concat([Buffer.from("OSTRA/CLOUD/ATTEST/v1"), Buffer.from(nonce, "hex")])).digest("hex"));
+  for (const bad of ["AB".repeat(32), "ab".repeat(31), "ab".repeat(33), `0x${"ab".repeat(32)}`, ""]) assert.throws(() => attestReportData(bad), /nonce must be 32 bytes/);
+  const attest = (args: Record<string, unknown>, token = adminToken(adminKey)) => call(ADMIN, { admin: token, op: "attest", args });
+  assert.equal((await attest({ nonce })).error, "no attestation here: the signer runs outside a TEE (its seal is from a file)");
+  assert.equal((await attest({ nonce: "AB".repeat(32) })).error, "nonce must be 32 bytes, lower case hex");
+  assert.equal((await attest({ nonce: 7 })).error, "nonce must be 32 bytes, lower case hex");
+  assert.equal((await attest({ nonce, more: 1 })).error, "attest takes exactly nonce");
+  assert.equal((await attest({ nonce }, agentToken(adminKey, "alice", 0))).error, "not authorized");
+  assert.equal((await call("alice", { admin: adminToken(adminKey), op: "attest", args: { nonce } })).error, "this socket serves another principal");
 });
 
 test("vouchers, close requests, EIP-3009 transfers and Ostrapad posts recover to the keys the signer reports", async () => {

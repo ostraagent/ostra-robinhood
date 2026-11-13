@@ -151,6 +151,10 @@ test("the remote gateway: an agent reached over Streamable HTTP, held to the own
   );
   const url = `http://${gatewayListen}`;
   await waitFor(`${url}/health`).catch((err: unknown) => assert.fail(`${String(err)}\n${tails()}`));
+  // Without a signer there is no enclave to attest.
+  const noAtt = await fetch(`${url}/attestation?nonce=${"ab".repeat(32)}`);
+  assert.equal(noAtt.status, 404);
+  assert.deepEqual(await noAtt.json(), { error: "no attestation here: the gateway runs without a signer" });
 
   // A wrong token, or none, is refused before any session.
   for (const auth of [{}, { authorization: "Bearer wrong" }]) {

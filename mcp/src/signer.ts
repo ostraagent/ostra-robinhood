@@ -22,7 +22,9 @@
 //   DSTACK_SOCK                  the dstack guest agent's socket (default /var/run/dstack.sock)
 //
 // The dstack socket is mounted into the signer's container only: GetKey derives from the app key and the path alone,
-// so any container of the app that reaches the socket would get the same seal key.
+// so any container of the app that reaches the socket would get the same seal key. The signer also answers the
+// gateway's attest (signer-protocol.ts): the guest agent's Attest over report data derived from the caller's nonce, at
+// most ATTESTS_PER_MINUTE a minute; with a seal from a file there is no guest agent, and attest is refused.
 //
 // A seed is sealed with AES-256-GCM under a key derived (HKDF-SHA256) from the seal key, the agent id as associated
 // data, so a sealed seed opens only in this app, and only as the agent it was made for. Logs are JSON lines on stderr
@@ -52,6 +54,7 @@ import {
   adminToken,
   agentAction,
   agentToken,
+  attestReportData,
   bytes,
   chainId,
   encode,
@@ -92,6 +95,10 @@ const CONNECTIONS_PER_MINUTE = 120;
 const WRITE_CAP = 256 * 1024;
 /** The longest sockets directory: "/agent-" + a 63-character id + "/sock" stays within a socket path's 107 bytes. */
 export const MAX_SOCKETS_DIR = 107 - "/agent-".length - 63 - "/sock".length;
+/** The attestations the signer asks the guest agent for per minute (each is a TDX quote). */
+const ATTESTS_PER_MINUTE = 30;
+/** The longest attestation taken from the guest agent (hex characters): the answer must fit a signer-client line. */
+const MAX_ATTESTATION = 3 * MAX_LINE;
 /** The associated data of the canary: not an agent id (AGENT_ID has no "/"), so no seed can be swapped in for it. */
 const CANARY_AAD = "OSTRA/CLOUD/SIGNER/CANARY/v1";
 
@@ -133,6 +140,41 @@ export function dstackGetKey(sock: string, path: string): Promise<Buffer> {
       },
     );
     q.setTimeout(20_000, () => q.destroy(new Error("dstack GetKey timeout")));
+    q.on("error", reject);
+    q.end(body);
+  });
+}
+
+/**
+ * The dstack guest agent's Attest (POST /v1/Attest over its Unix socket, as the proof of 11 Nov 2026 verified with
+ * dstack-verifier 0.6.3): the attestation (quote, event log, VM config) whose report data is `reportData`, as the
+ * guest agent encoded it (passed on unchanged: a verifier takes it as it is).
+ */
+export function dstackAttest(sock: string, reportData: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ report_data: reportData, include_boottime_gpu_evidence: false });
+    const q = httpRequest(
+      { socketPath: sock, path: "/v1/Attest", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
+      (res) => {
+        let b = "";
+        res.on("data", (x) => {
+          b += x;
+          if (b.length > MAX_ATTESTATION + 1024) q.destroy(new Error("dstack Attest answered too much"));
+        });
+        res.on("end", () => {
+          let a: unknown;
+          try {
+            a = (JSON.parse(b) as { attestation?: unknown }).attestation;
+          } catch {
+            return reject(new Error(`dstack Attest answered ${res.statusCode} without an attestation`));
+          }
+          if (res.statusCode !== 200 || typeof a !== "string" || !/^[0-9A-Za-z+/=x]+$/.test(a) || a.length > MAX_ATTESTATION) return reject(new Error(`dstack Attest answered ${res.statusCode} without an attestation`));
+          resolve(a);
+        });
+      },
+    );
+    // Below the client's 30 s (signer-client.ts REQUEST_MS): a stuck guest agent is answered as an error.
+    q.setTimeout(15_000, () => q.destroy(new Error("dstack Attest timeout")));
     q.on("error", reject);
     q.end(body);
   });
@@ -312,6 +354,8 @@ export type SignerOptions = {
   leaseMs?: number;
   /** Called once if the lease is lost (another signer took the root over): main() exits non-zero then. */
   onLeaseLost?: () => void;
+  /** The enclave's attestation over report data (hex), as the guest agent encodes it (dstackAttest); absent: attest is refused. */
+  attest?: (reportData: string) => Promise<string>;
 };
 
 /**
@@ -350,6 +394,7 @@ export class Signer {
   readonly #lines: Budget;
   readonly #bytes: Bucket;
   readonly #accepts: Bucket;
+  readonly #attests = new Bucket(ATTESTS_PER_MINUTE);
   /** The lock on the root: one signer at a time on these seeds (released by close): this instance's nonce in it, and
    *  the timer that keeps its lease. */
   #lockNonce: string | undefined;
@@ -837,6 +882,18 @@ export class Signer {
       const r = obj(parsed, "a request");
       id = r.id ?? null;
       if (typeof id !== "number" && typeof id !== "string") throw new BadRequest("id must be a number or a string");
+      if (r.op === "attest") {
+        exact(r, ["id", "admin", "op", "args"], "an admin request");
+        if (conn.principal !== ADMIN) throw new BadRequest("this socket serves another principal");
+        if (!this.#tokenOk(r.admin, this.#admin)) throw new BadRequest("not authorized");
+        this.#only(conn, ADMIN);
+        const a = exact(obj(r.args, "args"), ["nonce"], r.op);
+        if (typeof a.nonce !== "string") throw new BadRequest("nonce must be 32 bytes, lower case hex");
+        const reportData = attestReportData(a.nonce);
+        if (this.#o.attest === undefined) throw new BadRequest("no attestation here: the signer runs outside a TEE (its seal is from a file)");
+        if (!this.#attests.take(ADMIN, 1)) throw new BadRequest("rate limit: too many attestations this minute");
+        return { id, ok: true, result: { reportData, attestation: await this.#o.attest(reportData) } };
+      }
       if (r.op === "agent.create" || r.op === "agent.rotate") {
         exact(r, ["id", "admin", "op", "args"], "an admin request");
         if (conn.principal !== ADMIN) throw new BadRequest("this socket serves another principal");
@@ -1085,11 +1142,13 @@ async function main(): Promise<void> {
     }
   }
   const adminKey = await hexFile(adminFile, "the admin key");
+  const dstackSock = env.DSTACK_SOCK ?? "/var/run/dstack.sock";
   let sealKey: Uint8Array;
-  if (sealMode === "dstack") sealKey = await dstackKey(env.DSTACK_SOCK ?? "/var/run/dstack.sock");
+  if (sealMode === "dstack") sealKey = await dstackKey(dstackSock);
   else if (sealMode.startsWith("file:")) sealKey = await hexFile(sealMode.slice(5), "the seal key");
   else throw new Error('OSTRA_SIGNER_SEAL must be "dstack" or "file:<path>"');
-  const signer = new Signer({ sockets, root, adminKey, sealKey, rate, workRate, onLeaseLost: () => (process.exitCode = 1) });
+  const attest = sealMode === "dstack" ? (reportData: string) => dstackAttest(dstackSock, reportData) : undefined;
+  const signer = new Signer({ sockets, root, adminKey, sealKey, rate, workRate, attest, onLeaseLost: () => (process.exitCode = 1) });
   await signer.listen();
   let stopping = false;
   const stop = () => {
