@@ -14,8 +14,9 @@
 #   front    the one published port (8080, behind the dstack gateway's TLS), its bytes passed to the gateway
 #
 # The values from the deployment's encrypted environment (dstack's, never in this file): OSTRA_RPC_URL (the chain's
-# RPC, with its key) and OSTRA_REMOTE_USERS_JSON (the operators' fixed tokens, by their SHA-256: {"users":[...]},
-# mcp/scripts/remote-user.ts). dstack gives them to compose as its process environment (exactly, from JSON).
+# RPC, with its key), OSTRA_REMOTE_USERS_JSON (the operators' fixed tokens, by their SHA-256: {"users":[...]},
+# mcp/scripts/remote-user.ts) and OSTRA_REMOTE_TELEGRAM_TOKEN (Ostra Bot's token from BotFather). dstack gives them to
+# compose as its process environment (exactly, from JSON).
 
 services:
   signer:
@@ -44,8 +45,9 @@ services:
   gateway:
     image: "@IMAGE@"
     runtime: sysbox-runc
-    # The users file is written from the encrypted environment at each start (0600, outside the homes).
-    command: ["sh", "-c", "umask 077 && printf '%s' \"$$OSTRA_REMOTE_USERS_JSON\" > /run/ostra-users/users.json && unset OSTRA_REMOTE_USERS_JSON && exec node /opt/ostra/dist/gateway.mjs"]
+    # The users file and the bot's token are written from the encrypted environment at each start (0600, outside the
+    # homes), and taken out of the environment before the gateway starts: no child ever gets them.
+    command: ["sh", "-c", "umask 077 && printf '%s' \"$$OSTRA_REMOTE_USERS_JSON\" > /run/ostra-users/users.json && printf '%s' \"$$OSTRA_REMOTE_TELEGRAM_TOKEN\" > /run/ostra-users/telegram.token && unset OSTRA_REMOTE_USERS_JSON OSTRA_REMOTE_TELEGRAM_TOKEN && exec node /opt/ostra/dist/gateway.mjs"]
     depends_on:
       signer:
         condition: service_healthy
@@ -56,6 +58,11 @@ services:
       OSTRA_REMOTE_ROOT: /var/lib/ostra-remote
       OSTRA_REMOTE_USERS: /run/ostra-users/users.json
       OSTRA_REMOTE_USERS_JSON: ${OSTRA_REMOTE_USERS_JSON:?set the operators users}
+      # Ostra Bot (remote-telegram.ts): its token, its quota, and the web app whose /tg page is its Mini App.
+      OSTRA_REMOTE_TELEGRAM_TOKEN: ${OSTRA_REMOTE_TELEGRAM_TOKEN:?set the bot token}
+      OSTRA_REMOTE_TELEGRAM_TOKEN_FILE: /run/ostra-users/telegram.token
+      OSTRA_REMOTE_TELEGRAM_QUOTA: "15"
+      OSTRA_REMOTE_APP_URL: https://app.ostraagent.xyz
       OSTRA_REMOTE_ALLOWED_HOSTS: "@HOST@"
       OSTRA_REMOTE_SANDBOX: bwrap
       OSTRA_REMOTE_SIGNER_SOCKETS: /run/ostra-signer

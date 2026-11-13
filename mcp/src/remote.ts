@@ -62,6 +62,15 @@
 // attestation}, report data SHA-256(ATTEST_DOMAIN || nonce), so whoever chose the nonce knows the quote is fresh. At most
 // ATTESTS_PER_MINUTE a minute, for everyone together (each is a TDX quote); past it, 429.
 //
+// Ostra Bot (remote-telegram.ts, Ostra Cloud stage A), with OSTRA_REMOTE_TELEGRAM_TOKEN_FILE (and the sandbox): the
+// gateway is also a Telegram bot, each Telegram user's agent a home of its own (t<HMAC>), connected through the web
+// app (/tg/* routes, from OSTRA_REMOTE_APP_URL's origin only).
+//   OSTRA_REMOTE_TELEGRAM_TOKEN_FILE  the bot's token (0600; never passed to a child or seen by a sandbox)
+//   OSTRA_REMOTE_TELEGRAM_QUOTA       Telegram users bound at once (default 15)
+//   OSTRA_REMOTE_TELEGRAM_BUDGET      a message's AI budget until its owner sets one (USDG, default 0.05)
+//   OSTRA_REMOTE_TELEGRAM_POLL        on (default) or off: long polling of Telegram's updates (off: the routes only)
+// A Telegram home's child is kept OSTRA_REMOTE_IDLE_SECONDS after its last message.
+//
 // The other OSTRA_* variables of its environment (OSTRA_RPC_URL_FILE, OSTRA_DEPLOYMENT, the service URLs...) and a
 // few system ones (PASSED_ENV) are passed to the children; nothing else is. Per home it sets OSTRA_HOME,
 // OSTRA_AGENT_OF, OSTRA_PAD_FILES, OSTRA_FILES_ONLY_IN (tools read local files only from the home's own pad-files),
@@ -87,7 +96,9 @@ import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, isInitializeReque
 import { robinhoodChain } from "@ostraagent/sdk";
 import { loadConfig } from "./config.ts";
 import { bundled, isEntry } from "./entry.ts";
+import { parseTokenAmount } from "@ostraagent/core";
 import { OWNER_TOOLS, REMOTE_REFUSED_TOOLS, RemoteAuth } from "./remote-auth.ts";
+import { MAX_BUDGET_UNITS, MIN_BUDGET_UNITS, RemoteTelegram } from "./remote-telegram.ts";
 import { ADMIN, MAX_SOCKETS_DIR, socketPath } from "./signer.ts";
 import { SignerAdmin } from "./signer-client.ts";
 import { ATTEST_DOMAIN, ATTEST_NONCE, agentToken } from "./signer-protocol.ts";
@@ -193,7 +204,7 @@ export function parseUsers(text: string): Omit<User, "grant">[] {
     seen.add(id);
     if (typeof tokenSha256 !== "string" || !/^[0-9a-f]{64}$/.test(tokenSha256)) throw new Error(`user ${id}: tokenSha256 is 64 hex digits`);
     if (typeof vault !== "string" || !isAddress(vault, { strict: false })) throw new Error(`user ${id}: vault is an address`);
-    if (id.startsWith("v") && /^v[0-9a-f]{40}$/.test(id)) throw new Error(`user ${id}: ids of v and 40 hex digits are OAuth grants' homes`);
+    if (/^[vt][0-9a-f]{40}$/.test(id)) throw new Error(`user ${id}: ids of v or t and 40 hex digits are the homes of OAuth grants and of Ostra Bot`);
     return { id, tokenSha256: Buffer.from(tokenSha256, "hex"), vault: getAddress(vault), fixed: true };
   });
 }
@@ -257,7 +268,7 @@ function signerOf(root: string): { sockets: string; keyFile: string; adminKey: B
 async function main(): Promise<void> {
   const usersPath = process.env.OSTRA_REMOTE_USERS !== undefined && process.env.OSTRA_REMOTE_USERS !== "" ? process.env.OSTRA_REMOTE_USERS : null;
   const publicUrl = process.env.OSTRA_REMOTE_PUBLIC_URL !== undefined && process.env.OSTRA_REMOTE_PUBLIC_URL !== "" ? process.env.OSTRA_REMOTE_PUBLIC_URL.replace(/\/+$/, "") : null;
-  if (usersPath === null && publicUrl === null) throw new Error("set OSTRA_REMOTE_PUBLIC_URL (OAuth), OSTRA_REMOTE_USERS (fixed tokens), or both");
+  if (usersPath === null && publicUrl === null && (process.env.OSTRA_REMOTE_TELEGRAM_TOKEN_FILE ?? "") === "") throw new Error("set OSTRA_REMOTE_PUBLIC_URL (OAuth), OSTRA_REMOTE_USERS (fixed tokens), OSTRA_REMOTE_TELEGRAM_TOKEN_FILE (Ostra Bot), or more than one");
   const root = required("OSTRA_REMOTE_ROOT");
   if (usersPath !== null) checkPrivatePath(usersPath, 0o600);
   checkPrivatePath(root, 0o700);
@@ -385,6 +396,9 @@ async function main(): Promise<void> {
     }
   };
 
+  /** Ostra Bot: the homes kept running a while after a chat turn (each holds one of its home's `inflight`), by home. */
+  const keepers = new Map<Home, NodeJS.Timeout>();
+
   /**
    * Ends a home's child: its sessions first, then the child, waiting for its process to exit. Every later call waits
    * for the same end. The home's slot is freed only once the child is gone; a child that does not exit keeps its home
@@ -392,6 +406,11 @@ async function main(): Promise<void> {
    */
   const endHome = (h: Home, why: string): Promise<void> => {
     if (h.ending !== null) return h.ending;
+    const kept = keepers.get(h);
+    if (kept !== undefined) {
+      clearTimeout(kept);
+      keepers.delete(h);
+    }
     let done!: () => void;
     let failed!: (err: unknown) => void;
     h.ending = new Promise<void>((res, rej) => {
@@ -573,16 +592,16 @@ async function main(): Promise<void> {
   /** Connect children running now (short-lived, outside homes): counted with the homes against maxSessions. */
   let connecting = 0;
 
-  /** The gateway's own request to a home's child (never a client's): its answer, or an error after CHILD_CALL_MS. */
-  const askChild = (h: Home, method: string, params: Record<string, unknown>): Promise<JSONRPCMessage> =>
+  /** The gateway's own request to a home's child (never a client's): its answer, or an error after `timeoutMs`. */
+  const askChild = (h: Home, method: string, params: Record<string, unknown>, timeoutMs = CHILD_CALL_MS): Promise<JSONRPCMessage> =>
     new Promise<JSONRPCMessage>((resolve, reject) => {
       const id = `${mineId}${++mineSeq}`;
       h.inflight++;
       const timer = setTimeout(() => {
         h.mine.delete(id);
         finish();
-        reject(new Error(`${method}: no answer from the home's server within ${CHILD_CALL_MS / 1000} s`));
-      }, CHILD_CALL_MS);
+        reject(new Error(`${method}: no answer from the home's server within ${Math.round(timeoutMs / 1000)} s`));
+      }, timeoutMs);
       const finish = () => {
         clearTimeout(timer);
         h.inflight--;
@@ -834,13 +853,13 @@ async function main(): Promise<void> {
   };
 
   /**
-   * A new agent key root from vault `vault`'s home, for a connect (remote-auth.ts), under the home's lock: asked of
-   * the home's live child when there is one (its sessions go on), else of a short-lived child, gone before the lock is
-   * let go.
+   * A new agent key root from home `id` of vault `vault`, for a connect (remote-auth.ts: the vault's home; Ostra Bot:
+   * the home of a Telegram user and the vault), under the home's lock: asked of the home's live child when there is
+   * one (its sessions go on), else of a short-lived child, gone before the lock is let go.
    */
-  const issueAgentKey = (vault: Address) =>
-    withUserLock(vaultUserId(vault), async () => {
-      const u: User = { id: vaultUserId(vault), tokenSha256: Buffer.alloc(32), vault, fixed: false, grant: null };
+  const issueAgentKey = (id: string, vault: Address) =>
+    withUserLock(id, async () => {
+      const u: User = { id, tokenSha256: Buffer.alloc(32), vault, fixed: false, grant: null };
       const live = homes.get(u.id);
       if (live !== undefined && live.init !== null && live.ending === null) {
         const m = await callChild(live, "agent_key_request", {});
@@ -874,6 +893,57 @@ async function main(): Promise<void> {
         closeSync(stderr);
         await gone(pid).finally(() => connecting--);
       }
+    });
+
+  /**
+   * Ostra Bot: keeps home `h` running `ms` more (its keeper holds one of its `inflight`; a later turn restarts the
+   * wait). Its child ends once the wait is over and nothing else uses it.
+   */
+  const keepFor = (h: Home, ms: number): void => {
+    if (h.ending !== null) return;
+    const kept = keepers.get(h);
+    if (kept !== undefined) clearTimeout(kept);
+    else h.inflight++;
+    const timer = setTimeout(() => {
+      keepers.delete(h);
+      h.inflight--;
+      endHomeIfUnused(h, "idle");
+    }, ms);
+    timer.unref();
+    keepers.set(h, timer);
+  };
+
+  /**
+   * Ostra Bot: runs `fn` with home `id`'s child (vault `vault`), started under the home's lock when it is not running;
+   * the child is held while `fn` runs and kept idleSeconds after.
+   */
+  const withTelegramHome = async <T>(id: string, vault: Address, fn: (ask: (method: string, params: Record<string, unknown>, timeoutMs: number) => Promise<JSONRPCMessage>) => Promise<T>): Promise<T> => {
+    const h = await withUserLock(id, async () => {
+      let x = homes.get(id);
+      if (x !== undefined && x.ending === null && x.vault !== vault) await endHome(x, "vault_changed").catch(() => {});
+      if (x !== undefined && x.ending !== null) {
+        await x.ending.catch(() => {});
+        x = undefined;
+      }
+      if (x === undefined) x = await spawnHome({ id, tokenSha256: Buffer.alloc(32), vault, fixed: false, grant: null });
+      // Held before the lock is let go: nothing ends it between its start and fn.
+      x.inflight++;
+      return x;
+    });
+    try {
+      return await fn((method, params, timeoutMs) => askChild(h, method, params, timeoutMs));
+    } finally {
+      keepFor(h, idleSeconds * 1000);
+      h.inflight--;
+      endHomeIfUnused(h, "unused");
+    }
+  };
+
+  /** Ends home `id`'s child if it runs (Ostra Bot: a binding that ended). */
+  const endHomeById = (id: string, why: string): Promise<void> =>
+    withUserLock(id, async () => {
+      const h = homes.get(id);
+      if (h !== undefined) await endHome(h, why);
     });
 
   /**
@@ -913,26 +983,69 @@ async function main(): Promise<void> {
     return n;
   };
 
-  if (publicUrl !== null) {
-    // The chain as the children read it: the deployment and the RPCs of their environment (config.ts). OSTRA_PAY_PROXY
-    // is the children's (hosted ones only), never the gateway's.
-    const config = await loadConfig({ ...process.env, OSTRA_PAY_PROXY: "" });
+  const appUrl = (process.env.OSTRA_REMOTE_APP_URL ?? "https://app.ostraagent.xyz").replace(/\/+$/, "");
+  const tgTokenFile = process.env.OSTRA_REMOTE_TELEGRAM_TOKEN_FILE !== undefined && process.env.OSTRA_REMOTE_TELEGRAM_TOKEN_FILE !== "" ? process.env.OSTRA_REMOTE_TELEGRAM_TOKEN_FILE : null;
+  if (tgTokenFile !== null && !sandbox) throw new Error("OSTRA_REMOTE_TELEGRAM_TOKEN_FILE needs OSTRA_REMOTE_SANDBOX=bwrap: Ostra Bot runs strangers' agents");
+  // The chain as the children read it: the deployment and the RPCs of their environment (config.ts). OSTRA_PAY_PROXY
+  // is the children's (hosted ones only), never the gateway's.
+  const config = publicUrl !== null || tgTokenFile !== null ? await loadConfig({ ...process.env, OSTRA_PAY_PROXY: "" }) : null;
+  const chainClient = config === null ? null : (createPublicClient({ chain: robinhoodChain, transport: http(config.rpcUrl, { retryCount: 2, timeout: 8_000 }) }) as PublicClient);
+  const logsClient = config === null ? null : (createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 2, timeout: 20_000 }) }) as PublicClient);
+
+  if (publicUrl !== null && config !== null && chainClient !== null && logsClient !== null) {
     const keyStateSeconds = seconds("OSTRA_REMOTE_KEY_STATE_SECONDS", 1, 300);
     const redirects = (process.env.OSTRA_REMOTE_REDIRECTS ?? "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback").split(",").map((r) => r.trim()).filter((r) => r !== "");
     auth = new RemoteAuth({
       publicUrl,
-      appUrl: (process.env.OSTRA_REMOTE_APP_URL ?? "https://app.ostraagent.xyz").replace(/\/+$/, ""),
+      appUrl,
       dbPath: process.env.OSTRA_REMOTE_DB !== undefined && process.env.OSTRA_REMOTE_DB !== "" ? process.env.OSTRA_REMOTE_DB : join(root, "auth.sqlite"),
       redirects: { exact: redirects, loopback: process.env.OSTRA_REMOTE_LOOPBACK !== "no" },
-      client: createPublicClient({ chain: robinhoodChain, transport: http(config.rpcUrl, { retryCount: 2, timeout: 8_000 }) }) as PublicClient,
-      logsClient: createPublicClient({ chain: robinhoodChain, transport: http(config.logsRpcUrl, { retryCount: 2, timeout: 20_000 }) }) as PublicClient,
+      client: chainClient,
+      logsClient,
       deployment: config.deployment,
-      issueAgentKey,
+      issueAgentKey: (vault) => issueAgentKey(vaultUserId(vault), vault),
       homeId: vaultUserId,
       onGrantEnded: (grant) => endGrantSessions(grant, "grant_ended"),
       refreshGraceSeconds: seconds("OSTRA_REMOTE_REFRESH_GRACE_SECONDS", 0, 300),
       keyStateMs: keyStateSeconds === undefined ? undefined : keyStateSeconds * 1000,
       log,
+    });
+  }
+
+  /** Ostra Bot (remote-telegram.ts), with OSTRA_REMOTE_TELEGRAM_TOKEN_FILE; null otherwise. */
+  let telegram: RemoteTelegram | null = null;
+  if (tgTokenFile !== null && config !== null && chainClient !== null && logsClient !== null) {
+    checkPrivatePath(tgTokenFile, 0o600);
+    const tgToken = readFileSync(tgTokenFile, "utf8").trim();
+    if (!/^[0-9]{1,20}:[A-Za-z0-9_-]{20,100}$/.test(tgToken)) throw new Error(`${tgTokenFile} does not hold a Telegram bot token`);
+    const quota = Number(process.env.OSTRA_REMOTE_TELEGRAM_QUOTA ?? "15");
+    if (!Number.isInteger(quota) || quota < 1 || quota > maxSessions) throw new Error(`OSTRA_REMOTE_TELEGRAM_QUOTA is a whole number from 1 to OSTRA_REMOTE_MAX_SESSIONS (${maxSessions})`);
+    const budgetText = process.env.OSTRA_REMOTE_TELEGRAM_BUDGET ?? "0.05";
+    let defaultBudget: bigint;
+    try {
+      defaultBudget = parseTokenAmount(budgetText);
+    } catch {
+      throw new Error("OSTRA_REMOTE_TELEGRAM_BUDGET is USDG with at most 6 decimals");
+    }
+    if (defaultBudget < MIN_BUDGET_UNITS || defaultBudget > MAX_BUDGET_UNITS) throw new Error("OSTRA_REMOTE_TELEGRAM_BUDGET is from 0.001 to 5 USDG");
+    const poll = process.env.OSTRA_REMOTE_TELEGRAM_POLL ?? "on";
+    if (poll !== "on" && poll !== "off") throw new Error("OSTRA_REMOTE_TELEGRAM_POLL is on or off");
+    telegram = new RemoteTelegram({
+      token: tgToken,
+      appUrl,
+      dbPath: join(root, "telegram.sqlite"),
+      quota,
+      defaultBudget,
+      poll: poll === "on",
+      client: chainClient,
+      logsClient,
+      deployment: config.deployment,
+      homeKey: hidKey,
+      issueAgentKey,
+      withHome: withTelegramHome,
+      endHome: endHomeById,
+      log,
+      redact: [config.rpcUrl, config.logsRpcUrl],
     });
   }
 
@@ -998,6 +1111,7 @@ async function main(): Promise<void> {
         return;
       }
       if (path === "/attestation" && req.method === "GET") return await attestation(req, res);
+      if (telegram !== null && path.startsWith("/tg/") && (await telegram.handle(req, res, path, new URL(req.url ?? "/", "http://gateway")))) return;
       if (auth !== null && path !== "/mcp" && (await auth.handle(req, res, path, new URL(req.url ?? "/", "http://gateway")))) return;
       if (path !== "/mcp") return reply(res, 404, "not found");
       const u = await authenticate(req);
@@ -1047,9 +1161,13 @@ async function main(): Promise<void> {
   // Each session holds its GET stream and a POST or two: three connections per session a home may keep.
   server.maxConnections = 3 * maxSessions * MAX_SESSIONS_PER_HOME + 16;
   server.headersTimeout = 20_000;
-  server.listen(port, host, () => log("listening", { listen, users: users.length, idleSeconds, maxSessions, oauth: auth !== null, sandbox: sandboxMode, signer: signer !== null }));
+  server.listen(port, host, () => {
+    log("listening", { listen, users: users.length, idleSeconds, maxSessions, oauth: auth !== null, sandbox: sandboxMode, signer: signer !== null, telegram: telegram !== null });
+    telegram?.start();
+  });
   const stop = () => {
     log("stopping", { children: homes.size });
+    telegram?.stop();
     server.close();
     void Promise.allSettled([...homes.values()].map((h) => endHome(h, "stopping"))).then(() => process.exit(0));
   };
