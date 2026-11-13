@@ -23,9 +23,8 @@ import { ADDRCONFIG } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect, isIP, type Socket } from "node:net";
-import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
+import { isEntry } from "./entry.ts";
 import { EGRESS_REFUSED_HEADER, isPublicAddress } from "./public-fetch.ts";
 
 const CONNECT_MS = 10_000;
@@ -322,18 +321,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
 }
 
-/** True when this module is the program node runs. */
-function isEntry(): boolean {
-  const arg = process.argv[1];
-  if (arg === undefined) return false;
-  try {
-    return import.meta.url === pathToFileURL(realpathSync(arg)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (isEntry()) {
+if (isEntry("egress", import.meta.url)) {
   main().catch((err: unknown) => {
     process.stderr.write(`${JSON.stringify({ t: new Date().toISOString(), event: "fatal", message: err instanceof Error ? err.message : String(err) })}\n`);
     process.exit(1);

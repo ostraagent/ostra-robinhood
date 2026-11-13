@@ -20,7 +20,7 @@
 services:
   signer:
     image: "@IMAGE@"
-    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/signer.ts"]
+    command: ["node", "/opt/ostra/dist/signer.mjs"]
     network_mode: none
     environment:
       OSTRA_SIGNER_SOCKETS: /run/ostra-signer
@@ -45,7 +45,7 @@ services:
     image: "@IMAGE@"
     runtime: sysbox-runc
     # The users file is written from the encrypted environment at each start (0600, outside the homes).
-    command: ["sh", "-c", "umask 077 && printf '%s' \"$$OSTRA_REMOTE_USERS_JSON\" > /run/ostra-users/users.json && unset OSTRA_REMOTE_USERS_JSON && exec node /opt/ostra/ostra-robinhood/mcp/src/remote.ts"]
+    command: ["sh", "-c", "umask 077 && printf '%s' \"$$OSTRA_REMOTE_USERS_JSON\" > /run/ostra-users/users.json && unset OSTRA_REMOTE_USERS_JSON && exec node /opt/ostra/dist/gateway.mjs"]
     depends_on:
       signer:
         condition: service_healthy
@@ -85,7 +85,7 @@ services:
 
   egress:
     image: "@IMAGE@"
-    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/egress.ts"]
+    command: ["node", "/opt/ostra/dist/egress.mjs"]
     environment:
       OSTRA_EGRESS_LISTEN: 0.0.0.0:3128
     networks: [inner, outer]
@@ -93,7 +93,7 @@ services:
 
   front:
     image: "@IMAGE@"
-    command: ["node", "/opt/ostra/ostra-robinhood/mcp/src/front.ts"]
+    command: ["node", "/opt/ostra/dist/front.mjs"]
     environment:
       OSTRA_FRONT_LISTEN: 0.0.0.0:8080
       OSTRA_FRONT_TARGET: gateway:4920

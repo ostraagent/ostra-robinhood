@@ -30,16 +30,16 @@
 
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, link, lstat, mkdir, open, readdir, readFile, rename, stat, unlink, utimes } from "node:fs/promises";
-import { chmodSync, constants, existsSync, realpathSync } from "node:fs";
+import { chmodSync, constants, existsSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { FileWotsStore, PAD_ENC_KIND, WotsKeyMismatchError, WotsKeyReuseError, type PadEncKind } from "@ostraagent/sdk";
 import { Keys, type PadPostMessage } from "@ostraagent/core";
 import { DiskFolder, ensurePrivateDir } from "./disk.ts";
+import { isEntry } from "./entry.ts";
 import {
   AGENT_ID,
   AGENT_OPS,
@@ -1102,18 +1102,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
 }
 
-/** True when this module is the program node runs (also through a symlinked bin). */
-function isEntry(): boolean {
-  const arg = process.argv[1];
-  if (arg === undefined) return false;
-  try {
-    return import.meta.url === pathToFileURL(realpathSync(arg)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (isEntry()) {
+if (isEntry("signer", import.meta.url)) {
   main().catch((err) => {
     log("fatal", { message: (err as Error).message });
     process.exit(1);

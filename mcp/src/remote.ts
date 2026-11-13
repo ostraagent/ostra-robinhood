@@ -81,12 +81,14 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, isInitializeRequest, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { robinhoodChain } from "@ostraagent/sdk";
 import { loadConfig } from "./config.ts";
+import { bundled, isEntry } from "./entry.ts";
 import { OWNER_TOOLS, REMOTE_REFUSED_TOOLS, RemoteAuth } from "./remote-auth.ts";
 import { ADMIN, MAX_SOCKETS_DIR, socketPath } from "./signer.ts";
 import { SignerAdmin } from "./signer-client.ts";
 import { agentToken } from "./signer-protocol.ts";
 
-const SERVER = join(dirname(fileURLToPath(import.meta.url)), "server.ts");
+/** The agent server each child runs: server.ts beside this file, or in the image the server bundle beside this one. */
+const SERVER = join(dirname(fileURLToPath(import.meta.url)), bundled === null ? "server.ts" : "server.mjs");
 /** The largest request body taken (MCP requests are small; tool arguments are JSON). */
 const MAX_BODY = 1 << 20;
 const USER_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -208,6 +210,8 @@ function homeIdKey(root: string): Buffer {
  * paths (each with its node_modules).
  */
 function codeDirs(): string[] {
+  // In the image the bundles' directory holds all of it (scripts/cloud-bundle.ts).
+  if (bundled !== null) return [realpathSync(dirname(SERVER))];
   const out = new Set<string>();
   const walk = (dir: string) => {
     const real = realpathSync(dir);
@@ -1018,7 +1022,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
 }
 
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isEntry("gateway", import.meta.url)) {
   main().catch((err: unknown) => {
     log("fatal", { error: err instanceof Error ? err.message : String(err) });
     process.exit(1);

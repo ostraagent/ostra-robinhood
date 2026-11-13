@@ -9,8 +9,7 @@
 //   OSTRA_FRONT_MAX          connections at once (default 4096)
 
 import { connect, createServer, type Server, type Socket } from "node:net";
-import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { isEntry } from "./entry.ts";
 
 /** How long a connection may stay with no byte either way: longer than a gateway session's idle time (900 s default). */
 const IDLE_MS = 20 * 60_000;
@@ -64,17 +63,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
 }
 
-function isEntry(): boolean {
-  const arg = process.argv[1];
-  if (arg === undefined) return false;
-  try {
-    return import.meta.url === pathToFileURL(realpathSync(arg)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (isEntry()) {
+if (isEntry("front", import.meta.url)) {
   main().catch((err: unknown) => {
     process.stderr.write(`${JSON.stringify({ t: new Date().toISOString(), event: "fatal", message: err instanceof Error ? err.message : String(err) })}\n`);
     process.exit(1);
