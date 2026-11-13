@@ -70,6 +70,11 @@ const SEARCH_WINDOW = 256n;
 const RESTORE_SKIP = 64n;
 /** The roots agent_key_request handed out last, kept with their index: an installed one is found without a search. */
 const ISSUED_KEPT = 64;
+/**
+ * The keys a rebuild of the mark checks at a time: each check may ask the signature escrow, a request over the network
+ * (one after another, the 256 keys of a new seed took some 70 s from Ostra Cloud's enclave, 13 Nov 2026).
+ */
+const RESTORE_PARALLEL = 16n;
 
 type MarkRecord = { version: 1; chainId: number; vault: Address; next: string };
 type IssuedRecord = { version: 1; roots: [root: Hex, index: string][] };
@@ -213,8 +218,20 @@ export class AgentKey {
     }
     const onChain = await this.#rootsOnChain();
     let found = -1n;
-    for (let i = 0n; i < found + 1n + SEARCH_WINDOW; i++) {
-      if (onChain.has(await this.#root(i)) || (await this.#signed(i)) !== undefined) found = i;
+    // RESTORE_PARALLEL keys at a time. Their roots and this device's records first, one after another (a signer answers
+    // them in blocks, and takes only so many requests at once); then what each signed, together (the escrow's answers).
+    // A block may check a few keys past the window: one found there only moves the mark higher, never lower.
+    for (let from = 0n; from < found + 1n + SEARCH_WINDOW; from += RESTORE_PARALLEL) {
+      const block = Array.from({ length: Number(RESTORE_PARALLEL) }, (_, j) => from + BigInt(j));
+      for (const i of block) {
+        await this.#root(i);
+        await this.#p.keys.agentRecorded(this.#p.config.chainId, this.vault, i);
+      }
+      const used = await Promise.all(block.map(async (i) => onChain.has(await this.#root(i)) || (await this.#signed(i)) !== undefined));
+      used.forEach((u, j) => {
+        const i = block[j] as bigint;
+        if (u && i > found) found = i;
+      });
     }
     const next = found + 1n + RESTORE_SKIP;
     await this.#setNext(next);
