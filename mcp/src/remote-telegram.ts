@@ -27,12 +27,16 @@
 // conversation and the tools, its tool calls run in the child, up to MAX_STEPS model calls. The owner's per-message
 // budget (USDG, set in the Mini App; `defaultBudget` until then) bounds what the model calls of one message may cost:
 // each call's max_price is at most half of it, and what the calls cost (Ostra AI's `paid.cost`) is counted against
-// it. The conversation is kept in memory only (HISTORY entries per home), never on disk.
+// it. The conversation is kept in memory only (HISTORY entries per home), never on disk. What the model calls of a
+// chat cost since its vault was connected is kept with its binding, and the model is told it (the owner may ask).
+// The model's answer is sent with Telegram's formatting: its Markdown (bold, italic, strikethrough, code, links, lists,
+// headings) read into message entities (formatForTelegram), never a parse mode, so no answer is refused for its markup.
 //
 // The bot reads its updates by long polling (getUpdates through the enclave's egress, Node's proxy support); the last
 // update id taken is kept, so an update is handled at most once across restarts. The token is never logged.
 //
-// Everything kept is one SQLite file: links (the secret by its SHA-256), bindings, and the update offset.
+// Everything kept is one SQLite file: links (the secret by its SHA-256), bindings (with their chat's AI cost), and the
+// update offset.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -181,6 +185,203 @@ export function splitMessage(text: string, max = MESSAGE_CHARS): string[] {
   return out.length === 0 ? ["(empty)"] : out;
 }
 
+/** A Telegram message entity (core.telegram.org/bots/api#messageentity): offsets and lengths in UTF-16 code units. */
+export type TelegramEntity = { type: "bold" | "italic" | "strikethrough" | "code" | "pre" | "text_link"; offset: number; length: number; url?: string; language?: string };
+
+const ALNUM = /[\p{L}\p{N}]/u;
+
+/**
+ * `type` over `length` characters at `at` whose inner entities are `inner` (offsets from `at`): bold, italic,
+ * strikethrough and a link may not contain code or pre (Telegram's nesting rules), so the outer entity is cut around
+ * them.
+ */
+function outer(type: TelegramEntity["type"], at: number, length: number, inner: readonly TelegramEntity[], extra: Partial<TelegramEntity> = {}): TelegramEntity[] {
+  const holes = inner.filter((e) => e.type === "code" || e.type === "pre").sort((a, b) => a.offset - b.offset);
+  const out: TelegramEntity[] = [];
+  let from = 0;
+  for (const h of [...holes, { offset: length, length: 0 }]) {
+    if (h.offset > from) out.push({ type, offset: at + from, length: h.offset - from, ...extra });
+    from = Math.max(from, h.offset + h.length);
+  }
+  return out;
+}
+const LINK_MD = /^\[([^\]\n]{1,300})\]\((https?:\/\/[^\s)]{1,2000})\)/;
+
+/** Inline Markdown read into text and entities (offsets from the start of the returned text). */
+function inlineMarkdown(src: string): { text: string; entities: TelegramEntity[] } {
+  let text = "";
+  const entities: TelegramEntity[] = [];
+  const wrap = (type: TelegramEntity["type"], inner: { text: string; entities: TelegramEntity[] }, extra: Partial<TelegramEntity> = {}) => {
+    const at = text.length;
+    text += inner.text;
+    for (const e of inner.entities) entities.push({ ...e, offset: e.offset + at });
+    entities.push(...outer(type, at, inner.text.length, inner.entities, extra));
+  };
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i] as string;
+    const next = src[i + 1];
+    if (c === "\\" && next !== undefined && /[\\`*_~[\]()#+\-.!>|]/.test(next)) {
+      text += next;
+      i += 2;
+      continue;
+    }
+    if (c === "`") {
+      const end = src.indexOf("`", i + 1);
+      if (end > i + 1) {
+        const at = text.length;
+        text += src.slice(i + 1, end);
+        entities.push({ type: "code", offset: at, length: end - i - 1 });
+        i = end + 1;
+        continue;
+      }
+    }
+    if (c === "[") {
+      const m = LINK_MD.exec(src.slice(i));
+      if (m !== null) {
+        wrap("text_link", inlineMarkdown(m[1] as string), { url: m[2] as string });
+        i += m[0].length;
+        continue;
+      }
+    }
+    const pair = src.slice(i, i + 2);
+    if (pair === "**" || pair === "__" || pair === "~~") {
+      // __ is bold only when it is not inside a word (open_channel, __init__ stay as written).
+      const word = pair === "__" && i > 0 && ALNUM.test(src[i - 1] as string);
+      const end = word ? -1 : findCloser(src, i + 2, pair);
+      if (end > 0 && (pair !== "__" || end + 2 >= src.length || !ALNUM.test(src[end + 2] as string))) {
+        wrap(pair === "~~" ? "strikethrough" : "bold", inlineMarkdown(src.slice(i + 2, end)));
+        i = end + 2;
+        continue;
+      }
+      text += pair;
+      i += 2;
+      continue;
+    }
+    if (c === "*" && (i === 0 || !ALNUM.test(src[i - 1] as string))) {
+      const end = findCloser(src, i + 1, "*");
+      if (end > 0 && (end + 1 >= src.length || !ALNUM.test(src[end + 1] as string))) {
+        wrap("italic", inlineMarkdown(src.slice(i + 1, end)));
+        i = end + 1;
+        continue;
+      }
+    }
+    text += c;
+    i++;
+  }
+  return { text, entities };
+}
+
+/**
+ * Where the delimiter `d` opened before `from` closes on the same line: the opener must be followed and the closer
+ * preceded by a character that is not a space, and a lone `*` never closes on one of a `**`; -1 when it does not close.
+ */
+function findCloser(src: string, from: number, d: string): number {
+  if (from >= src.length || /\s/.test(src[from] as string)) return -1;
+  for (let j = from + 1; j <= src.length - d.length; j++) {
+    const ch = src[j] as string;
+    if (ch === "\n") return -1;
+    if (ch === "\\") {
+      j++;
+      continue;
+    }
+    if (ch === "`") {
+      const end = src.indexOf("`", j + 1);
+      if (end > j) {
+        j = end;
+        continue;
+      }
+    }
+    if (src.startsWith(d, j) && !/\s/.test(src[j - 1] as string)) {
+      if (d === "*" && (src[j + 1] === "*" || src[j - 1] === "*")) continue;
+      return j;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Message parts (splitMessage) whose fenced code was cut: a part that ends inside a fence is closed, and the next one
+ * opens it again (with its language), so each part formats on its own.
+ */
+export function balanceFences(parts: readonly string[]): string[] {
+  const out: string[] = [];
+  let open: string | null = null;
+  for (const part of parts) {
+    const text = open === null ? part : `${open}\n${part}`;
+    open = null;
+    for (const line of text.split("\n")) {
+      if (open === null) {
+        const m = /^\s*```\s*([A-Za-z0-9_+-]{1,32})?\s*$/.exec(line);
+        if (m !== null) open = m[1] === undefined ? "```" : `\`\`\`${m[1]}`;
+      } else if (/^\s*```\s*$/.test(line)) open = null;
+    }
+    out.push(open === null ? text : `${text}\n\`\`\``);
+  }
+  return out;
+}
+
+/**
+ * A model's Markdown answer as Telegram text and message entities: fenced code as pre (its language kept when it is
+ * a plain name), inline code, bold (** or __), italic (*, not between letters or digits), strikethrough (~~), links
+ * [text](http(s) URL), headings as bold lines, list bullets as "•", rules dropped, backslash escapes. What is not
+ * Markdown stays as written. Entities nest only as Telegram allows (none inside code, code inside none).
+ */
+export function formatForTelegram(md: string): { text: string; entities: TelegramEntity[] } {
+  let text = "";
+  const entities: TelegramEntity[] = [];
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  const addLine = (piece: { text: string; entities: TelegramEntity[] }, prefix = "", bold = false) => {
+    if (text !== "") text += "\n";
+    text += prefix;
+    const at = text.length;
+    text += piece.text;
+    for (const e of piece.entities) entities.push({ ...e, offset: e.offset + at });
+    // A heading whose text is bold already (## **Title**) gets no second bold over the same characters.
+    if (bold && !piece.entities.some((e) => e.type === "bold" && e.offset === 0 && e.length === piece.text.length)) entities.push(...outer("bold", at, piece.text.length, piece.entities));
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const fence = /^\s*```\s*([A-Za-z0-9_+-]{1,32})?\s*$/.exec(line);
+    if (fence !== null) {
+      const body: string[] = [];
+      let j = i + 1;
+      while (j < lines.length && !/^\s*```\s*$/.test(lines[j] as string)) body.push(lines[j++] as string);
+      const code = body.join("\n");
+      if (text !== "") text += "\n";
+      if (code.length > 0) entities.push({ type: "pre", offset: text.length, length: code.length, ...(fence[1] !== undefined ? { language: fence[1] } : {}) });
+      text += code;
+      i = j;
+      continue;
+    }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      addLine({ text: "", entities: [] });
+      continue;
+    }
+    const heading = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(line);
+    if (heading !== null) {
+      addLine(inlineMarkdown(heading[1] as string), "", true);
+      continue;
+    }
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (bullet !== null) {
+      addLine(inlineMarkdown(bullet[2] as string), `${bullet[1] as string}• `);
+      continue;
+    }
+    addLine(inlineMarkdown(line));
+  }
+  // Telegram drops a message's leading and trailing white space: the entities are moved with the text it keeps.
+  const lead = text.length - text.trimStart().length;
+  const kept = text.trim();
+  const out: TelegramEntity[] = [];
+  for (const e of entities) {
+    const start = Math.max(0, e.offset - lead);
+    const end = Math.min(kept.length, e.offset - lead + e.length);
+    if (end > start) out.push({ ...e, offset: start, length: end - start });
+  }
+  return { text: kept, entities: out.sort((a, b) => a.offset - b.offset || b.length - a.length) };
+}
+
 export type McpTool = { name: string; description?: string; inputSchema?: Record<string, unknown> };
 export type ModelTool = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } };
 
@@ -237,14 +438,22 @@ export function readAiAnswer(m: JSONRPCMessage, cap: bigint): AiOutcome {
   return { ok: true, message: { role: "assistant", content: typeof msg.content === "string" ? msg.content : null, ...(Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 ? { tool_calls: msg.tool_calls } : {}) }, cost: costOf(cap) };
 }
 
-export function systemPrompt(vault: Address): string {
+/** What a chat's model calls cost so far, for the model (the owner may ask). */
+export type ChatCost = { spent: bigint; messages: number; since: number; budget: bigint };
+
+export function systemPrompt(vault: Address, cost?: ChatCost): string {
   return [
     `You are the Ostra agent of the vault ${vault} on Robinhood Chain, talking with the vault's owner in a private Telegram chat (Ostra Bot).`,
     "You act only through the tools you are given. Every spend you make is held on chain to the policy the owner set: the actions allowed, the most per spend and per day, the recipients allowed.",
     "Changing the policy, the allowlist or the agent key is the owner's alone, in the Ostra web app (app.ostraagent.xyz, the vault page's Agent tab): you cannot do it, so say where it is done.",
     "Never ask for, accept or repeat a seed phrase, a private key or a password.",
     "Before a spend, a trade or anything that cannot be undone, do it only when the owner asked for it in this chat, and say what you did with the transaction's hash when there is one.",
-    "Answer briefly, in the owner's language, as plain text (Telegram shows no Markdown here).",
+    ...(cost === undefined
+      ? []
+      : [
+          `What this chat's model calls cost, paid from the vault to Ostra AI since this Telegram account connected the vault (${new Date(cost.since * 1000).toISOString()}): ${formatTokenAmount(cost.spent)} USDG over ${cost.messages} message${cost.messages === 1 ? "" : "s"}, not counting the message being answered. The owner's AI budget of a message: at most ${formatTokenAmount(cost.budget)} USDG.`,
+        ]),
+    "Answer briefly, in the owner's language. Telegram shows **bold**, *italic*, `code` and [links](https://example.com); use them sparingly, and no tables.",
   ].join(" ");
 }
 
@@ -279,7 +488,7 @@ export type TelegramOptions = {
 };
 
 type LinkRow = { id: string; secret: string; tg_user: string; tg_name: string; tg_username: string | null; created: number; expires: number; status: string; vault: string | null; root: string | null; from_block: string | null; issued_at: number | null };
-type Binding = { tg_user: string; vault: string; home: string; root: string; key_expiry: number; budget: string; created: number };
+type Binding = { tg_user: string; vault: string; home: string; root: string; key_expiry: number; budget: string; created: number; ai_spent: number; ai_messages: number };
 type Message = { role: string; content: string | null; tool_calls?: ToolCall[]; tool_call_id?: string };
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -335,9 +544,13 @@ export class RemoteTelegram {
       CREATE INDEX IF NOT EXISTS links_user ON links (tg_user, status);
       CREATE INDEX IF NOT EXISTS links_vault ON links (vault, issued_at);
       CREATE TABLE IF NOT EXISTS bindings (tg_user TEXT PRIMARY KEY, vault TEXT NOT NULL, home TEXT NOT NULL, root TEXT NOT NULL,
-        key_expiry INTEGER NOT NULL, budget TEXT NOT NULL, created INTEGER NOT NULL);
+        key_expiry INTEGER NOT NULL, budget TEXT NOT NULL, created INTEGER NOT NULL, ai_spent INTEGER NOT NULL DEFAULT 0, ai_messages INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT NOT NULL);
     `);
+    // A file from before the chat's AI cost was kept (13 Nov 2026): its bindings start counting at 0.
+    const cols = new Set((this.#db.prepare("PRAGMA table_info(bindings)").all() as { name: string }[]).map((c) => c.name));
+    if (!cols.has("ai_spent")) this.#db.exec("ALTER TABLE bindings ADD COLUMN ai_spent INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("ai_messages")) this.#db.exec("ALTER TABLE bindings ADD COLUMN ai_messages INTEGER NOT NULL DEFAULT 0");
   }
 
   /** Starts the bot (its menu button, then long polling), unless polling is off. */
@@ -382,14 +595,22 @@ export class RemoteTelegram {
     return { inline_keyboard: [[{ text, web_app: { url: this.#miniApp } }]] };
   }
 
-  async #send(chat: number | string, text: string, button = false): Promise<void> {
+  /** Sends `text` in parts; `format`: a model's Markdown, sent as Telegram entities (plain, if Telegram refuses them). */
+  async #send(chat: number | string, text: string, button = false, format = false): Promise<void> {
     // Polling off: the routes only, nothing sent to Telegram.
     if (!this.#o.poll) return;
-    const parts = splitMessage(text);
+    const parts = format ? balanceFences(splitMessage(text)) : splitMessage(text);
     for (const [i, part] of parts.entries()) {
-      await this.#api("sendMessage", { chat_id: chat, text: part, link_preview_options: { is_disabled: true }, ...(button && i === parts.length - 1 ? { reply_markup: this.#button() } : {}) }).catch((err: unknown) =>
-        this.#o.log("telegram_send_failed", { error: this.#safe(err) }),
-      );
+      const f = format ? formatForTelegram(part) : { text: part, entities: [] };
+      const body = { chat_id: chat, text: f.text.trim() === "" ? part : f.text, link_preview_options: { is_disabled: true }, ...(button && i === parts.length - 1 ? { reply_markup: this.#button() } : {}) };
+      const send = (withEntities: boolean) => this.#api("sendMessage", withEntities && f.entities.length > 0 && f.text.trim() !== "" ? { ...body, entities: f.entities } : body);
+      await send(true)
+        .catch((err: unknown) => {
+          if ((err as { code?: unknown }).code !== 400 || f.entities.length === 0) throw err;
+          this.#o.log("telegram_entities_refused", { error: this.#safe(err) });
+          return send(false);
+        })
+        .catch((err: unknown) => this.#o.log("telegram_send_failed", { error: this.#safe(err) }));
     }
   }
 
@@ -474,7 +695,7 @@ export class RemoteTelegram {
       }
       const vault = getAddress(b.vault);
       const reply = await this.#o.withHome(b.home, vault, (ask) => this.#chat(ask, b, text));
-      await this.#send(chat, reply);
+      await this.#send(chat, reply.text, false, reply.format);
     } catch (err) {
       const status = (err as { status?: unknown }).status;
       this.#o.log("telegram_turn_failed", { user: b.home, status: typeof status === "number" ? status : null, error: this.#safe(err) });
@@ -513,45 +734,58 @@ export class RemoteTelegram {
     return out.length > MAX_TOOL_CHARS ? `${out.slice(0, MAX_TOOL_CHARS)}\n[cut: the answer was ${out.length} characters]` : out;
   }
 
-  async #chat(ask: AskChild, b: Binding, text: string): Promise<string> {
+  /** One message's turn: the reply, and whether it is the model's Markdown (sent formatted) rather than a notice. */
+  async #chat(ask: AskChild, b: Binding, text: string): Promise<{ text: string; format: boolean }> {
     const vault = getAddress(b.vault);
     const tools = await this.#modelTools(ask, b.home);
     const history = this.#history.get(b.home) ?? [];
-    const messages: Message[] = [{ role: "system", content: systemPrompt(vault) }, ...history, { role: "user", content: text }];
     const budget = BigInt(b.budget);
+    const cost: ChatCost = { spent: BigInt(b.ai_spent ?? 0), messages: Number(b.ai_messages ?? 0), since: b.created, budget };
+    const messages: Message[] = [{ role: "system", content: systemPrompt(vault, cost) }, ...history, { role: "user", content: text }];
     let spent = 0n;
     let steps = 0;
     let final: string | null = null;
     let failed = false;
     let partial = "";
-    while (final === null && steps < MAX_STEPS) {
-      const cap = callCap(budget, spent);
-      if (cap < MIN_CALL_UNITS) break;
-      steps++;
-      const m = await ask(
-        "tools/call",
-        { name: "ostra_ai", arguments: { task: "text", request: { messages, max_tokens: MAX_TOKENS, tools: tools.model, tool_choice: "auto" }, maxPrice: formatTokenAmount(cap) } },
-        AI_CALL_MS,
-      );
-      const out = readAiAnswer(m, cap);
-      spent += out.cost;
-      if (!out.ok) {
-        final = out.text;
-        failed = true;
-        break;
+    // The max_price of a model call under way: counted as its cost if the call never answers (as readAiAnswer does).
+    let inflight = 0n;
+    try {
+      while (final === null && steps < MAX_STEPS) {
+        const cap = callCap(budget, spent);
+        if (cap < MIN_CALL_UNITS) break;
+        steps++;
+        inflight = cap;
+        const m = await ask(
+          "tools/call",
+          { name: "ostra_ai", arguments: { task: "text", request: { messages, max_tokens: MAX_TOKENS, tools: tools.model, tool_choice: "auto" }, maxPrice: formatTokenAmount(cap) } },
+          AI_CALL_MS,
+        );
+        inflight = 0n;
+        const out = readAiAnswer(m, cap);
+        spent += out.cost;
+        if (!out.ok) {
+          final = out.text;
+          failed = true;
+          break;
+        }
+        const calls = out.message.tool_calls ?? [];
+        if (out.message.content !== null && out.message.content.trim() !== "") partial = out.message.content.trim();
+        if (calls.length === 0) {
+          final = out.message.content?.trim() || "(the model gave no answer)";
+          break;
+        }
+        const ids = calls.map((c, i) => (typeof c.id === "string" && c.id !== "" ? c.id : `call_${steps}_${i}`));
+        messages.push({ role: "assistant", content: out.message.content ?? "", tool_calls: calls.map((c, i) => ({ ...c, id: ids[i] as string, type: "function" })) });
+        for (const [i, c] of calls.entries()) {
+          const content = i < MAX_CALLS_PER_STEP ? await this.#runTool(ask, tools.names, c) : "Not run: too many tool calls at once.";
+          messages.push({ role: "tool", tool_call_id: ids[i] as string, content });
+        }
       }
-      const calls = out.message.tool_calls ?? [];
-      if (out.message.content !== null && out.message.content.trim() !== "") partial = out.message.content.trim();
-      if (calls.length === 0) {
-        final = out.message.content?.trim() || "(the model gave no answer)";
-        break;
-      }
-      const ids = calls.map((c, i) => (typeof c.id === "string" && c.id !== "" ? c.id : `call_${steps}_${i}`));
-      messages.push({ role: "assistant", content: out.message.content ?? "", tool_calls: calls.map((c, i) => ({ ...c, id: ids[i] as string, type: "function" })) });
-      for (const [i, c] of calls.entries()) {
-        const content = i < MAX_CALLS_PER_STEP ? await this.#runTool(ask, tools.names, c) : "Not run: too many tool calls at once.";
-        messages.push({ role: "tool", tool_call_id: ids[i] as string, content });
-      }
+    } finally {
+      // What this message's calls cost counts for its binding even when the turn fails (the vault paid it); for this
+      // connection only (a new one, made meanwhile, counts from 0).
+      if (steps > 0)
+        this.#db.prepare("UPDATE bindings SET ai_spent = ai_spent + ?, ai_messages = ai_messages + 1 WHERE tg_user = ? AND home = ? AND created = ?").run(spent + inflight, b.tg_user, b.home, b.created);
     }
     if (final === null)
       final =
@@ -564,7 +798,7 @@ export class RemoteTelegram {
       const keep = [...history, { role: "user", content: text.slice(0, HISTORY_CHARS) }, { role: "assistant", content: final.slice(0, HISTORY_CHARS) }];
       this.#history.set(b.home, keep.slice(-HISTORY));
     }
-    return `${final}\n\nAI cost: ${formatTokenAmount(spent)} USDG`;
+    return { text: `${final}\n\nAI cost: ${formatTokenAmount(spent)} USDG`, format: !failed && steps > 0 };
   }
 
   // --- bindings and the chain ----------------------------------------------------------------------------------------
@@ -814,7 +1048,7 @@ export class RemoteTelegram {
     const budget = before?.budget ?? this.#o.defaultBudget.toString();
     this.#db
       .prepare(
-        "INSERT INTO bindings (tg_user, vault, home, root, key_expiry, budget, created) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tg_user) DO UPDATE SET vault = excluded.vault, home = excluded.home, root = excluded.root, key_expiry = excluded.key_expiry, created = excluded.created",
+        "INSERT INTO bindings (tg_user, vault, home, root, key_expiry, budget, created) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tg_user) DO UPDATE SET vault = excluded.vault, home = excluded.home, root = excluded.root, key_expiry = excluded.key_expiry, created = excluded.created, ai_spent = 0, ai_messages = 0",
       )
       .run(r.tg_user, vault, home, r.root, keyExpiry, budget, now());
     // Another Telegram user bound to this vault before: its key was replaced by this one.
