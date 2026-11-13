@@ -303,6 +303,7 @@ test("the remote gateway's OAuth: connect proved by the owner's key, sessions, a
   assert.equal(existsSync(`/proc/${pid}/root${join(root, "home-id.key")}`), false, "nor the homes' key");
   assert.equal(existsSync(`/proc/${pid}/root${join(root, homeDir, "mcp.log")}`), false, "nor its own log (the gateway writes it)");
   assert.equal(existsSync(`/proc/${pid}/root${ownerHome}`), false, "nor anything else of the host");
+  assert.equal(existsSync(`/proc/${pid}/root/proc/self`), false, "nor a process table (no /proc in the sandbox)");
   // A system file that is a link (here /etc/localtime; /etc/resolv.conf under systemd-resolved) is seen at its own path.
   for (const f of ["/etc/localtime", "/etc/resolv.conf"]) if (existsSync(f)) assert.ok(existsSync(`/proc/${pid}/root${f}`), `it sees ${f}`);
   if (existsSync("/etc/localtime")) assert.ok(lstatSync("/etc/localtime").isSymbolicLink(), "the test needs /etc/localtime to be a link");

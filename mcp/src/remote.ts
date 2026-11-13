@@ -314,8 +314,11 @@ async function main(): Promise<void> {
    */
   const sandboxArgs = (id: string): string[] => {
     const dir = join(root, id);
-    // No capabilities inside, whoever runs the gateway (bwrap started by root otherwise keeps all of root's).
-    const a: string[] = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
+    // No capabilities inside, whoever runs the gateway (bwrap started by root otherwise keeps all of root's). Its own
+    // process namespace and no /proc: the server needs none, and under sysbox (Ostra Cloud: dstack OS 0.6.1) a proc
+    // mount for a new process namespace fails ("Can't mount proc on /newroot/proc: Invalid argument", 13 Nov 2026),
+    // while the container's /proc would show every other home's processes (their roots and environments: the same uid).
+    const a: string[] = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--cap-drop", "ALL", "--dev", "/dev", "--tmpfs", "/tmp"];
     // /bin, /lib, /lib64 and /sbin as the system has them: links into /usr, or directories.
     for (const top of ["/bin", "/sbin", "/lib", "/lib64", "/lib32"]) {
       if (!existsSync(top)) continue;
